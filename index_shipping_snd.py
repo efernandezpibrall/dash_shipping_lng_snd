@@ -4,6 +4,7 @@ from dash.dependencies import Input, Output, State
 from app import app
 import pages.shipping_balance
 import pages.exporter_detail
+import pages.exporters
 
 import pandas as pd
 import configparser
@@ -55,7 +56,8 @@ nav_links = html.Header([
             # Secondary navigation group
             html.Div([
                 dcc.Link('Shipping Balance', href='/shipping_balance', id='nav-shipping-balance', className='nav-link-secondary'),
-                dcc.Link('Exporter Detail', href='/exporters', id='nav-exporters', className='nav-link-secondary'),
+                dcc.Link('Exporters', href='/exporters', id='nav-exporters', className='nav-link-secondary'),
+                dcc.Link('Exporter Detail', href='/exporter_detail', id='nav-exporter-detail', className='nav-link-secondary'),
             ], className='nav-group-secondary')
         ], className='main-navigation'),
         
@@ -86,6 +88,8 @@ def display_page(pathname):
     if pathname == '/' or pathname == '/shipping_balance':
         return pages.shipping_balance.layout
     elif pathname == '/exporters':
+        return pages.exporters.layout
+    elif pathname == '/exporter_detail':
         return pages.exporter_detail.layout
     else:
         return '404 - Page not found'
@@ -98,6 +102,8 @@ app.clientside_callback(
         if (pathname === '/' || pathname === '/shipping_balance') {
             document.title = 'LNG Shipping - Shipping Balance';
         } else if (pathname === '/exporters') {
+            document.title = 'LNG Shipping - Exporters';
+        } else if (pathname === '/exporter_detail') {
             document.title = 'LNG Shipping - Exporter Detail';
         } else {
             document.title = 'LNG Shipping - Page Not Found';
@@ -115,6 +121,8 @@ app.clientside_callback(
             activeNavId = 'nav-shipping-balance';
         } else if (pathname === '/exporters') {
             activeNavId = 'nav-exporters';
+        } else if (pathname === '/exporter_detail') {
+            activeNavId = 'nav-exporter-detail';
         }
         
         if (activeNavId) {

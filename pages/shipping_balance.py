@@ -93,31 +93,59 @@ def prepare_table_data(df, metric, selected_regions=None, selected_year=None, se
     if selected_statuses and 'All Statuses' not in selected_statuses:
         filtered_df = filtered_df[filtered_df['status'].isin(selected_statuses)]
 
+    # Determine aggregation method based on metric type
+    if metric.startswith('median_'):
+        agg_method = 'median'
+    elif metric.startswith('mean_'):
+        agg_method = 'mean'
+    elif metric in ['count_trades', 'sum_ton_miles']:
+        agg_method = 'sum'
+    else:
+        # Default to mean for other metrics that might be averages
+        agg_method = 'mean'
+    
     # Aggregate the data
-    agg_data = filtered_df.groupby([index_field, 'vessel_type'])[metric].sum().reset_index()
+    agg_data = filtered_df.groupby([index_field, 'vessel_type'])[metric].agg(agg_method).reset_index()
 
     # Pivot the data for the table - vessel types as columns
     pivot_table = agg_data.pivot_table(
         index=[index_field],
         columns='vessel_type',
         values=metric,
-        aggfunc='sum',
+        aggfunc=agg_method,
         fill_value=0
     ).reset_index()
 
     # Add a Total column
     vessel_cols = [col for col in pivot_table.columns if col != index_field]
-    pivot_table['Total'] = pivot_table[vessel_cols].sum(axis=1)
+    
+    if agg_method in ['median', 'mean']:
+        # For median/mean metrics, calculate overall median/mean across vessel types
+        pivot_table['Total'] = pivot_table[vessel_cols].mean(axis=1)
+    else:
+        # For sum metrics, sum across vessel types
+        pivot_table['Total'] = pivot_table[vessel_cols].sum(axis=1)
 
-    # Make sure all numeric values are integers for count_trades
+    # Format numeric values based on metric type
     if metric == 'count_trades':
+        # Integer formatting for count data
         for col in vessel_cols + ['Total']:
             pivot_table[col] = pivot_table[col].astype(int)
+    elif agg_method in ['median', 'mean']:
+        # Round to 2 decimal places for median/mean metrics
+        for col in vessel_cols + ['Total']:
+            pivot_table[col] = pivot_table[col].round(2)
 
     # Add a Total row
     total_row = {index_field: 'Total'}
     for col in vessel_cols + ['Total']:
-        total_row[col] = pivot_table[col].sum()
+        if agg_method in ['median', 'mean']:
+            # For median/mean metrics, calculate overall median/mean across regions
+            value = pivot_table[pivot_table[index_field] != 'Total'][col].median() if agg_method == 'median' else pivot_table[pivot_table[index_field] != 'Total'][col].mean()
+            total_row[col] = round(value, 2) if not pd.isna(value) else 0
+        else:
+            # For sum metrics, sum across regions
+            total_row[col] = int(pivot_table[col].sum()) if metric == 'count_trades' else pivot_table[col].sum()
     pivot_table = pd.concat([pivot_table, pd.DataFrame([total_row])], ignore_index=True)
 
     # Sort by Total value in descending order (except Total row)
@@ -244,7 +272,7 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
         x_ticks.append(year_center)
         x_labels.append(str(year))
 
-    # Add vessel type annotations
+    # Add vessel type abbreviations below each bar
     vessel_annotations = []
     for y_idx, year in enumerate(years):
         for v_idx, vessel in enumerate(vessel_types):
@@ -261,9 +289,11 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
                     showarrow=False,
                     xanchor='center',
                     yanchor='top',
-                    yshift=-15,
-                    font=dict(size=10),
-                    textangle=45
+                    yshift=-20,  # Position below x-axis
+                    font=dict(size=8, color='#6b7280'),  # Small, subtle text
+                    textangle=0,  # Keep horizontal for readability
+                    xref='x',
+                    yref='y'
                 )
             )
 
@@ -286,33 +316,82 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
         align='left'
     )
 
-    # Update layout
+    # Update layout with professional styling from dash_style.md
     fig.update_layout(
-        title=chart_title,
+        
+        # X-Axis Professional Styling
         xaxis=dict(
-            title='Year',
+            title=dict(text='Year', font=dict(size=13, color='#374151')),
             tickvals=x_ticks,
             ticktext=x_labels,
-            tickangle=0
+            tickangle=0,
+            tickmode='array',  # Use array mode to ensure custom ticks are used
+            showgrid=True,
+            gridcolor='rgba(200, 200, 200, 0.3)',  # Subtle grid
+            gridwidth=0.5,
+            linecolor='#d1d5db',  # Subtle gray borders
+            linewidth=1,
+            tickfont=dict(size=11, color='#6b7280')
         ),
+        
+        # Y-Axis Professional Styling
         yaxis=dict(
-            title=title_suffix
+            title=dict(text=title_suffix, font=dict(size=13, color='#374151')),
+            showgrid=True,
+            gridcolor='rgba(200, 200, 200, 0.3)',
+            gridwidth=0.5,
+            linecolor='#d1d5db',
+            linewidth=1,
+            tickfont=dict(size=11, color='#6b7280'),
+            zeroline=True,
+            zerolinecolor='rgba(150, 150, 150, 0.4)',
+            zerolinewidth=1
         ),
+        
         barmode='stack',
-        legend_title=legend_title,
+        
+        # Professional Legend Positioning (keep on the right as requested)
         legend=dict(
             x=1.02,
             y=1,
             xanchor='left',
-            yanchor='top'
+            yanchor='top',
+            title=dict(text=legend_title, font=dict(size=12, color='#374151')),
+            bgcolor='rgba(255, 255, 255, 0)',  # Transparent
+            bordercolor='rgba(255, 255, 255, 0)',
+            borderwidth=0,
+            font=dict(size=10, color='#374151'),
+            itemsizing='constant',
+            itemwidth=30
         ),
-        annotations=vessel_annotations + [vessel_legend],
-        height=700,  # Increased height
-        margin=dict(l=50, r=250, t=50, b=150),  # Make room for the legend
-        autosize=True  # Allow the figure to resize with its container
+        
+        annotations=vessel_annotations,
+        
+        # Professional Background and Margins
+        plot_bgcolor='rgba(248, 249, 250, 0.5)',  # Subtle background
+        paper_bgcolor='white',
+        height=700,
+        margin=dict(l=70, r=250, t=60, b=120),  # Increased bottom margin for vessel abbreviations
+        
+        # Enhanced Interactivity
+        hovermode='x unified',
+        hoverlabel=dict(
+            bgcolor='rgba(255, 255, 255, 0.95)',
+            bordercolor='rgba(200, 200, 200, 0.8)',
+            font=dict(size=11, color='#1f2937'),
+            align='left'
+        ),
+        
+        # Smooth Animations
+        transition=dict(duration=300, easing='cubic-in-out'),
+        autosize=True
     )
-
-    return fig
+    
+    # Create vessel types footnote information
+    vessel_abbrs = [vessel[:2] if len(vessel) >= 2 else vessel for vessel in vessel_types]
+    vessel_footnote = ' | '.join([f"{abbr}: {full}" for abbr, full in zip(vessel_abbrs, vessel_types)])
+    
+    return fig, vessel_footnote
 
 
 def global_shipping_balance(aggregation_level='monthly', life_expectancy=20, lng_view='demand', utilization_rate=0.85):
@@ -352,6 +431,7 @@ def global_shipping_balance(aggregation_level='monthly', life_expectancy=20, lng
         AND release_type = 'Short Term Outlook'
         AND direction = %(direction)s
         AND metric_name = 'Flow'
+        AND start_date<'2036-01-01'
         GROUP BY country_name, start_date, publication_date
         HAVING SUM(metric_value) > 0
     ),
@@ -376,6 +456,7 @@ def global_shipping_balance(aggregation_level='monthly', life_expectancy=20, lng
         AND direction = %(direction)s
         AND metric_name = 'Flow'
         AND start_date::DATE > (SELECT max_date FROM short_term_max_date)
+        AND start_date<'2036-01-01'
         GROUP BY country_name, start_date, publication_date
         HAVING SUM(metric_value) > 0
     ),
@@ -893,159 +974,82 @@ layout = html.Div([
 
     # Trade Analysis by Region Pairs Section - Enterprise Standard
     html.Div([
-        # Enterprise Standard Inline Section Header
+        # Enterprise Standard Inline Section Header with All Controls
         html.Div([
             html.H3('Trade Analysis by Region Pairs', className="section-title-inline"),
+            html.Label("Select Metric:", className="inline-filter-label"),
+            dcc.Dropdown(
+                id='trade-metric-selector',
+                options=[
+                    {'label': 'Count Trades', 'value': 'count_trades'},
+                    {'label': 'Ton Miles', 'value': 'ton_miles'},
+                    {'label': 'Median Delivery Days', 'value': 'median_delivery_days'},
+                    {'label': 'Median Mileage (Nautical Miles)', 'value': 'median_mileage_nautical_miles'},
+                    {'label': 'Median Ton Miles', 'value': 'median_ton_miles'},
+                    {'label': 'Median Utilization Rate', 'value': 'median_utilization_rate'},
+                    {'label': 'Median Cargo Volume (m³)', 'value': 'median_cargo_destination_cubic_meters'},
+                    {'label': 'Median Vessel Capacity (m³)', 'value': 'median_vessel_capacity_cubic_meters'}
+                ],
+                value='count_trades',
+                clearable=False,
+                className='inline-dropdown'
+            ),
+            html.Label("Origin Region:", className="inline-filter-label"),
+            dcc.Dropdown(
+                id='region-dropdown',
+                options=[{'label': 'All Regions', 'value': 'All Regions'}],
+                value=['All Regions'],
+                multi=True,
+                clearable=False,
+                className='inline-dropdown-multi'
+            ),
+            html.Label("Year:", className="inline-filter-label"),
+            dcc.Dropdown(
+                id='year-dropdown',
+                options=[{'label': 'All Years', 'value': 'All Years'}],
+                value=None,
+                clearable=False,
+                className='inline-dropdown'
+            ),
+            html.Label("Status:", className="inline-filter-label"),
+            dcc.Dropdown(
+                id='region-status-dropdown',
+                options=[{'label': 'All Statuses', 'value': 'All Statuses'}],
+                value=['All Statuses'],
+                multi=True,
+                clearable=False,
+                className='inline-dropdown-multi'
+            ),
         ], className="inline-section-header"),
         
-        # Chart Container with Professional Layout
+        # Vessel Types Information (between header and chart)
         html.Div([
-            # Left column - Trade Count
-            html.Div([
-                html.Div([
-                    html.H4('Count of Trades by Region Pair', className="subheader-title-inline"),
-                ], className="inline-subheader"),
-                dcc.Graph(id='trade-count-visualization', style={'height': '600px'})
-            ], style={'flex': '1', 'paddingRight': '12px'}),
-            
-            # Right column - Ton Miles
-            html.Div([
-                html.Div([
-                    html.H4('Ton Miles by Region Pair', className="subheader-title-inline"),
-                ], className="inline-subheader"),
-                dcc.Graph(id='ton-miles-visualization', style={'height': '600px'})
-            ], style={'flex': '1', 'paddingLeft': '12px'})
-        ], style={'display': 'flex', 'gap': '24px', 'marginTop': '16px'})
-    ], className='section-container'),
-
-    # Filter Controls for Region Tables
-    html.Div([
-        html.Div([
-            html.H3("Table Filters", className='section-title-inline'),
-            html.P("Configure data filters for detailed regional analysis", className='section-subtitle')
-        ], className='header-content'),
+            html.P([
+                html.Span("Vessel Types: ", style={'fontWeight': '500', 'color': '#374151', 'fontSize': '13px'}),
+                html.Span(id='vessel-types-info', style={'color': '#6b7280', 'fontSize': '13px'})
+            ], style={
+                'fontFamily': 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',
+                'marginTop': '12px',
+                'marginBottom': '16px',
+                'paddingLeft': '16px',
+                'paddingRight': '16px',
+                'paddingTop': '10px',
+                'paddingBottom': '10px',
+                'backgroundColor': '#f8f9fa',
+                'borderRadius': '4px',
+                'border': '1px solid #e9ecef'
+            })
+        ]),
         
+        # Single Chart Container
         html.Div([
-            html.Div([
-                html.Label("Filter by Origin Region:", className='filter-label'),
-                dcc.Dropdown(
-                    id='region-dropdown',
-                    options=[{'label': 'All Regions', 'value': 'All Regions'}],
-                    value=['All Regions'],
-                    multi=True,
-                    clearable=False,
-                    className='inline-dropdown-multi'
-                )
-            ], className='filter-group'),
-            
-            html.Div([
-                html.Label("Filter by Year:", className='filter-label'),
-                dcc.Dropdown(
-                    id='year-dropdown',
-                    options=[{'label': 'All Years', 'value': 'All Years'}],
-                    value=None,
-                    clearable=False,
-                    className='inline-dropdown'
-                )
-            ], className='filter-group'),
-            
-            html.Div([
-                html.Label("Filter by Status:", className='filter-label'),
-                dcc.Dropdown(
-                    id='region-status-dropdown',
-                    options=[{'label': 'All Statuses', 'value': 'All Statuses'}],
-                    value=['All Statuses'],
-                    multi=True,
-                    clearable=False,
-                    className='inline-dropdown'
-                )
-            ], className='filter-group')
-        ], className='filter-bar')
-    ], className='professional-section-header'),
-
-    # Data Tables for Region Visualizations - Enterprise Standard
-    html.Div([
-        # Enterprise Standard Inline Section Header
-        html.Div([
-            html.H3('Regional Trade Data Tables', className="section-title-inline"),
-        ], className="inline-section-header"),
+            dcc.Graph(id='trade-analysis-visualization', style={'height': '600px'})
+        ], style={'marginTop': '0px'}),
         
-        # Tables Container
+        # Single Table Container
         html.Div([
-            html.Div([
-                html.Div([
-                    html.H4('Trade Count Data', className="subheader-title-inline"),
-                ], className="inline-subheader"),
-                html.Div(id='trade-count-table-container', style={'overflow-x': 'auto'})
-            ], className='section-container', style={'flex': '1', 'marginRight': '12px'}),
-            
-            html.Div([
-                html.Div([
-                    html.H4('Ton Miles Data', className="subheader-title-inline"),
-                ], className="inline-subheader"),
-                html.Div(id='ton-miles-table-container', style={'overflow-x': 'auto'})
-            ], className='section-container', style={'flex': '1', 'marginLeft': '12px'})
-        ], style={'display': 'flex', 'gap': '24px', 'marginTop': '16px'})
-    ], style={'marginBottom': '32px'}),
-
-    # Custom Metrics Analysis Section
-    html.Div([
-        html.Div([
-            html.H2("Custom Metrics Analysis by Shipping Region", className='section-title-inline'),
-            html.P("Analyze detailed shipping metrics by region and vessel characteristics", className='section-subtitle')
-        ], className='header-content'),
-        
-        html.Div([
-            html.Div([
-                html.Label("Filter by Year:", className='filter-label'),
-                dcc.Dropdown(
-                    id='region-metrics-year-dropdown',
-                    options=[{'label': 'All Years', 'value': 'All Years'}],
-                    value=None,
-                    clearable=False,
-                    className='inline-dropdown'
-                )
-            ], className='filter-group'),
-            
-            html.Div([
-                html.Label("Filter by Status:", className='filter-label'),
-                dcc.Dropdown(
-                    id='region-metrics-status-dropdown',
-                    options=[{'label': 'All Statuses', 'value': 'All Statuses'}],
-                    multi=False,
-                    clearable=False,
-                    className='inline-dropdown'
-                )
-            ], className='filter-group'),
-            
-            html.Div([
-                html.Label("Select Metric:", className='filter-label'),
-                dcc.Dropdown(
-                    id='region-metric-dropdown',
-                    options=[
-                        {'label': 'Median Delivery Days', 'value': 'median_delivery_days'},
-                        {'label': 'Median Mileage (Nautical Miles)', 'value': 'median_mileage_nautical_miles'},
-                        {'label': 'Median Ton Miles', 'value': 'median_ton_miles'},
-                        {'label': 'Median Utilization Rate', 'value': 'median_utilization_rate'},
-                        {'label': 'Median Cargo Volume (m³)', 'value': 'median_cargo_destination_cubic_meters'},
-                        {'label': 'Median Vessel Capacity (m³)', 'value': 'median_vessel_capacity_cubic_meters'},
-                        {'label': 'Count of Trades', 'value': 'count_trades'},
-                    ],
-                    value='median_delivery_days',
-                    clearable=False,
-                    className='inline-dropdown',
-                    style={'min-width': '300px'}
-                )
-            ], className='filter-group')
-        ], className='filter-bar')
-    ], className='inline-section-header'),
-
-    # Custom Region Metrics Data Table
-    html.Div([
-        html.Div([
-            html.H3(id='region-custom-metrics-table-title', className='subheader-title-inline'),
-        ], style={'marginBottom': '16px'}),
-        html.Div(id='region-custom-metrics-table-container', style={'overflow-x': 'auto'})
+            html.Div(id='trade-analysis-table-container', style={'overflow-x': 'auto'})
+        ], style={'marginTop': '24px'})
     ], className='section-container'),
 
     # Intracountry Trade Analysis Section
@@ -1133,65 +1137,6 @@ layout = html.Div([
         ], style={'display': 'flex', 'gap': '24px', 'marginTop': '16px'})
     ], style={'marginBottom': '32px'}),
 
-    # Vessel Type Custom Metrics Analysis Section
-    html.Div([
-        html.Div([
-            html.H2("Custom Metrics Analysis by Vessel Type", className='section-title-inline'),
-            html.P("Detailed vessel performance metrics by type and operational characteristics", className='section-subtitle')
-        ], className='header-content'),
-        
-        html.Div([
-            html.Div([
-                html.Label("Filter by Year:", className='filter-label'),
-                dcc.Dropdown(
-                    id='metrics-year-dropdown',
-                    options=[{'label': 'All Years', 'value': 'All Years'}],
-                    value=None,
-                    clearable=False,
-                    className='inline-dropdown'
-                )
-            ], className='filter-group'),
-            
-            html.Div([
-                html.Label("Filter by Status:", className='filter-label'),
-                dcc.Dropdown(
-                    id='metrics-status-dropdown',
-                    options=[{'label': 'All Statuses', 'value': 'All Statuses'}],
-                    multi=False,
-                    clearable=False,
-                    className='inline-dropdown'
-                )
-            ], className='filter-group'),
-            
-            html.Div([
-                html.Label("Select Metric:", className='filter-label'),
-                dcc.Dropdown(
-                    id='metric-dropdown',
-                    options=[
-                        {'label': 'Median Delivery Days', 'value': 'median_delivery_days'},
-                        {'label': 'Median Mileage (Nautical Miles)', 'value': 'median_mileage_nautical_miles'},
-                        {'label': 'Median Ton Miles', 'value': 'median_ton_miles'},
-                        {'label': 'Median Utilization Rate', 'value': 'median_utilization_rate'},
-                        {'label': 'Median Cargo Volume (m³)', 'value': 'median_cargo_destination_cubic_meters'},
-                        {'label': 'Median Vessel Capacity (m³)', 'value': 'median_vessel_capacity_cubic_meters'},
-                        {'label': 'Count of Trades', 'value': 'count_trades'}
-                    ],
-                    value='median_delivery_days',
-                    clearable=False,
-                    className='inline-dropdown',
-                    style={'min-width': '300px'}
-                )
-            ], className='filter-group')
-        ], className='filter-bar')
-    ], className='inline-section-header'),
-
-    # Vessel Type Custom Metrics Data Table
-    html.Div([
-        html.Div([
-            html.H3(id='custom-metrics-table-title', className='subheader-title-inline'),
-        ], style={'marginBottom': '16px'}),
-        html.Div(id='custom-metrics-table-container', style={'overflow-x': 'auto'})
-    ], className='section-container')
 ])
 
 
@@ -1293,15 +1238,11 @@ def update_refresh_time(timestamp):
 @callback(
     Output('global-shipping-balance', 'figure'),
     Output('global-shipping-balance-supply', 'figure'),
-    Output('trade-count-visualization', 'figure'),
-    Output('ton-miles-visualization', 'figure'),
     Output('region-dropdown', 'options'),
     Output('year-dropdown', 'options'),
     Output('year-dropdown', 'value'),
     Output('region-status-dropdown', 'options'),
     Output('region-status-dropdown', 'value'),
-    Output('trade-count-table-container', 'children'),
-    Output('ton-miles-table-container', 'children'),
     Input('trades-shipping-data-store', 'data'),
     Input('shipping-balance-data-store', 'data'),
     Input('shipping-balance-supply-data-store', 'data'),
@@ -1337,21 +1278,6 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
         selected_statuses = ['All Statuses']
 
 
-    fig_trade_count = create_stacked_bar_chart(
-        df_trades_shipping_region,
-        metric='count_trades',
-        title_suffix='Count of Trades',
-        selected_statuses=selected_statuses,
-        is_intracountry=False
-    )
-
-    fig_ton_miles = create_stacked_bar_chart(
-        df_trades_shipping_region,
-        metric='sum_ton_miles',
-        title_suffix='Ton Miles',
-        selected_statuses=selected_statuses,
-        is_intracountry=False
-    )
 
     # Create global shipping balance chart with professional formatting
     fig_global_shipping = make_subplots(specs=[[{"secondary_y": True}]])
@@ -1487,7 +1413,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     fig_global_shipping.update_xaxes(
         title=dict(text='Date', font=dict(size=13, color='#4A4A4A')),
         tickformat=tick_format,
-        tickangle=45,  # Angled for better readability with dates
+        tickangle=0,  # Angled for better readability with dates
         dtick=dtick,
         showgrid=True,
         gridcolor='rgba(200, 200, 200, 0.3)',
@@ -1622,7 +1548,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     fig_global_shipping_supply.update_xaxes(
         title=dict(text='Date', font=dict(size=13, color='#4A4A4A')),
         tickformat=tick_format,
-        tickangle=45,  # Angled for better readability with dates
+        tickangle=0,  # Angled for better readability with dates
         dtick=dtick,
         showgrid=True,
         gridcolor='rgba(200, 200, 200, 0.3)',
@@ -1637,42 +1563,117 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     for trace in fig_global_shipping_supply.data:
         trace.hovertemplate = hover_templates.get(aggregation_level, '%{x}<br><b>%{y:,.0f}</b><extra></extra>')
 
-    # Prepare data tables
-    count_table_data = prepare_table_data(
-        df_trades_shipping_region,
-        'count_trades',
-        selected_regions,
-        selected_year,
-        selected_statuses,
-        is_intracountry=False
-    )
-
-    ton_miles_table_data = prepare_table_data(
-        df_trades_shipping_region,
-        'sum_ton_miles',
-        selected_regions,
-        selected_year,
-        selected_statuses,
-        is_intracountry=False
-    )
-
-    # Create data tables
-    trade_count_table = create_datatable(count_table_data, 'region_pair')
-    ton_miles_table = create_datatable(ton_miles_table_data, 'region_pair')
 
     return (
         fig_global_shipping,
         fig_global_shipping_supply,
-        fig_trade_count,
-        fig_ton_miles,
         region_options,
         year_options,
         selected_year,
         status_options,
         selected_statuses,
-        trade_count_table,
-        ton_miles_table
     )
+
+
+# Trade Analysis Visualization and Table Callback
+@callback(
+    Output('trade-analysis-visualization', 'figure'),
+    Output('trade-analysis-table-container', 'children'),
+    Output('vessel-types-info', 'children'),
+    Input('trade-metric-selector', 'value'),
+    Input('trades-shipping-data-store', 'data'),
+    Input('region-dropdown', 'value'),
+    Input('year-dropdown', 'value'),
+    Input('region-status-dropdown', 'value'),
+)
+def update_trade_analysis_chart_and_table(selected_metric, shipping_data, selected_regions, selected_year, selected_statuses):
+    """Update the trade analysis chart and table based on selected metric."""
+    if not shipping_data:
+        # Return empty figure and table
+        empty_fig = go.Figure().update_layout(
+            title="No data available",
+            annotations=[dict(text="Please refresh data to load charts", 
+                            x=0.5, y=0.5, showarrow=False)]
+        )
+        return empty_fig, "No data available", ""
+    
+    # Default to all statuses if none selected
+    if selected_statuses is None:
+        selected_statuses = ['All Statuses']
+    
+    try:
+        # Convert JSON back to DataFrame using the same method as main callback
+        from io import StringIO
+        df_trades_shipping_region = pd.read_json(StringIO(shipping_data), orient='split')
+        
+        # Check if DataFrame is empty
+        if df_trades_shipping_region.empty:
+            return go.Figure().update_layout(
+                title="No data to display",
+                annotations=[dict(text="No data available", 
+                                x=0.5, y=0.5, showarrow=False)]
+            ), "No data available", ""
+        
+        # Don't apply additional filters - use the full dataset like the original callback
+        # The filtering is handled by the table callbacks, not the chart callbacks
+        
+        # Determine metric based on selection
+        metric_mapping = {
+            'count_trades': ('count_trades', 'Count of Trades'),
+            'ton_miles': ('sum_ton_miles', 'Ton Miles'),
+            'median_delivery_days': ('median_delivery_days', 'Median Delivery Days'),
+            'median_mileage_nautical_miles': ('median_mileage_nautical_miles', 'Median Mileage (Nautical Miles)'),
+            'median_ton_miles': ('median_ton_miles', 'Median Ton Miles'),
+            'median_utilization_rate': ('median_utilization_rate', 'Median Utilization Rate'),
+            'median_cargo_destination_cubic_meters': ('median_cargo_destination_cubic_meters', 'Median Cargo Volume (m³)'),
+            'median_vessel_capacity_cubic_meters': ('median_vessel_capacity_cubic_meters', 'Median Vessel Capacity (m³)')
+        }
+        
+        metric, title_suffix = metric_mapping.get(selected_metric, ('count_trades', 'Count of Trades'))
+        
+        # Create the chart
+        fig, vessel_footnote = create_stacked_bar_chart(
+            df_trades_shipping_region,
+            metric=metric,
+            title_suffix=title_suffix,
+            selected_statuses=selected_statuses,
+            is_intracountry=False
+        )
+        
+        # Create the table data using the same filtering logic as main callback
+        filtered_df = df_trades_shipping_region.copy()
+        
+        # Apply filters
+        if selected_regions and 'All Regions' not in selected_regions:
+            filtered_df = filtered_df[filtered_df['origin_shipping_region'].isin(selected_regions)]
+        
+        if selected_year and selected_year != 'All Years':
+            filtered_df = filtered_df[filtered_df['year'] == int(selected_year)]
+        
+        if selected_statuses and 'All Statuses' not in selected_statuses:
+            filtered_df = filtered_df[filtered_df['status'].isin(selected_statuses)]
+        
+        # Create table data based on selected metric
+        table_data = prepare_table_data(
+            filtered_df,
+            metric=metric,
+            selected_statuses=selected_statuses,
+            is_intracountry=False
+        )
+        
+        # Create the table
+        table = create_datatable(table_data, 'region_pair')
+        
+        return fig, table, vessel_footnote
+        
+    except Exception as e:
+        print(f"Error updating trade analysis chart and table: {e}")
+        error_fig = go.Figure().update_layout(
+            title="Error loading chart",
+            annotations=[dict(text=f"Error: {str(e)}", 
+                            x=0.5, y=0.5, showarrow=False)]
+        )
+        return error_fig, f"Error loading table: {str(e)}", ""
 
 
 @callback(
@@ -1711,7 +1712,7 @@ def update_intracountry_visualizations(intracountry_data, dropdown_options, sele
         selected_statuses = ['All Statuses']
 
     # Create visualizations
-    fig_intracountry_count = create_stacked_bar_chart(
+    fig_intracountry_count, _ = create_stacked_bar_chart(
         df_intracountry_trades,
         metric='count_trades',
         title_suffix='Count of Trades',
@@ -1719,7 +1720,7 @@ def update_intracountry_visualizations(intracountry_data, dropdown_options, sele
         is_intracountry=True
     )
 
-    fig_intracountry_tonmiles = create_stacked_bar_chart(
+    fig_intracountry_tonmiles, _ = create_stacked_bar_chart(
         df_intracountry_trades,
         metric='sum_ton_miles',
         title_suffix='Ton Miles',

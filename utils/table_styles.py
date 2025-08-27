@@ -14,7 +14,7 @@ STANDARD_TABLE_HEADER = {
     'color': 'white',                 # White text for contrast
     'fontWeight': 'bold',             # Bold headers for prominence
     'fontSize': '12px',               # Consistent font size
-    'fontFamily': 'Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif',
+    'fontFamily': 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',  # Updated to Inter per dash_style.md
     'padding': '8px',                 # Standard padding
     'whiteSpace': 'pre-wrap',
     'lineHeight': '1.2',
@@ -27,7 +27,7 @@ STANDARD_TABLE_CELL = {
     'textAlign': 'center',
     'padding': '8px',
     'fontSize': '12px',
-    'fontFamily': 'Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif',
+    'fontFamily': 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',  # Updated to Inter per dash_style.md
     'backgroundColor': 'white',
     'minWidth': '60px',
     'maxWidth': '180px',
