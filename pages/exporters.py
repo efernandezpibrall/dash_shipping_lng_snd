@@ -47,6 +47,366 @@ def setup_database_connection():
     return engine, DB_SCHEMA
 
 
+def fetch_rolling_windows_data(engine, schema):
+    """
+    Fetch 7-day and 30-day rolling window data for each country and installation,
+    including previous year data for seasonal comparison
+    """
+    EXCLUDED_COUNTRIES = [
+        "Japan", "Belgium", "Brazil", "Chile", "China", "Equatorial Guinea",
+        "France", "Greece", "India", "Netherlands", "Peru", "Singapore Republic",
+        "South Korea", "Spain", "Portugal","United States Virgin Islands", "Germany", 
+        "Finland", "Jamaica","Lithuania","Sweden","Turkey"
+    ]
+    
+    try:
+        with engine.connect() as conn:
+            # Get data for current period and same period last year
+            query = text(f"""
+            WITH latest_data AS (
+                SELECT MAX(upload_timestamp_utc) as max_timestamp
+                FROM {schema}.kpler_trades
+            )
+            SELECT 
+                kt.origin_country_name,
+                kt.installation_origin_name,
+                kt.start::date as flow_date,
+                kt.cargo_origin_cubic_meters * 0.6 / 1000 as mcmd
+            FROM {schema}.kpler_trades kt, latest_data ld
+            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                AND kt.origin_country_name NOT IN :excluded
+                AND kt.installation_origin_name IS NOT NULL
+                AND (
+                    -- Current 30-day window
+                    (kt.start >= CURRENT_DATE - INTERVAL '30 days' AND kt.start <= CURRENT_DATE)
+                    OR
+                    -- Same 30-day window last year
+                    (kt.start >= CURRENT_DATE - INTERVAL '1 year' - INTERVAL '30 days' 
+                     AND kt.start <= CURRENT_DATE - INTERVAL '1 year')
+                )
+            ORDER BY kt.start::date
+            """)
+            
+            df = pd.read_sql(query, conn, params={"excluded": tuple(EXCLUDED_COUNTRIES)})
+            
+            if df.empty:
+                return pd.DataFrame()
+            
+            # Convert to datetime
+            df['flow_date'] = pd.to_datetime(df['flow_date'])
+            
+            # Calculate 7D and 30D averages for each country-installation combination
+            current_date = datetime.now().date()
+            date_7d_ago = current_date - timedelta(days=7)
+            date_30d_ago = current_date - timedelta(days=30)
+            date_30d_y1_start = current_date - timedelta(days=365) - timedelta(days=30)
+            date_30d_y1_end = current_date - timedelta(days=365)
+            
+            # Filter for 7D window (current)
+            df_7d = df[(df['flow_date'].dt.date > date_7d_ago) & 
+                      (df['flow_date'].dt.date <= current_date)].copy()
+            # Group and calculate daily average
+            rolling_7d = df_7d.groupby(['origin_country_name', 'installation_origin_name'])['mcmd'].sum() / 7
+            rolling_7d = rolling_7d.round(1).reset_index()
+            rolling_7d.columns = ['origin_country_name', 'installation_origin_name', '7D']
+            
+            # Filter for 30D window (current)
+            df_30d = df[(df['flow_date'].dt.date > date_30d_ago) & 
+                       (df['flow_date'].dt.date <= current_date)].copy()
+            # Group and calculate daily average
+            rolling_30d = df_30d.groupby(['origin_country_name', 'installation_origin_name'])['mcmd'].sum() / 30
+            rolling_30d = rolling_30d.round(1).reset_index()
+            rolling_30d.columns = ['origin_country_name', 'installation_origin_name', '30D']
+            
+            # Filter for 30D window (previous year)
+            df_30d_y1 = df[(df['flow_date'].dt.date > date_30d_y1_start) & 
+                          (df['flow_date'].dt.date <= date_30d_y1_end)].copy()
+            # Group and calculate daily average for previous year
+            rolling_30d_y1 = df_30d_y1.groupby(['origin_country_name', 'installation_origin_name'])['mcmd'].sum() / 30
+            rolling_30d_y1 = rolling_30d_y1.round(1).reset_index()
+            rolling_30d_y1.columns = ['origin_country_name', 'installation_origin_name', '30D_Y1']
+            
+            # Merge all data
+            result = rolling_7d.merge(
+                rolling_30d,
+                on=['origin_country_name', 'installation_origin_name'],
+                how='outer'
+            )
+            result = result.merge(
+                rolling_30d_y1,
+                on=['origin_country_name', 'installation_origin_name'],
+                how='outer'
+            )
+            
+            # Add country totals
+            country_totals_7d = result.groupby('origin_country_name')['7D'].sum().round(1)
+            country_totals_30d = result.groupby('origin_country_name')['30D'].sum().round(1)
+            country_totals_30d_y1 = result.groupby('origin_country_name')['30D_Y1'].sum().round(1)
+            
+            country_totals = pd.DataFrame({
+                'origin_country_name': country_totals_7d.index,
+                'installation_origin_name': 'Total',
+                '30D': country_totals_30d.values,
+                '7D': country_totals_7d.values,
+                '30D_Y1': country_totals_30d_y1.values
+            })
+            
+            # Combine installation-level and country-level data
+            final_result = pd.concat([result, country_totals], ignore_index=True)
+            final_result = final_result.fillna(0)
+            
+            # Calculate deltas
+            final_result['Δ 7D-30D'] = (final_result['7D'] - final_result['30D']).round(1)
+            final_result['Δ 30D Y/Y'] = (final_result['30D'] - final_result['30D_Y1']).round(1)
+            
+            # Drop the 30D_Y1 column as we only need it for calculation
+            final_result = final_result.drop('30D_Y1', axis=1)
+            
+            return final_result
+            
+    except Exception as e:
+        print(f"Error fetching rolling windows data: {e}")
+        return pd.DataFrame()
+
+
+def get_completed_periods(current_date=None):
+    """
+    Calculate the last 5 completed quarters, last 3 completed months, 
+    and last 3 completed weeks based on current date.
+    """
+    if current_date is None:
+        current_date = datetime.now()
+    
+    # Initialize lists
+    completed_quarters = []
+    completed_months = []
+    completed_weeks = []
+    
+    # Calculate completed quarters (last 5)
+    current_quarter = (current_date.month - 1) // 3 + 1
+    current_year = current_date.year
+    
+    # Start from previous quarter to ensure it's completed
+    quarter = current_quarter - 1
+    year = current_year
+    if quarter < 1:
+        quarter = 4
+        year -= 1
+    
+    for _ in range(5):
+        completed_quarters.append(f"{year}-Q{quarter}")
+        quarter -= 1
+        if quarter < 1:
+            quarter = 4
+            year -= 1
+    
+    completed_quarters.reverse()
+    
+    # Calculate completed months (last 3)
+    # Previous month is the last completed month
+    month = current_date.month - 1
+    year = current_date.year
+    if month < 1:
+        month = 12
+        year -= 1
+    
+    for _ in range(3):
+        month_name = calendar.month_abbr[month]
+        completed_months.append(f"{month_name}-{year}")
+        month -= 1
+        if month < 1:
+            month = 12
+            year -= 1
+    
+    completed_months.reverse()
+    
+    # Calculate completed weeks (last 3 full weeks Mon-Sun)
+    # Find the most recent Sunday
+    days_since_sunday = (current_date.weekday() + 1) % 7
+    last_sunday = current_date - timedelta(days=days_since_sunday)
+    
+    # If today is Sunday and it's not complete, go to previous Sunday
+    if days_since_sunday == 0:
+        last_sunday = last_sunday - timedelta(days=7)
+    
+    # Get last 3 complete weeks
+    for i in range(3):
+        week_end = last_sunday - timedelta(days=7*i)
+        week_start = week_end - timedelta(days=6)
+        week_num = week_end.isocalendar()[1]
+        year = week_end.year
+        # Handle year transition for week numbering
+        if week_num == 1 and week_end.month == 12:
+            year += 1
+        completed_weeks.append(f"W{week_num:02d}-{year}")
+    
+    completed_weeks.reverse()
+    
+    return {
+        'quarters': completed_quarters,
+        'months': completed_months,
+        'weeks': completed_weeks
+    }
+
+
+def fetch_summary_table_data(engine, schema):
+    """
+    Fetch data for summary table showing last 5 completed quarters, 3 completed months, 3 completed weeks,
+    and 7D/30D rolling windows
+    Returns data in the same format as quarters/months/weeks tables for consistency
+    """
+    try:
+        # Fetch the existing data using the same function
+        quarters_df, months_df, weeks_df = fetch_installation_data(engine, schema)
+        
+        if quarters_df.empty and months_df.empty and weeks_df.empty:
+            return pd.DataFrame()
+        
+        # Also fetch 7D and 30D rolling data directly from database
+        rolling_data = fetch_rolling_windows_data(engine, schema)
+        
+        if rolling_data.empty:
+            # If no rolling data, create empty columns
+            rolling_data = pd.DataFrame()
+        
+        # Get current date to determine what's complete
+        current_date = datetime.now()
+        current_quarter = (current_date.month - 1) // 3 + 1
+        current_year = current_date.year
+        
+        # Get period columns - identify by pattern
+        quarter_cols = [col for col in quarters_df.columns 
+                       if col not in ['origin_country_name', 'installation_origin_name']]
+        month_cols = [col for col in months_df.columns 
+                     if col not in ['origin_country_name', 'installation_origin_name']]
+        week_cols = [col for col in weeks_df.columns 
+                    if col not in ['origin_country_name', 'installation_origin_name']]
+        
+        # Filter out current/incomplete periods
+        # For quarters: exclude current quarter
+        quarter_cols_filtered = []
+        for col in quarter_cols:
+            if "Q" in col and "'" in col:
+                q_num = int(col.split("Q")[1].split("'")[0])
+                year = int("20" + col.split("'")[1])
+                # Exclude if it's the current quarter or future
+                if year < current_year or (year == current_year and q_num < current_quarter):
+                    quarter_cols_filtered.append(col)
+        
+        # Sort and take last 5 completed quarters
+        quarter_cols_sorted = sorted(quarter_cols_filtered, 
+                                    key=lambda x: (x.split("'")[1], x.split("Q")[1].split("'")[0]))
+        selected_quarter_cols = quarter_cols_sorted[-5:] if len(quarter_cols_sorted) >= 5 else quarter_cols_sorted
+        
+        # For months: exclude current month
+        month_order = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+                      'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+        month_cols_filtered = []
+        for col in month_cols:
+            if "'" in col and not col.startswith("Q") and not col.startswith("W"):
+                month_abbr = col.split("'")[0]
+                year = int("20" + col.split("'")[1])
+                month_num = month_order.get(month_abbr, 0)
+                # Exclude if it's the current month or future
+                if year < current_year or (year == current_year and month_num < current_date.month):
+                    month_cols_filtered.append(col)
+        
+        # Sort and take last 3 completed months
+        month_cols_sorted = sorted(month_cols_filtered,
+                                  key=lambda x: (x.split("'")[1], month_order.get(x.split("'")[0], 0)))
+        selected_month_cols = month_cols_sorted[-3:] if len(month_cols_sorted) >= 3 else month_cols_sorted
+        
+        # For weeks: exclude current week
+        # Calculate current week number
+        current_week_num = current_date.isocalendar()[1]
+        week_cols_filtered = []
+        for col in week_cols:
+            if "W" in col and "'" in col:
+                week_num = int(col.split("W")[1].split("'")[0])
+                year = int("20" + col.split("'")[1])
+                # Exclude if it's the current week or future
+                if year < current_year or (year == current_year and week_num < current_week_num):
+                    week_cols_filtered.append(col)
+        
+        # Sort and take last 3 completed weeks
+        week_cols_sorted = sorted(week_cols_filtered,
+                                 key=lambda x: (x.split("'")[1], x.split("W")[1].split("'")[0].zfill(2)))
+        selected_week_cols = week_cols_sorted[-3:] if len(week_cols_sorted) >= 3 else week_cols_sorted
+        
+        # Create subset dataframes with selected columns
+        quarters_subset = quarters_df[['origin_country_name', 'installation_origin_name'] + selected_quarter_cols].copy()
+        months_subset = months_df[['origin_country_name', 'installation_origin_name'] + selected_month_cols].copy()
+        weeks_subset = weeks_df[['origin_country_name', 'installation_origin_name'] + selected_week_cols].copy()
+        
+        # Merge the dataframes in desired order
+        # Start with quarters
+        result = quarters_subset.copy()
+        
+        # Merge with months
+        result = result.merge(
+            months_subset,
+            on=['origin_country_name', 'installation_origin_name'],
+            how='outer'
+        )
+        
+        # Now add 30D column right after months (before weeks)
+        if not rolling_data.empty:
+            # First merge just the 30D column
+            result = result.merge(
+                rolling_data[['origin_country_name', 'installation_origin_name', '30D']],
+                on=['origin_country_name', 'installation_origin_name'],
+                how='left'
+            )
+        else:
+            result['30D'] = 0
+        
+        # Then merge with weeks
+        result = result.merge(
+            weeks_subset,
+            on=['origin_country_name', 'installation_origin_name'],
+            how='outer'
+        )
+        
+        # Finally add the remaining rolling window columns
+        if not rolling_data.empty:
+            result = result.merge(
+                rolling_data[['origin_country_name', 'installation_origin_name', '7D', 'Δ 7D-30D', 'Δ 30D Y/Y']],
+                on=['origin_country_name', 'installation_origin_name'],
+                how='left'
+            )
+        else:
+            result['7D'] = 0
+            result['Δ 7D-30D'] = 0
+            result['Δ 30D Y/Y'] = 0
+        
+        # Fill NaN values with 0
+        result = result.fillna(0)
+        
+        # Ensure numeric columns are float (in the order they appear in the dataframe)
+        numeric_cols = selected_quarter_cols + selected_month_cols + ['30D'] + selected_week_cols + ['7D', 'Δ 7D-30D', 'Δ 30D Y/Y']
+        for col in numeric_cols:
+            if col in result.columns:
+                result[col] = result[col].astype(float)
+        
+        # Sort by country and installation (Total rows should be at bottom of each country)
+        result['is_total'] = result['installation_origin_name'] == 'Total'
+        result = result.sort_values(['origin_country_name', 'is_total', 'installation_origin_name'])
+        result = result.drop('is_total', axis=1)
+        
+        # Round all numeric values
+        for col in numeric_cols:
+            if col in result.columns:
+                result[col] = result[col].round(1)
+        
+        return result
+            
+    except Exception as e:
+        print(f"Error fetching summary table data: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
+
 def fetch_global_supply_data(engine, schema):
     """Fetch daily global LNG supply data for seasonal chart"""
     
@@ -513,19 +873,18 @@ def get_table_conditional_styles():
 
 # Dashboard layout
 layout = html.Div([
+    # Interval component to trigger initial data load (runs once on page load)
+    dcc.Interval(id='initial-load-trigger', interval=1000*60*60*24, n_intervals=0, max_intervals=1),
+    
     # Store components for caching data
     dcc.Store(id='global-supply-data-store', storage_type='local'),
     dcc.Store(id='us-supply-data-store', storage_type='local'),
     dcc.Store(id='australia-supply-data-store', storage_type='local'),
     dcc.Store(id='qatar-supply-data-store', storage_type='local'),
-    dcc.Store(id='quarters-data-store', storage_type='local'),
-    dcc.Store(id='months-data-store', storage_type='local'),
-    dcc.Store(id='weeks-data-store', storage_type='local'),
+    dcc.Store(id='summary-data-store', storage_type='local'),
     
-    # Store for expanded state of countries
-    dcc.Store(id='quarters-expanded-countries', data=[]),
-    dcc.Store(id='months-expanded-countries', data=[]),
-    dcc.Store(id='weeks-expanded-countries', data=[]),
+    # Store for expanded state of countries in summary table
+    dcc.Store(id='summary-expanded-countries', data=[]),
 
     # Supply Charts Row - All 4 charts in one row
     html.Div([
@@ -584,55 +943,29 @@ layout = html.Div([
         ], style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'space-between'})
     ], className="main-section-container", style={'marginBottom': '30px'}),
 
-    # Exporters Section
+    # LNG Loadings Section
     html.Div([
         # Header
         html.Div([
-            html.H3('Exporters', className="section-title-inline"),
+            html.H3('LNG loadings on export countries and installations (mcm/d)', className="section-title-inline"),
         ], className="inline-section-header"),
         
-        # Instructions only
+        # Summary Table
         html.Div([
-            html.Span("Click on ▶ country row to expand and see installations", 
-                     style={'fontSize': '14px', 'color': '#666', 'fontStyle': 'italic'})
-        ], style={'marginTop': '15px', 'marginBottom': '20px'}),
-        
-        # Hidden components to maintain callback compatibility
-        html.Div([
-            dcc.Dropdown(id='country-filter-dropdown', value=None, style={'display': 'none'}),
-            dcc.Checklist(id='show-country-totals-checkbox', value=['show_totals'])
-        ], style={'display': 'none'}),
-        
-        # Loading wrapper for the tables
-        dcc.Loading(
-            id="installation-trends-loading",
-            children=[
-                # Quarterly Table
-                html.Div([
-                    html.Div([
-                        html.H4('Quarterly Trends (Last 8 Quarters)', className="subheader-title-inline"),
-                    ], className="inline-subheader"),
-                    html.Div(id='quarters-table-container')
-                ]),
-                
-                # Monthly Table
-                html.Div([
-                    html.Div([
-                        html.H4('Monthly Trends (Last 12 Months)', className="subheader-title-inline"),
-                    ], className="inline-subheader", style={'marginTop': '20px'}),
-                    html.Div(id='months-table-container')
-                ]),
-                
-                # Weekly Table
-                html.Div([
-                    html.Div([
-                        html.H4('Weekly Trends (Last 12 Weeks)', className="subheader-title-inline"),
-                    ], className="inline-subheader", style={'marginTop': '20px'}),
-                    html.Div(id='weeks-table-container')
-                ])
-            ],
-            type="default",
-        )
+            # Instructions at the top
+            html.Div([
+                html.Span("Click on ▶ country row to expand and see installations", 
+                         style={'fontSize': '14px', 'color': '#666', 'fontStyle': 'italic'})
+            ], style={'marginTop': '20px', 'marginBottom': '15px'}),
+            
+            dcc.Loading(
+                id="summary-table-loading",
+                children=[
+                    html.Div(id='summary-table-container')
+                ],
+                type="default"
+            )
+        ], style={'marginBottom': '30px'})
     ], className="main-section-container")
 ])
 
@@ -643,13 +976,11 @@ layout = html.Div([
      Output('us-supply-data-store', 'data'),
      Output('australia-supply-data-store', 'data'),
      Output('qatar-supply-data-store', 'data'),
-     Output('quarters-data-store', 'data'),
-     Output('months-data-store', 'data'),
-     Output('weeks-data-store', 'data')],
-    [Input('global-refresh-button', 'n_clicks')],
+     Output('summary-data-store', 'data')],
+    [Input('initial-load-trigger', 'n_intervals')],
     prevent_initial_call=False
 )
-def refresh_all_data(n_clicks):
+def refresh_all_data(n_intervals):
     """Load all data from database"""
     try:
         # Fetch data
@@ -663,19 +994,17 @@ def refresh_all_data(n_clicks):
         australia_supply_df = fetch_country_supply_data(engine_inst, schema, "Australia")
         qatar_supply_df = fetch_country_supply_data(engine_inst, schema, "Qatar")
         
-        # Fetch installation data
-        quarters_df, months_df, weeks_df = fetch_installation_data(engine_inst, schema)
+        # Fetch summary table data (which internally uses fetch_installation_data)
+        summary_df = fetch_summary_table_data(engine_inst, schema)
         
         return (global_supply_df.to_dict('records') if not global_supply_df.empty else [],
                 us_supply_df.to_dict('records') if not us_supply_df.empty else [],
                 australia_supply_df.to_dict('records') if not australia_supply_df.empty else [],
                 qatar_supply_df.to_dict('records') if not qatar_supply_df.empty else [],
-                quarters_df.to_dict('records'), 
-                months_df.to_dict('records'), 
-                weeks_df.to_dict('records'))
+                summary_df.to_dict('records') if not summary_df.empty else [])
         
     except Exception as e:
-        return [], [], [], [], [], [], []
+        return [], [], [], [], []
 
 
 def create_supply_chart(data, title_prefix="", show_legend=True):
@@ -848,70 +1177,47 @@ def update_qatar_supply_chart(qatar_data):
 
 
 @callback(
-    [Output('quarters-table-container', 'children'),
-     Output('months-table-container', 'children'),
-     Output('weeks-table-container', 'children')],
-    [Input('quarters-data-store', 'data'),
-     Input('months-data-store', 'data'),
-     Input('weeks-data-store', 'data'),
-     Input('country-filter-dropdown', 'value'),
-     Input('show-country-totals-checkbox', 'value'),
-     Input('quarters-expanded-countries', 'data'),
-     Input('months-expanded-countries', 'data'),
-     Input('weeks-expanded-countries', 'data')],
+    Output('summary-table-container', 'children'),
+    [Input('summary-data-store', 'data'),
+     Input('summary-expanded-countries', 'data')],
     prevent_initial_call=False
 )
-def update_installation_tables(quarters_data, months_data, weeks_data, selected_countries, show_totals_option,
-                              quarters_expanded, months_expanded, weeks_expanded):
-    """Update all three installation trends tables with expandable rows"""
+def update_summary_table(summary_data, expanded_countries):
+    """Update the summary table with 5 quarters, 3 months, 3 weeks data with expandable rows"""
     
-    # Initialize expanded states if None
-    quarters_expanded = quarters_expanded or []
-    months_expanded = months_expanded or []
-    weeks_expanded = weeks_expanded or []
+    if not summary_data:
+        return html.Div("No data available. Please refresh to load data.", 
+                       style={'textAlign': 'center', 'padding': '20px'})
     
-    def create_table(stored_data, table_type, expanded_countries):
-        """Helper function to create a table with expandable rows"""
-        if not stored_data:
+    try:
+        # Convert stored data back to DataFrame (same pattern as working tables)
+        df = pd.DataFrame(summary_data)
+        
+        if df.empty:
             return html.Div("No data available. Please refresh to load data.", 
                           style={'textAlign': 'center', 'padding': '20px'})
         
-        # Convert stored data back to DataFrame
-        df = pd.DataFrame(stored_data)
+        # Initialize expanded countries if None
+        expanded_countries = expanded_countries or []
         
-        # Determine current period column based on table type
-        from datetime import datetime
-        current_date = datetime.now()
-        if table_type == 'quarters':
-            current_period = pd.Period(current_date, freq='Q')
-            current_col = f"Q{current_period.quarter}'{str(current_period.year)[2:]}"
-        elif table_type == 'months':
-            current_period = pd.Period(current_date, freq='M')
-            current_col = f"{calendar.month_abbr[current_period.month]}'{str(current_period.year)[2:]}"
-        else:  # weeks
-            current_period = pd.Period(current_date, freq='W')
-            current_col = f"W{current_period.start_time.isocalendar()[1]}'{str(current_period.year)[2:]}"
-        
-        # No country filter needed anymore
-        
-        # Prepare data for table display with expansion
-        display_df, columns = prepare_table_for_display(df, table_type, expanded_countries)
+        # Prepare data for display with expandable rows
+        display_df, columns = prepare_table_for_display(df, 'summary', expanded_countries)
         
         if display_df.empty:
-            return html.Div("No data matches the selected filters.", 
+            return html.Div("No data to display.", 
                           style={'textAlign': 'center', 'padding': '20px'})
         
         # Get conditional styles (includes alternating rows, country totals, grand total)
         conditional_styles = get_table_conditional_styles()
         
-        # Add style for indented installations (before Grand Total to maintain priority)
+        # Add style for indented installations
         conditional_styles.insert(1, {
             'if': {'filter_query': '{Country} = ""'},
             'backgroundColor': '#f9f9f9',
             'fontSize': '13px'
         })
         
-        # Add left alignment for Country and Installation columns
+        # Add alignment styles
         conditional_styles.append({
             'if': {'column_id': 'Country'},
             'textAlign': 'left'
@@ -921,14 +1227,112 @@ def update_installation_tables(quarters_data, months_data, weeks_data, selected_
             'textAlign': 'left'
         })
         
-        # Add right alignment for all numeric columns (quarterly data)
-        # This ensures better readability for numbers per dash_style.md guidelines
+        # Add right alignment for all numeric columns
         for col in display_df.columns:
             if col not in ['Country', 'Installation']:
                 conditional_styles.append({
                     'if': {'column_id': col},
                     'textAlign': 'right',
-                    'paddingRight': '12px'  # Add padding for better readability
+                    'paddingRight': '12px'
+                })
+        
+        # Find the last quarter column to add separator after it
+        quarter_columns = [col for col in display_df.columns if col.startswith('Q') and "'" in col]
+        last_quarter_col = quarter_columns[-1] if quarter_columns else None
+        
+        # Different background colors for different period types
+        for col in display_df.columns:
+            if col.startswith('Q') and "'" in col:  # Quarter columns
+                conditional_styles.append({
+                    'if': {'column_id': col, 'row_index': 0},
+                    'backgroundColor': '#e3f2fd'  # Light blue for quarters
+                })
+                # Add left border to first quarter column for visual separation from Installation
+                quarter_columns = [c for c in display_df.columns if c.startswith('Q') and "'" in c]
+                if quarter_columns and col == quarter_columns[0]:
+                    conditional_styles.append({
+                        'if': {'column_id': col},
+                        'borderLeft': '3px solid white'
+                    })
+            elif col.startswith('W') and "'" in col:  # Week columns
+                conditional_styles.append({
+                    'if': {'column_id': col, 'row_index': 0},
+                    'backgroundColor': '#e8f5e9'  # Light green for weeks
+                })
+                # Add left border to first week column for visual separation from 30D
+                week_columns = [c for c in display_df.columns if c.startswith('W') and "'" in c]
+                if week_columns and col == week_columns[0]:
+                    conditional_styles.append({
+                        'if': {'column_id': col},
+                        'borderLeft': '3px solid white'
+                    })
+            elif "'" in col and not col.startswith('Q') and not col.startswith('W') and col not in ['Country', 'Installation']:  # Month columns
+                conditional_styles.append({
+                    'if': {'column_id': col, 'row_index': 0},
+                    'backgroundColor': '#f3e5f5'  # Light purple for months
+                })
+                # Add left border to first month column for visual separation
+                month_columns = [c for c in display_df.columns if "'" in c and not c.startswith('Q') and not c.startswith('W') and c not in ['Country', 'Installation']]
+                if month_columns and col == month_columns[0]:
+                    conditional_styles.append({
+                        'if': {'column_id': col},
+                        'borderLeft': '3px solid white'
+                    })
+            elif col in ['30D', '7D']:  # Rolling window columns
+                conditional_styles.append({
+                    'if': {'column_id': col},
+                    'backgroundColor': '#fff3e0',  # Light orange for rolling windows
+                    'fontWeight': '500'
+                })
+            elif col == 'Δ 7D-30D':  # Delta column
+                conditional_styles.append({
+                    'if': {'column_id': col},
+                    'backgroundColor': '#f5f5f5',  # Light gray background
+                    'fontWeight': '600',
+                    'borderLeft': '3px solid white'  # Add separator before first delta
+                })
+                # Add conditional formatting for positive values (green)
+                conditional_styles.append({
+                    'if': {
+                        'column_id': col,
+                        'filter_query': f'{{{col}}} > 0'
+                    },
+                    'color': '#2e7d32',  # Green for positive
+                    'fontWeight': '600'
+                })
+                # Add conditional formatting for negative values (red)
+                conditional_styles.append({
+                    'if': {
+                        'column_id': col,
+                        'filter_query': f'{{{col}}} < 0'
+                    },
+                    'color': '#c62828',  # Red for negative
+                    'fontWeight': '600'
+                })
+            elif col == 'Δ 30D Y/Y':  # Seasonal delta column
+                conditional_styles.append({
+                    'if': {'column_id': col},
+                    'backgroundColor': '#e8f5e9',  # Light green background for seasonal
+                    'fontWeight': '600',
+                    'borderLeft': '3px solid white'  # Add separator between the two deltas
+                })
+                # Add conditional formatting for positive values (dark green)
+                conditional_styles.append({
+                    'if': {
+                        'column_id': col,
+                        'filter_query': '{Δ 30D Y/Y} > 0'
+                    },
+                    'color': '#1b5e20',  # Dark green for positive Y/Y growth
+                    'fontWeight': '600'
+                })
+                # Add conditional formatting for negative values (dark red)
+                conditional_styles.append({
+                    'if': {
+                        'column_id': col,
+                        'filter_query': '{Δ 30D Y/Y} < 0'
+                    },
+                    'color': '#b71c1c',  # Dark red for negative Y/Y growth
+                    'fontWeight': '600'
                 })
         
         # Re-add Grand Total style at the end to ensure highest priority
@@ -943,9 +1347,57 @@ def update_installation_tables(quarters_data, months_data, weeks_data, selected_
         table_config = StandardTableStyleManager.get_base_datatable_config()
         table_config['style_data_conditional'] = conditional_styles
         
-        # Create the DataTable with pattern matching ID
+        # Add header styles for the separators
+        header_styles = []
+        
+        # Find first quarter column for header separator (after Installation)
+        quarter_columns_for_header = [c for c in display_df.columns if c.startswith('Q') and "'" in c]
+        if quarter_columns_for_header:
+            first_quarter_col = quarter_columns_for_header[0]
+            header_styles.append({
+                'if': {'column_id': first_quarter_col},
+                'borderLeft': '3px solid white'
+            })
+        
+        # Find first month column for header separator
+        month_columns_for_header = [c for c in display_df.columns if "'" in c and not c.startswith('Q') and not c.startswith('W') and c not in ['Country', 'Installation']]
+        if month_columns_for_header:
+            first_month_col = month_columns_for_header[0]
+            header_styles.append({
+                'if': {'column_id': first_month_col},
+                'borderLeft': '3px solid white'
+            })
+        
+        # Find first week column for header separator (after 30D)
+        week_columns_for_header = [c for c in display_df.columns if c.startswith('W') and "'" in c]
+        if week_columns_for_header:
+            first_week_col = week_columns_for_header[0]
+            header_styles.append({
+                'if': {'column_id': first_week_col},
+                'borderLeft': '3px solid white'
+            })
+        
+        # Add separator before first delta column (Δ 7D-30D)
+        if 'Δ 7D-30D' in display_df.columns:
+            header_styles.append({
+                'if': {'column_id': 'Δ 7D-30D'},
+                'borderLeft': '3px solid white'
+            })
+        
+        # Add separator before second delta column (Δ 30D Y/Y)
+        if 'Δ 30D Y/Y' in display_df.columns:
+            header_styles.append({
+                'if': {'column_id': 'Δ 30D Y/Y'},
+                'borderLeft': '3px solid white'
+            })
+        
+        # Apply header styles
+        if header_styles:
+            table_config['style_header_conditional'] = header_styles
+        
+        # Create the DataTable with pattern matching ID for click handling
         table = dash_table.DataTable(
-            id={'type': 'expandable-table', 'index': table_type},
+            id={'type': 'expandable-table', 'index': 'summary'},
             data=display_df.to_dict('records'),
             columns=columns,
             page_size=100,  # Increased to show expanded rows
@@ -954,49 +1406,54 @@ def update_installation_tables(quarters_data, months_data, weeks_data, selected_
             **table_config
         )
         
-        return table
-    
-    try:
-        quarters_table = create_table(quarters_data, 'quarters', quarters_expanded)
-        months_table = create_table(months_data, 'months', months_expanded)
-        weeks_table = create_table(weeks_data, 'weeks', weeks_expanded)
+        # Calculate date ranges for footnote
+        from datetime import datetime, timedelta
+        today = datetime.now().date()
+        date_7d_start = (today - timedelta(days=6)).strftime('%b %d, %Y')
+        date_30d_start = (today - timedelta(days=29)).strftime('%b %d, %Y')
+        date_today = today.strftime('%b %d, %Y')
         
-        return quarters_table, months_table, weeks_table
+        # Previous year 30D window dates
+        date_30d_y1_start = (today - timedelta(days=365) - timedelta(days=29)).strftime('%b %d, %Y')
+        date_30d_y1_end = (today - timedelta(days=365)).strftime('%b %d, %Y')
+        
+        # Create footnote
+        footnote = html.Div([
+            html.P([
+                html.Span('Note: ', style={'fontWeight': 'bold'}),
+                html.Span(f'30D: {date_30d_start} to {date_today} | ', style={'color': '#666'}),
+                html.Span(f'7D: {date_7d_start} to {date_today} | ', style={'color': '#666'}),
+                html.Span(f'30D Y-1: {date_30d_y1_start} to {date_30d_y1_end}', style={'color': '#666'})
+            ], style={'fontSize': '12px', 'fontStyle': 'italic', 'marginTop': '10px', 'color': '#666'})
+        ])
+        
+        # Return table with footnote
+        return html.Div([table, footnote])
         
     except Exception as e:
-        error_div = html.Div(f"Error updating tables: {str(e)}", 
-                           style={'textAlign': 'center', 'padding': '20px', 'color': 'red'})
-        return error_div, error_div, error_div
+        return html.Div(f"Error creating summary table: {str(e)}", 
+                       style={'textAlign': 'center', 'padding': '20px', 'color': 'red'})
 
 
-# Callback to handle expanding/collapsing rows
+# Callback to handle expanding/collapsing rows for summary table
 @callback(
-    [Output('quarters-expanded-countries', 'data', allow_duplicate=True),
-     Output('months-expanded-countries', 'data', allow_duplicate=True),
-     Output('weeks-expanded-countries', 'data', allow_duplicate=True)],
+    Output('summary-expanded-countries', 'data', allow_duplicate=True),
     [Input({'type': 'expandable-table', 'index': ALL}, 'active_cell')],
     [State({'type': 'expandable-table', 'index': ALL}, 'data'),
-     State('quarters-expanded-countries', 'data'),
-     State('months-expanded-countries', 'data'),
-     State('weeks-expanded-countries', 'data'),
-     State('quarters-data-store', 'data'),
-     State('months-data-store', 'data'),
-     State('weeks-data-store', 'data')],
+     State('summary-expanded-countries', 'data'),
+     State('summary-data-store', 'data')],
     prevent_initial_call=True
 )
-def handle_row_expansion(active_cells, table_data_list, quarters_expanded, months_expanded, weeks_expanded,
-                        quarters_data, months_data, weeks_data):
-    """Handle clicking on rows to expand/collapse"""
+def handle_row_expansion(active_cells, table_data_list, summary_expanded, summary_data):
+    """Handle clicking on rows to expand/collapse in summary table"""
     
     # Initialize if None
-    quarters_expanded = quarters_expanded or []
-    months_expanded = months_expanded or []
-    weeks_expanded = weeks_expanded or []
+    summary_expanded = summary_expanded or []
     
     # Check which table was clicked
     ctx = callback_context
     if not ctx.triggered:
-        return quarters_expanded, months_expanded, weeks_expanded
+        return summary_expanded
     
     # Get the triggered input
     triggered = ctx.triggered[0]
@@ -1014,49 +1471,23 @@ def handle_row_expansion(active_cells, table_data_list, quarters_expanded, month
             # Get the active cell value
             active_cell = triggered['value']
             if not active_cell:
-                return quarters_expanded, months_expanded, weeks_expanded
+                return summary_expanded
             
             # Get the corresponding table data
-            if table_type == 'quarters' and quarters_data:
-                df = pd.DataFrame(quarters_data)
-                display_df, _ = prepare_table_for_display(df, 'quarters', quarters_expanded)
+            if table_type == 'summary' and summary_data:
+                df = pd.DataFrame(summary_data)
+                display_df, _ = prepare_table_for_display(df, 'summary', summary_expanded)
                 if active_cell['row'] < len(display_df):
                     clicked_row = display_df.iloc[active_cell['row']]
                     country_col = clicked_row.get('Country', '')
                     if country_col and (country_col.startswith('▶') or country_col.startswith('▼')):
                         country = country_col[2:].strip()
-                        if country in quarters_expanded:
-                            quarters_expanded.remove(country)
+                        if country in summary_expanded:
+                            summary_expanded.remove(country)
                         else:
-                            quarters_expanded.append(country)
-            
-            elif table_type == 'months' and months_data:
-                df = pd.DataFrame(months_data)
-                display_df, _ = prepare_table_for_display(df, 'months', months_expanded)
-                if active_cell['row'] < len(display_df):
-                    clicked_row = display_df.iloc[active_cell['row']]
-                    country_col = clicked_row.get('Country', '')
-                    if country_col and (country_col.startswith('▶') or country_col.startswith('▼')):
-                        country = country_col[2:].strip()
-                        if country in months_expanded:
-                            months_expanded.remove(country)
-                        else:
-                            months_expanded.append(country)
-            
-            elif table_type == 'weeks' and weeks_data:
-                df = pd.DataFrame(weeks_data)
-                display_df, _ = prepare_table_for_display(df, 'weeks', weeks_expanded)
-                if active_cell['row'] < len(display_df):
-                    clicked_row = display_df.iloc[active_cell['row']]
-                    country_col = clicked_row.get('Country', '')
-                    if country_col and (country_col.startswith('▶') or country_col.startswith('▼')):
-                        country = country_col[2:].strip()
-                        if country in weeks_expanded:
-                            weeks_expanded.remove(country)
-                        else:
-                            weeks_expanded.append(country)
+                            summary_expanded.append(country)
                             
         except Exception as e:
             pass
     
-    return quarters_expanded, months_expanded, weeks_expanded
+    return summary_expanded
