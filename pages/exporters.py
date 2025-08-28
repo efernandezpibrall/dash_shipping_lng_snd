@@ -412,21 +412,46 @@ def fetch_global_supply_data(engine, schema):
     
     try:
         with engine.connect() as conn:
-            # Get daily aggregated data from 2024-01-01 onwards - NO EXCLUSIONS
+            # Get daily aggregated data with rolling average calculated in SQL
             query = text(f"""
             WITH latest_data AS (
                 SELECT MAX(upload_timestamp_utc) as max_timestamp
                 FROM {schema}.kpler_trades
+            ),
+            daily_supply AS (
+                SELECT 
+                    kt.start::date as date,
+                    SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as mcmd
+                FROM {schema}.kpler_trades kt, latest_data ld
+                WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                    AND kt.start >= '2023-11-01'
+                    AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+                GROUP BY kt.start::date
+            ),
+            rolling_supply AS (
+                SELECT 
+                    date,
+                    mcmd,
+                    AVG(mcmd) OVER (
+                        ORDER BY date 
+                        ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                    ) as rolling_avg,
+                    CASE 
+                        WHEN date > CURRENT_DATE THEN true
+                        ELSE false
+                    END as is_forecast
+                FROM daily_supply
             )
             SELECT 
-                kt.start::date as date,
-                SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as mcmd
-            FROM {schema}.kpler_trades kt, latest_data ld
-            WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                AND kt.start >= '2023-11-01'
-                AND kt.start <= CURRENT_DATE
-            GROUP BY kt.start::date
-            ORDER BY kt.start::date
+                date,
+                EXTRACT(YEAR FROM date) as year,
+                EXTRACT(DOY FROM date) as day_of_year,
+                TO_CHAR(date, 'Mon DD') as month_day,
+                rolling_avg,
+                is_forecast
+            FROM rolling_supply
+            WHERE date >= '2024-01-01'
+            ORDER BY date
             """)
             
             df = pd.read_sql(query, conn)
@@ -437,16 +462,7 @@ def fetch_global_supply_data(engine, schema):
             # Convert to datetime
             df['date'] = pd.to_datetime(df['date'])
             
-            # Calculate 30-day rolling average
-            df = df.set_index('date').sort_index()
-            df['rolling_avg'] = df['mcmd'].rolling(window=30, min_periods=1).mean().round(1)
-            
-            # Extract year and day of year for seasonal comparison
-            df['year'] = df.index.year
-            df['day_of_year'] = df.index.dayofyear
-            df['month_day'] = df.index.strftime('%b %d')
-            
-            return df.reset_index()
+            return df
             
     except Exception as e:
         print(f"Error fetching global supply data: {e}")
@@ -458,22 +474,47 @@ def fetch_country_supply_data(engine, schema, country_name):
     
     try:
         with engine.connect() as conn:
-            # Get daily aggregated data for specific country
+            # Get daily aggregated data for specific country with rolling average calculated in SQL
             query = text(f"""
             WITH latest_data AS (
                 SELECT MAX(upload_timestamp_utc) as max_timestamp
                 FROM {schema}.kpler_trades
+            ),
+            daily_supply AS (
+                SELECT 
+                    kt.start::date as date,
+                    SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as mcmd
+                FROM {schema}.kpler_trades kt, latest_data ld
+                WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                    AND kt.origin_country_name = :country
+                    AND kt.start >= '2023-11-01'
+                    AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+                GROUP BY kt.start::date
+            ),
+            rolling_supply AS (
+                SELECT 
+                    date,
+                    mcmd,
+                    AVG(mcmd) OVER (
+                        ORDER BY date 
+                        ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                    ) as rolling_avg,
+                    CASE 
+                        WHEN date > CURRENT_DATE THEN true
+                        ELSE false
+                    END as is_forecast
+                FROM daily_supply
             )
             SELECT 
-                kt.start::date as date,
-                SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as mcmd
-            FROM {schema}.kpler_trades kt, latest_data ld
-            WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                AND kt.origin_country_name = :country
-                AND kt.start >= '2023-11-01'
-                AND kt.start <= CURRENT_DATE
-            GROUP BY kt.start::date
-            ORDER BY kt.start::date
+                date,
+                EXTRACT(YEAR FROM date) as year,
+                EXTRACT(DOY FROM date) as day_of_year,
+                TO_CHAR(date, 'Mon DD') as month_day,
+                rolling_avg,
+                is_forecast
+            FROM rolling_supply
+            WHERE date >= '2024-01-01'
+            ORDER BY date
             """)
             
             df = pd.read_sql(query, conn, params={"country": country_name})
@@ -484,16 +525,7 @@ def fetch_country_supply_data(engine, schema, country_name):
             # Convert to datetime
             df['date'] = pd.to_datetime(df['date'])
             
-            # Calculate 30-day rolling average
-            df = df.set_index('date').sort_index()
-            df['rolling_avg'] = df['mcmd'].rolling(window=30, min_periods=1).mean().round(1)
-            
-            # Extract year and day of year for seasonal comparison
-            df['year'] = df.index.year
-            df['day_of_year'] = df.index.dayofyear
-            df['month_day'] = df.index.strftime('%b %d')
-            
-            return df.reset_index()
+            return df
             
     except Exception as e:
         print(f"Error fetching {country_name} supply data: {e}")
@@ -1050,21 +1082,80 @@ def create_supply_chart(data, title_prefix="", show_legend=True):
         # Create a dummy date with same year for proper month display
         year_data['plot_date'] = pd.to_datetime('2024-01-01') + pd.to_timedelta(year_data['day_of_year'] - 1, unit='d')
         
-        fig.add_trace(go.Scatter(
-            x=year_data['plot_date'],
-            y=year_data['rolling_avg'],
-            mode='lines',
-            name=str(year),
-            line=dict(
-                color=colors[i % len(colors)],
-                width=3 if year == years[-1] else 2  # Highlight current year
-            ),
-            hovertemplate=f'<b>{year}</b><br>' +
-                         '%{text}<br>' +
-                         'Supply: %{y:.1f} Mcm/d<br>' +
-                         '<extra></extra>',
-            text=year_data['month_day']
-        ))
+        # Check if we have is_forecast column
+        if 'is_forecast' in year_data.columns:
+            # Split data into historical and forecast
+            historical_data = year_data[~year_data['is_forecast']]
+            forecast_data = year_data[year_data['is_forecast']]
+            
+            # Plot historical data with solid line
+            if not historical_data.empty:
+                fig.add_trace(go.Scatter(
+                    x=historical_data['plot_date'],
+                    y=historical_data['rolling_avg'],
+                    mode='lines',
+                    name=str(int(year)) if pd.api.types.is_numeric_dtype(type(year)) else str(year),
+                    line=dict(
+                        color=colors[i % len(colors)],
+                        width=3 if year == years[-1] else 2,  # Highlight current year
+                        dash='solid'
+                    ),
+                    hovertemplate=f'<b>{int(year) if pd.api.types.is_numeric_dtype(type(year)) else year} (Historical)</b><br>' +
+                                 '%{text}<br>' +
+                                 'Supply: %{y:.1f} mcm/d<br>' +
+                                 '<extra></extra>',
+                    text=historical_data['month_day'],
+                    showlegend=True
+                ))
+            
+            # Plot forecast data with lighter/transparent color
+            if not forecast_data.empty:
+                # Connect forecast line to historical by including last historical point
+                if not historical_data.empty:
+                    connect_data = pd.concat([historical_data.tail(1), forecast_data])
+                else:
+                    connect_data = forecast_data
+                
+                # Create a lighter version of the color for forecast
+                base_color = colors[i % len(colors)]
+                # Convert hex to rgba with transparency
+                forecast_color = f"rgba({int(base_color[1:3], 16)}, {int(base_color[3:5], 16)}, {int(base_color[5:7], 16)}, 0.5)"
+                    
+                fig.add_trace(go.Scatter(
+                    x=connect_data['plot_date'],
+                    y=connect_data['rolling_avg'],
+                    mode='lines',
+                    name=f"{int(year) if pd.api.types.is_numeric_dtype(type(year)) else year} (Forecast)",
+                    line=dict(
+                        color=forecast_color,  # Lighter/transparent version
+                        width=3 if year == years[-1] else 2,  # Same width as historical
+                        dash='solid'  # Solid line instead of dashed
+                    ),
+                    opacity=0.7,  # Additional opacity for visual distinction
+                    hovertemplate=f'<b>{int(year) if pd.api.types.is_numeric_dtype(type(year)) else year} (Forecast)</b><br>' +
+                                 '%{text}<br>' +
+                                 'Supply: %{y:.1f} mcm/d<br>' +
+                                 '<extra></extra>',
+                    text=connect_data['month_day'],
+                    showlegend=False  # Don't show separate legend entry for forecast
+                ))
+        else:
+            # Old behavior if no forecast column (backward compatibility)
+            fig.add_trace(go.Scatter(
+                x=year_data['plot_date'],
+                y=year_data['rolling_avg'],
+                mode='lines',
+                name=str(int(year)) if pd.api.types.is_numeric_dtype(type(year)) else str(year),
+                line=dict(
+                    color=colors[i % len(colors)],
+                    width=3 if year == years[-1] else 2  # Highlight current year
+                ),
+                hovertemplate=f'<b>{int(year) if pd.api.types.is_numeric_dtype(type(year)) else year}</b><br>' +
+                             '%{text}<br>' +
+                             'Supply: %{y:.1f} mcm/d<br>' +
+                             '<extra></extra>',
+                text=year_data['month_day']
+            ))
     
     # Update layout with professional styling standards
     fig.update_layout(

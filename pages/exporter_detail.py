@@ -1,4 +1,4 @@
-from dash import html, dcc, dash_table, callback, Output, Input, State, Dash, ALL
+from dash import html, dcc, dash_table, callback, Output, Input, State, Dash, ALL, ctx
 from dash.dash_table.Format import Format, Group, Scheme
 import plotly.graph_objects as go
 import dash_bootstrap_components as dbc
@@ -1377,161 +1377,192 @@ layout = html.Div([
     dcc.Store(id='us-dropdown-options-store', storage_type='local'),
     dcc.Store(id='us-refresh-timestamp-store', storage_type='local'),
     dcc.Store(id='diversion-processed-data', storage_type='local'),
+    dcc.Store(id='destination-expanded-continents', data=[]),  # Store for expanded state of continents
 
     # Professional Section Header - Exporter Analysis Configuration
     html.Div([
         html.Div([
-            html.H1("LNG Exporter Analysis", className='section-header-primary'),
-            html.P("Configure origin country and destination parameters for comprehensive trade route analysis", 
-                   className='section-subtitle')
-        ], className='header-content'),
-        
-        html.Div([
-            html.Div([
-                html.Label("Origin Country:", className='filter-label'),
-                dcc.Dropdown(
-                    id='origin-country-dropdown',
-                    options=[],  # Will be populated by callback
-                    value='United States',  # Default to United States
-                    multi=False,
-                    clearable=False,
-                    className='filter-dropdown'
-                )
-            ], className='filter-group'),
+            html.Label("Origin Country:", className='filter-label', style={'margin-right': '2px', 'align-self': 'center', 'padding-right': '0px'}),
+            dcc.Dropdown(
+                id='origin-country-dropdown',
+                options=[],  # Will be populated by callback
+                value='United States',  # Default to United States
+                multi=False,
+                clearable=False,
+                className='filter-dropdown',
+                style={'min-width': '200px'}
+            ),
 
-            html.Div([
-                html.Label("Destination Level:", className='filter-label'),
-                dcc.Dropdown(
-                    id='destination-level-dropdown',
-                    options=[
-                        {'label': 'Shipping Region', 'value': 'destination_shipping_region'},
-                        {'label': 'Country', 'value': 'destination_country_name'}
-                    ],
-                    value='destination_shipping_region',  # Default to shipping region
-                    multi=False,
-                    clearable=False,
-                    className='filter-dropdown'
-                )
-            ], className='filter-group'),
+            html.Label("Destination Level:", className='filter-label', style={'margin-right': '2px', 'margin-left': '12px', 'align-self': 'center', 'padding-right': '0px'}),
+            dcc.Dropdown(
+                id='destination-level-dropdown',
+                options=[
+                    {'label': 'Shipping Region', 'value': 'destination_shipping_region'},
+                    {'label': 'Country', 'value': 'destination_country_name'}
+                ],
+                value='destination_shipping_region',  # Default to shipping region
+                multi=False,
+                clearable=False,
+                className='filter-dropdown',
+                style={'min-width': '200px'}
+            ),
 
-            html.Div([
-                html.Label("Aggregation:", className='filter-label'),
-                dcc.Dropdown(
-                    id='aggregation-dropdown',
-                    options=[
-                        {'label': 'Year', 'value': 'Year'},
-                        {'label': 'Year + Season', 'value': 'Year+Season'},
-                        {'label': 'Year + Quarter', 'value': 'Year+Quarter'},
-                        {'label': 'Month', 'value': 'Month'},
-                        {'label': 'Week', 'value': 'Week'},
-                    ],
-                    value='Year+Quarter',  # Default aggregation
-                    multi=False,
-                    clearable=False,
-                    className='filter-dropdown'
-                )
-            ], className='filter-group'),
+            html.Label("Aggregation:", className='filter-label', style={'margin-right': '2px', 'margin-left': '12px', 'align-self': 'center', 'padding-right': '0px'}),
+            dcc.Dropdown(
+                id='aggregation-dropdown',
+                options=[
+                    {'label': 'Year', 'value': 'Year'},
+                    {'label': 'Year + Season', 'value': 'Year+Season'},
+                    {'label': 'Year + Quarter', 'value': 'Year+Quarter'},
+                    {'label': 'Month', 'value': 'Month'},
+                    {'label': 'Week', 'value': 'Week'},
+                ],
+                value='Year+Quarter',  # Default aggregation
+                multi=False,
+                clearable=False,
+                className='filter-dropdown',
+                style={'min-width': '144px'}
+            ),
 
-            html.Div([
-                html.Label("Filter by Status:", className='filter-label'),
-                dcc.Dropdown(
-                    id='us-region-status-dropdown',
-                    options=[
-                        {'label': 'Laden', 'value': 'laden'},
-                        {'label': 'Non-Laden', 'value': 'non_laden'}
-                    ],
-                    value='laden',
-                    multi=False,
-                    clearable=False,
-                    className='filter-dropdown'
-                )
-            ], className='filter-group'),
+            html.Label("Status:", className='filter-label', style={'margin-right': '2px', 'margin-left': '12px', 'align-self': 'center', 'padding-right': '0px'}),
+            dcc.Dropdown(
+                id='us-region-status-dropdown',
+                options=[
+                    {'label': 'Laden', 'value': 'laden'},
+                    {'label': 'Non-Laden', 'value': 'non_laden'}
+                ],
+                value='laden',
+                multi=False,
+                clearable=False,
+                className='filter-dropdown',
+                style={'width': '100px'}
+            ),
 
-            html.Div([
-                html.Label("Select Vessel Size:", className='filter-label'),
-                dcc.Dropdown(
-                    id='us-vessel-type-dropdown',
-                    options=[],  # Options populated by callback
-                    value='All',  # Default value
-                    clearable=False,
-                    className='filter-dropdown',
-                    style={'min-width': '300px'}
-                )
-            ], className='filter-group'),
+            html.Label("Vessel Size:", className='filter-label', style={'margin-right': '2px', 'margin-left': '12px', 'align-self': 'center', 'padding-right': '0px'}),
+            dcc.Dropdown(
+                id='us-vessel-type-dropdown',
+                options=[],  # Options populated by callback
+                value='All',  # Default value
+                clearable=False,
+                className='filter-dropdown',
+                style={'min-width': '200px'}
+            ),
 
-            html.Div([
-                html.Label("Select Metric:", className='filter-label'),
-                dcc.Dropdown(
-                    id='chart-metric-dropdown',
-                    options=[
-                        {'label': 'Count of Trades', 'value': 'count_trades'},
-                        {'label': 'MTPA', 'value': 'mtpa'},
-                        {'label': 'mcm/d', 'value': 'mcm_d'},
-                        {'label': 'm³', 'value': 'm3'}
-                    ],
-                    value='mcm_d',  # Default to mcm/d
-                    clearable=False,
-                    className='filter-dropdown',
-                    style={'width': '200px'}
-                )
-            ], className='filter-group'),
-            
-            html.Div(id='us-last-refresh-indicator', className='text-tertiary', style={'margin-left': '16px'})
+            html.Label("Metric:", className='filter-label', style={'margin-right': '2px', 'margin-left': '12px', 'align-self': 'center', 'padding-right': '0px'}),
+            dcc.Dropdown(
+                id='chart-metric-dropdown',
+                options=[
+                    {'label': 'Count of Trades', 'value': 'count_trades'},
+                    {'label': 'MTPA', 'value': 'mtpa'},
+                    {'label': 'mcm/d', 'value': 'mcm_d'},
+                    {'label': 'm³', 'value': 'm3'},
+                    {'label': 'Median Delivery Days', 'value': 'median_delivery_days'},
+                    {'label': 'Median Speed', 'value': 'median_speed'},
+                    {'label': 'Median Mileage (Nautical Miles)', 'value': 'median_mileage_nautical_miles'},
+                    {'label': 'Median Ton Miles', 'value': 'median_ton_miles'},
+                    {'label': 'Median Utilization Rate', 'value': 'median_utilization_rate'},
+                    {'label': 'Median Cargo Volume (m³)', 'value': 'median_cargo_destination_cubic_meters'},
+                    {'label': 'Median Vessel Capacity (m³)', 'value': 'median_vessel_capacity_cubic_meters'}
+                ],
+                value='mcm_d',  # Default to mcm/d
+                clearable=False,
+                className='filter-dropdown',
+                style={'min-width': '250px'}
+            )
         ], className='filter-bar')
     ], className='professional-section-header'),
 
-
-    # Trade Analysis by Destination Section
+    # Country Supply Charts Section - Three charts side by side
     html.Div([
-        html.H2(id='trade-analysis-header', className='mckinsey-header'),
+        # Section Header
+        html.Div([
+            html.H3('LNG Supply Analysis - 30-Day Rolling Average', className="section-title-inline"),
+        ], className="inline-section-header"),
         
+        # Charts Container - Three charts side by side
+        html.Div([
+            # Left Chart - Country Supply
+            html.Div([
+                html.H4(id='country-supply-header', children='Total Supply', 
+                       style={'fontSize': '14px', 'marginBottom': '10px', 'color': '#4A4A4A'}),
+                dcc.Loading(
+                    id="country-supply-loading",
+                    children=[
+                        dcc.Graph(id='country-supply-chart', style={'height': '400px'})
+                    ],
+                    type="default",
+                )
+            ], style={'width': '32%', 'display': 'inline-block', 'verticalAlign': 'top'}),
+            
+            # Spacer
+            html.Div(style={'width': '2%', 'display': 'inline-block'}),
+            
+            # Middle Chart - Continent Destinations (Absolute)
+            html.Div([
+                html.H4(id='continent-destination-header', children='By Destination Continent (mcm/d)',
+                       style={'fontSize': '14px', 'marginBottom': '10px', 'color': '#4A4A4A'}),
+                dcc.Loading(
+                    id="continent-destination-loading",
+                    children=[
+                        dcc.Graph(id='continent-destination-chart', style={'height': '400px'})
+                    ],
+                    type="default",
+                )
+            ], style={'width': '32%', 'display': 'inline-block', 'verticalAlign': 'top'}),
+            
+            # Spacer
+            html.Div(style={'width': '2%', 'display': 'inline-block'}),
+            
+            # Right Chart - Continent Destinations (Percentage)
+            html.Div([
+                html.H4(id='continent-percentage-header', children='By Destination Continent (%)',
+                       style={'fontSize': '14px', 'marginBottom': '10px', 'color': '#4A4A4A'}),
+                dcc.Loading(
+                    id="continent-percentage-loading",
+                    children=[
+                        dcc.Graph(id='continent-percentage-chart', style={'height': '400px'})
+                    ],
+                    type="default",
+                )
+            ], style={'width': '32%', 'display': 'inline-block', 'verticalAlign': 'top'})
+        ], style={'padding': '20px'})
+    ], className="main-section-container", style={'marginBottom': '30px'}),
+
+    # Destination Analysis Summary Section
+    html.Div([
+        # Header
+        html.Div([
+            html.H3('Destination Analysis Summary (mcm/d)', className="section-title-inline"),
+        ], className="inline-section-header"),
         
+        # Summary Table
+        html.Div([
+            dcc.Loading(
+                id="destination-summary-loading",
+                children=[
+                    html.Div(id='destination-summary-table-container')
+                ],
+                type="default"
+            )
+        ], style={'marginTop': '20px'})
+    ], className='section-container', style={'margin-bottom': '32px'}),
+
+    # Trade Analysis by Destination Section (Chart and Table combined)
+    html.Div([
+        # Enterprise Standard Inline Section Header
+        html.Div([
+            html.H3(id='trade-analysis-header', className='section-title-inline'),
+        ], className='inline-section-header'),
+        
+        # Chart
         html.Div([
             dcc.Graph(id='us-trade-count-visualization', style={'height': '600px'})
-        ])
-    ], className='section-container'),
-
-    # Data Tables Section
-    html.Div([
-        html.Div([
-            html.H3(id='us-trade-count-table-title', className='mckinsey-header'),
-            html.Div(id='us-trade-count-table-container', style={'overflow-x': 'auto'})
-        ], className='section-container', style={'width': '50%', 'margin-right': '8px'}),
-
-        html.Div([
-            html.H3('Ton Miles Data Table', className='mckinsey-header'),
-            html.Div(id='us-ton-miles-table-container', style={'overflow-x': 'auto'})
-        ], className='section-container', style={'width': '50%', 'margin': '0 4px'})
-    ], style={'display': 'flex', 'width': '100%', 'margin-bottom': '32px'}),
-
-    # Custom Metrics Table Section (moved from above)
-    html.Div([
-        html.Div([
-            html.Div([
-                html.Label("Select Metric:", className='filter-label'),
-                dcc.Dropdown(
-                    id='us-region-metric-dropdown',
-                    options=[
-                        {'label': 'Median Delivery Days', 'value': 'median_delivery_days'},
-                        {'label': 'Median Speed', 'value': 'median_speed'},
-                        {'label': 'Median Mileage (Nautical Miles)', 'value': 'median_mileage_nautical_miles'},
-                        {'label': 'Median Ton Miles', 'value': 'median_ton_miles'},
-                        {'label': 'Median Utilization Rate', 'value': 'median_utilization_rate'},
-                        {'label': 'Median Cargo Volume (m³)', 'value': 'median_cargo_destination_cubic_meters'},
-                        {'label': 'Median Vessel Capacity (m³)', 'value': 'median_vessel_capacity_cubic_meters'},
-                        {'label': 'Count of Trades', 'value': 'count_trades'},
-                    ],
-                    value='median_delivery_days',
-                    clearable=False,
-                    className='inline-dropdown-subheader',
-                    style={'width': '220px'}
-                )
-            ], className='filter-group'),
-            
-            html.H3(id='us-region-custom-metrics-table-title', className='mckinsey-header')
-        ], className='inline-subheader'),
+        ]),
         
-        html.Div(id='us-region-custom-metrics-table-container', style={'overflow-x': 'auto'})
+        # Data Table (no separator)
+        html.Div([
+            html.Div(id='us-trade-count-table-container', style={'overflow-x': 'auto', 'margin-top': '20px'})
+        ])
     ], className='section-container', style={'margin-bottom': '32px'}),
 
     # Route Analysis Section
@@ -1653,6 +1684,1607 @@ layout = html.Div([
     ], className='section-container')
 
 ])
+
+# ========================================
+# DESTINATION SUMMARY TABLE FUNCTIONS
+# ========================================
+
+def fetch_destination_summary_data(engine, origin_country, status, vessel_type):
+    """
+    Fetch destination summary data with expandable continent/country hierarchy
+    """
+    print(f"DEBUG fetch_destination_summary_data called with:")
+    print(f"  - origin_country: {origin_country}")
+    print(f"  - status: {status}")
+    print(f"  - vessel_type: {vessel_type}")
+    
+    try:
+        # We'll fetch data at country level with continent information
+        dest_country_col = "COALESCE(NULLIF(destination_country_name, ''), 'Unknown')"
+        dest_continent_col = "COALESCE(NULLIF(continent_destination_name, ''), 'Unknown')"
+        print(f"DEBUG: Using country and continent columns")
+        
+        # Build WHERE clause based on filters
+        where_conditions = [f"origin_country_name = '{origin_country}'"]
+        
+        where_clause = " AND ".join(where_conditions)
+        print(f"DEBUG: WHERE clause: {where_clause}")
+        
+        with engine.connect() as conn:
+            # Get quarters, months, weeks data with continent/country hierarchy
+            quarters_df = fetch_destination_periods_data_hierarchical(conn, dest_continent_col, dest_country_col, where_clause, 'quarter')
+            print(f"DEBUG: quarters_df shape: {quarters_df.shape if not quarters_df.empty else 'EMPTY'}")
+            
+            months_df = fetch_destination_periods_data_hierarchical(conn, dest_continent_col, dest_country_col, where_clause, 'month')
+            print(f"DEBUG: months_df shape: {months_df.shape if not months_df.empty else 'EMPTY'}")
+            
+            weeks_df = fetch_destination_periods_data_hierarchical(conn, dest_continent_col, dest_country_col, where_clause, 'week')
+            print(f"DEBUG: weeks_df shape: {weeks_df.shape if not weeks_df.empty else 'EMPTY'}")
+            
+            # Get rolling windows data with hierarchy
+            rolling_df = fetch_destination_rolling_windows_hierarchical(conn, dest_continent_col, dest_country_col, where_clause)
+            print(f"DEBUG: rolling_df shape: {rolling_df.shape if not rolling_df.empty else 'EMPTY'}")
+            
+            # Combine all data with hierarchy
+            result = combine_destination_summary_data_hierarchical(quarters_df, months_df, weeks_df, rolling_df)
+            print(f"DEBUG: Combined result shape: {result.shape if not result.empty else 'EMPTY'}")
+            if not result.empty:
+                print(f"DEBUG: Result columns: {result.columns.tolist()}")
+                print(f"DEBUG: First few rows:\n{result.head()}")
+            
+            return result
+            
+    except Exception as e:
+        print(f"Error fetching destination summary data: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
+def fetch_destination_periods_data(conn, dest_col, where_clause, period_type):
+    """Fetch data for specific period type (quarter, month, week)"""
+    from sqlalchemy import text
+    
+    print(f"DEBUG fetch_destination_periods_data: period_type={period_type}, dest_col={dest_col}")
+    
+    try:
+        # Determine the grouping and formatting based on period type
+        if period_type == 'quarter':
+            period_expr = """
+                'Q' || EXTRACT(QUARTER FROM "start")::text || '''' || 
+                RIGHT(EXTRACT(YEAR FROM "start")::text, 2) as period
+            """
+            order_expr = "EXTRACT(YEAR FROM \"start\"), EXTRACT(QUARTER FROM \"start\")"
+        elif period_type == 'month':
+            period_expr = """
+                TO_CHAR("start", 'Mon') || '''' || 
+                RIGHT(EXTRACT(YEAR FROM "start")::text, 2) as period
+            """
+            order_expr = "EXTRACT(YEAR FROM \"start\"), EXTRACT(MONTH FROM \"start\")"
+        else:  # week
+            period_expr = """
+                'W' || EXTRACT(WEEK FROM "start")::text || '''' || 
+                RIGHT(EXTRACT(YEAR FROM "start")::text, 2) as period
+            """
+            order_expr = "EXTRACT(YEAR FROM \"start\"), EXTRACT(WEEK FROM \"start\")"
+        
+        # First check if we have any data
+        check_query = text(f"""
+            SELECT COUNT(*) as count
+            FROM {DB_SCHEMA}.kpler_trades
+            WHERE origin_country_name = :origin_country
+            AND "start" IS NOT NULL
+        """)
+        
+        # Extract origin_country from where_clause
+        import re
+        origin_match = re.search(r"origin_country_name = '([^']*)'", where_clause)
+        origin_country = origin_match.group(1) if origin_match else None
+        
+        if origin_country:
+            check_result = conn.execute(check_query, {"origin_country": origin_country})
+            count = check_result.fetchone()[0]
+            print(f"DEBUG: Total rows for {origin_country}: {count}")
+        
+        # Build query with proper daily average calculation using total calendar days
+        if period_type == 'quarter':
+            # Quarters have ~90-92 days, we'll use a fixed 91.25 days (365.25/4)
+            query_str = f"""
+                WITH latest_timestamp AS (
+                    SELECT MAX(upload_timestamp_utc) as max_ts
+                    FROM {DB_SCHEMA}.kpler_trades
+                ),
+                period_data AS (
+                    SELECT 
+                        {dest_col} as destination,
+                        {period_expr},
+                        SUM(cargo_origin_cubic_meters * 0.6 / 1000) / 91.25 as mcm_d
+                    FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                    WHERE upload_timestamp_utc = max_ts
+                        AND {where_clause}
+                        AND "start" >= CURRENT_DATE - INTERVAL '2 years'
+                        AND "start" < CURRENT_DATE
+                    GROUP BY {dest_col}, period, {order_expr}
+                    ORDER BY {dest_col}, {order_expr}
+                )
+                SELECT destination, period, mcm_d
+                FROM period_data
+            """
+        elif period_type == 'month':
+            # For months, we need to calculate days per each month/year combination
+            query_str = f"""
+                WITH latest_timestamp AS (
+                    SELECT MAX(upload_timestamp_utc) as max_ts
+                    FROM {DB_SCHEMA}.kpler_trades
+                ),
+                period_data AS (
+                    SELECT 
+                        {dest_col} as destination,
+                        {period_expr},
+                        EXTRACT(YEAR FROM "start") as year,
+                        EXTRACT(MONTH FROM "start") as month,
+                        SUM(cargo_origin_cubic_meters * 0.6 / 1000) as total_mcm
+                    FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                    WHERE upload_timestamp_utc = max_ts
+                        AND {where_clause}
+                        AND "start" >= CURRENT_DATE - INTERVAL '2 years'
+                        AND "start" < CURRENT_DATE
+                    GROUP BY {dest_col}, period, EXTRACT(YEAR FROM "start"), EXTRACT(MONTH FROM "start")
+                ),
+                with_days AS (
+                    SELECT 
+                        destination,
+                        period,
+                        total_mcm / EXTRACT(DAY FROM 
+                            (DATE_TRUNC('month', MAKE_DATE(year::int, month::int, 1)) + 
+                             INTERVAL '1 month' - INTERVAL '1 day')
+                        ) as mcm_d
+                    FROM period_data
+                )
+                SELECT destination, period, mcm_d
+                FROM with_days
+                ORDER BY destination, period
+            """
+        else:  # week
+            # Weeks always have 7 days
+            query_str = f"""
+                WITH latest_timestamp AS (
+                    SELECT MAX(upload_timestamp_utc) as max_ts
+                    FROM {DB_SCHEMA}.kpler_trades
+                ),
+                period_data AS (
+                    SELECT 
+                        {dest_col} as destination,
+                        {period_expr},
+                        SUM(cargo_origin_cubic_meters * 0.6 / 1000) / 7.0 as mcm_d
+                    FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                    WHERE upload_timestamp_utc = max_ts
+                        AND {where_clause}
+                        AND "start" >= CURRENT_DATE - INTERVAL '2 years'
+                        AND "start" < CURRENT_DATE
+                    GROUP BY {dest_col}, period, {order_expr}
+                    ORDER BY {dest_col}, {order_expr}
+                )
+                SELECT destination, period, mcm_d
+                FROM period_data
+            """
+        
+        print(f"DEBUG SQL Query for {period_type}:")
+        print(query_str[:500])  # Print first 500 chars
+        
+        query = text(query_str)
+        df = pd.read_sql(query, conn)
+        print(f"DEBUG: Query returned {len(df)} rows")
+        
+        if df.empty:
+            return pd.DataFrame()
+        
+        # Pivot to get periods as columns
+        pivot_df = df.pivot_table(
+            index='destination',
+            columns='period',
+            values='mcm_d',
+            aggfunc='sum',
+            fill_value=0
+        ).reset_index()
+        
+        return pivot_df
+        
+    except Exception as e:
+        print(f"Error fetching {period_type} data: {e}")
+        return pd.DataFrame()
+
+def fetch_destination_rolling_windows(conn, dest_col, where_clause):
+    """Fetch 7D and 30D rolling window data with deltas"""
+    from sqlalchemy import text
+    from datetime import datetime, timedelta
+    
+    try:
+        current_date = datetime.now().date()
+        date_7d_ago = current_date - timedelta(days=7)
+        date_30d_ago = current_date - timedelta(days=30)
+        date_30d_y1_start = current_date - timedelta(days=365) - timedelta(days=30)
+        date_30d_y1_end = current_date - timedelta(days=365)
+        
+        query = text(f"""
+            WITH latest_timestamp AS (
+                SELECT MAX(upload_timestamp_utc) as max_ts
+                FROM {DB_SCHEMA}.kpler_trades
+            ),
+            window_7d AS (
+                SELECT 
+                    {dest_col} as destination,
+                    SUM(cargo_origin_cubic_meters * 0.6 / 1000) / 7.0 as avg_7d
+                FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                WHERE upload_timestamp_utc = max_ts
+                    AND {where_clause}
+                    AND "start" > '{date_7d_ago}'
+                    AND "start" <= '{current_date}'
+                GROUP BY {dest_col}
+            ),
+            window_30d AS (
+                SELECT 
+                    {dest_col} as destination,
+                    SUM(cargo_origin_cubic_meters * 0.6 / 1000) / 30.0 as avg_30d
+                FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                WHERE upload_timestamp_utc = max_ts
+                    AND {where_clause}
+                    AND "start" > '{date_30d_ago}'
+                    AND "start" <= '{current_date}'
+                GROUP BY {dest_col}
+            ),
+            window_30d_y1 AS (
+                SELECT 
+                    {dest_col} as destination,
+                    SUM(cargo_origin_cubic_meters * 0.6 / 1000) / 30.0 as avg_30d_y1
+                FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                WHERE upload_timestamp_utc = max_ts
+                    AND {where_clause}
+                    AND "start" > '{date_30d_y1_start}'
+                    AND "start" <= '{date_30d_y1_end}'
+                GROUP BY {dest_col}
+            )
+            SELECT 
+                COALESCE(w7.destination, w30.destination, w30y1.destination) as destination,
+                COALESCE(w7.avg_7d, 0) as "7D",
+                COALESCE(w30.avg_30d, 0) as "30D",
+                COALESCE(w30y1.avg_30d_y1, 0) as "30D_Y1",
+                COALESCE(w7.avg_7d, 0) - COALESCE(w30.avg_30d, 0) as "Δ 7D-30D",
+                COALESCE(w30.avg_30d, 0) - COALESCE(w30y1.avg_30d_y1, 0) as "Δ 30D Y/Y"
+            FROM window_7d w7
+            FULL OUTER JOIN window_30d w30 ON w7.destination = w30.destination
+            FULL OUTER JOIN window_30d_y1 w30y1 ON COALESCE(w7.destination, w30.destination) = w30y1.destination
+        """)
+        
+        df = pd.read_sql(query, conn)
+        return df
+        
+    except Exception as e:
+        print(f"Error fetching rolling windows data: {e}")
+        return pd.DataFrame()
+
+def fetch_destination_periods_data_hierarchical(conn, continent_col, country_col, where_clause, period_type):
+    """Fetch data for specific period type with continent/country hierarchy"""
+    from sqlalchemy import text
+    
+    print(f"DEBUG fetch_destination_periods_data_hierarchical: period_type={period_type}")
+    
+    try:
+        # Determine the grouping and formatting based on period type
+        if period_type == 'quarter':
+            period_expr = """
+                'Q' || EXTRACT(QUARTER FROM "start")::text || '''' || 
+                RIGHT(EXTRACT(YEAR FROM "start")::text, 2) as period
+            """
+            order_expr = "EXTRACT(YEAR FROM \"start\"), EXTRACT(QUARTER FROM \"start\")"
+            days_divisor = "91.25"
+        elif period_type == 'month':
+            period_expr = """
+                TO_CHAR("start", 'Mon') || '''' || 
+                RIGHT(EXTRACT(YEAR FROM "start")::text, 2) as period
+            """
+            order_expr = "EXTRACT(YEAR FROM \"start\"), EXTRACT(MONTH FROM \"start\")"
+            # For months, we need a subquery approach as before
+        else:  # week
+            period_expr = """
+                'W' || EXTRACT(WEEK FROM "start")::text || '''' || 
+                RIGHT(EXTRACT(YEAR FROM "start")::text, 2) as period
+            """
+            order_expr = "EXTRACT(YEAR FROM \"start\"), EXTRACT(WEEK FROM \"start\")"
+            days_divisor = "7.0"
+        
+        if period_type == 'month':
+            # Special handling for months to get actual days
+            query_str = f"""
+                WITH latest_timestamp AS (
+                    SELECT MAX(upload_timestamp_utc) as max_ts
+                    FROM {DB_SCHEMA}.kpler_trades
+                ),
+                period_data AS (
+                    SELECT 
+                        {continent_col} as continent,
+                        {country_col} as country,
+                        {period_expr},
+                        EXTRACT(YEAR FROM "start") as year,
+                        EXTRACT(MONTH FROM "start") as month,
+                        SUM(cargo_origin_cubic_meters * 0.6 / 1000) as total_mcm
+                    FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                    WHERE upload_timestamp_utc = max_ts
+                        AND {where_clause}
+                        AND "start" >= CURRENT_DATE - INTERVAL '2 years'
+                        AND "start" < CURRENT_DATE
+                    GROUP BY {continent_col}, {country_col}, period, EXTRACT(YEAR FROM "start"), EXTRACT(MONTH FROM "start")
+                ),
+                with_days AS (
+                    SELECT 
+                        continent,
+                        country,
+                        period,
+                        total_mcm / EXTRACT(DAY FROM 
+                            (DATE_TRUNC('month', MAKE_DATE(year::int, month::int, 1)) + 
+                             INTERVAL '1 month' - INTERVAL '1 day')
+                        ) as mcm_d
+                    FROM period_data
+                )
+                SELECT continent, country, period, mcm_d
+                FROM with_days
+            """
+        else:
+            # Quarters and weeks
+            query_str = f"""
+                WITH latest_timestamp AS (
+                    SELECT MAX(upload_timestamp_utc) as max_ts
+                    FROM {DB_SCHEMA}.kpler_trades
+                ),
+                period_data AS (
+                    SELECT 
+                        {continent_col} as continent,
+                        {country_col} as country,
+                        {period_expr},
+                        SUM(cargo_origin_cubic_meters * 0.6 / 1000) / {days_divisor} as mcm_d
+                    FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                    WHERE upload_timestamp_utc = max_ts
+                        AND {where_clause}
+                        AND "start" >= CURRENT_DATE - INTERVAL '2 years'
+                        AND "start" < CURRENT_DATE
+                    GROUP BY {continent_col}, {country_col}, period, {order_expr}
+                )
+                SELECT continent, country, period, mcm_d
+                FROM period_data
+            """
+        
+        query = text(query_str)
+        df = pd.read_sql(query, conn)
+        
+        if df.empty:
+            return pd.DataFrame()
+        
+        # Pivot to get periods as columns, keeping continent and country
+        pivot_df = df.pivot_table(
+            index=['continent', 'country'],
+            columns='period',
+            values='mcm_d',
+            aggfunc='sum',
+            fill_value=0
+        ).reset_index()
+        
+        return pivot_df
+        
+    except Exception as e:
+        print(f"Error fetching hierarchical {period_type} data: {e}")
+        return pd.DataFrame()
+
+def fetch_destination_rolling_windows_hierarchical(conn, continent_col, country_col, where_clause):
+    """Fetch 7D and 30D rolling window data with continent/country hierarchy"""
+    from sqlalchemy import text
+    from datetime import datetime, timedelta
+    
+    try:
+        current_date = datetime.now().date()
+        date_7d_ago = current_date - timedelta(days=7)
+        date_30d_ago = current_date - timedelta(days=30)
+        date_30d_y1_start = current_date - timedelta(days=365) - timedelta(days=30)
+        date_30d_y1_end = current_date - timedelta(days=365)
+        
+        query = text(f"""
+            WITH latest_timestamp AS (
+                SELECT MAX(upload_timestamp_utc) as max_ts
+                FROM {DB_SCHEMA}.kpler_trades
+            ),
+            window_7d AS (
+                SELECT 
+                    {continent_col} as continent,
+                    {country_col} as country,
+                    SUM(cargo_origin_cubic_meters * 0.6 / 1000) / 7.0 as avg_7d
+                FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                WHERE upload_timestamp_utc = max_ts
+                    AND {where_clause}
+                    AND "start" > '{date_7d_ago}'
+                    AND "start" <= '{current_date}'
+                GROUP BY {continent_col}, {country_col}
+            ),
+            window_30d AS (
+                SELECT 
+                    {continent_col} as continent,
+                    {country_col} as country,
+                    SUM(cargo_origin_cubic_meters * 0.6 / 1000) / 30.0 as avg_30d
+                FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                WHERE upload_timestamp_utc = max_ts
+                    AND {where_clause}
+                    AND "start" > '{date_30d_ago}'
+                    AND "start" <= '{current_date}'
+                GROUP BY {continent_col}, {country_col}
+            ),
+            window_30d_y1 AS (
+                SELECT 
+                    {continent_col} as continent,
+                    {country_col} as country,
+                    SUM(cargo_origin_cubic_meters * 0.6 / 1000) / 30.0 as avg_30d_y1
+                FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                WHERE upload_timestamp_utc = max_ts
+                    AND {where_clause}
+                    AND "start" > '{date_30d_y1_start}'
+                    AND "start" <= '{date_30d_y1_end}'
+                GROUP BY {continent_col}, {country_col}
+            )
+            SELECT 
+                COALESCE(w7.continent, w30.continent, w30y1.continent) as continent,
+                COALESCE(w7.country, w30.country, w30y1.country) as country,
+                COALESCE(w7.avg_7d, 0) as "7D",
+                COALESCE(w30.avg_30d, 0) as "30D",
+                COALESCE(w30y1.avg_30d_y1, 0) as "30D_Y1",
+                COALESCE(w7.avg_7d, 0) - COALESCE(w30.avg_30d, 0) as "Δ 7D-30D",
+                COALESCE(w30.avg_30d, 0) - COALESCE(w30y1.avg_30d_y1, 0) as "Δ 30D Y/Y"
+            FROM window_7d w7
+            FULL OUTER JOIN window_30d w30 ON w7.continent = w30.continent AND w7.country = w30.country
+            FULL OUTER JOIN window_30d_y1 w30y1 ON COALESCE(w7.continent, w30.continent) = w30y1.continent 
+                AND COALESCE(w7.country, w30.country) = w30y1.country
+        """)
+        
+        df = pd.read_sql(query, conn)
+        return df
+        
+    except Exception as e:
+        print(f"Error fetching hierarchical rolling windows data: {e}")
+        return pd.DataFrame()
+
+def prepare_destination_table_for_display(df, expanded_continents=None):
+    """Prepare destination data for display with expandable continent/country rows"""
+    if df.empty:
+        return pd.DataFrame()
+    
+    expanded_continents = expanded_continents or []
+    
+    # Filter data based on expanded state
+    filtered_rows = []
+    continent_totals_for_grand = []  # Store continent totals for grand total calculation
+    
+    # Group by continent first
+    for continent in df['continent'].unique():
+        continent_data = df[df['continent'] == continent]
+        
+        # Calculate continent total
+        numeric_cols = [col for col in df.columns if col not in ['continent', 'country']]
+        continent_total = pd.DataFrame([{
+            'Continent': f"▼ {continent}" if continent in expanded_continents else f"▶ {continent}",
+            'Country': 'Total',
+            **{col: continent_data[col].sum() for col in numeric_cols}
+        }])
+        
+        filtered_rows.append(continent_total)
+        continent_totals_for_grand.append(pd.DataFrame([{
+            'continent': continent,
+            **{col: continent_data[col].sum() for col in numeric_cols}
+        }]))
+        
+        # Only show countries if continent is expanded
+        if continent in expanded_continents:
+            countries = continent_data.copy()
+            # Indent country names for visual hierarchy
+            countries.loc[:, 'country'] = "    " + countries['country']
+            countries.loc[:, 'continent'] = ""  # Clear continent name for countries
+            # Rename columns for display
+            countries = countries.rename(columns={'continent': 'Continent', 'country': 'Country'})
+            filtered_rows.append(countries)
+    
+    # Add GRAND TOTAL row
+    if continent_totals_for_grand:
+        grand_total_df = pd.concat(continent_totals_for_grand, ignore_index=True)
+        
+        grand_total_row = pd.DataFrame([{
+            'Continent': 'GRAND TOTAL',
+            'Country': '',
+            **{col: grand_total_df[col].sum() for col in numeric_cols}
+        }])
+        
+        filtered_rows.append(grand_total_row)
+    
+    # Combine all rows
+    if filtered_rows:
+        display_df = pd.concat(filtered_rows, ignore_index=True)
+    else:
+        display_df = pd.DataFrame()
+    
+    return display_df
+
+def combine_destination_summary_data_hierarchical(quarters_df, months_df, weeks_df, rolling_df):
+    """Combine all period data with continent/country hierarchy into final summary table"""
+    from datetime import datetime
+    
+    try:
+        # Get all unique continent/country combinations
+        all_combinations = set()
+        
+        for df in [quarters_df, months_df, weeks_df, rolling_df]:
+            if not df.empty and 'continent' in df.columns and 'country' in df.columns:
+                all_combinations.update(df[['continent', 'country']].apply(tuple, axis=1))
+        
+        if not all_combinations:
+            return pd.DataFrame()
+        
+        # Create base DataFrame
+        result = pd.DataFrame(list(all_combinations), columns=['continent', 'country'])
+        
+        # Get current date for filtering completed periods
+        current_date = datetime.now()
+        current_quarter = (current_date.month - 1) // 3 + 1
+        current_year = current_date.year
+        
+        # Process quarters - get last 5 completed quarters
+        if not quarters_df.empty:
+            quarter_cols = [col for col in quarters_df.columns if col not in ['continent', 'country']]
+            
+            # Filter completed quarters
+            completed_quarters = []
+            for col in quarter_cols:
+                if "Q" in col and "'" in col:
+                    q_num = int(col.split("Q")[1].split("'")[0])
+                    year = int("20" + col.split("'")[1])
+                    if year < current_year or (year == current_year and q_num < current_quarter):
+                        completed_quarters.append(col)
+            
+            # Sort and take last 5
+            completed_quarters = sorted(completed_quarters, 
+                                      key=lambda x: (x.split("'")[1], x.split("Q")[1].split("'")[0]))[-5:]
+            
+            if completed_quarters:
+                quarters_subset = quarters_df[['continent', 'country'] + completed_quarters]
+                result = result.merge(quarters_subset, on=['continent', 'country'], how='left')
+        
+        # Process months - get last 3 completed months
+        if not months_df.empty:
+            month_cols = [col for col in months_df.columns if col not in ['continent', 'country']]
+            month_order = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+                          'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+            
+            # Filter completed months
+            completed_months = []
+            for col in month_cols:
+                if "'" in col:
+                    month_abbr = col.split("'")[0]
+                    year = int("20" + col.split("'")[1])
+                    month_num = month_order.get(month_abbr, 0)
+                    if year < current_year or (year == current_year and month_num < current_date.month):
+                        completed_months.append(col)
+            
+            # Sort and take last 3
+            completed_months = sorted(completed_months,
+                                    key=lambda x: (x.split("'")[1], month_order.get(x.split("'")[0], 0)))[-3:]
+            
+            if completed_months:
+                months_subset = months_df[['continent', 'country'] + completed_months]
+                result = result.merge(months_subset, on=['continent', 'country'], how='left')
+        
+        # Add 30D column from rolling data
+        if not rolling_df.empty and '30D' in rolling_df.columns:
+            result = result.merge(rolling_df[['continent', 'country', '30D']], on=['continent', 'country'], how='left')
+        
+        # Process weeks - get last 3 completed weeks  
+        if not weeks_df.empty:
+            week_cols = [col for col in weeks_df.columns if col not in ['continent', 'country']]
+            current_week = current_date.isocalendar()[1]
+            
+            # Filter completed weeks
+            completed_weeks = []
+            for col in week_cols:
+                if "W" in col and "'" in col:
+                    week_num = int(col.split("W")[1].split("'")[0])
+                    year = int("20" + col.split("'")[1])
+                    if year < current_year or (year == current_year and week_num < current_week):
+                        completed_weeks.append(col)
+            
+            # Sort and take last 3
+            completed_weeks = sorted(completed_weeks,
+                                   key=lambda x: (x.split("'")[1], x.split("W")[1].split("'")[0].zfill(2)))[-3:]
+            
+            if completed_weeks:
+                weeks_subset = weeks_df[['continent', 'country'] + completed_weeks]
+                result = result.merge(weeks_subset, on=['continent', 'country'], how='left')
+        
+        # Add remaining rolling columns
+        if not rolling_df.empty:
+            remaining_cols = ['7D', 'Δ 7D-30D', 'Δ 30D Y/Y']
+            for col in remaining_cols:
+                if col in rolling_df.columns:
+                    result = result.merge(rolling_df[['continent', 'country', col]], on=['continent', 'country'], how='left')
+        
+        # Fill NaN values
+        result = result.fillna(0)
+        
+        # Round numeric columns
+        numeric_cols = [col for col in result.columns if col not in ['continent', 'country']]
+        for col in numeric_cols:
+            result[col] = result[col].round(1)
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error combining hierarchical destination summary data: {e}")
+        return pd.DataFrame()
+
+def combine_destination_summary_data(quarters_df, months_df, weeks_df, rolling_df):
+    """Combine all period data into final summary table"""
+    from datetime import datetime
+    
+    try:
+        # Start with destinations from rolling data (most complete)
+        if not rolling_df.empty:
+            result = rolling_df[['destination']].copy()
+        else:
+            # Get unique destinations from all dataframes
+            all_destinations = set()
+            if not quarters_df.empty:
+                all_destinations.update(quarters_df['destination'].unique())
+            if not months_df.empty:
+                all_destinations.update(months_df['destination'].unique())
+            if not weeks_df.empty:
+                all_destinations.update(weeks_df['destination'].unique())
+            
+            if not all_destinations:
+                return pd.DataFrame()
+            
+            result = pd.DataFrame({'destination': sorted(list(all_destinations))})
+        
+        # Get current date for filtering completed periods
+        current_date = datetime.now()
+        current_quarter = (current_date.month - 1) // 3 + 1
+        current_year = current_date.year
+        
+        # Process quarters - get last 5 completed quarters
+        if not quarters_df.empty:
+            quarter_cols = [col for col in quarters_df.columns if col != 'destination']
+            
+            # Filter completed quarters
+            completed_quarters = []
+            for col in quarter_cols:
+                if "Q" in col and "'" in col:
+                    q_num = int(col.split("Q")[1].split("'")[0])
+                    year = int("20" + col.split("'")[1])
+                    if year < current_year or (year == current_year and q_num < current_quarter):
+                        completed_quarters.append(col)
+            
+            # Sort and take last 5
+            completed_quarters = sorted(completed_quarters, 
+                                      key=lambda x: (x.split("'")[1], x.split("Q")[1].split("'")[0]))[-5:]
+            
+            # Merge selected quarters
+            if completed_quarters:
+                quarters_subset = quarters_df[['destination'] + completed_quarters]
+                result = result.merge(quarters_subset, on='destination', how='left')
+        
+        # Process months - get last 3 completed months
+        if not months_df.empty:
+            month_cols = [col for col in months_df.columns if col != 'destination']
+            month_order = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+                          'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+            
+            # Filter completed months
+            completed_months = []
+            for col in month_cols:
+                if "'" in col:
+                    month_abbr = col.split("'")[0]
+                    year = int("20" + col.split("'")[1])
+                    month_num = month_order.get(month_abbr, 0)
+                    if year < current_year or (year == current_year and month_num < current_date.month):
+                        completed_months.append(col)
+            
+            # Sort and take last 3
+            completed_months = sorted(completed_months,
+                                    key=lambda x: (x.split("'")[1], month_order.get(x.split("'")[0], 0)))[-3:]
+            
+            # Merge selected months
+            if completed_months:
+                months_subset = months_df[['destination'] + completed_months]
+                result = result.merge(months_subset, on='destination', how='left')
+        
+        # Add 30D column from rolling data
+        if not rolling_df.empty and '30D' in rolling_df.columns:
+            result = result.merge(rolling_df[['destination', '30D']], on='destination', how='left')
+        
+        # Process weeks - get last 3 completed weeks
+        if not weeks_df.empty:
+            week_cols = [col for col in weeks_df.columns if col != 'destination']
+            current_week = current_date.isocalendar()[1]
+            
+            # Filter completed weeks
+            completed_weeks = []
+            for col in week_cols:
+                if "W" in col and "'" in col:
+                    week_num = int(col.split("W")[1].split("'")[0])
+                    year = int("20" + col.split("'")[1])
+                    if year < current_year or (year == current_year and week_num < current_week):
+                        completed_weeks.append(col)
+            
+            # Sort and take last 3
+            completed_weeks = sorted(completed_weeks,
+                                   key=lambda x: (x.split("'")[1], x.split("W")[1].split("'")[0].zfill(2)))[-3:]
+            
+            # Merge selected weeks
+            if completed_weeks:
+                weeks_subset = weeks_df[['destination'] + completed_weeks]
+                result = result.merge(weeks_subset, on='destination', how='left')
+        
+        # Add remaining rolling columns (7D and deltas)
+        if not rolling_df.empty:
+            remaining_cols = ['7D', 'Δ 7D-30D', 'Δ 30D Y/Y']
+            for col in remaining_cols:
+                if col in rolling_df.columns:
+                    result = result.merge(rolling_df[['destination', col]], on='destination', how='left')
+        
+        # Add TOTAL row
+        numeric_cols = [col for col in result.columns if col != 'destination']
+        total_row = pd.DataFrame([{
+            'destination': 'TOTAL',
+            **{col: result[col].sum() for col in numeric_cols}
+        }])
+        result = pd.concat([result, total_row], ignore_index=True)
+        
+        # Fill NaN values and round
+        result = result.fillna(0)
+        for col in numeric_cols:
+            result[col] = result[col].round(1)
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error combining destination summary data: {e}")
+        return pd.DataFrame()
+
+def create_country_supply_chart(country_name):
+    """Create seasonal comparison chart for selected country's LNG supply"""
+    
+    try:
+        # Query to get supply data for the selected country
+        query = f"""
+        WITH latest_data AS (
+            SELECT MAX(upload_timestamp_utc) as max_timestamp
+            FROM {DB_SCHEMA}.kpler_trades
+        ),
+        daily_supply AS (
+            SELECT 
+                kt.start::date as date,
+                kt.origin_country_name,
+                SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_supply_mcmd
+            FROM {DB_SCHEMA}.kpler_trades kt, latest_data ld
+            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                AND kt.origin_country_name = %(country_name)s
+                AND kt.start >= '2023-11-01'
+                AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+            GROUP BY kt.start::date, kt.origin_country_name
+        ),
+        rolling_supply AS (
+            SELECT 
+                date,
+                origin_country_name,
+                daily_supply_mcmd,
+                AVG(daily_supply_mcmd) OVER (
+                    PARTITION BY origin_country_name 
+                    ORDER BY date 
+                    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                ) as rolling_avg_30d,
+                CASE 
+                    WHEN date > CURRENT_DATE THEN true
+                    ELSE false
+                END as is_forecast
+            FROM daily_supply
+        )
+        SELECT 
+            date,
+            EXTRACT(YEAR FROM date) as year,
+            EXTRACT(DOY FROM date) as day_of_year,
+            TO_CHAR(date, 'Mon DD') as month_day,
+            rolling_avg_30d as rolling_avg,
+            is_forecast
+        FROM rolling_supply
+        WHERE date >= '2024-01-01'
+        ORDER BY date
+        """
+        
+        df = pd.read_sql(query, engine, params={'country_name': country_name})
+        
+        if df.empty:
+            # Return empty chart with message
+            fig = go.Figure()
+            fig.add_annotation(
+                text=f"No supply data available for {country_name}",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color='#6b7280')
+            )
+            fig.update_layout(
+                xaxis=dict(showgrid=False, showticklabels=False),
+                yaxis=dict(showgrid=False, showticklabels=False),
+                height=400,
+                paper_bgcolor='white',
+                plot_bgcolor='white'
+            )
+            return fig
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Get unique years and assign colors - McKinsey blue palette (same as exporters.py)
+        years = sorted(df['year'].unique())
+        colors = ['#2E86C1', '#1B4F72', '#5DADE2', '#3498DB', '#76D7C4']  # McKinsey blue palette
+        
+        # Plot each year's data
+        for i, year in enumerate(years):
+            year_data = df[df['year'] == year].copy()
+            
+            # For seasonal comparison, use day of year as x-axis
+            year_data['plot_date'] = pd.to_datetime('2024-01-01') + pd.to_timedelta(year_data['day_of_year'] - 1, unit='d')
+            
+            # Split data into historical and forecast
+            historical_data = year_data[~year_data['is_forecast']]
+            forecast_data = year_data[year_data['is_forecast']]
+            
+            # Plot historical data with solid line
+            if not historical_data.empty:
+                fig.add_trace(go.Scatter(
+                    x=historical_data['plot_date'],
+                    y=historical_data['rolling_avg'],
+                    mode='lines',
+                    name=str(int(year)),  # Convert to int to remove decimal
+                    line=dict(
+                        color=colors[i % len(colors)],
+                        width=3 if year == years[-1] else 2,  # Highlight current year
+                        dash='solid'
+                    ),
+                    hovertemplate=f'<b>{int(year)} (Historical)</b><br>' +  # Convert to int here too
+                                 '%{text}<br>' +
+                                 'Supply: %{y:.1f} mcm/d<br>' +
+                                 '<extra></extra>',
+                    text=historical_data['month_day'],
+                    showlegend=True
+                ))
+            
+            # Plot forecast data with lighter/transparent color
+            if not forecast_data.empty:
+                # Connect forecast line to historical by including last historical point
+                if not historical_data.empty:
+                    # Get last historical point to connect the lines
+                    connect_data = pd.concat([historical_data.tail(1), forecast_data])
+                else:
+                    connect_data = forecast_data
+                
+                # Create a lighter version of the color for forecast
+                base_color = colors[i % len(colors)]
+                # Convert hex to rgba with transparency
+                forecast_color = f"rgba({int(base_color[1:3], 16)}, {int(base_color[3:5], 16)}, {int(base_color[5:7], 16)}, 0.5)"
+                    
+                fig.add_trace(go.Scatter(
+                    x=connect_data['plot_date'],
+                    y=connect_data['rolling_avg'],
+                    mode='lines',
+                    name=f"{int(year)} (Forecast)",
+                    line=dict(
+                        color=forecast_color,  # Lighter/transparent version
+                        width=3 if year == years[-1] else 2,  # Same width as historical
+                        dash='solid'  # Solid line instead of dashed
+                    ),
+                    opacity=0.7,  # Additional opacity for visual distinction
+                    hovertemplate=f'<b>{int(year)} (Forecast)</b><br>' +
+                                 '%{text}<br>' +
+                                 'Supply: %{y:.1f} mcm/d<br>' +
+                                 '<extra></extra>',
+                    text=connect_data['month_day'],
+                    showlegend=False  # Don't show separate legend entry for forecast
+                ))
+        
+        # Update layout with professional styling standards (matching exporters.py)
+        fig.update_layout(
+            # X-Axis Professional Styling
+            xaxis=dict(
+                title=dict(text='', font=dict(size=13, color='#4A4A4A')),
+                tickformat='%b',
+                dtick='M1',
+                tickangle=0,
+                showgrid=True,
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                gridwidth=0.5,
+                linecolor='#CCCCCC',
+                linewidth=1,
+                tickfont=dict(size=11, color='#666666')
+            ),
+            
+            # Y-Axis Professional Styling
+            yaxis=dict(
+                title=dict(text='mcm/d', font=dict(size=13, color='#4A4A4A')),
+                showgrid=True,
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                gridwidth=0.5,
+                linecolor='#CCCCCC',
+                linewidth=1,
+                tickfont=dict(size=11, color='#666666'),
+                zeroline=False
+            ),
+            
+            # Legend positioning (matching exporters.py)
+            showlegend=True,
+            legend=dict(
+                orientation='h',
+                yanchor='top',
+                y=-0.08,
+                xanchor='left',
+                x=0,
+                bgcolor='rgba(255, 255, 255, 0)',
+                bordercolor='rgba(255, 255, 255, 0)',
+                borderwidth=0,
+                font=dict(size=12, color='#4A4A4A'),
+                itemsizing='constant'
+            ),
+            
+            # General Layout
+            height=400,
+            margin=dict(l=60, r=40, t=40, b=60),
+            paper_bgcolor='white',
+            plot_bgcolor='white',
+            hovermode='x unified',
+            
+            # Title - removed since we have headers
+            title=None
+        )
+        
+        return fig
+        
+    except Exception as e:
+        print(f"Error creating supply chart for {country_name}: {e}")
+        # Return empty chart with error message
+        fig = go.Figure()
+        fig.add_annotation(
+            text=f"Error loading supply data for {country_name}",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color='#ef4444')
+        )
+        fig.update_layout(
+            xaxis=dict(showgrid=False, showticklabels=False),
+            yaxis=dict(showgrid=False, showticklabels=False),
+            height=400,
+            paper_bgcolor='white',
+            plot_bgcolor='white'
+        )
+        return fig
+
+def create_continent_destination_chart(country_name):
+    """Create seasonal comparison chart by continent destination for selected country's LNG exports"""
+    
+    try:
+        print(f"DEBUG: Creating continent destination chart for: '{country_name}'")
+        # Query to get export data by continent destination for the selected country
+        query = f"""
+        WITH latest_data AS (
+            SELECT MAX(upload_timestamp_utc) as max_timestamp
+            FROM {DB_SCHEMA}.kpler_trades
+        ),
+        daily_exports AS (
+            SELECT 
+                kt.start::date as date,
+                kt.origin_country_name,
+                COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
+                SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
+            FROM {DB_SCHEMA}.kpler_trades kt, latest_data ld
+            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                AND kt.origin_country_name = %(country_name)s
+                AND kt.start >= '2023-11-01'
+                AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+            GROUP BY kt.start::date, kt.origin_country_name, kt.continent_destination_name
+        ),
+        rolling_exports AS (
+            SELECT 
+                date,
+                origin_country_name,
+                continent_destination,
+                daily_export_mcmd,
+                AVG(daily_export_mcmd) OVER (
+                    PARTITION BY origin_country_name, continent_destination
+                    ORDER BY date 
+                    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                ) as rolling_avg_30d,
+                CASE 
+                    WHEN date > CURRENT_DATE THEN true
+                    ELSE false
+                END as is_forecast
+            FROM daily_exports
+        )
+        SELECT 
+            date,
+            continent_destination,
+            EXTRACT(YEAR FROM date) as year,
+            EXTRACT(DOY FROM date) as day_of_year,
+            TO_CHAR(date, 'Mon DD') as month_day,
+            rolling_avg_30d as rolling_avg,
+            is_forecast
+        FROM rolling_exports
+        WHERE date >= '2024-01-01'
+        ORDER BY continent_destination, date
+        """
+        
+        df = pd.read_sql(query, engine, params={'country_name': country_name})
+        
+        print(f"DEBUG: Query returned {len(df)} rows")
+        if not df.empty:
+            print(f"DEBUG: Continents found: {df['continent_destination'].unique()}")
+            print(f"DEBUG: Years found: {sorted(df['year'].unique())}")
+            print(f"DEBUG: Date range: {df['date'].min()} to {df['date'].max()}")
+        
+        if df.empty:
+            # Return empty chart with message
+            fig = go.Figure()
+            fig.add_annotation(
+                text=f"No export data available for {country_name}",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color='#6b7280')
+            )
+            fig.update_layout(
+                xaxis=dict(showgrid=False, showticklabels=False),
+                yaxis=dict(showgrid=False, showticklabels=False),
+                height=400,
+                paper_bgcolor='white',
+                plot_bgcolor='white'
+            )
+            return fig
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Get unique years and continents
+        years = sorted(df['year'].unique())
+        continents = sorted(df['continent_destination'].unique())
+        
+        # Define color palette for continents - distinct colors for actual data
+        continent_colors = {
+            'Africa': '#8E24AA',        # Purple
+            'Americas': '#43A047',      # Green
+            'Asia': '#FF4444',          # Bright Red
+            'Europe': '#1E88E5',        # Strong Blue
+            'Unknown': '#757575',       # Gray
+            # Add fallback colors just in case
+            'Oceania': '#FB8C00',       # Orange
+            'Middle East': '#00ACC1',   # Cyan
+            'North America': '#D81B60', # Pink
+            'South America': '#FFC107'  # Amber
+        }
+        
+        # Get current year for line width highlighting
+        current_year = max(years)
+        
+        # Process each continent and year combination
+        continent_legend_shown = {}  # Track which continents have shown legend
+        
+        for continent in continents:
+            continent_data = df[df['continent_destination'] == continent]
+            
+            # Get color for this continent
+            color = continent_colors.get(continent, '#808080')
+            
+            for year in years:
+                year_continent_data = continent_data[continent_data['year'] == year].copy()
+                
+                if year_continent_data.empty:
+                    continue
+                
+                # For seasonal comparison, use day of year as x-axis
+                year_continent_data['plot_date'] = pd.to_datetime('2024-01-01') + pd.to_timedelta(year_continent_data['day_of_year'] - 1, unit='d')
+                
+                # Split data into historical and forecast
+                historical_data = year_continent_data[~year_continent_data['is_forecast']]
+                forecast_data = year_continent_data[year_continent_data['is_forecast']]
+                
+                # Determine line width based on year
+                line_width = 3 if year == current_year else 1.5
+                
+                # Show legend only for the first occurrence of this continent
+                show_legend = bool(continent not in continent_legend_shown)
+                if show_legend:
+                    continent_legend_shown[continent] = True
+                
+                # Plot historical data
+                if not historical_data.empty:
+                    fig.add_trace(go.Scatter(
+                        x=historical_data['plot_date'],
+                        y=historical_data['rolling_avg'],
+                        mode='lines',
+                        name=continent if show_legend else None,
+                        legendgroup=continent,
+                        line=dict(
+                            color=color,
+                            width=line_width,
+                            dash='solid'
+                        ),
+                        hovertemplate=f'<b>{continent} - {int(year)}</b><br>' +
+                                     '%{text}<br>' +
+                                     'Export: %{y:.1f} mcm/d<br>' +
+                                     '<extra></extra>',
+                        text=historical_data['month_day'],
+                        showlegend=show_legend
+                    ))
+                
+                # Plot forecast data with transparency
+                if not forecast_data.empty:
+                    # Connect forecast line to historical
+                    if not historical_data.empty:
+                        connect_data = pd.concat([historical_data.tail(1), forecast_data])
+                    else:
+                        connect_data = forecast_data
+                    
+                    # Create transparent version of color for forecast
+                    import re
+                    if color.startswith('#'):
+                        r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+                        forecast_color = f"rgba({r}, {g}, {b}, 0.4)"
+                    else:
+                        forecast_color = color
+                    
+                    fig.add_trace(go.Scatter(
+                        x=connect_data['plot_date'],
+                        y=connect_data['rolling_avg'],
+                        mode='lines',
+                        name=None,
+                        legendgroup=continent,
+                        line=dict(
+                            color=forecast_color,
+                            width=line_width,
+                            dash='solid'
+                        ),
+                        opacity=0.6,
+                        hovertemplate=f'<b>{continent} - {int(year)} (Forecast)</b><br>' +
+                                     '%{text}<br>' +
+                                     'Export: %{y:.1f} mcm/d<br>' +
+                                     '<extra></extra>',
+                        text=connect_data['month_day'],
+                        showlegend=False
+                    ))
+        
+        # Update layout
+        fig.update_layout(
+            # X-Axis Professional Styling
+            xaxis=dict(
+                title=dict(text='', font=dict(size=13, color='#4A4A4A')),
+                tickformat='%b',
+                dtick='M1',
+                tickangle=0,
+                showgrid=True,
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                gridwidth=0.5,
+                linecolor='#CCCCCC',
+                linewidth=1,
+                tickfont=dict(size=11, color='#666666')
+            ),
+            
+            # Y-Axis Professional Styling
+            yaxis=dict(
+                title=dict(text='mcm/d', font=dict(size=13, color='#4A4A4A')),
+                showgrid=True,
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                gridwidth=0.5,
+                linecolor='#CCCCCC',
+                linewidth=1,
+                tickfont=dict(size=11, color='#666666'),
+                zeroline=False
+            ),
+            
+            # Legend positioning - compact for three-chart layout
+            showlegend=True,
+            legend=dict(
+                orientation='h',
+                yanchor='top',
+                y=-0.15,
+                xanchor='center',
+                x=0.5,
+                bgcolor='rgba(255, 255, 255, 0)',
+                bordercolor='rgba(255, 255, 255, 0)',
+                borderwidth=0,
+                font=dict(size=10, color='#4A4A4A'),
+                itemsizing='constant'
+            ),
+            
+            # General Layout
+            height=400,
+            margin=dict(l=50, r=120, t=30, b=50),  # Adjusted margins for three-chart layout
+            paper_bgcolor='white',
+            plot_bgcolor='white',
+            hovermode='x unified',
+            
+            # Title - removed since we have headers
+            title=None
+        )
+        
+        return fig
+        
+    except Exception as e:
+        print(f"ERROR creating continent destination chart for {country_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return empty chart with error message
+        fig = go.Figure()
+        fig.add_annotation(
+            text=f"Error loading export data for {country_name}: {str(e)}",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color='#ef4444')
+        )
+        fig.update_layout(
+            xaxis=dict(showgrid=False, showticklabels=False),
+            yaxis=dict(showgrid=False, showticklabels=False),
+            height=400,
+            paper_bgcolor='white',
+            plot_bgcolor='white'
+        )
+        return fig
+
+def create_continent_percentage_chart(country_name):
+    """Create percentage distribution chart by continent destination for selected country's LNG exports"""
+    
+    try:
+        print(f"DEBUG: Creating continent percentage chart for: '{country_name}'")
+        # Query to get export data by continent destination for percentage calculation
+        query = f"""
+        WITH latest_data AS (
+            SELECT MAX(upload_timestamp_utc) as max_timestamp
+            FROM {DB_SCHEMA}.kpler_trades
+        ),
+        daily_exports AS (
+            SELECT 
+                kt.start::date as date,
+                kt.origin_country_name,
+                COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
+                SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
+            FROM {DB_SCHEMA}.kpler_trades kt, latest_data ld
+            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                AND kt.origin_country_name = %(country_name)s
+                AND kt.start >= '2023-11-01'
+                AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+            GROUP BY kt.start::date, kt.origin_country_name, kt.continent_destination_name
+        ),
+        daily_totals AS (
+            SELECT 
+                date,
+                SUM(daily_export_mcmd) as total_daily_export
+            FROM daily_exports
+            GROUP BY date
+        ),
+        rolling_data AS (
+            SELECT 
+                de.date,
+                de.origin_country_name,
+                de.continent_destination,
+                de.daily_export_mcmd,
+                -- Rolling average for each continent
+                AVG(de.daily_export_mcmd) OVER (
+                    PARTITION BY de.continent_destination
+                    ORDER BY de.date 
+                    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                ) as rolling_avg_30d,
+                -- Rolling average for total
+                AVG(dt.total_daily_export) OVER (
+                    ORDER BY dt.date 
+                    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                ) as total_rolling_avg_30d,
+                CASE 
+                    WHEN de.date > CURRENT_DATE THEN true
+                    ELSE false
+                END as is_forecast
+            FROM daily_exports de
+            JOIN daily_totals dt ON de.date = dt.date
+        )
+        SELECT 
+            date,
+            continent_destination,
+            EXTRACT(YEAR FROM date) as year,
+            EXTRACT(DOY FROM date) as day_of_year,
+            TO_CHAR(date, 'Mon DD') as month_day,
+            rolling_avg_30d as rolling_avg,
+            CASE 
+                WHEN total_rolling_avg_30d > 0 
+                THEN (rolling_avg_30d / total_rolling_avg_30d) * 100
+                ELSE 0
+            END as percentage,
+            is_forecast
+        FROM rolling_data
+        WHERE date >= '2024-01-01'
+        ORDER BY continent_destination, date
+        """
+        
+        df = pd.read_sql(query, engine, params={'country_name': country_name})
+        
+        print(f"DEBUG: Percentage query returned {len(df)} rows")
+        if not df.empty:
+            print(f"DEBUG: Continents found: {df['continent_destination'].unique()}")
+            print(f"DEBUG: Percentage range: {df['percentage'].min():.1f}% to {df['percentage'].max():.1f}%")
+        
+        if df.empty:
+            # Return empty chart with message
+            fig = go.Figure()
+            fig.add_annotation(
+                text=f"No export data available for {country_name}",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color='#6b7280')
+            )
+            fig.update_layout(
+                xaxis=dict(showgrid=False, showticklabels=False),
+                yaxis=dict(showgrid=False, showticklabels=False),
+                height=400,
+                paper_bgcolor='white',
+                plot_bgcolor='white'
+            )
+            return fig
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Get unique years and continents
+        years = sorted(df['year'].unique())
+        continents = sorted(df['continent_destination'].unique())
+        
+        # Define color palette for continents - same as absolute chart
+        continent_colors = {
+            'Africa': '#8E24AA',        # Purple
+            'Americas': '#43A047',      # Green
+            'Asia': '#FF4444',          # Bright Red
+            'Europe': '#1E88E5',        # Strong Blue
+            'Unknown': '#757575',       # Gray
+            # Add fallback colors just in case
+            'Oceania': '#FB8C00',       # Orange
+            'Middle East': '#00ACC1',   # Cyan
+            'North America': '#D81B60', # Pink
+            'South America': '#FFC107'  # Amber
+        }
+        
+        # Get current year for line width highlighting
+        current_year = max(years)
+        
+        # Process each continent and year combination
+        continent_legend_shown = {}  # Track which continents have shown legend
+        
+        for continent in continents:
+            continent_data = df[df['continent_destination'] == continent]
+            
+            # Get color for this continent
+            color = continent_colors.get(continent, '#808080')
+            
+            for year in years:
+                year_continent_data = continent_data[continent_data['year'] == year].copy()
+                
+                if year_continent_data.empty:
+                    continue
+                
+                # For seasonal comparison, use day of year as x-axis
+                year_continent_data['plot_date'] = pd.to_datetime('2024-01-01') + pd.to_timedelta(year_continent_data['day_of_year'] - 1, unit='d')
+                
+                # Split data into historical and forecast
+                historical_data = year_continent_data[~year_continent_data['is_forecast']]
+                forecast_data = year_continent_data[year_continent_data['is_forecast']]
+                
+                # Determine line width based on year
+                line_width = 3 if year == current_year else 1.5
+                
+                # Show legend only for the first occurrence of this continent
+                show_legend = bool(continent not in continent_legend_shown)
+                if show_legend:
+                    continent_legend_shown[continent] = True
+                
+                # Plot historical data
+                if not historical_data.empty:
+                    fig.add_trace(go.Scatter(
+                        x=historical_data['plot_date'],
+                        y=historical_data['percentage'],
+                        mode='lines',
+                        name=continent if show_legend else None,
+                        legendgroup=continent,
+                        line=dict(
+                            color=color,
+                            width=line_width,
+                            dash='solid'
+                        ),
+                        hovertemplate=f'<b>{continent} - {int(year)}</b><br>' +
+                                     '%{text}<br>' +
+                                     'Share: %{y:.1f}%<br>' +
+                                     '<extra></extra>',
+                        text=historical_data['month_day'],
+                        showlegend=show_legend
+                    ))
+                
+                # Plot forecast data with transparency
+                if not forecast_data.empty:
+                    # Connect forecast line to historical
+                    if not historical_data.empty:
+                        connect_data = pd.concat([historical_data.tail(1), forecast_data])
+                    else:
+                        connect_data = forecast_data
+                    
+                    # Create transparent version of color for forecast
+                    import re
+                    if color.startswith('#'):
+                        r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+                        forecast_color = f"rgba({r}, {g}, {b}, 0.4)"
+                    else:
+                        forecast_color = color
+                    
+                    fig.add_trace(go.Scatter(
+                        x=connect_data['plot_date'],
+                        y=connect_data['percentage'],
+                        mode='lines',
+                        name=None,
+                        legendgroup=continent,
+                        line=dict(
+                            color=forecast_color,
+                            width=line_width,
+                            dash='solid'
+                        ),
+                        opacity=0.6,
+                        hovertemplate=f'<b>{continent} - {int(year)} (Forecast)</b><br>' +
+                                     '%{text}<br>' +
+                                     'Share: %{y:.1f}%<br>' +
+                                     '<extra></extra>',
+                        text=connect_data['month_day'],
+                        showlegend=False
+                    ))
+        
+        # Update layout
+        fig.update_layout(
+            # X-Axis Professional Styling
+            xaxis=dict(
+                title=dict(text='', font=dict(size=13, color='#4A4A4A')),
+                tickformat='%b',
+                dtick='M1',
+                tickangle=0,
+                showgrid=True,
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                gridwidth=0.5,
+                linecolor='#CCCCCC',
+                linewidth=1,
+                tickfont=dict(size=11, color='#666666')
+            ),
+            
+            # Y-Axis Professional Styling - Percentage scale
+            yaxis=dict(
+                title=dict(text='Share (%)', font=dict(size=13, color='#4A4A4A')),
+                showgrid=True,
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                gridwidth=0.5,
+                linecolor='#CCCCCC',
+                linewidth=1,
+                tickfont=dict(size=11, color='#666666'),
+                zeroline=False,
+                range=[0, 100],  # Fixed range for percentage
+                ticksuffix='%',
+                dtick=10,  # Show tick marks every 10%
+                tick0=0    # Start ticks at 0
+            ),
+            
+            # Legend positioning - compact for three-chart layout
+            showlegend=True,
+            legend=dict(
+                orientation='h',
+                yanchor='top',
+                y=-0.15,
+                xanchor='center',
+                x=0.5,
+                bgcolor='rgba(255, 255, 255, 0)',
+                bordercolor='rgba(255, 255, 255, 0)',
+                borderwidth=0,
+                font=dict(size=10, color='#4A4A4A'),
+                itemsizing='constant'
+            ),
+            
+            # General Layout
+            height=400,
+            margin=dict(l=50, r=120, t=30, b=50),  # Adjusted margins for three-chart layout
+            paper_bgcolor='white',
+            plot_bgcolor='white',
+            hovermode='x unified',
+            
+            # Title - removed since we have headers
+            title=None
+        )
+        
+        return fig
+        
+    except Exception as e:
+        print(f"ERROR creating continent percentage chart for {country_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return empty chart with error message
+        fig = go.Figure()
+        fig.add_annotation(
+            text=f"Error loading percentage data for {country_name}: {str(e)}",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color='#ef4444')
+        )
+        fig.update_layout(
+            xaxis=dict(showgrid=False, showticklabels=False),
+            yaxis=dict(showgrid=False, showticklabels=False),
+            height=400,
+            paper_bgcolor='white',
+            plot_bgcolor='white'
+        )
+        return fig
+
+@callback(
+    [Output('country-supply-chart', 'figure'),
+     Output('country-supply-header', 'children')],
+    Input('origin-country-dropdown', 'value')
+)
+def update_country_supply_chart(selected_country):
+    """Update the supply chart based on selected country"""
+    if not selected_country:
+        # Return empty chart if no country selected
+        fig = go.Figure()
+        fig.update_layout(height=400)
+        return fig, "Total Supply"
+    
+    # Create the chart
+    fig = create_country_supply_chart(selected_country)
+    
+    # Update header with country name
+    header_text = f"{selected_country} - Total Supply"
+    
+    return fig, header_text
+
+@callback(
+    [Output('continent-destination-chart', 'figure'),
+     Output('continent-destination-header', 'children')],
+    Input('origin-country-dropdown', 'value')
+)
+def update_continent_destination_chart(selected_country):
+    """Update the continent destination chart based on selected country"""
+    if not selected_country:
+        # Return empty chart if no country selected
+        fig = go.Figure()
+        fig.update_layout(height=400)
+        return fig, "By Destination Continent"
+    
+    # Create the chart
+    fig = create_continent_destination_chart(selected_country)
+    
+    # Update header
+    header_text = f"{selected_country} - By Destination Continent"
+    
+    return fig, header_text
+
+@callback(
+    [Output('continent-percentage-chart', 'figure'),
+     Output('continent-percentage-header', 'children')],
+    Input('origin-country-dropdown', 'value')
+)
+def update_continent_percentage_chart(selected_country):
+    """Update the continent percentage chart based on selected country"""
+    if not selected_country:
+        # Return empty chart if no country selected
+        fig = go.Figure()
+        fig.update_layout(height=400)
+        return fig, "By Destination Continent (%)"
+    
+    # Create the chart
+    fig = create_continent_percentage_chart(selected_country)
+    
+    # Update header
+    header_text = f"{selected_country} - Market Share (%)"
+    
+    return fig, header_text
 
 @callback(
     Output('trade-analysis-header', 'children'),
@@ -1807,28 +3439,12 @@ def refresh_us_data(n_clicks, selected_destination_level, selected_origin_countr
         us_default_vessel_value,
     )
 
-@callback(
-    Output('us-last-refresh-indicator', 'children'),
-    Input('us-refresh-timestamp-store', 'data'),
-    prevent_initial_call=True # Only update when timestamp changes
-)
-def update_us_refresh_time(timestamp):
-    """Update the US refresh time indicator."""
-    if timestamp is None:
-        # This might happen on initial load before refresh is clicked
-        return "Click 'Refresh US Data' to load."
-    if "Error" in timestamp: # Check if the timestamp string contains an error message
-        return f"Error during data refresh: {timestamp}"
-
-    return f"US Data Last Refreshed: {timestamp}"
 
 
 @callback(
     # Outputs for US Region Trades section
     Output('us-trade-count-visualization', 'figure'),
-    Output('us-trade-count-table-title', 'children'),
     Output('us-trade-count-table-container', 'children'),
-    Output('us-ton-miles-table-container', 'children'),
 
     # Inputs
     Input('us-region-data-store', 'data'),
@@ -1850,22 +3466,22 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
     # Default empty figures and messages
     no_data_msg = "No data available for the selected filters."
 
-    # Create an empty subplot figure for the default case
-    from plotly.subplots import make_subplots
-    empty_fig = make_subplots(rows=1, cols=3, subplot_titles=[f"Loading {origin_country} Trade Count...",
-                                                              f"Loading {origin_country} Ton Miles...",
-                                                              f"Loading {origin_country} Cargo Volumes..."])
-    empty_fig.update_layout(height=500)
+    # Create an empty figure for the default case
+    empty_fig = go.Figure()
+    empty_fig.update_layout(
+        title=f"Loading {origin_country} Trade Data...",
+        height=600
+    )
 
     # --- Input Data Checks ---
     if us_shipping_data is None or us_dropdown_options is None:
         error_msg = f"{origin_country} data not loaded."
         empty_fig.update_layout(title_text=error_msg)
-        return empty_fig, html.Div(error_msg), html.Div(error_msg)
+        return empty_fig, html.Div(error_msg)
 
     if not all([selected_aggregation, selected_status, selected_destination_level]):
         empty_fig.update_layout(title_text="Please select Aggregation, Status, and Destination Level")
-        return empty_fig, html.Div("Please select all filter values."), html.Div("Please select all filter values.")
+        return empty_fig, html.Div("Please select all filter values.")
 
     try:
         df_trades_shipping_region_us = pd.read_json(us_shipping_data, orient='split')
@@ -1877,7 +3493,7 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
             error_msg = f"Selected destination level column '{selected_destination_level}' not found in data."
             print(f"Update US Region Viz: {error_msg}")
             empty_fig.update_layout(title_text=error_msg)
-            return empty_fig, html.Div(error_msg), html.Div(error_msg)
+            return empty_fig, html.Div(error_msg)
 
         # --- Filter data for charts ---
         df_for_charts = df_trades_shipping_region_us[df_trades_shipping_region_us['status'] == selected_status].copy()
@@ -1888,7 +3504,7 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
 
         if df_for_charts.empty:
             empty_fig.update_layout(title_text="No data available after filtering")
-            return empty_fig, html.Div(no_data_msg), html.Div(no_data_msg)
+            return empty_fig, html.Div(no_data_msg)
 
         # Use professional color palette
         unique_destinations = df_for_charts[selected_destination_level].unique()
@@ -1915,6 +3531,41 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
                 'column': 'sum_cargo_destination_cubic_meters',
                 'title': 'm³',
                 'unit': 'm³'
+            },
+            'median_delivery_days': {
+                'column': 'median_delivery_days',
+                'title': 'Median Delivery Days',
+                'unit': 'days'
+            },
+            'median_speed': {
+                'column': 'median_speed',
+                'title': 'Median Speed',
+                'unit': 'knots'
+            },
+            'median_mileage_nautical_miles': {
+                'column': 'median_mileage_nautical_miles',
+                'title': 'Median Mileage',
+                'unit': 'nautical miles'
+            },
+            'median_ton_miles': {
+                'column': 'median_ton_miles',
+                'title': 'Median Ton Miles',
+                'unit': 'ton miles'
+            },
+            'median_utilization_rate': {
+                'column': 'median_utilization_rate',
+                'title': 'Median Utilization Rate',
+                'unit': '%'
+            },
+            'median_cargo_destination_cubic_meters': {
+                'column': 'median_cargo_destination_cubic_meters',
+                'title': 'Median Cargo Volume',
+                'unit': 'm³'
+            },
+            'median_vessel_capacity_cubic_meters': {
+                'column': 'median_vessel_capacity_cubic_meters',
+                'title': 'Median Vessel Capacity',
+                'unit': 'm³'
             }
         }
         
@@ -1923,16 +3574,8 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
         metric_title = selected_metric_info['title']
         metric_unit = selected_metric_info['unit']
 
-        # Create subplot with 1 row and 2 columns
-        fig = make_subplots(
-            rows=1,
-            cols=2,
-            subplot_titles=[
-                f'{metric_title} ({origin_country} Origin, Status: {selected_status})',
-                f'Ton Miles ({origin_country} Origin, Status: {selected_status})'
-            ],
-            horizontal_spacing=0.1  # Increase spacing for better layout with 2 columns
-        )
+        # Create single figure for selected metric
+        fig = go.Figure()
 
         # Determine grouping columns based on aggregation level
         if selected_aggregation == 'Year':
@@ -1963,8 +3606,16 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
         try:
             # Prepare data
             all_groupby_cols = groupby_time_cols + [selected_destination_level]
-            selected_metric_data = df_for_charts.groupby(all_groupby_cols, observed=False)[
-                metric_column].sum().reset_index()
+            
+            # Use appropriate aggregation based on metric type
+            if 'median' in selected_chart_metric:
+                # For median metrics, use median aggregation
+                selected_metric_data = df_for_charts.groupby(all_groupby_cols, observed=False)[
+                    metric_column].median().reset_index()
+            else:
+                # For count and sum metrics, use sum aggregation
+                selected_metric_data = df_for_charts.groupby(all_groupby_cols, observed=False)[
+                    metric_column].sum().reset_index()
             
             # Convert to appropriate units for display
             if selected_chart_metric == 'mtpa':
@@ -2026,96 +3677,37 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
                             name=dest,
                             marker_color=color_mapping[dest],
                             legendgroup=dest,
-                        ),
-                        row=1, col=1
+                        )
                     )
 
             # Update x-axis to enforce the correct order
             fig.update_xaxes(
                 categoryorder='array',
-                categoryarray=sorted_time_labels,
-                row=1, col=1
+                categoryarray=sorted_time_labels
             )
 
         except Exception as e:
             print(f"Error creating trade count chart: {e}")
             print(traceback.format_exc())
 
-        # --- Prepare and add traces for Ton Miles subplot ---
-        try:
-            # Prepare data
-            ton_miles_data = df_for_charts.groupby(all_groupby_cols, observed=False)[
-                'sum_ton_miles'].sum().reset_index()
-
-            # Create time labels and sorting fields (same logic as above)
-            if 'year' in ton_miles_data.columns:
-                if 'quarter' in ton_miles_data.columns and 'quarter' in groupby_time_cols:
-                    ton_miles_data['quarter_num'] = ton_miles_data['quarter'].str.extract(r'(\d+)').astype(int)
-                    ton_miles_data['time_label'] = ton_miles_data['year'].astype(str) + '-' + ton_miles_data[
-                        'quarter'].astype(str)
-                    ton_miles_data['sort_key'] = ton_miles_data['year'] * 10 + ton_miles_data['quarter_num']
-                elif 'season' in ton_miles_data.columns and 'season' in groupby_time_cols:
-                    ton_miles_data['time_label'] = ton_miles_data['year'].astype(str) + '-' + ton_miles_data[
-                        'season'].astype(str)
-                    ton_miles_data['season_num'] = ton_miles_data['season'].apply(lambda x: 1 if x == 'S' else 2)
-                    ton_miles_data['sort_key'] = ton_miles_data['year'] * 10 + ton_miles_data['season_num']
-                elif 'month' in ton_miles_data.columns and 'month' in groupby_time_cols:
-                    # Handle month aggregation
-                    ton_miles_data['time_label'] = ton_miles_data['year'].astype(str) + '-' + ton_miles_data[
-                        'month'].astype(str).str.zfill(2)
-                    ton_miles_data['sort_key'] = ton_miles_data['year'] * 100 + ton_miles_data['month']
-                elif 'week' in ton_miles_data.columns and 'week' in groupby_time_cols:
-                    # Handle week aggregation  
-                    ton_miles_data['time_label'] = ton_miles_data['year'].astype(str) + '-W' + ton_miles_data[
-                        'week'].astype(str).str.zfill(2)
-                    ton_miles_data['sort_key'] = ton_miles_data['year'] * 100 + ton_miles_data['week']
-                else:
-                    ton_miles_data['time_label'] = ton_miles_data['year'].astype(str)
-                    ton_miles_data['sort_key'] = ton_miles_data['year']
-            else:
-                ton_miles_data['time_label'] = 'Unknown'
-                ton_miles_data['sort_key'] = 0
-
-            # Sort data by sort_key in ascending order
-            ton_miles_data = ton_miles_data.sort_values('sort_key', ascending=True)
-
-            # Get the unique time labels in the sorted order
-            sorted_time_labels = ton_miles_data['time_label'].unique()
-
-            # Add traces for each destination (use showlegend=False to avoid duplicates)
-            for dest in sorted(unique_destinations):
-                dest_data = ton_miles_data[ton_miles_data[selected_destination_level] == dest]
-                if not dest_data.empty:
-                    fig.add_trace(
-                        go.Bar(
-                            x=dest_data['time_label'],
-                            y=dest_data['sum_ton_miles'],
-                            name=dest,
-                            marker_color=color_mapping[dest],
-                            legendgroup=dest,
-                            showlegend=False,
-                        ),
-                        row=1, col=2
-                    )
-
-            # Update x-axis to enforce the correct order
-            fig.update_xaxes(
-                categoryorder='array',
-                categoryarray=sorted_time_labels,
-                row=1, col=2
-            )
-
-        except Exception as e:
-            print(f"Error creating ton miles chart: {e}")
-            print(traceback.format_exc())
 
 
-        # Apply professional styling for subplots
+        # Apply professional styling
         destination_display = "Countries" if selected_destination_level == "destination_country_name" else "Shipping Regions"
         
         fig.update_layout(
+            title=dict(
+                text=f'{metric_title} ({origin_country} Origin, Status: {selected_status})',
+                font=dict(
+                    family='Inter, -apple-system, BlinkMacSystemFont, sans-serif',
+                    size=18,
+                    color=PROFESSIONAL_COLORS['text_primary']
+                ),
+                x=0.5,
+                xanchor='center'
+            ),
             barmode='stack',
-            height=500,
+            height=600,
             paper_bgcolor=PROFESSIONAL_COLORS['bg_white'],
             plot_bgcolor=PROFESSIONAL_COLORS['bg_white'],
             font=dict(
@@ -2145,7 +3737,7 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
                 bordercolor=PROFESSIONAL_COLORS['grid_color'],
                 borderwidth=1
             ),
-            margin=dict(l=60, r=250, t=80, b=60),
+            margin=dict(l=60, r=200, t=80, b=60),
         )
 
         # Update axes with professional styling
@@ -2169,9 +3761,9 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
             zeroline=False
         )
         
-        # Individual y-axis titles with professional styling
+        # Y-axis title with professional styling
         fig.update_yaxes(
-            title_text=metric_title,
+            title_text=metric_unit,
             title_font=dict(
                 family='Inter, -apple-system, BlinkMacSystemFont, sans-serif',
                 size=13,
@@ -2187,29 +3779,7 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
             linecolor=PROFESSIONAL_COLORS['grid_color'],
             linewidth=1,
             showgrid=True,
-            zeroline=False,
-            row=1, col=1
-        )
-        
-        fig.update_yaxes(
-            title_text="Ton Miles",
-            title_font=dict(
-                family='Inter, -apple-system, BlinkMacSystemFont, sans-serif',
-                size=13,
-                color=PROFESSIONAL_COLORS['text_primary']
-            ),
-            tickfont=dict(
-                family='Inter, -apple-system, BlinkMacSystemFont, sans-serif',
-                size=11,
-                color=PROFESSIONAL_COLORS['text_secondary']
-            ),
-            gridcolor=PROFESSIONAL_COLORS['grid_color'],
-            gridwidth=0.5,
-            linecolor=PROFESSIONAL_COLORS['grid_color'],
-            linewidth=1,
-            showgrid=True,
-            zeroline=False,
-            row=1, col=2
+            zeroline=False
         )
 
         # --- Prepare Data for Tables 1 & 2 ---
@@ -2225,10 +3795,23 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
             'count_trades': 'count_trades',
             'mtpa': 'sum_cargo_destination_cubic_meters', 
             'mcm_d': 'sum_cargo_destination_cubic_meters',
-            'm3': 'sum_cargo_destination_cubic_meters'
+            'm3': 'sum_cargo_destination_cubic_meters',
+            'median_delivery_days': 'median_delivery_days',
+            'median_speed': 'median_speed',
+            'median_mileage_nautical_miles': 'median_mileage_nautical_miles',
+            'median_ton_miles': 'median_ton_miles',
+            'median_utilization_rate': 'median_utilization_rate',
+            'median_cargo_destination_cubic_meters': 'median_cargo_destination_cubic_meters',
+            'median_vessel_capacity_cubic_meters': 'median_vessel_capacity_cubic_meters'
         }
         
         selected_metric_column = chart_metric_mapping.get(selected_chart_metric, 'count_trades')
+        
+        # Determine aggregation function based on metric type
+        if 'median' in selected_chart_metric:
+            agg_func = 'median'
+        else:
+            agg_func = 'sum'
         
         # Use the existing prepare_pivot_table function with selected metric
         count_table_data = prepare_pivot_table(
@@ -2237,19 +3820,10 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
             filters=table_filters,
             aggregation_level=selected_aggregation,
             add_total_column=True,
-            aggfunc='sum',
+            aggfunc=agg_func,
             destination_level=selected_destination_level
         )
 
-        ton_miles_table_data = prepare_pivot_table(
-            df=df_trades_shipping_region_us,
-            values_col='sum_ton_miles',
-            filters=table_filters,
-            aggregation_level=selected_aggregation,
-            add_total_column=True,
-            aggfunc='sum',
-            destination_level=selected_destination_level
-        )
 
         # Apply unit conversions to table data (same as chart)
         if not count_table_data.empty and selected_chart_metric in ['mtpa', 'mcm_d']:
@@ -2276,129 +3850,297 @@ def update_us_region_visualizations(us_shipping_data, us_dropdown_options,
                 aggregation_level=selected_aggregation
             )
         else:
-            table1_content = html.Div(f"{no_data_msg} (Trade Count)")
+            table1_content = html.Div(f"{no_data_msg}")
 
-        if not ton_miles_table_data.empty:
-            table2_content = create_datatable(
-                ton_miles_table_data,
-                metric_for_format='sum_ton_miles',
-                aggregation_level=selected_aggregation
-            )
-        else:
-            table2_content = html.Div(f"{no_data_msg} (Ton Miles)")
-        # Create dynamic title for the first table based on selected metric
-        metric_title_mapping = {
-            'count_trades': 'Trade Count Data Table',
-            'mtpa': 'MTPA Data Table', 
-            'mcm_d': 'mcm/d Data Table',
-            'm3': 'm³ Data Table'
-        }
-        table1_title = metric_title_mapping.get(selected_chart_metric, 'Trade Count Data Table')
-        
-        return fig, table1_title, table1_content, table2_content
+        return fig, table1_content
 
     except Exception as e:
         error_message = f"Error updating US region visuals/tables: {e}"
         empty_fig.update_layout(title_text=error_message)
-        return empty_fig, "Error", html.Div(error_message), html.Div(error_message)
+        return empty_fig, html.Div(error_message)
+
 
 
 @callback(
-    Output('us-region-custom-metrics-table-title', 'children'),
-    Output('us-region-custom-metrics-table-container', 'children'),
-    # Inputs
-    Input('us-region-data-store', 'data'),
-    Input('aggregation-dropdown', 'value'),
-    Input('us-region-status-dropdown', 'value'),
-    Input('us-region-metric-dropdown', 'value'),
-    Input('us-vessel-type-dropdown', 'value'),
-    Input('destination-level-dropdown', 'value'),
-    Input('origin-country-dropdown', 'value'),
-    prevent_initial_call=True
+    Output('destination-summary-table-container', 'children'),
+    [Input('origin-country-dropdown', 'value'),
+     Input('us-region-status-dropdown', 'value'),
+     Input('us-vessel-type-dropdown', 'value'),
+     Input('destination-expanded-continents', 'data')],
+    prevent_initial_call=False
 )
-def update_us_region_metrics_table(us_shipping_data,
-                                   selected_aggregation,
-                                   selected_status,
-                                   selected_metric,
-                                   selected_vessel_type,
-                                   selected_destination_level,
-                                   origin_country):
-    """Update US region custom metrics table (Table 3) based on selected filters."""
-
-
-    # Get the display name for the destination level
-    destination_display = "Countries" if selected_destination_level == "destination_country_name" else "Shipping Regions"
-
-    # Find the label corresponding to the selected metric value for the title
-    metric_options_list = [
-        {'label': 'Median Delivery Days', 'value': 'median_delivery_days'},
-        {'label': 'Median Speed', 'value': 'median_speed'},
-        {'label': 'Median Mileage (Nautical Miles)', 'value': 'median_mileage_nautical_miles'},
-        {'label': 'Median Ton Miles', 'value': 'median_ton_miles'},
-        {'label': 'Median Utilization Rate', 'value': 'median_utilization_rate'},
-        {'label': 'Median Cargo Volume (m³)', 'value': 'median_cargo_destination_cubic_meters'},
-        {'label': 'Median Vessel Capacity (m³)', 'value': 'median_vessel_capacity_cubic_meters'},
-        {'label': 'Count of Trades', 'value': 'count_trades'},
-    ]
-    metric_name = next((opt['label'] for opt in metric_options_list if opt['value'] == selected_metric),
-                       selected_metric)
-
-    # Updated title to include destination level type
-    table_title = f"{origin_country} Origin: {metric_name} for {selected_vessel_type} by Destination {destination_display} (Status: {selected_status})"
-
-    # --- Input Data Checks ---
-    if us_shipping_data is None:
-
-        return table_title, html.Div(f"{origin_country}  Region trade data not loaded.")
-    if not all(
-            [selected_aggregation, selected_status, selected_metric, selected_vessel_type, selected_destination_level]):
-        missing = [name for item, name in [
-            (selected_aggregation, "Aggregation"), (selected_status, "Status"),
-            (selected_metric, "Metric"), (selected_vessel_type, "Vessel Type"),
-            (selected_destination_level, "Destination Level")
-        ] if item is None]
-        return table_title, html.Div(f"Please select {', '.join(missing)}.")
-
+def update_destination_summary_table(origin_country, status, vessel_type, expanded_continents):
+    """Update the destination summary table with expandable continent/country hierarchy"""
+    
+    print(f"DEBUG: update_destination_summary_table called with:")
+    print(f"  - origin_country: {origin_country}")
+    print(f"  - status: {status}")
+    print(f"  - vessel_type: {vessel_type}")
+    print(f"  - expanded_continents: {expanded_continents}")
+    
+    if not origin_country:
+        print("DEBUG: No origin country selected")
+        return html.Div("Please select an origin country.", 
+                       style={'textAlign': 'center', 'padding': '20px'})
+    
     try:
-        df_trades_shipping_region_us_agg = pd.read_json(us_shipping_data, orient='split')
-        if df_trades_shipping_region_us_agg.empty:
-            return table_title, html.Div(f"No {origin_country}  data available.")
-
-        # --- Check if selected destination level column exists ---
-        if selected_destination_level not in df_trades_shipping_region_us_agg.columns:
-            error_msg = f"Selected destination level column '{selected_destination_level}' not found in data."
-            return table_title, html.Div(error_msg)
-
-        # --- Prepare Data for Table 3 ---
-        table_filters = {'status': selected_status, 'vessel_type': selected_vessel_type}
-
-        # Use the prepare_pivot_table function with destination_level
-        metric_table_data = prepare_pivot_table(
-            df=df_trades_shipping_region_us_agg,
-            values_col=selected_metric,
-            filters=table_filters,
-            aggregation_level=selected_aggregation,
-            add_total_column=False,  # No total column for custom metrics table
-            aggfunc='mean',  # Use mean for median metrics
-            destination_level=selected_destination_level  # Pass the selected destination level
+        # Initialize expanded continents if None
+        expanded_continents = expanded_continents or []
+        
+        # Fetch the data
+        print("DEBUG: Calling fetch_destination_summary_data...")
+        df = fetch_destination_summary_data(engine, origin_country, status, vessel_type)
+        
+        print(f"DEBUG: Returned df shape: {df.shape if not df.empty else 'EMPTY'}")
+        if not df.empty:
+            print(f"DEBUG: df columns: {df.columns.tolist()}")
+            print(f"DEBUG: df head:\n{df.head()}")
+        
+        if df.empty:
+            print("DEBUG: DataFrame is empty, returning no data message")
+            return html.Div("No data available for the selected filters.", 
+                           style={'textAlign': 'center', 'padding': '20px'})
+        
+        # Prepare data for display with expandable rows
+        display_df = prepare_destination_table_for_display(df, expanded_continents)
+        
+        # Create column definitions
+        columns = []
+        for col in display_df.columns:
+            if col in ['Continent', 'Country']:
+                columns.append({
+                    'name': col,
+                    'id': col,
+                    'type': 'text'
+                })
+            else:
+                columns.append({
+                    'name': col,
+                    'id': col,
+                    'type': 'numeric',
+                    'format': Format(precision=1, scheme=Scheme.fixed)
+                })
+        
+        # Create conditional styles
+        conditional_styles = []
+        
+        # Style for continent total rows
+        conditional_styles.append({
+            'if': {'filter_query': '{Country} = "Total"'},
+            'backgroundColor': '#e3f2fd',
+            'fontWeight': 'bold'
+        })
+        
+        # Style for indented countries
+        conditional_styles.append({
+            'if': {'filter_query': '{Continent} = ""'},
+            'backgroundColor': '#f9f9f9',
+            'fontSize': '13px'
+        })
+        
+        # Alternating row colors
+        conditional_styles.append({
+            'if': {'row_index': 'odd'},
+            'backgroundColor': '#f5f5f5'
+        })
+        
+        # Left align text columns
+        conditional_styles.append({
+            'if': {'column_id': 'Continent'},
+            'textAlign': 'left'
+        })
+        conditional_styles.append({
+            'if': {'column_id': 'Country'},
+            'textAlign': 'left'
+        })
+        
+        # Right align numeric columns
+        for col in display_df.columns:
+            if col not in ['Continent', 'Country']:
+                conditional_styles.append({
+                    'if': {'column_id': col},
+                    'textAlign': 'right',
+                    'paddingRight': '12px'
+                })
+        
+        # Get column groups for adding white separators
+        quarter_columns = [col for col in display_df.columns if col.startswith('Q') and "'" in col]
+        month_columns = [col for col in display_df.columns if "'" in col and not col.startswith('Q') and not col.startswith('W') and col not in ['Continent', 'Country']]
+        week_columns = [col for col in display_df.columns if col.startswith('W') and "'" in col]
+        
+        # Color coding for different time periods and add white separators
+        for col in display_df.columns:
+            if col.startswith('Q') and "'" in col:  # Quarter columns
+                conditional_styles.append({
+                    'if': {'column_id': col, 'row_index': 0},
+                    'backgroundColor': '#e3f2fd'  # Light blue
+                })
+                # Add left border to first quarter column for visual separation
+                if quarter_columns and col == quarter_columns[0]:
+                    conditional_styles.append({
+                        'if': {'column_id': col},
+                        'borderLeft': '3px solid white'
+                    })
+            elif col.startswith('W') and "'" in col:  # Week columns
+                conditional_styles.append({
+                    'if': {'column_id': col, 'row_index': 0},
+                    'backgroundColor': '#e8f5e9'  # Light green
+                })
+                # Add left border to first week column for visual separation from 30D
+                if week_columns and col == week_columns[0]:
+                    conditional_styles.append({
+                        'if': {'column_id': col},
+                        'borderLeft': '3px solid white'
+                    })
+            elif "'" in col and not col.startswith('Q') and not col.startswith('W'):  # Month columns
+                conditional_styles.append({
+                    'if': {'column_id': col, 'row_index': 0},
+                    'backgroundColor': '#f3e5f5'  # Light purple
+                })
+                # Add left border to first month column for visual separation
+                if month_columns and col == month_columns[0]:
+                    conditional_styles.append({
+                        'if': {'column_id': col},
+                        'borderLeft': '3px solid white'
+                    })
+            elif col in ['30D', '7D']:  # Rolling windows
+                conditional_styles.append({
+                    'if': {'column_id': col},
+                    'backgroundColor': '#fff3e0',  # Light orange
+                    'fontWeight': '500'
+                })
+                # No separator between months and 30D - removed the borderLeft for 30D
+            elif col == 'Δ 7D-30D':  # Delta column
+                conditional_styles.append({
+                    'if': {'column_id': col},
+                    'backgroundColor': '#f5f5f5',
+                    'fontWeight': '600',
+                    'borderLeft': '3px solid white'  # Add separator before first delta
+                })
+                # Green for positive
+                conditional_styles.append({
+                    'if': {
+                        'column_id': col,
+                        'filter_query': f'{{{col}}} > 0'
+                    },
+                    'color': '#2e7d32'
+                })
+                # Red for negative
+                conditional_styles.append({
+                    'if': {
+                        'column_id': col,
+                        'filter_query': f'{{{col}}} < 0'
+                    },
+                    'color': '#c62828'
+                })
+            elif col == 'Δ 30D Y/Y':  # Year-over-year delta
+                conditional_styles.append({
+                    'if': {'column_id': col},
+                    'backgroundColor': '#e8f5e9',
+                    'fontWeight': '600',
+                    'borderLeft': '3px solid white'  # Add separator between the two deltas
+                })
+                # Dark green for positive
+                conditional_styles.append({
+                    'if': {
+                        'column_id': col,
+                        'filter_query': '{Δ 30D Y/Y} > 0'
+                    },
+                    'color': '#1b5e20'
+                })
+                # Dark red for negative
+                conditional_styles.append({
+                    'if': {
+                        'column_id': col,
+                        'filter_query': '{Δ 30D Y/Y} < 0'
+                    },
+                    'color': '#b71c1c'
+                })
+        
+        # Style for GRAND TOTAL row - added last for highest priority
+        conditional_styles.append({
+            'if': {'filter_query': '{Continent} = "GRAND TOTAL"'},
+            'backgroundColor': '#2E86C1',
+            'color': 'white',
+            'fontWeight': 'bold'
+        })
+        
+        # Add header styles for the white column separators
+        header_styles = []
+        
+        # Add separator before first quarter column
+        if quarter_columns:
+            header_styles.append({
+                'if': {'column_id': quarter_columns[0]},
+                'borderLeft': '3px solid white'
+            })
+        
+        # Add separator before first month column
+        if month_columns:
+            header_styles.append({
+                'if': {'column_id': month_columns[0]},
+                'borderLeft': '3px solid white'
+            })
+        
+        # No separator before 30D column - removed
+        
+        # Add separator before first week column
+        if week_columns:
+            header_styles.append({
+                'if': {'column_id': week_columns[0]},
+                'borderLeft': '3px solid white'
+            })
+        
+        # Add separator before first delta column
+        if 'Δ 7D-30D' in df.columns:
+            header_styles.append({
+                'if': {'column_id': 'Δ 7D-30D'},
+                'borderLeft': '3px solid white'
+            })
+        
+        # Add separator before second delta column
+        if 'Δ 30D Y/Y' in df.columns:
+            header_styles.append({
+                'if': {'column_id': 'Δ 30D Y/Y'},
+                'borderLeft': '3px solid white'
+            })
+        
+        # Create the DataTable with expandable ID for click handling
+        table = dash_table.DataTable(
+            id={'type': 'destination-expandable-table', 'index': 'summary'},
+            data=display_df.to_dict('records'),
+            columns=columns,
+            style_table={'overflowX': 'auto'},
+            style_header={
+                'backgroundColor': '#2E86C1',
+                'color': 'white',
+                'fontWeight': 'bold',
+                'fontSize': '12px',
+                'fontFamily': 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',
+                'textAlign': 'center'
+            },
+            style_header_conditional=header_styles,  # Apply the header separators
+            style_cell={
+                'textAlign': 'center',
+                'fontSize': '12px',
+                'fontFamily': 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',
+                'padding': '8px',
+                'minWidth': '80px'
+            },
+            style_data_conditional=conditional_styles,
+            sort_action='native',
+            page_size=50,
+            fill_width=False
         )
-
-        # --- Create Table ---
-        if metric_table_data.empty:
-            table_content = html.Div("No data available for the selected filters.")
-        else:
-            # Pass aggregation level to create_datatable
-            table_content = create_datatable(
-                metric_table_data,
-                metric_for_format=selected_metric,  # Pass metric for conditional formatting
-                aggregation_level=selected_aggregation
-            )
-
-        return table_title, table_content
-
+        
+        return table
+        
     except Exception as e:
-        error_message = f"Error updating US region metrics table (Table 3): {e}"
-        return table_title, html.Div(error_message)
+        print(f"Error updating destination summary table: {e}")
+        import traceback
+        traceback.print_exc()
+        return html.Div(f"Error loading data: {str(e)}", 
+                       style={'textAlign': 'center', 'padding': '20px', 'color': 'red'})
 
 
 @callback(
@@ -3377,4 +5119,66 @@ def update_diversion_ui(stored_data, destination_level):
         count_table_data, count_table_columns,  # Count table data and columns
         days_table_data, days_table_columns  # Added days table data and columns
     )
+
+# Callback to handle expanding/collapsing rows for destination summary table
+@callback(
+    Output('destination-expanded-continents', 'data', allow_duplicate=True),
+    [Input({'type': 'destination-expandable-table', 'index': ALL}, 'active_cell')],
+    [State({'type': 'destination-expandable-table', 'index': ALL}, 'data'),
+     State('destination-expanded-continents', 'data')],
+    prevent_initial_call=True
+)
+def toggle_destination_continent_expansion(active_cells, table_data_list, expanded_continents):
+    """Handle expanding/collapsing of continent rows in destination summary table"""
+    
+    if not any(active_cells):
+        return expanded_continents or []
+    
+    triggered = ctx.triggered[0]
+    prop_id = triggered['prop_id']
+    
+    # Parse which table and what was clicked
+    if 'destination-expandable-table' in prop_id and '.active_cell' in prop_id:
+        try:
+            # Get the active cell
+            active_cell = active_cells[0]
+            if not active_cell:
+                return expanded_continents or []
+            
+            # Get the data from the table
+            table_data = table_data_list[0]
+            if not table_data:
+                return expanded_continents or []
+            
+            row_index = active_cell['row']
+            col_id = active_cell['column_id']
+            
+            # Only respond to clicks on the Continent column
+            if col_id != 'Continent':
+                return expanded_continents or []
+            
+            # Get the clicked row
+            clicked_row = table_data[row_index]
+            continent_value = clicked_row.get('Continent', '')
+            
+            # Check if this is a continent total row (has arrow indicator)
+            if continent_value.startswith('▶') or continent_value.startswith('▼'):
+                # Extract continent name (remove arrow and spaces)
+                continent_name = continent_value[2:].strip()
+                
+                # Initialize expanded list if None
+                expanded_continents = expanded_continents or []
+                
+                # Toggle expansion state
+                if continent_name in expanded_continents:
+                    expanded_continents.remove(continent_name)
+                else:
+                    expanded_continents.append(continent_name)
+                
+                return expanded_continents
+            
+        except Exception as e:
+            print(f"Error in toggle_destination_continent_expansion: {e}")
+    
+    return expanded_continents or []
  
