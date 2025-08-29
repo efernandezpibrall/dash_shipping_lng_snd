@@ -1378,6 +1378,7 @@ layout = html.Div([
     dcc.Store(id='us-refresh-timestamp-store', storage_type='local'),
     dcc.Store(id='diversion-processed-data', storage_type='local'),
     dcc.Store(id='destination-expanded-continents', data=[]),  # Store for expanded state of continents
+    dcc.Store(id='maintenance-expanded-plants', data=[]),  # Store for expanded state of plants
 
     # Professional Section Header - Exporter Analysis Configuration
     html.Div([
@@ -1546,6 +1547,25 @@ layout = html.Div([
             )
         ], style={'marginTop': '20px'})
     ], className='section-container', style={'margin-bottom': '32px'}),
+    
+    # Train Maintenance Schedule Section
+    html.Div([
+        # Header
+        html.Div([
+            html.H3('Train Maintenance Schedule (MCM/D Impact)', className="section-title-inline"),
+        ], className="inline-section-header"),
+        
+        # Maintenance Summary Table
+        html.Div([
+            dcc.Loading(
+                id="maintenance-summary-loading",
+                children=[
+                    html.Div(id='maintenance-summary-container')
+                ],
+                type="default"
+            )
+        ], style={'marginTop': '20px'})
+    ], className='section-container', style={'margin-bottom': '32px'}),
 
     # Trade Analysis by Destination Section (Chart and Table combined)
     html.Div([
@@ -1567,8 +1587,10 @@ layout = html.Div([
 
     # Route Analysis Section
     html.Div([
-        html.H2("Route Analysis", className='mckinsey-header'),
-        html.P("Comparison of shipping routes by canal availability and geographic constraints", className='section-subtitle'),
+        # Enterprise Standard Inline Section Header
+        html.Div([
+            html.H3("Route Analysis", className='section-title-inline'),
+        ], className='inline-section-header'),
         
         # Route Visualization Chart
         html.Div([
@@ -1627,8 +1649,6 @@ layout = html.Div([
     ], className='inline-section-header'),
     # Diversions Analysis Charts and Tables
     html.Div([
-        html.H2("Diversions Analysis Visualization", className='mckinsey-header'),
-        
         # Diversion Chart
         html.Div([
             dcc.Graph(id='diversion-count-chart', style={'height': '600px'})
@@ -2090,41 +2110,107 @@ def fetch_destination_rolling_windows_hierarchical(conn, continent_col, country_
                 SELECT MAX(upload_timestamp_utc) as max_ts
                 FROM {DB_SCHEMA}.kpler_trades
             ),
+            -- Get all unique continent/country combinations
+            all_destinations AS (
+                SELECT DISTINCT
+                    {continent_col} as continent,
+                    {country_col} as country
+                FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                WHERE upload_timestamp_utc = max_ts
+                    AND {where_clause}
+                    AND "start" >= '{date_30d_y1_start}'
+                    AND "start" <= '{current_date}'
+            ),
+            -- Generate date series for each window
+            dates_7d AS (
+                SELECT generate_series(
+                    '{date_7d_ago}'::date + INTERVAL '1 day',
+                    '{current_date}'::date,
+                    '1 day'::interval
+                )::date as date
+            ),
+            dates_30d AS (
+                SELECT generate_series(
+                    '{date_30d_ago}'::date + INTERVAL '1 day',
+                    '{current_date}'::date,
+                    '1 day'::interval
+                )::date as date
+            ),
+            dates_30d_y1 AS (
+                SELECT generate_series(
+                    '{date_30d_y1_start}'::date + INTERVAL '1 day',
+                    '{date_30d_y1_end}'::date,
+                    '1 day'::interval
+                )::date as date
+            ),
+            -- Create matrices for each period
+            matrix_7d AS (
+                SELECT d.date, a.continent, a.country
+                FROM dates_7d d
+                CROSS JOIN all_destinations a
+            ),
+            matrix_30d AS (
+                SELECT d.date, a.continent, a.country
+                FROM dates_30d d
+                CROSS JOIN all_destinations a
+            ),
+            matrix_30d_y1 AS (
+                SELECT d.date, a.continent, a.country
+                FROM dates_30d_y1 d
+                CROSS JOIN all_destinations a
+            ),
+            -- Get actual daily data
+            daily_data AS (
+                SELECT 
+                    "start"::date as date,
+                    {continent_col} as continent,
+                    {country_col} as country,
+                    SUM(cargo_origin_cubic_meters * 0.6 / 1000) as daily_mcmd
+                FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
+                WHERE upload_timestamp_utc = max_ts
+                    AND {where_clause}
+                    AND "start" >= '{date_30d_y1_start}'
+                    AND "start" <= '{current_date}'
+                GROUP BY "start"::date, {continent_col}, {country_col}
+            ),
+            -- Calculate averages for 7-day window with zeros for missing days
             window_7d AS (
                 SELECT 
-                    {continent_col} as continent,
-                    {country_col} as country,
-                    SUM(cargo_origin_cubic_meters * 0.6 / 1000) / 7.0 as avg_7d
-                FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
-                WHERE upload_timestamp_utc = max_ts
-                    AND {where_clause}
-                    AND "start" > '{date_7d_ago}'
-                    AND "start" <= '{current_date}'
-                GROUP BY {continent_col}, {country_col}
+                    m.continent,
+                    m.country,
+                    AVG(COALESCE(d.daily_mcmd, 0)) as avg_7d
+                FROM matrix_7d m
+                LEFT JOIN daily_data d 
+                    ON m.date = d.date 
+                    AND m.continent = d.continent 
+                    AND m.country = d.country
+                GROUP BY m.continent, m.country
             ),
+            -- Calculate averages for 30-day window with zeros for missing days
             window_30d AS (
                 SELECT 
-                    {continent_col} as continent,
-                    {country_col} as country,
-                    SUM(cargo_origin_cubic_meters * 0.6 / 1000) / 30.0 as avg_30d
-                FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
-                WHERE upload_timestamp_utc = max_ts
-                    AND {where_clause}
-                    AND "start" > '{date_30d_ago}'
-                    AND "start" <= '{current_date}'
-                GROUP BY {continent_col}, {country_col}
+                    m.continent,
+                    m.country,
+                    AVG(COALESCE(d.daily_mcmd, 0)) as avg_30d
+                FROM matrix_30d m
+                LEFT JOIN daily_data d 
+                    ON m.date = d.date 
+                    AND m.continent = d.continent 
+                    AND m.country = d.country
+                GROUP BY m.continent, m.country
             ),
+            -- Calculate averages for 30-day window year ago with zeros for missing days
             window_30d_y1 AS (
                 SELECT 
-                    {continent_col} as continent,
-                    {country_col} as country,
-                    SUM(cargo_origin_cubic_meters * 0.6 / 1000) / 30.0 as avg_30d_y1
-                FROM {DB_SCHEMA}.kpler_trades, latest_timestamp
-                WHERE upload_timestamp_utc = max_ts
-                    AND {where_clause}
-                    AND "start" > '{date_30d_y1_start}'
-                    AND "start" <= '{date_30d_y1_end}'
-                GROUP BY {continent_col}, {country_col}
+                    m.continent,
+                    m.country,
+                    AVG(COALESCE(d.daily_mcmd, 0)) as avg_30d_y1
+                FROM matrix_30d_y1 m
+                LEFT JOIN daily_data d 
+                    ON m.date = d.date 
+                    AND m.continent = d.continent 
+                    AND m.country = d.country
+                GROUP BY m.continent, m.country
             )
             SELECT 
                 COALESCE(w7.continent, w30.continent, w30y1.continent) as continent,
@@ -2676,10 +2762,35 @@ def create_continent_destination_chart(country_name):
             SELECT MAX(upload_timestamp_utc) as max_timestamp
             FROM {DB_SCHEMA}.kpler_trades
         ),
-        daily_exports AS (
+        -- Get all unique continents that have ever had exports from this country
+        all_continents AS (
+            SELECT DISTINCT 
+                COALESCE(NULLIF(continent_destination_name, ''), 'Unknown') as continent_destination
+            FROM {DB_SCHEMA}.kpler_trades kt, latest_data ld
+            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                AND kt.origin_country_name = %(country_name)s
+                AND kt.start >= '2023-11-01'
+        ),
+        -- Get all dates in our range
+        all_dates AS (
+            SELECT generate_series(
+                '2023-11-01'::date,
+                (CURRENT_DATE + INTERVAL '14 days')::date,
+                '1 day'::interval
+            )::date as date
+        ),
+        -- Create complete date/continent matrix
+        date_continent_matrix AS (
+            SELECT 
+                d.date,
+                c.continent_destination
+            FROM all_dates d
+            CROSS JOIN all_continents c
+        ),
+        -- Get actual daily exports
+        daily_exports_raw AS (
             SELECT 
                 kt.start::date as date,
-                kt.origin_country_name,
                 COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
                 SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
             FROM {DB_SCHEMA}.kpler_trades kt, latest_data ld
@@ -2687,16 +2798,27 @@ def create_continent_destination_chart(country_name):
                 AND kt.origin_country_name = %(country_name)s
                 AND kt.start >= '2023-11-01'
                 AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
-            GROUP BY kt.start::date, kt.origin_country_name, kt.continent_destination_name
+            GROUP BY kt.start::date, kt.continent_destination_name
         ),
+        -- Join to get complete dataset with zeros for missing data
+        daily_exports_complete AS (
+            SELECT 
+                dcm.date,
+                dcm.continent_destination,
+                COALESCE(der.daily_export_mcmd, 0) as daily_export_mcmd
+            FROM date_continent_matrix dcm
+            LEFT JOIN daily_exports_raw der 
+                ON dcm.date = der.date 
+                AND dcm.continent_destination = der.continent_destination
+        ),
+        -- Calculate rolling averages on complete dataset
         rolling_exports AS (
             SELECT 
                 date,
-                origin_country_name,
                 continent_destination,
                 daily_export_mcmd,
                 AVG(daily_export_mcmd) OVER (
-                    PARTITION BY origin_country_name, continent_destination
+                    PARTITION BY continent_destination
                     ORDER BY date 
                     ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
                 ) as rolling_avg_30d,
@@ -2704,7 +2826,7 @@ def create_continent_destination_chart(country_name):
                     WHEN date > CURRENT_DATE THEN true
                     ELSE false
                 END as is_forecast
-            FROM daily_exports
+            FROM daily_exports_complete
         )
         SELECT 
             date,
@@ -2944,10 +3066,35 @@ def create_continent_percentage_chart(country_name):
             SELECT MAX(upload_timestamp_utc) as max_timestamp
             FROM {DB_SCHEMA}.kpler_trades
         ),
-        daily_exports AS (
+        -- Get all unique continents that have ever had exports from this country
+        all_continents AS (
+            SELECT DISTINCT 
+                COALESCE(NULLIF(continent_destination_name, ''), 'Unknown') as continent_destination
+            FROM {DB_SCHEMA}.kpler_trades kt, latest_data ld
+            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                AND kt.origin_country_name = %(country_name)s
+                AND kt.start >= '2023-11-01'
+        ),
+        -- Get all dates in our range
+        all_dates AS (
+            SELECT generate_series(
+                '2023-11-01'::date,
+                (CURRENT_DATE + INTERVAL '14 days')::date,
+                '1 day'::interval
+            )::date as date
+        ),
+        -- Create complete date/continent matrix
+        date_continent_matrix AS (
+            SELECT 
+                d.date,
+                c.continent_destination
+            FROM all_dates d
+            CROSS JOIN all_continents c
+        ),
+        -- Get actual daily exports
+        daily_exports_raw AS (
             SELECT 
                 kt.start::date as date,
-                kt.origin_country_name,
                 COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
                 SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
             FROM {DB_SCHEMA}.kpler_trades kt, latest_data ld
@@ -2955,55 +3102,61 @@ def create_continent_percentage_chart(country_name):
                 AND kt.origin_country_name = %(country_name)s
                 AND kt.start >= '2023-11-01'
                 AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
-            GROUP BY kt.start::date, kt.origin_country_name, kt.continent_destination_name
+            GROUP BY kt.start::date, kt.continent_destination_name
         ),
-        daily_totals AS (
+        -- Join to get complete dataset with zeros for missing data
+        daily_exports_complete AS (
+            SELECT 
+                dcm.date,
+                dcm.continent_destination,
+                COALESCE(der.daily_export_mcmd, 0) as daily_export_mcmd
+            FROM date_continent_matrix dcm
+            LEFT JOIN daily_exports_raw der 
+                ON dcm.date = der.date 
+                AND dcm.continent_destination = der.continent_destination
+        ),
+        -- Calculate rolling averages on complete dataset
+        rolling_continents AS (
             SELECT 
                 date,
-                SUM(daily_export_mcmd) as total_daily_export
-            FROM daily_exports
-            GROUP BY date
-        ),
-        rolling_data AS (
-            SELECT 
-                de.date,
-                de.origin_country_name,
-                de.continent_destination,
-                de.daily_export_mcmd,
-                -- Rolling average for each continent
-                AVG(de.daily_export_mcmd) OVER (
-                    PARTITION BY de.continent_destination
-                    ORDER BY de.date 
+                continent_destination,
+                daily_export_mcmd,
+                AVG(daily_export_mcmd) OVER (
+                    PARTITION BY continent_destination
+                    ORDER BY date 
                     ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
                 ) as rolling_avg_30d,
-                -- Rolling average for total
-                AVG(dt.total_daily_export) OVER (
-                    ORDER BY dt.date 
-                    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
-                ) as total_rolling_avg_30d,
                 CASE 
-                    WHEN de.date > CURRENT_DATE THEN true
+                    WHEN date > CURRENT_DATE THEN true
                     ELSE false
                 END as is_forecast
-            FROM daily_exports de
-            JOIN daily_totals dt ON de.date = dt.date
+            FROM daily_exports_complete
+        ),
+        -- Sum rolling averages for total
+        rolling_totals AS (
+            SELECT 
+                date,
+                SUM(rolling_avg_30d) as total_rolling_avg_30d
+            FROM rolling_continents
+            GROUP BY date
         )
         SELECT 
-            date,
-            continent_destination,
-            EXTRACT(YEAR FROM date) as year,
-            EXTRACT(DOY FROM date) as day_of_year,
-            TO_CHAR(date, 'Mon DD') as month_day,
-            rolling_avg_30d as rolling_avg,
+            rc.date,
+            rc.continent_destination,
+            EXTRACT(YEAR FROM rc.date) as year,
+            EXTRACT(DOY FROM rc.date) as day_of_year,
+            TO_CHAR(rc.date, 'Mon DD') as month_day,
+            rc.rolling_avg_30d as rolling_avg,
             CASE 
-                WHEN total_rolling_avg_30d > 0 
-                THEN (rolling_avg_30d / total_rolling_avg_30d) * 100
+                WHEN rt.total_rolling_avg_30d > 0 
+                THEN (rc.rolling_avg_30d / rt.total_rolling_avg_30d) * 100
                 ELSE 0
             END as percentage,
-            is_forecast
-        FROM rolling_data
-        WHERE date >= '2024-01-01'
-        ORDER BY continent_destination, date
+            rc.is_forecast
+        FROM rolling_continents rc
+        JOIN rolling_totals rt ON rc.date = rt.date
+        WHERE rc.date >= '2024-01-01'
+        ORDER BY rc.continent_destination, rc.date
         """
         
         df = pd.read_sql(query, engine, params={'country_name': country_name})
@@ -3327,6 +3480,504 @@ def initialize_country_dropdown(n_clicks):
         # Return a default option if there's an error
         return [{'label': 'United States', 'value': 'United States'}], 'United States'
 
+# ========================================
+# TRAIN MAINTENANCE DATA FUNCTIONS
+# ========================================
+
+def fetch_train_maintenance_data(engine, country_name=None):
+    """
+    Fetch and process maintenance data from both planned and unplanned tables.
+    Returns raw maintenance data for the specified country or all countries.
+    """
+    try:
+        # Build the query with optional country filter
+        country_filter = ""
+        if country_name:
+            country_filter = f"AND country_name = '{country_name}'"
+        
+        query = f"""
+        WITH combined_maintenance AS (
+            SELECT 
+                plant_name,
+                country_name,
+                lng_train_name_short,
+                year,
+                month,
+                year_actual_forecast,
+                SUM(metric_value) as total_mtpa,
+                STRING_AGG(metric_comment, '; ') as metric_comment
+            FROM (
+                SELECT plant_name, country_name, lng_train_name_short, 
+                       year, month, year_actual_forecast, metric_value, metric_comment
+                FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_unplanned_downtime_mta
+                WHERE metric_value > 0
+                UNION ALL
+                SELECT plant_name, country_name, lng_train_name_short, 
+                       year, month, year_actual_forecast, metric_value, metric_comment
+                FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_planned_maintenance_mta
+                WHERE metric_value > 0
+            ) maintenance_data
+            WHERE 1=1
+            {country_filter}
+            GROUP BY plant_name, country_name, lng_train_name_short, 
+                     year, month, year_actual_forecast
+        )
+        SELECT * FROM combined_maintenance
+        ORDER BY plant_name, lng_train_name_short, year, month
+        """
+        
+        df = pd.read_sql(query, engine)
+        
+        # Create date column for easier processing
+        df['date'] = pd.to_datetime(df[['year', 'month']].assign(day=1))
+        
+        return df
+        
+    except Exception as e:
+        print(f"Error fetching maintenance data: {e}")
+        return pd.DataFrame()
+
+
+def process_maintenance_periods_hierarchical(df, expanded_plants=None):
+    """
+    Process maintenance data into hierarchical structure with plant totals and train details.
+    Returns data suitable for expandable table display.
+    
+    Conversion: 1 MTPA = 1.372 MCM/D (approximately)
+    """
+    if df.empty:
+        return pd.DataFrame()
+    
+    try:
+        # Get current date
+        current_date = pd.Timestamp.now()
+        current_quarter = current_date.quarter
+        current_year = current_date.year
+        
+        # Define MTPA to MCM/D conversion factor
+        MTPA_TO_MCM_D = 1.372
+        
+        # Initialize expanded plants list
+        expanded_plants = expanded_plants or []
+        
+        # Define period columns
+        period_cols = ([f'Q-{i}' for i in range(5, 0, -1)] + 
+                      [f'M-{i}' for i in range(3, 0, -1)] + 
+                      [f'M+{i}' for i in range(1, 4)] + 
+                      [f'Q+{i}' for i in range(1, 5)])
+        
+        # Calculate period boundaries
+        last_month_end = pd.Timestamp(year=current_date.year, month=current_date.month, day=1) - pd.DateOffset(days=1)
+        next_3m_start = pd.Timestamp(year=current_date.year, month=current_date.month, day=1)
+        
+        # Process each plant-train combination
+        train_data = []
+        plant_totals = {}
+        plant_trains = {}  # Store trains for each plant
+        comments_data = {}  # Store comments for tooltips
+        
+        for (plant, train), group_df in df.groupby(['plant_name', 'lng_train_name_short']):
+            row = {
+                'Plant': '',  # Will be filled later for expanded rows
+                'Train': train,
+                'Type': 'train',
+                '_plant': plant
+            }
+            
+            # Initialize plant total if not exists
+            if plant not in plant_totals:
+                plant_totals[plant] = {col: 0 for col in period_cols}
+                plant_trains[plant] = []
+                comments_data[plant] = {}
+            
+            plant_trains[plant].append(train)
+            comments_data[plant][train] = {}
+            
+            # Process last 5 quarters
+            for q_offset in range(5, 0, -1):
+                # Calculate target quarter and year
+                target_q = current_quarter - q_offset
+                target_year = current_year
+                while target_q <= 0:
+                    target_q += 4
+                    target_year -= 1
+                
+                # Calculate quarter boundaries (Q1=Jan-Mar, Q2=Apr-Jun, Q3=Jul-Sep, Q4=Oct-Dec)
+                q_start_month = (target_q - 1) * 3 + 1  # Q1->1, Q2->4, Q3->7, Q4->10
+                q_start = pd.Timestamp(year=target_year, month=q_start_month, day=1)
+                q_end = q_start + pd.DateOffset(months=3) - pd.DateOffset(days=1)
+                
+                q_data = group_df[(group_df['date'] >= q_start) & (group_df['date'] <= q_end)]
+                days_in_quarter = (q_end - q_start).days + 1
+                total_mtpa = q_data['total_mtpa'].sum()
+                avg_mcm_d = (total_mtpa * MTPA_TO_MCM_D * 365) / days_in_quarter if days_in_quarter > 0 else 0
+                
+                quarter_label = f"Q-{q_offset}"
+                value = round(avg_mcm_d, 1)
+                row[quarter_label] = value if value > 0 else None
+                plant_totals[plant][quarter_label] += value
+                
+                # Store comments for this period
+                if not q_data.empty and 'metric_comment' in q_data.columns:
+                    comments = q_data['metric_comment'].dropna().unique()
+                    if len(comments) > 0:
+                        comments_data[plant][train][quarter_label] = '; '.join(comments)
+            
+            # Process last 3 months
+            for m_offset in range(3, 0, -1):
+                m_date = last_month_end - pd.DateOffset(months=m_offset-1)
+                m_start = pd.Timestamp(year=m_date.year, month=m_date.month, day=1)
+                m_end = m_start + pd.DateOffset(months=1) - pd.DateOffset(days=1)
+                
+                m_data = group_df[(group_df['date'] >= m_start) & (group_df['date'] <= m_end)]
+                days_in_month = m_end.day
+                total_mtpa = m_data['total_mtpa'].sum()
+                avg_mcm_d = (total_mtpa * MTPA_TO_MCM_D * 365) / days_in_month if days_in_month > 0 else 0
+                
+                month_label = f"M-{m_offset}"
+                value = round(avg_mcm_d, 1)
+                row[month_label] = value if value > 0 else None
+                plant_totals[plant][month_label] += value
+                
+                # Store comments for this period
+                if not m_data.empty and 'metric_comment' in m_data.columns:
+                    comments = m_data['metric_comment'].dropna().unique()
+                    if len(comments) > 0:
+                        comments_data[plant][train][month_label] = '; '.join(comments)
+            
+            # Process next 3 months (future)
+            for m_offset in range(1, 4):
+                m_date = next_3m_start + pd.DateOffset(months=m_offset-1)
+                m_start = pd.Timestamp(year=m_date.year, month=m_date.month, day=1)
+                m_end = m_start + pd.DateOffset(months=1) - pd.DateOffset(days=1)
+                
+                m_data = group_df[(group_df['date'] >= m_start) & (group_df['date'] <= m_end)]
+                days_in_month = m_end.day
+                total_mtpa = m_data['total_mtpa'].sum()
+                avg_mcm_d = (total_mtpa * MTPA_TO_MCM_D * 365) / days_in_month if days_in_month > 0 else 0
+                
+                month_label = f"M+{m_offset}"
+                value = round(avg_mcm_d, 1)
+                row[month_label] = value if value > 0 else None
+                plant_totals[plant][month_label] += value
+                
+                # Store comments for this period
+                if not m_data.empty and 'metric_comment' in m_data.columns:
+                    comments = m_data['metric_comment'].dropna().unique()
+                    if len(comments) > 0:
+                        comments_data[plant][train][month_label] = '; '.join(comments)
+            
+            # Process next 4 quarters (future)
+            for q_offset in range(1, 5):
+                # Calculate target quarter and year
+                target_q = current_quarter + q_offset - 1
+                target_year = current_year
+                while target_q > 4:
+                    target_q -= 4
+                    target_year += 1
+                
+                # Calculate quarter boundaries (Q1=Jan-Mar, Q2=Apr-Jun, Q3=Jul-Sep, Q4=Oct-Dec)
+                q_start_month = (target_q - 1) * 3 + 1  # Q1->1, Q2->4, Q3->7, Q4->10
+                q_start = pd.Timestamp(year=target_year, month=q_start_month, day=1)
+                q_end = q_start + pd.DateOffset(months=3) - pd.DateOffset(days=1)
+                
+                q_data = group_df[(group_df['date'] >= q_start) & (group_df['date'] <= q_end)]
+                days_in_quarter = (q_end - q_start).days + 1
+                total_mtpa = q_data['total_mtpa'].sum()
+                avg_mcm_d = (total_mtpa * MTPA_TO_MCM_D * 365) / days_in_quarter if days_in_quarter > 0 else 0
+                
+                quarter_label = f"Q+{q_offset}"
+                value = round(avg_mcm_d, 1)
+                row[quarter_label] = value if value > 0 else None
+                plant_totals[plant][quarter_label] += value
+                
+                # Store comments for this period
+                if not q_data.empty and 'metric_comment' in q_data.columns:
+                    comments = q_data['metric_comment'].dropna().unique()
+                    if len(comments) > 0:
+                        comments_data[plant][train][quarter_label] = '; '.join(comments)
+            
+            train_data.append(row)
+        
+        # Build hierarchical data with plant totals
+        final_data = []
+        grand_total = {col: 0 for col in period_cols}
+        
+        for plant in sorted(plant_totals.keys()):
+            # Add arrow indicator for expandable plant
+            is_expanded = plant in expanded_plants
+            arrow = '▼ ' if is_expanded else '▶ '
+            
+            # Add plant total row
+            plant_row = {
+                'Plant': arrow + plant,
+                'Train': 'Total',  # Show "Total" for collapsed plants
+                'Type': 'plant'
+            }
+            
+            # Add period values
+            for col in period_cols:
+                value = round(plant_totals[plant][col], 1)
+                plant_row[col] = value if value > 0 else None
+                grand_total[col] += plant_totals[plant][col]
+            
+            final_data.append(plant_row)
+            
+            # Add train rows if plant is expanded
+            if is_expanded:
+                plant_train_rows = [r for r in train_data if r.get('_plant') == plant]
+                for row in plant_train_rows:
+                    # Remove the hidden _plant column and keep Plant column empty for train rows
+                    row.pop('_plant', None)
+                    row['Plant'] = ''  # Empty for train detail rows
+                final_data.extend(plant_train_rows)
+        
+        # Add grand total row
+        grand_total_row = {
+            'Plant': 'GRAND TOTAL',
+            'Train': '',
+            'Type': 'total'
+        }
+        for col in period_cols:
+            value = round(grand_total[col], 1)
+            grand_total_row[col] = value if value > 0 else None
+        
+        final_data.append(grand_total_row)
+        
+        return pd.DataFrame(final_data), comments_data
+        
+    except Exception as e:
+        print(f"Error processing maintenance periods: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return pd.DataFrame(), {}
+
+
+def create_maintenance_summary_table(df, comments_data=None):
+    """
+    Create expandable Dash DataTable with maintenance summary showing outage impact in MCM/D.
+    Similar format to Destination Analysis Summary table.
+    Includes tooltips showing metric comments for each cell.
+    """
+    if df.empty:
+        return html.Div("No maintenance data available", className="no-data-message")
+    
+    try:
+        # Get current date info for column headers
+        current_date = pd.Timestamp.now()
+        current_year = current_date.year
+        current_quarter = current_date.quarter
+        
+        # Define columns with proper formatting - Include Plant and Train columns
+        columns = [
+            {'name': 'Plant', 'id': 'Plant', 'type': 'text'},
+            {'name': 'Train', 'id': 'Train', 'type': 'text'},
+        ]
+        
+        # Add quarter columns (historical) with year labels
+        for i in range(5, 0, -1):
+            q_num = current_quarter - i
+            q_year = current_year
+            if q_num <= 0:
+                q_num += 4
+                q_year -= 1
+            columns.append({
+                'name': f"Q{q_num}'{str(q_year)[2:]}",
+                'id': f'Q-{i}',
+                'type': 'numeric',
+                'format': Format(precision=1, scheme=Scheme.fixed)
+            })
+        
+        # Add month columns (historical) with month names
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        for i in range(3, 0, -1):
+            month_date = current_date - pd.DateOffset(months=i)
+            columns.append({
+                'name': f"{month_names[month_date.month-1]}'{str(month_date.year)[2:]}",
+                'id': f'M-{i}',
+                'type': 'numeric',
+                'format': Format(precision=1, scheme=Scheme.fixed)
+            })
+        
+        # Add month columns (future)
+        for i in range(1, 4):
+            month_date = current_date + pd.DateOffset(months=i-1)
+            columns.append({
+                'name': f"{month_names[month_date.month-1]}'{str(month_date.year)[2:]}",
+                'id': f'M+{i}',
+                'type': 'numeric',
+                'format': Format(precision=1, scheme=Scheme.fixed)
+            })
+        
+        # Add quarter columns (future)
+        for i in range(1, 5):
+            q_num = current_quarter + i - 1
+            q_year = current_year
+            if q_num > 4:
+                q_num -= 4
+                q_year += 1
+            columns.append({
+                'name': f"Q{q_num}'{str(q_year)[2:]}",
+                'id': f'Q+{i}',
+                'type': 'numeric',
+                'format': Format(precision=1, scheme=Scheme.fixed)
+            })
+        
+        # Add Type column (hidden) for filtering
+        columns.append({'name': 'Type', 'id': 'Type', 'type': 'text'})
+        
+        # Prepare data for display - Keep Type column but don't display it
+        data = df.to_dict('records')
+        
+        # Style conditions matching destination summary table
+        style_data_conditional = []
+        
+        # Alternating row colors (apply first, lowest priority)
+        style_data_conditional.append({
+            'if': {'row_index': 'odd'},
+            'backgroundColor': '#f5f5f5'
+        })
+        
+        # Style for train detail rows (similar to country rows)
+        style_data_conditional.append({
+            'if': {'filter_query': '{Type} = "train"'},
+            'backgroundColor': '#f9f9f9',
+            'fontSize': '13px'
+        })
+        
+        # Style for plant total rows (similar to continent totals)
+        style_data_conditional.append({
+            'if': {'filter_query': '{Type} = "plant"'},
+            'backgroundColor': '#e3f2fd',
+            'fontWeight': 'bold'
+        })
+        
+        # Style for GRAND TOTAL row (highest priority)
+        style_data_conditional.append({
+            'if': {'filter_query': '{Plant} = "GRAND TOTAL"'},
+            'backgroundColor': '#2E86C1',
+            'color': 'white',
+            'fontWeight': 'bold'
+        })
+        
+        # Left align text columns
+        style_data_conditional.append({
+            'if': {'column_id': 'Plant'},
+            'textAlign': 'left'
+        })
+        style_data_conditional.append({
+            'if': {'column_id': 'Train'},
+            'textAlign': 'left'
+        })
+        
+        # Highlight non-zero maintenance values
+        for col in columns:
+            if col['id'] not in ['Plant', 'Train']:
+                style_data_conditional.append({
+                    'if': {
+                        'column_id': col['id'],
+                        'filter_query': f'{{{col["id"]}}} > 0'
+                    },
+                    'backgroundColor': 'rgba(255, 193, 7, 0.15)',
+                    'fontWeight': '600',
+                    'color': '#856404'
+                })
+        
+        # Add header styles for white column separators
+        header_styles = []
+        quarter_cols = [c['id'] for c in columns if c['id'].startswith('Q')]
+        month_cols = [c['id'] for c in columns if c['id'].startswith('M')]
+        
+        # Add separator before first quarter column
+        if quarter_cols:
+            header_styles.append({
+                'if': {'column_id': quarter_cols[0]},
+                'borderLeft': '3px solid white'
+            })
+            # Also add to data cells
+            style_data_conditional.append({
+                'if': {'column_id': quarter_cols[0]},
+                'borderLeft': '3px solid #e0e0e0'
+            })
+        
+        # Add separator before first month column
+        if month_cols:
+            header_styles.append({
+                'if': {'column_id': month_cols[0]},
+                'borderLeft': '3px solid white'
+            })
+            # Also add to data cells
+            style_data_conditional.append({
+                'if': {'column_id': month_cols[0]},
+                'borderLeft': '3px solid #e0e0e0'
+            })
+        
+        # Create tooltip data if comments are available
+        tooltip_data = []
+        if comments_data:
+            current_plant = None
+            for row in data:
+                tooltip_row = {}
+                
+                # Track current plant from plant rows
+                if row.get('Type') == 'plant':
+                    current_plant = row.get('Plant', '').replace('▼ ', '').replace('▶ ', '')
+                
+                # Add tooltips for train detail rows
+                elif row.get('Type') == 'train' and current_plant:
+                    train = row.get('Train', '')
+                    
+                    # Check if we have comments for this plant-train combination
+                    if current_plant in comments_data and train in comments_data[current_plant]:
+                        train_comments = comments_data[current_plant][train]
+                        
+                        # Add tooltip for each period column that has a comment
+                        for col in columns:
+                            if col['id'] not in ['Plant', 'Train', 'Type']:
+                                if col['id'] in train_comments and row.get(col['id']):
+                                    tooltip_row[col['id']] = {
+                                        'value': train_comments[col['id']],
+                                        'type': 'text'
+                                    }
+                
+                tooltip_data.append(tooltip_row)
+        
+        return dash_table.DataTable(
+            id={'type': 'maintenance-expandable-table', 'index': 0},
+            columns=columns,
+            data=data,  # Include full data with Type column
+            tooltip_data=tooltip_data if tooltip_data else None,
+            tooltip_delay=0,
+            tooltip_duration=None,
+            style_table={'overflowX': 'auto'},
+            style_header={
+                'backgroundColor': '#2E86C1',
+                'color': 'white',
+                'fontWeight': 'bold',
+                'fontSize': '12px',
+                'fontFamily': 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',
+                'textAlign': 'center'
+            },
+            style_header_conditional=header_styles,  # Apply the header separators
+            style_cell={
+                'textAlign': 'center',
+                'fontSize': '12px',
+                'fontFamily': 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',
+                'padding': '8px',
+                'minWidth': '80px'
+            },
+            style_data_conditional=style_data_conditional,
+            hidden_columns=['Type'],  # Hide the Type column from display
+            sort_action='native',
+            page_size=50,
+            fill_width=False
+        )
+        
+    except Exception as e:
+        print(f"Error creating maintenance summary table: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return html.Div(f"Error creating table: {str(e)}", className="error-message")
 
 
 # --- Callbacks for US Data ---
@@ -4866,16 +5517,6 @@ def update_diversion_ui(stored_data, destination_level):
     
     # Apply professional styling for diversion charts
     fig.update_layout(
-        title=dict(
-            text=f'{origin_country} Diversions Analysis by {combo_field.replace("_", " ").title()}',
-            font=dict(
-                family='Inter, -apple-system, BlinkMacSystemFont, sans-serif',
-                size=18,
-                color=PROFESSIONAL_COLORS['text_primary']
-            ),
-            x=0.02,
-            xanchor='left'
-        ),
         barmode='stack',
         height=500,
         paper_bgcolor=PROFESSIONAL_COLORS['bg_white'],
@@ -5181,4 +5822,127 @@ def toggle_destination_continent_expansion(active_cells, table_data_list, expand
             print(f"Error in toggle_destination_continent_expansion: {e}")
     
     return expanded_continents or []
+
+
+# Callback for Train Maintenance Schedule
+@callback(
+    Output('maintenance-summary-container', 'children'),
+    Input('origin-country-dropdown', 'value'),
+    State('maintenance-expanded-plants', 'data')
+)
+def update_maintenance_table(selected_country, expanded_plants):
+    """
+    Update maintenance table based on selected country.
+    Shows planned and unplanned maintenance outages converted to MCM/D impact.
+    """
+    if not selected_country:
+        return html.Div("Please select an origin country.", 
+                       style={'textAlign': 'center', 'padding': '20px'})
+    
+    try:
+        # Fetch maintenance data for selected country
+        raw_data = fetch_train_maintenance_data(engine, selected_country)
+        
+        if raw_data.empty:
+            return html.Div(f"No maintenance data available for {selected_country}.", 
+                          style={'textAlign': 'center', 'padding': '20px'})
+        
+        # Process data into hierarchical format with expanded plants
+        processed_data, comments_data = process_maintenance_periods_hierarchical(raw_data, expanded_plants)
+        
+        if processed_data.empty:
+            return html.Div("No maintenance data to display.", 
+                          style={'textAlign': 'center', 'padding': '20px'})
+        
+        # Create and return the maintenance table
+        return create_maintenance_summary_table(processed_data, comments_data)
+        
+    except Exception as e:
+        print(f"Error updating maintenance table: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return html.Div(f"Error loading maintenance data: {str(e)}", 
+                       style={'textAlign': 'center', 'padding': '20px', 'color': 'red'})
+
+
+# Callback for handling plant expansion/collapse in maintenance table
+@callback(
+    Output('maintenance-expanded-plants', 'data', allow_duplicate=True),
+    Output('maintenance-summary-container', 'children', allow_duplicate=True),
+    [Input({'type': 'maintenance-expandable-table', 'index': ALL}, 'active_cell')],
+    [State({'type': 'maintenance-expandable-table', 'index': ALL}, 'data'),
+     State('maintenance-expanded-plants', 'data'),
+     State('origin-country-dropdown', 'value')],
+    prevent_initial_call=True
+)
+def toggle_maintenance_plant_expansion(active_cells, table_data_list, expanded_plants, selected_country):
+    """Handle expanding/collapsing of plant rows in maintenance summary table"""
+    
+    if not any(active_cells):
+        raise PreventUpdate
+    
+    triggered = ctx.triggered[0]
+    prop_id = triggered['prop_id']
+    
+    # Parse which table and what was clicked
+    if 'maintenance-expandable-table' in prop_id and '.active_cell' in prop_id:
+        try:
+            # Get the active cell
+            active_cell = active_cells[0]
+            if not active_cell:
+                raise PreventUpdate
+            
+            # Get the data from the table
+            table_data = table_data_list[0]
+            if not table_data:
+                raise PreventUpdate
+            
+            row_index = active_cell['row']
+            col_id = active_cell['column_id']
+            
+            # Only respond to clicks on the Plant column
+            if col_id != 'Plant':
+                raise PreventUpdate
+            
+            # Get the clicked row
+            clicked_row = table_data[row_index]
+            plant_value = clicked_row.get('Plant', '')
+            
+            # Skip if it's GRAND TOTAL row or empty
+            if plant_value == 'GRAND TOTAL' or not plant_value or plant_value.strip() == '':
+                raise PreventUpdate
+            
+            # Check if this is a plant total row (has arrow indicator)
+            if plant_value.startswith('▶') or plant_value.startswith('▼'):
+                # Extract plant name (remove arrow and spaces)
+                plant_name = plant_value[2:].strip()
+                
+                # Initialize expanded list if None
+                expanded_plants = expanded_plants or []
+                
+                # Toggle expansion state
+                if plant_name in expanded_plants:
+                    expanded_plants.remove(plant_name)
+                else:
+                    expanded_plants.append(plant_name)
+                
+                # Re-fetch and regenerate the table with new expanded state
+                try:
+                    raw_data = fetch_train_maintenance_data(engine, selected_country)
+                    if not raw_data.empty:
+                        processed_data, comments_data = process_maintenance_periods_hierarchical(raw_data, expanded_plants)
+                        if not processed_data.empty:
+                            updated_table = create_maintenance_summary_table(processed_data, comments_data)
+                            return expanded_plants, updated_table
+                except Exception as e:
+                    print(f"Error regenerating table: {e}")
+                
+                return expanded_plants, dash.no_update
+            
+        except Exception as e:
+            print(f"Error in toggle_maintenance_plant_expansion: {e}")
+            import traceback
+            print(traceback.format_exc())
+    
+    raise PreventUpdate
  

@@ -256,7 +256,8 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
                         marker_color=color,
                         showlegend=showlegend,
                         base=stack_values[(year, vessel)],
-                        width=bar_width * 0.95  # Make bars slightly narrower than the allocated space
+                        width=bar_width * 0.95,  # Make bars slightly narrower than the allocated space
+                        hovertemplate='%{y:,.0f}<extra></extra>'  # Show only y-value in hover
                     ))
 
                     # Update the stack value for the next segment
@@ -318,10 +319,19 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
 
     # Update layout with professional styling from dash_style.md
     fig.update_layout(
+        # Professional Title Styling (following dash_style.md standards)
+        title=dict(
+            text=chart_title,
+            font=dict(size=22, color='#2C3E50', family='Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif'),
+            x=0.5,  # Centered
+            y=0.98,  # Top positioning
+            xanchor='center',
+            pad=dict(b=20)
+        ),
         
         # X-Axis Professional Styling
         xaxis=dict(
-            title=dict(text='Year', font=dict(size=13, color='#374151')),
+            title=dict(text='Year', font=dict(size=13, color='#4A4A4A')),
             tickvals=x_ticks,
             ticktext=x_labels,
             tickangle=0,
@@ -329,20 +339,20 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
             showgrid=True,
             gridcolor='rgba(200, 200, 200, 0.3)',  # Subtle grid
             gridwidth=0.5,
-            linecolor='#d1d5db',  # Subtle gray borders
+            linecolor='#CCCCCC',
             linewidth=1,
-            tickfont=dict(size=11, color='#6b7280')
+            tickfont=dict(size=11, color='#666666')
         ),
         
         # Y-Axis Professional Styling
         yaxis=dict(
-            title=dict(text=title_suffix, font=dict(size=13, color='#374151')),
+            title=dict(text=title_suffix, font=dict(size=13, color='#4A4A4A')),
             showgrid=True,
             gridcolor='rgba(200, 200, 200, 0.3)',
             gridwidth=0.5,
-            linecolor='#d1d5db',
+            linecolor='#CCCCCC',
             linewidth=1,
-            tickfont=dict(size=11, color='#6b7280'),
+            tickfont=dict(size=11, color='#666666'),
             zeroline=True,
             zerolinecolor='rgba(150, 150, 150, 0.4)',
             zerolinewidth=1
@@ -350,35 +360,36 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
         
         barmode='stack',
         
-        # Professional Legend Positioning (keep on the right as requested)
+        # Professional Legend Positioning (horizontal below chart as per dash_style.md)
         legend=dict(
-            x=1.02,
-            y=1,
-            xanchor='left',
+            orientation='h',  # Horizontal layout
             yanchor='top',
-            title=dict(text=legend_title, font=dict(size=12, color='#374151')),
+            y=-0.15,  # Below chart
+            xanchor='center',
+            x=0.5,  # Centered
+            title=dict(text=legend_title, font=dict(size=12, color='#4A4A4A')),
             bgcolor='rgba(255, 255, 255, 0)',  # Transparent
             bordercolor='rgba(255, 255, 255, 0)',
             borderwidth=0,
-            font=dict(size=10, color='#374151'),
+            font=dict(size=12, color='#4A4A4A'),
             itemsizing='constant',
             itemwidth=30
         ),
         
         annotations=vessel_annotations,
         
-        # Professional Background and Margins
+        # Professional Background and Margins (following dash_style.md standards)
         plot_bgcolor='rgba(248, 249, 250, 0.5)',  # Subtle background
         paper_bgcolor='white',
-        height=700,
-        margin=dict(l=70, r=250, t=60, b=120),  # Increased bottom margin for vessel abbreviations
+        height=600,  # Standard height as per dash_style.md
+        margin=dict(l=70, r=70, t=80, b=180),  # Professional margins with extra bottom for legend
         
         # Enhanced Interactivity
         hovermode='x unified',
         hoverlabel=dict(
             bgcolor='rgba(255, 255, 255, 0.95)',
             bordercolor='rgba(200, 200, 200, 0.8)',
-            font=dict(size=11, color='#1f2937'),
+            font=dict(size=11, color='#2C3E50'),
             align='left'
         ),
         
@@ -881,26 +892,45 @@ def create_datatable(data, index_field):
     return dash_table.DataTable(
         columns=columns,
         data=data.to_dict('records'),
-        style_table={'overflowX': 'auto'},
+        style_table={
+            'overflowX': 'auto',
+            'width': '100%'
+        },
         style_cell={
-            'textAlign': 'left',
-            'padding': '5px',
-            'minWidth': '100px',
-            'maxWidth': '300px',
-            'whiteSpace': 'normal',
+            'textAlign': 'center',
+            'padding': '8px',
+            'fontSize': '12px',
+            'minWidth': '80px',
+            'fontFamily': 'Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif'
         },
         style_header={
-            'backgroundColor': 'rgb(230, 230, 230)',
-            'fontWeight': 'bold'
+            'backgroundColor': '#2E86C1',  # McKinsey blue
+            'color': 'white',
+            'fontWeight': 'bold',
+            'fontSize': '13px',
+            'padding': '10px',
+            'border': '1px solid #1B4F72',
+            'whiteSpace': 'pre-wrap',
+            'lineHeight': '1.2',
+            'height': 'auto'
         },
         style_data_conditional=[
             {
+                'if': {'row_index': 'odd'},
+                'backgroundColor': 'rgb(248, 248, 248)'
+            },
+            {
                 'if': {'row_index': len(data) - 1},  # Total row
                 'fontWeight': 'bold',
-                'backgroundColor': 'rgb(240, 240, 240)'
+                'backgroundColor': '#f0f8ff',  # Light blue for total row
+                'borderTop': '2px solid #2E86C1'
             }
         ],
-        page_size=25,
+        style_data={
+            'border': '1px solid #e3e6f0',
+            'color': '#1f2937'
+        },
+        page_size=30,
         sort_action='native',
         filter_action='native',
         fill_width=False,
@@ -1022,24 +1052,13 @@ layout = html.Div([
             ),
         ], className="inline-section-header"),
         
-        # Vessel Types Information (between header and chart)
+        # Vessel Types Information (Enterprise Standard Subheader Style)
         html.Div([
             html.P([
-                html.Span("Vessel Types: ", style={'fontWeight': '500', 'color': '#374151', 'fontSize': '13px'}),
+                html.Span("Vessel Types: ", className="inline-filter-label"),
                 html.Span(id='vessel-types-info', style={'color': '#6b7280', 'fontSize': '13px'})
-            ], style={
-                'fontFamily': 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',
-                'marginTop': '12px',
-                'marginBottom': '16px',
-                'paddingLeft': '16px',
-                'paddingRight': '16px',
-                'paddingTop': '10px',
-                'paddingBottom': '10px',
-                'backgroundColor': '#f8f9fa',
-                'borderRadius': '4px',
-                'border': '1px solid #e9ecef'
-            })
-        ]),
+            ], style={'margin': '0'})
+        ], className="inline-subheader", style={'marginTop': '8px', 'marginBottom': '20px'}),
         
         # Single Chart Container
         html.Div([
@@ -1411,7 +1430,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
 
     # Professional X-Axis Styling
     fig_global_shipping.update_xaxes(
-        title=dict(text='Date', font=dict(size=13, color='#4A4A4A')),
+        title=None,  # Remove x-axis title
         tickformat=tick_format,
         tickangle=0,  # Angled for better readability with dates
         dtick=dtick,
@@ -1546,7 +1565,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
 
     # Professional X-Axis Styling
     fig_global_shipping_supply.update_xaxes(
-        title=dict(text='Date', font=dict(size=13, color='#4A4A4A')),
+        title=None,  # Remove x-axis title
         tickformat=tick_format,
         tickangle=0,  # Angled for better readability with dates
         dtick=dtick,

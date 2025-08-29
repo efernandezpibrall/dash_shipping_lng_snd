@@ -791,6 +791,507 @@ def process_weeks_data(df, current_date):
     return final_df
 
 
+def create_continent_destination_chart(country_name, engine, db_schema):
+    """Create seasonal comparison chart by continent destination for selected country's LNG exports"""
+    
+    try:
+        # Handle Global case
+        country_filter = "" if country_name == "Global" else "AND kt.origin_country_name = %(country_name)s"
+        
+        # Query to get export data by continent destination
+        query = f"""
+        WITH latest_data AS (
+            SELECT MAX(upload_timestamp_utc) as max_timestamp
+            FROM {db_schema}.kpler_trades
+        ),
+        -- Get all unique continents
+        all_continents AS (
+            SELECT DISTINCT 
+                COALESCE(NULLIF(continent_destination_name, ''), 'Unknown') as continent_destination
+            FROM {db_schema}.kpler_trades kt, latest_data ld
+            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                {country_filter}
+                AND kt.start >= '2023-11-01'
+        ),
+        -- Get all dates in our range
+        all_dates AS (
+            SELECT generate_series(
+                '2023-11-01'::date,
+                (CURRENT_DATE + INTERVAL '14 days')::date,
+                '1 day'::interval
+            )::date as date
+        ),
+        -- Create complete date/continent matrix
+        date_continent_matrix AS (
+            SELECT 
+                d.date,
+                c.continent_destination
+            FROM all_dates d
+            CROSS JOIN all_continents c
+        ),
+        -- Get actual daily exports
+        daily_exports_raw AS (
+            SELECT 
+                kt.start::date as date,
+                COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
+                SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
+            FROM {db_schema}.kpler_trades kt, latest_data ld
+            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                {country_filter}
+                AND kt.start >= '2023-11-01'
+                AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+            GROUP BY kt.start::date, kt.continent_destination_name
+        ),
+        -- Join to get complete dataset with zeros for missing data
+        daily_exports_complete AS (
+            SELECT 
+                dcm.date,
+                dcm.continent_destination,
+                COALESCE(der.daily_export_mcmd, 0) as daily_export_mcmd
+            FROM date_continent_matrix dcm
+            LEFT JOIN daily_exports_raw der 
+                ON dcm.date = der.date 
+                AND dcm.continent_destination = der.continent_destination
+        ),
+        -- Calculate rolling averages on complete dataset
+        rolling_exports AS (
+            SELECT 
+                date,
+                continent_destination,
+                daily_export_mcmd,
+                AVG(daily_export_mcmd) OVER (
+                    PARTITION BY continent_destination
+                    ORDER BY date 
+                    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                ) as rolling_avg_30d,
+                CASE 
+                    WHEN date > CURRENT_DATE THEN true
+                    ELSE false
+                END as is_forecast
+            FROM daily_exports_complete
+        )
+        SELECT 
+            date,
+            continent_destination,
+            EXTRACT(YEAR FROM date) as year,
+            EXTRACT(DOY FROM date) as day_of_year,
+            TO_CHAR(date, 'Mon DD') as month_day,
+            rolling_avg_30d as rolling_avg,
+            is_forecast
+        FROM rolling_exports
+        WHERE date >= '2024-01-01'
+        ORDER BY continent_destination, date
+        """
+        
+        params = {} if country_name == "Global" else {'country_name': country_name}
+        df = pd.read_sql(query, engine, params=params)
+        
+        if df.empty:
+            fig = go.Figure()
+            fig.add_annotation(
+                text=f"No export data available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=12, color='#6b7280')
+            )
+            fig.update_layout(
+                xaxis=dict(showgrid=False, showticklabels=False),
+                yaxis=dict(showgrid=False, showticklabels=False),
+                height=300,
+                paper_bgcolor='white',
+                plot_bgcolor='white'
+            )
+            return fig
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Get unique years and continents
+        years = sorted(df['year'].unique())
+        continents = sorted(df['continent_destination'].unique())
+        
+        # Define color palette for continents
+        continent_colors = {
+            'Africa': '#8E24AA',
+            'Americas': '#43A047',
+            'Asia': '#FF4444',
+            'Europe': '#1E88E5',
+            'Unknown': '#757575',
+            'Oceania': '#FB8C00',
+            'Middle East': '#00ACC1',
+            'North America': '#D81B60',
+            'South America': '#FFC107'
+        }
+        
+        current_year = max(years)
+        continent_legend_shown = {}
+        
+        for continent in continents:
+            continent_data = df[df['continent_destination'] == continent]
+            color = continent_colors.get(continent, '#808080')
+            
+            for year in years:
+                year_continent_data = continent_data[continent_data['year'] == year].copy()
+                
+                if year_continent_data.empty:
+                    continue
+                
+                year_continent_data['plot_date'] = pd.to_datetime('2024-01-01') + pd.to_timedelta(year_continent_data['day_of_year'] - 1, unit='d')
+                
+                historical_data = year_continent_data[~year_continent_data['is_forecast']]
+                forecast_data = year_continent_data[year_continent_data['is_forecast']]
+                
+                line_width = 2.5 if year == current_year else 1.5
+                show_legend = bool(continent not in continent_legend_shown)
+                if show_legend:
+                    continent_legend_shown[continent] = True
+                
+                if not historical_data.empty:
+                    fig.add_trace(go.Scatter(
+                        x=historical_data['plot_date'],
+                        y=historical_data['rolling_avg'],
+                        mode='lines',
+                        name=continent if show_legend else None,
+                        legendgroup=continent,
+                        line=dict(color=color, width=line_width, dash='solid'),
+                        hovertemplate=f'<b>{continent} - {int(year)}</b><br>' +
+                                     '%{text}<br>' +
+                                     'Volume: %{y:.1f} mcm/d<br>' +
+                                     '<extra></extra>',
+                        text=historical_data['month_day'],
+                        showlegend=show_legend
+                    ))
+                
+                if not forecast_data.empty:
+                    if not historical_data.empty:
+                        connect_data = pd.concat([historical_data.tail(1), forecast_data])
+                    else:
+                        connect_data = forecast_data
+                    
+                    if color.startswith('#'):
+                        r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+                        forecast_color = f"rgba({r}, {g}, {b}, 0.4)"
+                    else:
+                        forecast_color = color
+                    
+                    fig.add_trace(go.Scatter(
+                        x=connect_data['plot_date'],
+                        y=connect_data['rolling_avg'],
+                        mode='lines',
+                        name=None,
+                        legendgroup=continent,
+                        line=dict(color=forecast_color, width=line_width, dash='solid'),
+                        opacity=0.6,
+                        hovertemplate=f'<b>{continent} - {int(year)} (Forecast)</b><br>' +
+                                     '%{text}<br>' +
+                                     'Volume: %{y:.1f} mcm/d<br>' +
+                                     '<extra></extra>',
+                        text=connect_data['month_day'],
+                        showlegend=False
+                    ))
+        
+        # Update layout
+        fig.update_layout(
+            xaxis=dict(
+                tickformat='%b',
+                dtick='M1',
+                tickangle=0,
+                showgrid=True,
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                tickfont=dict(size=10)
+            ),
+            yaxis=dict(
+                title=dict(text='mcm/d', font=dict(size=11)),
+                showgrid=True,
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                tickfont=dict(size=10)
+            ),
+            legend=dict(
+                orientation='h',
+                yanchor='bottom',
+                y=-0.3,
+                xanchor='center',
+                x=0.5,
+                font=dict(size=10)
+            ),
+            margin=dict(l=50, r=20, t=20, b=80),
+            height=300,
+            hovermode='x',
+            paper_bgcolor='white',
+            plot_bgcolor='white'
+        )
+        return fig
+        
+    except Exception as e:
+        print(f"Error creating continent destination chart: {e}")
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Error loading data",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False
+        )
+        fig.update_layout(height=300, paper_bgcolor='white', plot_bgcolor='white')
+        return fig
+
+
+def create_continent_percentage_chart(country_name, engine, db_schema):
+    """Create percentage distribution chart by continent destination"""
+    
+    try:
+        # Handle Global case
+        country_filter = "" if country_name == "Global" else "AND kt.origin_country_name = %(country_name)s"
+        
+        # Query to get export data by continent destination for percentage calculation
+        query = f"""
+        WITH latest_data AS (
+            SELECT MAX(upload_timestamp_utc) as max_timestamp
+            FROM {db_schema}.kpler_trades
+        ),
+        -- Get all unique continents
+        all_continents AS (
+            SELECT DISTINCT 
+                COALESCE(NULLIF(continent_destination_name, ''), 'Unknown') as continent_destination
+            FROM {db_schema}.kpler_trades kt, latest_data ld
+            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                {country_filter}
+                AND kt.start >= '2023-11-01'
+        ),
+        -- Get all dates in our range
+        all_dates AS (
+            SELECT generate_series(
+                '2023-11-01'::date,
+                (CURRENT_DATE + INTERVAL '14 days')::date,
+                '1 day'::interval
+            )::date as date
+        ),
+        -- Create complete date/continent matrix
+        date_continent_matrix AS (
+            SELECT 
+                d.date,
+                c.continent_destination
+            FROM all_dates d
+            CROSS JOIN all_continents c
+        ),
+        -- Get actual daily exports
+        daily_exports_raw AS (
+            SELECT 
+                kt.start::date as date,
+                COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
+                SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
+            FROM {db_schema}.kpler_trades kt, latest_data ld
+            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                {country_filter}
+                AND kt.start >= '2023-11-01'
+                AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+            GROUP BY kt.start::date, kt.continent_destination_name
+        ),
+        -- Join to get complete dataset with zeros for missing data
+        daily_exports_complete AS (
+            SELECT 
+                dcm.date,
+                dcm.continent_destination,
+                COALESCE(der.daily_export_mcmd, 0) as daily_export_mcmd
+            FROM date_continent_matrix dcm
+            LEFT JOIN daily_exports_raw der 
+                ON dcm.date = der.date 
+                AND dcm.continent_destination = der.continent_destination
+        ),
+        -- Calculate rolling averages on complete dataset
+        rolling_continents AS (
+            SELECT 
+                date,
+                continent_destination,
+                daily_export_mcmd,
+                AVG(daily_export_mcmd) OVER (
+                    PARTITION BY continent_destination
+                    ORDER BY date 
+                    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                ) as rolling_avg_30d,
+                CASE 
+                    WHEN date > CURRENT_DATE THEN true
+                    ELSE false
+                END as is_forecast
+            FROM daily_exports_complete
+        ),
+        -- Sum rolling averages for total
+        rolling_totals AS (
+            SELECT 
+                date,
+                SUM(rolling_avg_30d) as total_rolling_avg_30d
+            FROM rolling_continents
+            GROUP BY date
+        )
+        SELECT 
+            rc.date,
+            rc.continent_destination,
+            EXTRACT(YEAR FROM rc.date) as year,
+            EXTRACT(DOY FROM rc.date) as day_of_year,
+            TO_CHAR(rc.date, 'Mon DD') as month_day,
+            rc.rolling_avg_30d as rolling_avg,
+            CASE 
+                WHEN rt.total_rolling_avg_30d > 0 
+                THEN (rc.rolling_avg_30d / rt.total_rolling_avg_30d) * 100
+                ELSE 0
+            END as percentage,
+            rc.is_forecast
+        FROM rolling_continents rc
+        JOIN rolling_totals rt ON rc.date = rt.date
+        WHERE rc.date >= '2024-01-01'
+        ORDER BY rc.continent_destination, rc.date
+        """
+        
+        params = {} if country_name == "Global" else {'country_name': country_name}
+        df = pd.read_sql(query, engine, params=params)
+        
+        if df.empty:
+            fig = go.Figure()
+            fig.add_annotation(
+                text=f"No export data available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=12, color='#6b7280')
+            )
+            fig.update_layout(
+                xaxis=dict(showgrid=False, showticklabels=False),
+                yaxis=dict(showgrid=False, showticklabels=False),
+                height=300,
+                paper_bgcolor='white',
+                plot_bgcolor='white'
+            )
+            return fig
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Get unique years and continents
+        years = sorted(df['year'].unique())
+        continents = sorted(df['continent_destination'].unique())
+        
+        # Define color palette - same as absolute chart
+        continent_colors = {
+            'Africa': '#8E24AA',
+            'Americas': '#43A047',
+            'Asia': '#FF4444',
+            'Europe': '#1E88E5',
+            'Unknown': '#757575',
+            'Oceania': '#FB8C00',
+            'Middle East': '#00ACC1',
+            'North America': '#D81B60',
+            'South America': '#FFC107'
+        }
+        
+        current_year = max(years)
+        continent_legend_shown = {}
+        
+        for continent in continents:
+            continent_data = df[df['continent_destination'] == continent]
+            color = continent_colors.get(continent, '#808080')
+            
+            for year in years:
+                year_continent_data = continent_data[continent_data['year'] == year].copy()
+                
+                if year_continent_data.empty:
+                    continue
+                
+                year_continent_data['plot_date'] = pd.to_datetime('2024-01-01') + pd.to_timedelta(year_continent_data['day_of_year'] - 1, unit='d')
+                
+                historical_data = year_continent_data[~year_continent_data['is_forecast']]
+                forecast_data = year_continent_data[year_continent_data['is_forecast']]
+                
+                line_width = 2.5 if year == current_year else 1.5
+                show_legend = bool(continent not in continent_legend_shown)
+                if show_legend:
+                    continent_legend_shown[continent] = True
+                
+                if not historical_data.empty:
+                    fig.add_trace(go.Scatter(
+                        x=historical_data['plot_date'],
+                        y=historical_data['percentage'],
+                        mode='lines',
+                        name=continent if show_legend else None,
+                        legendgroup=continent,
+                        line=dict(color=color, width=line_width, dash='solid'),
+                        hovertemplate=f'<b>{continent} - {int(year)}</b><br>' +
+                                     '%{text}<br>' +
+                                     'Share: %{y:.1f}%<br>' +
+                                     '<extra></extra>',
+                        text=historical_data['month_day'],
+                        showlegend=show_legend
+                    ))
+                
+                if not forecast_data.empty:
+                    if not historical_data.empty:
+                        connect_data = pd.concat([historical_data.tail(1), forecast_data])
+                    else:
+                        connect_data = forecast_data
+                    
+                    if color.startswith('#'):
+                        r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+                        forecast_color = f"rgba({r}, {g}, {b}, 0.4)"
+                    else:
+                        forecast_color = color
+                    
+                    fig.add_trace(go.Scatter(
+                        x=connect_data['plot_date'],
+                        y=connect_data['percentage'],
+                        mode='lines',
+                        name=None,
+                        legendgroup=continent,
+                        line=dict(color=forecast_color, width=line_width, dash='solid'),
+                        opacity=0.6,
+                        hovertemplate=f'<b>{continent} - {int(year)} (Forecast)</b><br>' +
+                                     '%{text}<br>' +
+                                     'Share: %{y:.1f}%<br>' +
+                                     '<extra></extra>',
+                        text=connect_data['month_day'],
+                        showlegend=False
+                    ))
+        
+        # Update layout
+        fig.update_layout(
+            xaxis=dict(
+                tickformat='%b',
+                dtick='M1',
+                tickangle=0,
+                showgrid=True,
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                tickfont=dict(size=10)
+            ),
+            yaxis=dict(
+                title=dict(text='%', font=dict(size=11)),
+                showgrid=True,
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                tickfont=dict(size=10),
+                range=[0, 100]
+            ),
+            legend=dict(
+                orientation='h',
+                yanchor='bottom',
+                y=-0.3,
+                xanchor='center',
+                x=0.5,
+                font=dict(size=10)
+            ),
+            margin=dict(l=50, r=20, t=20, b=80),
+            height=300,
+            hovermode='x',
+            paper_bgcolor='white',
+            plot_bgcolor='white'
+        )
+        return fig
+        
+    except Exception as e:
+        print(f"Error creating continent percentage chart: {e}")
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Error loading data",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False
+        )
+        fig.update_layout(height=300, paper_bgcolor='white', plot_bgcolor='white')
+        return fig
+
+
 def prepare_table_for_display(df, table_type, expanded_countries=None):
     """Prepare data for display in DataTable with expandable rows"""
     if df.empty:
@@ -913,6 +1414,10 @@ layout = html.Div([
     dcc.Store(id='us-supply-data-store', storage_type='local'),
     dcc.Store(id='australia-supply-data-store', storage_type='local'),
     dcc.Store(id='qatar-supply-data-store', storage_type='local'),
+    dcc.Store(id='russia-supply-data-store', storage_type='local'),
+    dcc.Store(id='nigeria-supply-data-store', storage_type='local'),
+    dcc.Store(id='angola-supply-data-store', storage_type='local'),
+    dcc.Store(id='malaysia-supply-data-store', storage_type='local'),
     dcc.Store(id='summary-data-store', storage_type='local'),
     
     # Store for expanded state of countries in summary table
@@ -972,7 +1477,178 @@ layout = html.Div([
                     type="default",
                 )
             ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
-        ], style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'space-between'})
+        ], style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'space-between'}),
+        
+        # Second row of charts - Russian Federation, Nigeria, Angola, Malaysia
+        html.Div([
+            # Russian Federation Supply Chart
+            html.Div([
+                html.H5('Russian Federation', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="russia-supply-loading",
+                    children=[
+                        dcc.Graph(id='russia-supply-chart', style={'height': '350px'})
+                    ],
+                    type="default",
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+            
+            # Nigeria Supply Chart
+            html.Div([
+                html.H5('Nigeria', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="nigeria-supply-loading",
+                    children=[
+                        dcc.Graph(id='nigeria-supply-chart', style={'height': '350px'})
+                    ],
+                    type="default",
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+            
+            # Angola Supply Chart
+            html.Div([
+                html.H5('Angola', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="angola-supply-loading",
+                    children=[
+                        dcc.Graph(id='angola-supply-chart', style={'height': '350px'})
+                    ],
+                    type="default",
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+            
+            # Malaysia Supply Chart
+            html.Div([
+                html.H5('Malaysia', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="malaysia-supply-loading",
+                    children=[
+                        dcc.Graph(id='malaysia-supply-chart', style={'height': '350px'})
+                    ],
+                    type="default",
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+        ], style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'space-between', 'marginTop': '20px'})
+    ], className="main-section-container", style={'marginBottom': '30px'}),
+
+    # Continent Destination Charts Section - 30-Day Rolling Average
+    html.Div([
+        # Header with dropdown
+        html.Div([
+            html.H3('LNG Supply by Destination Continent - 30-Day Rolling Average', className="section-title-inline"),
+            dcc.Dropdown(
+                id='continent-chart-type',
+                options=[
+                    {'label': 'By Continent (mcm/d)', 'value': 'absolute'},
+                    {'label': 'Market Share (%)', 'value': 'percentage'}
+                ],
+                value='absolute',
+                clearable=False,
+                style={'width': '200px', 'display': 'inline-block', 'marginLeft': '20px', 'verticalAlign': 'middle'}
+            )
+        ], className="inline-section-header", style={'display': 'flex', 'alignItems': 'center'}),
+        
+        # First row - Global, United States, Australia, Qatar
+        html.Div([
+            # Global Continent Chart
+            html.Div([
+                html.H5('Global', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="global-continent-loading",
+                    children=[
+                        dcc.Graph(id='global-continent-chart', style={'height': '350px'})
+                    ],
+                    type="default"
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+            
+            # United States Continent Chart
+            html.Div([
+                html.H5('United States', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="us-continent-loading",
+                    children=[
+                        dcc.Graph(id='us-continent-chart', style={'height': '350px'})
+                    ],
+                    type="default"
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+            
+            # Australia Continent Chart
+            html.Div([
+                html.H5('Australia', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="australia-continent-loading",
+                    children=[
+                        dcc.Graph(id='australia-continent-chart', style={'height': '350px'})
+                    ],
+                    type="default"
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+            
+            # Qatar Continent Chart
+            html.Div([
+                html.H5('Qatar', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="qatar-continent-loading",
+                    children=[
+                        dcc.Graph(id='qatar-continent-chart', style={'height': '350px'})
+                    ],
+                    type="default"
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+        ], style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'space-between'}),
+        
+        # Second row - Russian Federation, Nigeria, Angola, Malaysia
+        html.Div([
+            # Russian Federation Continent Chart
+            html.Div([
+                html.H5('Russian Federation', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="russia-continent-loading",
+                    children=[
+                        dcc.Graph(id='russia-continent-chart', style={'height': '350px'})
+                    ],
+                    type="default"
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+            
+            # Nigeria Continent Chart
+            html.Div([
+                html.H5('Nigeria', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="nigeria-continent-loading",
+                    children=[
+                        dcc.Graph(id='nigeria-continent-chart', style={'height': '350px'})
+                    ],
+                    type="default"
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+            
+            # Angola Continent Chart
+            html.Div([
+                html.H5('Angola', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="angola-continent-loading",
+                    children=[
+                        dcc.Graph(id='angola-continent-chart', style={'height': '350px'})
+                    ],
+                    type="default"
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+            
+            # Malaysia Continent Chart
+            html.Div([
+                html.H5('Malaysia', style={'textAlign': 'center', 'marginBottom': '10px'}),
+                dcc.Loading(
+                    id="malaysia-continent-loading",
+                    children=[
+                        dcc.Graph(id='malaysia-continent-chart', style={'height': '350px'})
+                    ],
+                    type="default"
+                )
+            ], style={'width': '25%', 'display': 'inline-block', 'padding': '0 10px'}),
+        ], style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'space-between', 'marginTop': '20px'})
     ], className="main-section-container", style={'marginBottom': '30px'}),
 
     # LNG Loadings Section
@@ -1008,6 +1684,10 @@ layout = html.Div([
      Output('us-supply-data-store', 'data'),
      Output('australia-supply-data-store', 'data'),
      Output('qatar-supply-data-store', 'data'),
+     Output('russia-supply-data-store', 'data'),
+     Output('nigeria-supply-data-store', 'data'),
+     Output('angola-supply-data-store', 'data'),
+     Output('malaysia-supply-data-store', 'data'),
      Output('summary-data-store', 'data')],
     [Input('initial-load-trigger', 'n_intervals')],
     prevent_initial_call=False
@@ -1025,6 +1705,10 @@ def refresh_all_data(n_intervals):
         us_supply_df = fetch_country_supply_data(engine_inst, schema, "United States")
         australia_supply_df = fetch_country_supply_data(engine_inst, schema, "Australia")
         qatar_supply_df = fetch_country_supply_data(engine_inst, schema, "Qatar")
+        russia_supply_df = fetch_country_supply_data(engine_inst, schema, "Russian Federation")
+        nigeria_supply_df = fetch_country_supply_data(engine_inst, schema, "Nigeria")
+        angola_supply_df = fetch_country_supply_data(engine_inst, schema, "Angola")
+        malaysia_supply_df = fetch_country_supply_data(engine_inst, schema, "Malaysia")
         
         # Fetch summary table data (which internally uses fetch_installation_data)
         summary_df = fetch_summary_table_data(engine_inst, schema)
@@ -1033,10 +1717,14 @@ def refresh_all_data(n_intervals):
                 us_supply_df.to_dict('records') if not us_supply_df.empty else [],
                 australia_supply_df.to_dict('records') if not australia_supply_df.empty else [],
                 qatar_supply_df.to_dict('records') if not qatar_supply_df.empty else [],
+                russia_supply_df.to_dict('records') if not russia_supply_df.empty else [],
+                nigeria_supply_df.to_dict('records') if not nigeria_supply_df.empty else [],
+                angola_supply_df.to_dict('records') if not angola_supply_df.empty else [],
+                malaysia_supply_df.to_dict('records') if not malaysia_supply_df.empty else [],
                 summary_df.to_dict('records') if not summary_df.empty else [])
         
     except Exception as e:
-        return [], [], [], [], []
+        return [], [], [], [], [], [], [], [], []
 
 
 def create_supply_chart(data, title_prefix="", show_legend=True):
@@ -1234,7 +1922,7 @@ def create_supply_chart(data, title_prefix="", show_legend=True):
 )
 def update_global_supply_chart(global_data):
     """Create seasonal comparison chart of global LNG supply"""
-    return create_supply_chart(global_data, "Global", show_legend=True)  # Show legend on first chart
+    return create_supply_chart(global_data, "Global", show_legend=False)  # Hide legend
 
 
 @callback(
@@ -1265,6 +1953,46 @@ def update_australia_supply_chart(australia_data):
 def update_qatar_supply_chart(qatar_data):
     """Create seasonal comparison chart of Qatar LNG supply"""
     return create_supply_chart(qatar_data, "Qatar", show_legend=False)  # Hide legend
+
+
+@callback(
+    Output('russia-supply-chart', 'figure'),
+    [Input('russia-supply-data-store', 'data')],
+    prevent_initial_call=False
+)
+def update_russia_supply_chart(russia_data):
+    """Create seasonal comparison chart of Russian Federation LNG supply"""
+    return create_supply_chart(russia_data, "Russian Federation", show_legend=True)  # Show legend on this chart
+
+
+@callback(
+    Output('nigeria-supply-chart', 'figure'),
+    [Input('nigeria-supply-data-store', 'data')],
+    prevent_initial_call=False
+)
+def update_nigeria_supply_chart(nigeria_data):
+    """Create seasonal comparison chart of Nigeria LNG supply"""
+    return create_supply_chart(nigeria_data, "Nigeria", show_legend=False)  # Hide legend
+
+
+@callback(
+    Output('angola-supply-chart', 'figure'),
+    [Input('angola-supply-data-store', 'data')],
+    prevent_initial_call=False
+)
+def update_angola_supply_chart(angola_data):
+    """Create seasonal comparison chart of Angola LNG supply"""
+    return create_supply_chart(angola_data, "Angola", show_legend=False)  # Hide legend
+
+
+@callback(
+    Output('malaysia-supply-chart', 'figure'),
+    [Input('malaysia-supply-data-store', 'data')],
+    prevent_initial_call=False
+)
+def update_malaysia_supply_chart(malaysia_data):
+    """Create seasonal comparison chart of Malaysia LNG supply"""
+    return create_supply_chart(malaysia_data, "Malaysia", show_legend=False)  # Hide legend
 
 
 @callback(
@@ -1582,3 +2310,32 @@ def handle_row_expansion(active_cells, table_data_list, summary_expanded, summar
             pass
     
     return summary_expanded
+
+
+# Callbacks for continent destination charts
+@callback(
+    [Output('global-continent-chart', 'figure'),
+     Output('us-continent-chart', 'figure'),
+     Output('australia-continent-chart', 'figure'),
+     Output('qatar-continent-chart', 'figure'),
+     Output('russia-continent-chart', 'figure'),
+     Output('nigeria-continent-chart', 'figure'),
+     Output('angola-continent-chart', 'figure'),
+     Output('malaysia-continent-chart', 'figure')],
+    [Input('continent-chart-type', 'value'),
+     Input('global-refresh-button', 'n_clicks')]
+)
+def update_continent_charts(chart_type, n_clicks):
+    """Update all continent charts based on selected type"""
+    countries = ["Global", "United States", "Australia", "Qatar", 
+                 "Russian Federation", "Nigeria", "Angola", "Malaysia"]
+    
+    figures = []
+    for country in countries:
+        if chart_type == 'percentage':
+            fig = create_continent_percentage_chart(country, engine, DB_SCHEMA)
+        else:
+            fig = create_continent_destination_chart(country, engine, DB_SCHEMA)
+        figures.append(fig)
+    
+    return figures
