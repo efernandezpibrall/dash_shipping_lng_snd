@@ -5,6 +5,7 @@ from app import app
 import pages.shipping_balance
 import pages.exporter_detail
 import pages.exporters
+import pages.country_mappings
 
 import pandas as pd
 import configparser
@@ -58,6 +59,7 @@ nav_links = html.Header([
                 dcc.Link('Shipping Balance', href='/shipping_balance', id='nav-shipping-balance', className='nav-link-secondary'),
                 dcc.Link('Exporters', href='/exporters', id='nav-exporters', className='nav-link-secondary'),
                 dcc.Link('Exporter Detail', href='/exporter_detail', id='nav-exporter-detail', className='nav-link-secondary'),
+                dcc.Link('Country Mappings', href='/country_mappings', id='nav-country-mappings', className='nav-link-secondary'),
             ], className='nav-group-secondary')
         ], className='main-navigation'),
         
@@ -91,6 +93,8 @@ def display_page(pathname):
         return pages.exporters.layout
     elif pathname == '/exporter_detail':
         return pages.exporter_detail.layout
+    elif pathname == '/country_mappings':
+        return pages.country_mappings.layout
     else:
         return '404 - Page not found'
 
@@ -105,6 +109,8 @@ app.clientside_callback(
             document.title = 'LNG Shipping - Exporters';
         } else if (pathname === '/exporter_detail') {
             document.title = 'LNG Shipping - Exporter Detail';
+        } else if (pathname === '/country_mappings') {
+            document.title = 'LNG Shipping - Country Mappings';
         } else {
             document.title = 'LNG Shipping - Page Not Found';
         }
@@ -123,6 +129,8 @@ app.clientside_callback(
             activeNavId = 'nav-exporters';
         } else if (pathname === '/exporter_detail') {
             activeNavId = 'nav-exporter-detail';
+        } else if (pathname === '/country_mappings') {
+            activeNavId = 'nav-country-mappings';
         }
         
         if (activeNavId) {
