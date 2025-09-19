@@ -785,8 +785,6 @@ button.show-hide { display: none; }
     display: flex;
     gap: 24px;
     align-items: end;
-    padding-top: 16px;
-    border-top: 1px solid #e5e7eb;
     flex-wrap: wrap;
 }
 
@@ -832,7 +830,6 @@ button.show-hide { display: none; }
 
 /* Filter Dropdown Styling */
 .filter-dropdown {
-    min-width: 200px;
     font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
     font-size: 13px;
 }
