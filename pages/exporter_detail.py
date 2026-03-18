@@ -1,4 +1,4 @@
-from dash import html, dcc, dash_table, callback, Output, Input, State, Dash, ALL, ctx, no_update
+from dash import html, dcc, dash_table, callback, Output, Input, State, ALL, ctx, no_update
 from dash.dash_table.Format import Format, Group, Scheme
 import plotly.graph_objects as go
 import dash_bootstrap_components as dbc
@@ -839,10 +839,6 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_status=None, sel
         )
         return fig
 
-    # Use professional color palette
-    n_groups = len(unique_groups)
-    distinct_colors = get_professional_colors(n_groups)
-
     # Determine grouping columns based on aggregation level
     if aggregation_level == 'Year':
         groupby_time_cols = ['year']
@@ -970,6 +966,9 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_status=None, sel
     # Get unique values
     time_labels = sorted(stacked_data['time_label'].unique())
     group_values = sorted(stacked_data[group_field].unique())
+
+    # Use professional color palette
+    distinct_colors = get_professional_colors(len(group_values))
 
     # Create figure
     fig = go.Figure()
