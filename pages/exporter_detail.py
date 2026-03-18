@@ -1,4 +1,4 @@
-from dash import html, dcc, dash_table, callback, Output, Input, State, Dash, ALL, ctx
+from dash import html, dcc, dash_table, callback, Output, Input, State, Dash, ALL, ctx, no_update
 from dash.dash_table.Format import Format, Group, Scheme
 import plotly.graph_objects as go
 import dash_bootstrap_components as dbc
@@ -7352,7 +7352,7 @@ def toggle_maintenance_plant_expansion(active_cells, table_data_list, expanded_p
                 except Exception as e:
                     pass
 
-                return expanded_plants, dash.no_update
+                return expanded_plants, no_update
 
         except Exception as e:
             pass
