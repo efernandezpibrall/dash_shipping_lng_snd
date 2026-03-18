@@ -1,21 +1,28 @@
-from dash import html, dcc, dash_table, callback, Output, Input, State, Dash, ALL, callback_context
-from dash.dash_table.Format import Format, Group, Scheme
+from dash import html, dcc, dash_table, callback, Output, Input, State, ALL, callback_context
+from dash.dash_table.Format import Format, Scheme
 import plotly.graph_objects as go
-import dash_bootstrap_components as dbc
-import plotly.express as px
-from plotly.subplots import make_subplots
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
-import json
-from io import StringIO
-from dash.exceptions import PreventUpdate
+from io import BytesIO
 import configparser
 import os
 from sqlalchemy import create_engine, text
 import calendar
 
 from utils.table_styles import StandardTableStyleManager, TABLE_COLORS
+
+# Month order constant for sorting (used in multiple functions)
+MONTH_ORDER = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+               'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+
+
+def safe_concat(dataframes, **kwargs):
+    """Concatenate DataFrames, filtering out empty ones to avoid FutureWarning."""
+    non_empty_dfs = [df for df in dataframes if not df.empty]
+    if not non_empty_dfs:
+        return pd.DataFrame()
+    return pd.concat(non_empty_dfs, **kwargs)
+
 
 ############################################ postgres sql connection ###################################################
 #------ code to be able to access config.ini, even having the path in the .virtualenvs is not working without it ------#
@@ -26,7 +33,7 @@ try:
     # Adjust the number of '..' as needed to reach the correct directory
     config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))  # Go up two levels
     CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except:
+except Exception:
     CONFIG_FILE_PATH = 'config.ini'  # Assumes it's in the same directory or the path it is detected
 
 
@@ -45,6 +52,23 @@ engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 def setup_database_connection():
     """Setup database connection using existing configuration"""
     return engine, DB_SCHEMA
+
+
+def get_latest_upload_timestamp(engine, schema):
+    """Fetch the latest upload_timestamp_utc from kpler_trades table"""
+    try:
+        query = text(f"""
+            SELECT MAX(upload_timestamp_utc) as max_timestamp
+            FROM {schema}.kpler_trades
+        """)
+
+        with engine.connect() as conn:
+            result = conn.execute(query).fetchone()
+            if result and result[0]:
+                return result[0]
+            return None
+    except Exception as e:
+        return None
 
 
 def fetch_rolling_windows_data(engine, schema, classification_mode='Country'):
@@ -203,7 +227,7 @@ def fetch_rolling_windows_data(engine, schema, classification_mode='Country'):
                 })
             
             # Combine installation-level and country-level data
-            final_result = pd.concat([result, country_totals], ignore_index=True)
+            final_result = safe_concat([result, country_totals], ignore_index=True)
             final_result = final_result.fillna(0)
             
             # Calculate deltas
@@ -216,7 +240,6 @@ def fetch_rolling_windows_data(engine, schema, classification_mode='Country'):
             return final_result
             
     except Exception as e:
-        print(f"Error fetching rolling windows data: {e}")
         return pd.DataFrame()
 
 
@@ -261,7 +284,6 @@ def get_all_classification_groups(engine, schema):
             return result['classification'].tolist()
             
     except Exception as e:
-        print(f"Error fetching classification groups: {e}")
         return []
 
 
@@ -328,7 +350,6 @@ def get_completed_periods(current_date=None):
     # Get last 3 complete weeks
     for i in range(3):
         week_end = last_sunday - timedelta(days=7*i)
-        week_start = week_end - timedelta(days=6)
         week_num = week_end.isocalendar()[1]
         year = week_end.year
         # Handle year transition for week numbering
@@ -494,7 +515,7 @@ def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Count
                 })
                 
                 # Combine all
-                final_result = pd.concat([result, country_totals, class_totals], ignore_index=True)
+                final_result = safe_concat([result, country_totals, class_totals], ignore_index=True)
             else:
                 final_result = result
             
@@ -510,9 +531,6 @@ def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Count
             return final_result
             
     except Exception as e:
-        print(f"Error fetching supply-destination rolling windows data: {e}")
-        import traceback
-        traceback.print_exc()
         return pd.DataFrame()
 
 
@@ -532,11 +550,9 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, quarters
         
         # Fetch rolling windows data for supply-destination pairs
         rolling_data = fetch_supply_dest_rolling_windows(engine, schema, classification_mode)
-        print(f"Supply-dest rolling data shape: {rolling_data.shape if not rolling_data.empty else 'Empty'}")
-        
+
         # Also fetch the global rolling totals (same as LNG loadings uses) for GRAND TOTAL
         global_rolling_data = fetch_rolling_windows_data(engine, schema, classification_mode)
-        print(f"Global rolling data shape: {global_rolling_data.shape if not global_rolling_data.empty else 'Empty'}")
         
         # Identify columns based on classification mode
         if classification_mode == 'Classification Level 1':
@@ -566,8 +582,7 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, quarters
         selected_quarter_cols = quarter_cols_sorted[-5:] if len(quarter_cols_sorted) >= 5 else quarter_cols_sorted
         
         # For months: exclude current month
-        month_order = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
-                      'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+        month_order = MONTH_ORDER
         month_cols_filtered = []
         for col in month_cols:
             if "'" in col and not col.startswith("Q") and not col.startswith("W"):
@@ -694,14 +709,11 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, quarters
                     }])
                 
                 # Append GRAND TOTAL row
-                result = pd.concat([result, grand_total_row], ignore_index=True)
+                result = safe_concat([result, grand_total_row], ignore_index=True)
         
         return result
             
     except Exception as e:
-        print(f"Error fetching supply-destination summary data: {e}")
-        import traceback
-        traceback.print_exc()
         return pd.DataFrame()
 
 
@@ -760,8 +772,7 @@ def fetch_summary_table_data(engine, schema, classification_mode='Country'):
         selected_quarter_cols = quarter_cols_sorted[-5:] if len(quarter_cols_sorted) >= 5 else quarter_cols_sorted
         
         # For months: exclude current month
-        month_order = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
-                      'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+        month_order = MONTH_ORDER
         month_cols_filtered = []
         for col in month_cols:
             if "'" in col and not col.startswith("Q") and not col.startswith("W"):
@@ -891,9 +902,6 @@ def fetch_summary_table_data(engine, schema, classification_mode='Country'):
         return result
             
     except Exception as e:
-        print(f"Error fetching summary table data: {e}")
-        import traceback
-        traceback.print_exc()
         return pd.DataFrame()
 
 
@@ -1008,7 +1016,6 @@ def fetch_global_supply_data(engine, schema, classification_mode='Country'):
             return df
             
     except Exception as e:
-        print(f"Error fetching global supply data: {e}")
         return pd.DataFrame()
 
 
@@ -1221,7 +1228,6 @@ def fetch_country_supply_data(engine, schema, country_name, classification_mode=
             return df
             
     except Exception as e:
-        print(f"Error fetching {country_name} supply data: {e}")
         return pd.DataFrame()
 
 
@@ -1383,21 +1389,11 @@ def fetch_supply_destination_data(engine, schema, classification_mode='Country')
             df = pd.read_sql(base_query, conn)
     
     except Exception as e:
-        print(f"Error fetching supply-destination data: {e}")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    
+
     if df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    
-    # Debug: Check for Unknown values
-    if classification_mode == 'Classification Level 1':
-        print(f"Supply classifications: {df['supply_classification'].unique()[:5]}")
-        print(f"Demand classifications: {df['demand_classification'].unique()[:5]}")
-        unknown_supply = df[df['supply_classification'] == 'Unknown'].shape[0]
-        unknown_demand = df[df['demand_classification'] == 'Unknown'].shape[0]
-        print(f"Records with Unknown supply classification: {unknown_supply}")
-        print(f"Records with Unknown demand classification: {unknown_demand}")
-    
+
     # Common data preparation
     if classification_mode == 'Classification Level 1':
         # In classification mode, we have classification and country names for both supply and demand
@@ -1484,7 +1480,7 @@ def process_supply_dest_quarters(df, current_date, classification_mode='Country'
         country_totals['supply_country'] = 'Total'
         
         # Combine all
-        final_df = pd.concat([result, country_totals, class_totals], ignore_index=True)
+        final_df = safe_concat([result, country_totals, class_totals], ignore_index=True)
         final_df = final_df.sort_values(['supply_classification', 'demand_classification', 'demand_country', 'supply_country']).reset_index(drop=True)
     else:
         # Add country pair totals
@@ -1548,7 +1544,7 @@ def process_supply_dest_months(df, current_date, classification_mode='Country'):
         country_totals = result.groupby(['supply_classification', 'demand_classification', 'demand_country'])[numeric_cols].sum().round(1).reset_index()
         country_totals['supply_country'] = 'Total'
         
-        final_df = pd.concat([result, country_totals, class_totals], ignore_index=True)
+        final_df = safe_concat([result, country_totals, class_totals], ignore_index=True)
         final_df = final_df.sort_values(['supply_classification', 'demand_classification', 'demand_country', 'supply_country']).reset_index(drop=True)
     else:
         final_df = result
@@ -1610,7 +1606,7 @@ def process_supply_dest_weeks(df, current_date, classification_mode='Country'):
         country_totals = result.groupby(['supply_classification', 'demand_classification', 'demand_country'])[numeric_cols].sum().round(1).reset_index()
         country_totals['supply_country'] = 'Total'
         
-        final_df = pd.concat([result, country_totals, class_totals], ignore_index=True)
+        final_df = safe_concat([result, country_totals, class_totals], ignore_index=True)
         final_df = final_df.sort_values(['supply_classification', 'demand_classification', 'demand_country', 'supply_country']).reset_index(drop=True)
     else:
         final_df = result
@@ -1694,7 +1690,7 @@ def process_quarters_data(df, current_date, classification_mode='Country'):
         classification_totals = country_totals
     
     # Combine and sort
-    final_df = pd.concat([result, classification_totals], ignore_index=True)
+    final_df = safe_concat([result, classification_totals], ignore_index=True)
     if classification_mode == 'Classification Level 1' and 'actual_country_name' in final_df.columns:
         final_df['sort_key'] = final_df['installation_origin_name'].apply(lambda x: (1, '') if x == 'Total' else (0, x))
         final_df = final_df.sort_values(['origin_country_name', 'actual_country_name', 'sort_key']).drop('sort_key', axis=1).reset_index(drop=True)
@@ -1784,7 +1780,7 @@ def process_months_data(df, current_date, classification_mode='Country'):
         country_totals['installation_origin_name'] = 'Total'
     
     # Combine and sort
-    final_df = pd.concat([result, country_totals], ignore_index=True)
+    final_df = safe_concat([result, country_totals], ignore_index=True)
     if classification_mode == 'Classification Level 1' and 'actual_country_name' in final_df.columns:
         final_df['sort_key'] = final_df['installation_origin_name'].apply(lambda x: (1, '') if x == 'Total' else (0, x))
         final_df = final_df.sort_values(['origin_country_name', 'actual_country_name', 'sort_key']).drop('sort_key', axis=1).reset_index(drop=True)
@@ -1875,7 +1871,7 @@ def process_weeks_data(df, current_date, classification_mode='Country'):
         country_totals['installation_origin_name'] = 'Total'
     
     # Combine and sort
-    final_df = pd.concat([result, country_totals], ignore_index=True)
+    final_df = safe_concat([result, country_totals], ignore_index=True)
     if classification_mode == 'Classification Level 1' and 'actual_country_name' in final_df.columns:
         final_df['sort_key'] = final_df['installation_origin_name'].apply(lambda x: (1, '') if x == 'Total' else (0, x))
         final_df = final_df.sort_values(['origin_country_name', 'actual_country_name', 'sort_key']).drop('sort_key', axis=1).reset_index(drop=True)
@@ -2143,7 +2139,6 @@ def create_continent_destination_chart(entity_name, engine, db_schema, classific
         return fig
         
     except Exception as e:
-        print(f"Error creating continent destination chart: {e}")
         fig = go.Figure()
         fig.add_annotation(
             text="Error loading data",
@@ -2422,7 +2417,6 @@ def create_continent_percentage_chart(entity_name, engine, db_schema, classifica
         return fig
         
     except Exception as e:
-        print(f"Error creating continent percentage chart: {e}")
         fig = go.Figure()
         fig.add_annotation(
             text="Error loading data",
@@ -2495,9 +2489,8 @@ def prepare_table_for_display(df, table_type, expanded_countries=None, classific
                 # Get non-total rows for this classification
                 classification_installations = classification_data[classification_data['installation_origin_name'] != 'Total'].copy()
                 
-                # Debug: Check if actual_country_name column exists
+                # Check if actual_country_name column exists
                 if 'actual_country_name' not in classification_installations.columns:
-                    print(f"Warning: actual_country_name column not found. Columns: {classification_installations.columns.tolist()}")
                     # Try to display installations directly if no country grouping available
                     if not classification_installations.empty:
                         classification_installations.loc[:, 'installation_origin_name'] = "    " + classification_installations['installation_origin_name']
@@ -2581,7 +2574,7 @@ def prepare_table_for_display(df, table_type, expanded_countries=None, classific
     
     # Add Grand Total row
     if entity_totals_for_grand:
-        grand_total_df = pd.concat(entity_totals_for_grand, ignore_index=True)
+        grand_total_df = safe_concat(entity_totals_for_grand, ignore_index=True)
         numeric_cols = [col for col in grand_total_df.columns if col not in ['origin_country_name', 'installation_origin_name', 'actual_country_name']]
         
         if classification_mode == 'Classification Level 1' and 'actual_country_name' in df.columns:
@@ -2602,7 +2595,7 @@ def prepare_table_for_display(df, table_type, expanded_countries=None, classific
     
     # Combine all rows
     if filtered_rows:
-        display_df = pd.concat(filtered_rows, ignore_index=True)
+        display_df = safe_concat(filtered_rows, ignore_index=True)
     else:
         display_df = pd.DataFrame()
     
@@ -2811,7 +2804,7 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
             # Add subtotal row for this supply country
             if supply_country_rows:
                 # Calculate subtotal for this supply country
-                supply_total_df = pd.concat(supply_country_rows, ignore_index=True)
+                supply_total_df = safe_concat(supply_country_rows, ignore_index=True)
                 numeric_cols = [col for col in supply_total_df.columns if col not in 
                                ['supply_country', 'demand_country']]
                 
@@ -2824,7 +2817,7 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
     
     # Add Grand Total row (only if not in percentage mode)
     if entity_totals_for_grand and view_type != 'percentage':
-        grand_total_df = pd.concat(entity_totals_for_grand, ignore_index=True)
+        grand_total_df = safe_concat(entity_totals_for_grand, ignore_index=True)
         numeric_cols = [col for col in grand_total_df.columns if col not in 
                        ['supply_classification', 'demand_classification', 'supply_country', 'demand_country']]
         
@@ -2847,7 +2840,7 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
     
     # Combine all rows
     if filtered_rows:
-        display_df = pd.concat(filtered_rows, ignore_index=True)
+        display_df = safe_concat(filtered_rows, ignore_index=True)
     else:
         display_df = pd.DataFrame()
     
@@ -2920,33 +2913,33 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
     return display_df, columns
 
 
-def get_table_conditional_styles():
-    """Get conditional styling for tables"""
-    styles = []
-    
+# Pre-computed conditional styles (computed once at module load)
+TABLE_CONDITIONAL_STYLES = [
     # Alternating row colors (lowest priority)
-    styles.append({
-        'if': {'row_index': 'odd'}, 
+    {
+        'if': {'row_index': 'odd'},
         'backgroundColor': '#f8f9fa'
-    })
-    
+    },
     # Country total rows styling (medium priority)
-    styles.append({
+    {
         'if': {'filter_query': '{Installation} = "Total"'},
         'backgroundColor': TABLE_COLORS['bg_lighter'],
         'fontWeight': 'bold',
         'color': TABLE_COLORS['text_primary']
-    })
-    
+    },
     # Grand Total row styling (highest priority - must be last)
-    styles.append({
+    {
         'if': {'filter_query': '{Country} = "GRAND TOTAL"'},
         'backgroundColor': '#2E86C1',  # McKinsey blue
         'fontWeight': 'bold',
         'color': 'white'
-    })
-    
-    return styles
+    }
+]
+
+
+def get_table_conditional_styles():
+    """Get conditional styling for tables"""
+    return TABLE_CONDITIONAL_STYLES
 
 
 # Dashboard layout
@@ -2954,11 +2947,11 @@ layout = html.Div([
     # Interval component to trigger initial data load (runs once on page load)
     dcc.Interval(id='initial-load-trigger', interval=1000*60*60*24, n_intervals=0, max_intervals=1),
     
-    # Store components for caching data
-    dcc.Store(id='supply-charts-data', storage_type='local'),  # Single store for all supply chart data
-    dcc.Store(id='continent-charts-data', storage_type='local'),  # Store for continent charts data
-    dcc.Store(id='summary-data-store', storage_type='local'),
-    dcc.Store(id='supply-dest-data-store', storage_type='local'),  # Store for supply-destination data
+    # Store components for caching data (memory is faster than local storage)
+    dcc.Store(id='supply-charts-data', storage_type='memory'),  # Single store for all supply chart data
+    dcc.Store(id='continent-charts-data', storage_type='memory'),  # Store for continent charts data
+    dcc.Store(id='summary-data-store', storage_type='memory'),
+    dcc.Store(id='supply-dest-data-store', storage_type='memory'),  # Store for supply-destination data
     
     # Store for expanded state of countries in summary table
     dcc.Store(id='summary-expanded-countries', data=[]),
@@ -2973,11 +2966,18 @@ layout = html.Div([
     # Store for country classification mode
     dcc.Store(id='country-classification-mode', data='Country'),
 
-    # Country Classification Dropdown - Top left
+    # Store for latest upload timestamp
+    dcc.Store(id='latest-upload-timestamp', data=None),
+
+    # Download components for Excel exports
+    dcc.Download(id='download-supply-charts-excel'),
+    dcc.Download(id='download-continent-charts-excel'),
+
+    # Country Classification Dropdown - Top left with timestamp
     html.Div([
         html.Div([
-            html.Label('Country classification:', 
-                      style={'display': 'inline-block', 'marginRight': '10px', 
+            html.Label('Country classification:',
+                      style={'display': 'inline-block', 'marginRight': '10px',
                              'fontWeight': 'bold', 'fontSize': '14px'}),
             dcc.Dropdown(
                 id='country-classification-dropdown',
@@ -2988,7 +2988,10 @@ layout = html.Div([
                 value='Country',
                 style={'width': '250px', 'display': 'inline-block', 'verticalAlign': 'middle'},
                 clearable=False
-            )
+            ),
+            html.Span(id='data-timestamp-display',
+                     style={'display': 'inline-block', 'marginLeft': '20px',
+                            'fontSize': '13px', 'color': '#666', 'fontStyle': 'italic'})
         ], style={'padding': '10px 20px', 'marginBottom': '10px'})
     ]),
 
@@ -2997,7 +3000,23 @@ layout = html.Div([
         # Header matching the style of Installation Trends
         html.Div([
             html.H3('LNG Supply - 30-Day Rolling Average', className="section-title-inline"),
-        ], className="inline-section-header"),
+            html.Button(
+                'Export to Excel',
+                id='export-supply-charts-button',
+                n_clicks=0,
+                style={
+                    'marginLeft': '20px',
+                    'padding': '5px 15px',
+                    'backgroundColor': '#28a745',
+                    'color': 'white',
+                    'border': 'none',
+                    'borderRadius': '4px',
+                    'cursor': 'pointer',
+                    'fontWeight': 'bold',
+                    'fontSize': '12px'
+                }
+            ),
+        ], className="inline-section-header", style={'display': 'flex', 'alignItems': 'center'}),
         # Dynamic charts container - will be populated by callback
         dcc.Loading(
             id="supply-charts-loading",
@@ -3022,7 +3041,23 @@ layout = html.Div([
                 value='absolute',
                 clearable=False,
                 style={'width': '200px', 'display': 'inline-block', 'marginLeft': '20px', 'verticalAlign': 'middle'}
-            )
+            ),
+            html.Button(
+                'Export to Excel',
+                id='export-continent-charts-button',
+                n_clicks=0,
+                style={
+                    'marginLeft': '20px',
+                    'padding': '5px 15px',
+                    'backgroundColor': '#28a745',
+                    'color': 'white',
+                    'border': 'none',
+                    'borderRadius': '4px',
+                    'cursor': 'pointer',
+                    'fontWeight': 'bold',
+                    'fontSize': '12px'
+                }
+            ),
         ], className="inline-section-header", style={'display': 'flex', 'alignItems': 'center'}),
         
         # Dynamic continent charts container - will be populated by callback
@@ -3095,6 +3130,35 @@ layout = html.Div([
 
 # Callback to update the classification mode store
 @callback(
+    Output('latest-upload-timestamp', 'data'),
+    Input('initial-load-trigger', 'n_intervals'),
+    prevent_initial_call=False
+)
+def fetch_latest_timestamp(n_intervals):
+    """Fetch the latest upload timestamp from kpler_trades table"""
+    engine, schema = setup_database_connection()
+    timestamp = get_latest_upload_timestamp(engine, schema)
+    if timestamp:
+        return timestamp.isoformat()
+    return None
+
+@callback(
+    Output('data-timestamp-display', 'children'),
+    Input('latest-upload-timestamp', 'data'),
+    prevent_initial_call=False
+)
+def display_timestamp(timestamp_iso):
+    """Display the latest upload timestamp in a formatted way"""
+    if timestamp_iso:
+        try:
+            timestamp = datetime.fromisoformat(timestamp_iso)
+            formatted_date = timestamp.strftime('%Y-%m-%d %H:%M UTC')
+            return f"Data as of: {formatted_date}"
+        except:
+            return ""
+    return ""
+
+@callback(
     Output('country-classification-mode', 'data'),
     Input('country-classification-dropdown', 'value'),
     prevent_initial_call=False
@@ -3117,22 +3181,22 @@ def refresh_all_data(n_intervals, classification_mode):
     try:
         # Fetch data
         engine_inst, schema = setup_database_connection()
-        
+
         # Default to 'Country' if classification_mode is None
         if classification_mode is None:
             classification_mode = 'Country'
-        
+
         # Dictionary to store all chart data
         charts_data = {}
-        
-        # Always fetch global supply data
+
+        # Fetch global supply data
         global_supply_df = fetch_global_supply_data(engine_inst, schema, classification_mode)
         charts_data['Global'] = global_supply_df.to_dict('records') if not global_supply_df.empty else []
-        
+
         if classification_mode == 'Classification Level 1':
             # Get all classification groups
             classification_groups = get_all_classification_groups(engine_inst, schema)
-            
+
             # Fetch data for each classification group
             for group in classification_groups:
                 group_df = fetch_country_supply_data(engine_inst, schema, group, classification_mode)
@@ -3143,35 +3207,31 @@ def refresh_all_data(n_intervals, classification_mode):
                 "United States", "Australia", "Qatar", "Russian Federation",
                 "Nigeria", "Angola", "Malaysia"
             ]
-            
+
             for country in countries:
                 country_df = fetch_country_supply_data(engine_inst, schema, country, classification_mode)
                 charts_data[country] = country_df.to_dict('records') if not country_df.empty else []
-        
-        # Fetch summary table data (which internally uses fetch_installation_data)
+
+        # Fetch summary table data
         summary_df = fetch_summary_table_data(engine_inst, schema, classification_mode)
-        
+
         # Fetch supply-destination data
         supply_dest_quarters, supply_dest_months, supply_dest_weeks = fetch_supply_destination_data(engine_inst, schema, classification_mode)
-        
+
         # Combine supply-destination data similar to summary table
-        supply_dest_df = fetch_supply_dest_summary_data(engine_inst, schema, classification_mode, 
+        supply_dest_df = fetch_supply_dest_summary_data(engine_inst, schema, classification_mode,
                                                         supply_dest_quarters, supply_dest_months, supply_dest_weeks)
-        
-        # For continent charts, we use the same entities as the supply charts
-        # The actual continent data will be fetched when the charts are created
+
+        # For continent charts, pass the same entity names
         continent_charts_entities = list(charts_data.keys())
-        
+
         return (charts_data,
-                continent_charts_entities,  # Just pass the entity names for continent charts
+                continent_charts_entities,
                 summary_df.to_dict('records') if not summary_df.empty else [],
                 supply_dest_df.to_dict('records') if not supply_dest_df.empty else [])
-                
+
     except Exception as e:
-        print(f"Error loading data: {e}")
-        import traceback
-        traceback.print_exc()
-        return {}, [], []
+        return {}, [], [], []
 
 
 def create_supply_chart(data, title_prefix="", show_legend=True):
@@ -4387,8 +4447,8 @@ def handle_supply_dest_row_expansion(active_cells, table_data_list, expanded_cla
                                     break
                             
         except Exception as e:
-            print(f"Error in supply-dest row expansion: {e}")
-    
+            pass
+
     return expanded_classifications, expanded_countries, expanded_supply_countries
 
 
@@ -4404,12 +4464,12 @@ def update_continent_charts(entities_list, chart_type, classification_mode):
     """Dynamically generate continent charts based on classification mode"""
     if not entities_list:
         return html.Div("No data available", style={'textAlign': 'center', 'padding': '20px'})
-    
-    # Setup database connection
+
+    # Get database connection
     engine_inst, schema = setup_database_connection()
-    
+
     charts = []
-    
+
     # Determine the number of charts and calculate width
     num_charts = len(entities_list)
     if num_charts <= 4:
@@ -4420,15 +4480,15 @@ def update_continent_charts(entities_list, chart_type, classification_mode):
         chart_width = '20%'
     else:
         chart_width = '16.66%'  # 6 columns for many charts
-    
-    # Create chart for each entity (country or classification group)
+
+    # Create chart for each entity
     for entity_name in entities_list:
-        # Create the figure based on chart type
+        # Create the figure using the original chart functions
         if chart_type == 'percentage':
-            fig = create_continent_percentage_chart(entity_name, engine_inst, schema, classification_mode)
+            fig = create_continent_percentage_chart(entity_name, engine_inst, schema, classification_mode or 'Country')
         else:
-            fig = create_continent_destination_chart(entity_name, engine_inst, schema, classification_mode)
-        
+            fig = create_continent_destination_chart(entity_name, engine_inst, schema, classification_mode or 'Country')
+
         # Create chart container
         chart_div = html.Div([
             html.H5(entity_name, style={'textAlign': 'center', 'marginBottom': '10px', 'fontSize': '14px'}),
@@ -4438,9 +4498,9 @@ def update_continent_charts(entities_list, chart_type, classification_mode):
                 style={'height': '350px'}
             )
         ], style={'width': chart_width, 'display': 'inline-block', 'padding': '0 10px', 'marginBottom': '20px'})
-        
+
         charts.append(chart_div)
-    
+
     # Wrap charts in a flex container
     return html.Div(
         charts,
@@ -4477,7 +4537,7 @@ def update_supply_charts(charts_data, classification_mode):
     for idx, (entity_name, entity_data) in enumerate(charts_data.items()):
         # Create the figure
         fig = create_supply_chart(entity_data, entity_name, show_legend=False)
-        
+
         # Create chart container
         chart_div = html.Div([
             html.H5(entity_name, style={'textAlign': 'center', 'marginBottom': '10px', 'fontSize': '14px'}),
@@ -4487,11 +4547,352 @@ def update_supply_charts(charts_data, classification_mode):
                 style={'height': '350px'}
             )
         ], style={'width': chart_width, 'display': 'inline-block', 'padding': '0 10px', 'marginBottom': '20px'})
-        
+
         charts.append(chart_div)
-    
+
     # Wrap charts in a flex container
     return html.Div(
         charts,
         style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'flex-start'}
     )
+
+
+# Export callback for Supply Charts
+@callback(
+    Output('download-supply-charts-excel', 'data'),
+    Input('export-supply-charts-button', 'n_clicks'),
+    State('supply-charts-data', 'data'),
+    State('country-classification-mode', 'data'),
+    prevent_initial_call=True
+)
+def export_supply_charts_to_excel(n_clicks, charts_data, classification_mode):
+    """Export LNG Supply 30-Day Rolling Average data to Excel"""
+    if n_clicks == 0 or not charts_data:
+        return None
+
+    # Convert all entities' data to DataFrames
+    all_data = []
+    for entity_name, entity_data in charts_data.items():
+        if entity_data:
+            df = pd.DataFrame(entity_data)
+            df['entity'] = entity_name
+            all_data.append(df)
+
+    if not all_data:
+        return None
+
+    # Create Excel file with BytesIO
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Combined sheet with all data
+        combined_df = safe_concat(all_data, ignore_index=True)
+        # Reorder columns for better readability
+        cols = ['entity', 'date', 'year', 'month_day', 'rolling_avg', 'is_forecast']
+        cols = [c for c in cols if c in combined_df.columns]
+        combined_df = combined_df[cols]
+        combined_df.to_excel(writer, sheet_name='All Data', index=False)
+
+        # Individual sheets per entity
+        for entity_name, entity_data in charts_data.items():
+            if entity_data:
+                df = pd.DataFrame(entity_data)
+                # Excel sheet name limit is 31 characters
+                sheet_name = entity_name[:31].replace('/', '-').replace('\\', '-')
+                sheet_cols = ['date', 'year', 'month_day', 'rolling_avg', 'is_forecast']
+                sheet_cols = [c for c in sheet_cols if c in df.columns]
+                df = df[sheet_cols]
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # Auto-adjust column widths
+        for sheet_name in writer.sheets:
+            worksheet = writer.sheets[sheet_name]
+            for column in worksheet.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)
+                worksheet.column_dimensions[column_letter].width = adjusted_width
+
+    output.seek(0)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f'LNG_Supply_30D_Rolling_{timestamp}.xlsx'
+
+    return dcc.send_bytes(output.getvalue(), filename)
+
+
+# Export callback for Continent Charts
+@callback(
+    Output('download-continent-charts-excel', 'data'),
+    Input('export-continent-charts-button', 'n_clicks'),
+    State('continent-charts-data', 'data'),
+    State('continent-chart-type', 'value'),
+    State('country-classification-mode', 'data'),
+    prevent_initial_call=True
+)
+def export_continent_charts_to_excel(n_clicks, entities_list, chart_type, classification_mode):
+    """Export LNG Supply by Destination Continent data to Excel"""
+    if n_clicks == 0 or not entities_list:
+        return None
+
+    engine_inst, schema = setup_database_connection()
+
+    all_data = []
+    for entity_name in entities_list:
+        try:
+            # Handle Global case
+            if entity_name == "Global":
+                country_filter = ""
+            elif classification_mode == 'Classification Level 1':
+                country_filter = "AND mc.country_classification_level1 = %(entity_name)s"
+            else:
+                country_filter = "AND kt.origin_country_name = %(entity_name)s"
+
+            # Add join for classification mode
+            join_clause = ""
+            if classification_mode == 'Classification Level 1' and entity_name != "Global":
+                join_clause = f"INNER JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country"
+
+            # Use different query based on chart_type
+            if chart_type == 'percentage':
+                # Query with percentage calculation (matches create_continent_percentage_chart)
+                query = f"""
+                WITH latest_data AS (
+                    SELECT MAX(upload_timestamp_utc) as max_timestamp
+                    FROM {schema}.kpler_trades
+                ),
+                all_continents AS (
+                    SELECT DISTINCT
+                        COALESCE(NULLIF(continent_destination_name, ''), 'Unknown') as continent_destination
+                    FROM {schema}.kpler_trades kt
+                    {join_clause}
+                    , latest_data ld
+                    WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                        {country_filter}
+                        AND kt.start >= '2023-11-01'
+                ),
+                all_dates AS (
+                    SELECT generate_series(
+                        '2023-11-01'::date,
+                        (CURRENT_DATE + INTERVAL '14 days')::date,
+                        '1 day'::interval
+                    )::date as date
+                ),
+                date_continent_matrix AS (
+                    SELECT
+                        d.date,
+                        c.continent_destination
+                    FROM all_dates d
+                    CROSS JOIN all_continents c
+                ),
+                daily_exports_raw AS (
+                    SELECT
+                        kt.start::date as date,
+                        COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
+                        SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
+                    FROM {schema}.kpler_trades kt
+                    {join_clause}
+                    , latest_data ld
+                    WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                        {country_filter}
+                        AND kt.start >= '2023-11-01'
+                        AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+                    GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
+                ),
+                daily_exports_complete AS (
+                    SELECT
+                        dcm.date,
+                        dcm.continent_destination,
+                        COALESCE(der.daily_export_mcmd, 0) as daily_export_mcmd
+                    FROM date_continent_matrix dcm
+                    LEFT JOIN daily_exports_raw der
+                        ON dcm.date = der.date
+                        AND dcm.continent_destination = der.continent_destination
+                ),
+                rolling_continents AS (
+                    SELECT
+                        date,
+                        continent_destination,
+                        daily_export_mcmd,
+                        AVG(daily_export_mcmd) OVER (
+                            PARTITION BY continent_destination
+                            ORDER BY date
+                            ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                        ) as rolling_avg_30d,
+                        CASE
+                            WHEN date > CURRENT_DATE THEN true
+                            ELSE false
+                        END as is_forecast
+                    FROM daily_exports_complete
+                ),
+                rolling_totals AS (
+                    SELECT
+                        date,
+                        SUM(rolling_avg_30d) as total_rolling_avg_30d
+                    FROM rolling_continents
+                    GROUP BY date
+                )
+                SELECT
+                    rc.date,
+                    rc.continent_destination,
+                    EXTRACT(YEAR FROM rc.date) as year,
+                    EXTRACT(DOY FROM rc.date) as day_of_year,
+                    TO_CHAR(rc.date, 'Mon DD') as month_day,
+                    rc.rolling_avg_30d as rolling_avg,
+                    CASE
+                        WHEN rt.total_rolling_avg_30d > 0
+                        THEN (rc.rolling_avg_30d / rt.total_rolling_avg_30d) * 100
+                        ELSE 0
+                    END as percentage,
+                    rc.is_forecast
+                FROM rolling_continents rc
+                JOIN rolling_totals rt ON rc.date = rt.date
+                WHERE rc.date >= '2024-01-01'
+                ORDER BY rc.continent_destination, rc.date
+                """
+            else:
+                # Query for absolute values (original query)
+                query = f"""
+                WITH latest_data AS (
+                    SELECT MAX(upload_timestamp_utc) as max_timestamp
+                    FROM {schema}.kpler_trades
+                ),
+                all_continents AS (
+                    SELECT DISTINCT
+                        COALESCE(NULLIF(continent_destination_name, ''), 'Unknown') as continent_destination
+                    FROM {schema}.kpler_trades kt
+                    {join_clause}
+                    , latest_data ld
+                    WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                        {country_filter}
+                        AND kt.start >= '2023-11-01'
+                ),
+                all_dates AS (
+                    SELECT generate_series(
+                        '2023-11-01'::date,
+                        (CURRENT_DATE + INTERVAL '14 days')::date,
+                        '1 day'::interval
+                    )::date as date
+                ),
+                date_continent_matrix AS (
+                    SELECT
+                        d.date,
+                        c.continent_destination
+                    FROM all_dates d
+                    CROSS JOIN all_continents c
+                ),
+                daily_exports_raw AS (
+                    SELECT
+                        kt.start::date as date,
+                        COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
+                        SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
+                    FROM {schema}.kpler_trades kt
+                    {join_clause}
+                    , latest_data ld
+                    WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                        {country_filter}
+                        AND kt.start >= '2023-11-01'
+                        AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+                    GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
+                ),
+                daily_exports_complete AS (
+                    SELECT
+                        m.date,
+                        m.continent_destination,
+                        COALESCE(e.daily_export_mcmd, 0) as daily_export_mcmd
+                    FROM date_continent_matrix m
+                    LEFT JOIN daily_exports_raw e
+                        ON m.date = e.date AND m.continent_destination = e.continent_destination
+                ),
+                rolling_exports AS (
+                    SELECT
+                        date,
+                        continent_destination,
+                        daily_export_mcmd,
+                        AVG(daily_export_mcmd) OVER (
+                            PARTITION BY continent_destination
+                            ORDER BY date
+                            ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                        ) as rolling_avg_30d,
+                        CASE
+                            WHEN date > CURRENT_DATE THEN true
+                            ELSE false
+                        END as is_forecast
+                    FROM daily_exports_complete
+                )
+                SELECT
+                    date,
+                    continent_destination,
+                    EXTRACT(YEAR FROM date) as year,
+                    EXTRACT(DOY FROM date) as day_of_year,
+                    TO_CHAR(date, 'Mon DD') as month_day,
+                    rolling_avg_30d as rolling_avg,
+                    is_forecast
+                FROM rolling_exports
+                WHERE date >= '2024-01-01'
+                ORDER BY continent_destination, date
+                """
+
+            params = {} if entity_name == "Global" else {'entity_name': entity_name}
+            df = pd.read_sql(query, engine_inst, params=params)
+
+            if not df.empty:
+                df['entity'] = entity_name
+                all_data.append(df)
+
+        except Exception as e:
+            continue
+
+    if not all_data:
+        return None
+
+    # Create Excel file with BytesIO
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Combined sheet with all data
+        combined_df = safe_concat(all_data, ignore_index=True)
+        # Use different columns based on chart_type
+        if chart_type == 'percentage':
+            cols = ['entity', 'date', 'continent_destination', 'year', 'month_day', 'percentage', 'is_forecast']
+        else:
+            cols = ['entity', 'date', 'continent_destination', 'year', 'month_day', 'rolling_avg', 'is_forecast']
+        cols = [c for c in cols if c in combined_df.columns]
+        combined_df = combined_df[cols]
+        combined_df.to_excel(writer, sheet_name='All Data', index=False)
+
+        # Individual sheets per entity
+        for entity_df in all_data:
+            entity_name = entity_df['entity'].iloc[0]
+            sheet_name = entity_name[:31].replace('/', '-').replace('\\', '-')
+            if chart_type == 'percentage':
+                sheet_cols = ['date', 'continent_destination', 'year', 'month_day', 'percentage', 'is_forecast']
+            else:
+                sheet_cols = ['date', 'continent_destination', 'year', 'month_day', 'rolling_avg', 'is_forecast']
+            sheet_cols = [c for c in sheet_cols if c in entity_df.columns]
+            entity_df[sheet_cols].to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # Auto-adjust column widths
+        for sheet_name in writer.sheets:
+            worksheet = writer.sheets[sheet_name]
+            for column in worksheet.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)
+                worksheet.column_dimensions[column_letter].width = adjusted_width
+
+    output.seek(0)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    chart_type_label = 'Absolute' if chart_type == 'absolute' else 'Percentage'
+    filename = f'LNG_Supply_by_Continent_{chart_type_label}_{timestamp}.xlsx'
+
+    return dcc.send_bytes(output.getvalue(), filename)

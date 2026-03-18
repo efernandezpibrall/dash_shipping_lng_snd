@@ -8,13 +8,16 @@ import pandas as pd
 import numpy as np
 import datetime as dt
 import json
-from io import StringIO
+import copy
+import plotly.io as pio
+from io import StringIO, BytesIO
 from dash.exceptions import PreventUpdate
 import configparser
 import os
 from sqlalchemy import create_engine
 
 from fundamentals.kpler_fundamentals import *
+from fundamentals.shipping_balance_calculator import global_shipping_balance as calc_global_shipping_balance, kpler_analysis
 
 ############################################ postgres sql connection ###################################################
 #------ code to be able to access config.ini, even having the path in the .virtualenvs is not working without it ------#
@@ -78,8 +81,16 @@ def prepare_table_data(df, metric, selected_regions=None, selected_year=None, se
 
     # Apply filters specific to trade region or intracountry
     if is_intracountry:
+        # Check if origin_country_name exists
+        if 'origin_country_name' not in filtered_df.columns:
+            # Return empty DataFrame if column doesn't exist
+            return pd.DataFrame({'Error': ['origin_country_name column not found in data']})
         index_field = 'origin_country_name'
     else:
+        # Check if required columns exist
+        if 'origin_shipping_region' not in filtered_df.columns or 'destination_shipping_region' not in filtered_df.columns:
+            # Return empty DataFrame if columns don't exist
+            return pd.DataFrame({'Error': ['Required shipping region columns not found in data']})
         # Create a new column combining origin and destination regions
         filtered_df['region_pair'] = filtered_df['origin_shipping_region'] + ' → ' + filtered_df[
             'destination_shipping_region']
@@ -93,6 +104,10 @@ def prepare_table_data(df, metric, selected_regions=None, selected_year=None, se
     if selected_statuses and 'All Statuses' not in selected_statuses:
         filtered_df = filtered_df[filtered_df['status'].isin(selected_statuses)]
 
+    # Check if data is empty after filtering
+    if filtered_df.empty:
+        return pd.DataFrame({index_field: ['No data'], 'Total': [0]})
+
     # Determine aggregation method based on metric type
     if metric.startswith('median_'):
         agg_method = 'median'
@@ -103,49 +118,33 @@ def prepare_table_data(df, metric, selected_regions=None, selected_year=None, se
     else:
         # Default to mean for other metrics that might be averages
         agg_method = 'mean'
-    
-    # Aggregate the data
-    agg_data = filtered_df.groupby([index_field, 'vessel_type'])[metric].agg(agg_method).reset_index()
 
-    # Pivot the data for the table - vessel types as columns
-    pivot_table = agg_data.pivot_table(
-        index=[index_field],
-        columns='vessel_type',
-        values=metric,
-        aggfunc=agg_method,
-        fill_value=0
-    ).reset_index()
+    # Aggregate the data (vessel_type removed)
+    agg_data = filtered_df.groupby([index_field])[metric].agg(agg_method).reset_index()
 
-    # Add a Total column
-    vessel_cols = [col for col in pivot_table.columns if col != index_field]
-    
-    if agg_method in ['median', 'mean']:
-        # For median/mean metrics, calculate overall median/mean across vessel types
-        pivot_table['Total'] = pivot_table[vessel_cols].mean(axis=1)
-    else:
-        # For sum metrics, sum across vessel types
-        pivot_table['Total'] = pivot_table[vessel_cols].sum(axis=1)
+    # Create simplified table without vessel type pivoting
+    pivot_table = agg_data.copy()
+
+    # Rename metric column to Total for consistency
+    pivot_table = pivot_table.rename(columns={metric: 'Total'})
 
     # Format numeric values based on metric type
     if metric == 'count_trades':
         # Integer formatting for count data
-        for col in vessel_cols + ['Total']:
-            pivot_table[col] = pivot_table[col].astype(int)
+        pivot_table['Total'] = pivot_table['Total'].astype(int)
     elif agg_method in ['median', 'mean']:
         # Round to 2 decimal places for median/mean metrics
-        for col in vessel_cols + ['Total']:
-            pivot_table[col] = pivot_table[col].round(2)
+        pivot_table['Total'] = pivot_table['Total'].round(2)
 
     # Add a Total row
     total_row = {index_field: 'Total'}
-    for col in vessel_cols + ['Total']:
-        if agg_method in ['median', 'mean']:
-            # For median/mean metrics, calculate overall median/mean across regions
-            value = pivot_table[pivot_table[index_field] != 'Total'][col].median() if agg_method == 'median' else pivot_table[pivot_table[index_field] != 'Total'][col].mean()
-            total_row[col] = round(value, 2) if not pd.isna(value) else 0
-        else:
-            # For sum metrics, sum across regions
-            total_row[col] = int(pivot_table[col].sum()) if metric == 'count_trades' else pivot_table[col].sum()
+    if agg_method in ['median', 'mean']:
+        # For median/mean metrics, calculate overall median/mean across regions
+        value = pivot_table[pivot_table[index_field] != 'Total']['Total'].median() if agg_method == 'median' else pivot_table[pivot_table[index_field] != 'Total']['Total'].mean()
+        total_row['Total'] = round(value, 2) if not pd.isna(value) else 0
+    else:
+        # For sum metrics, sum across regions
+        total_row['Total'] = int(pivot_table['Total'].sum()) if metric == 'count_trades' else pivot_table['Total'].sum()
     pivot_table = pd.concat([pivot_table, pd.DataFrame([total_row])], ignore_index=True)
 
     # Sort by Total value in descending order (except Total row)
@@ -161,7 +160,7 @@ def prepare_table_data(df, metric, selected_regions=None, selected_year=None, se
 
 def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, is_intracountry=False):
     """
-    Create a Plotly visualization showing data by year, vessel type, and shipping regions/countries.
+    Create a Plotly visualization showing data by year and shipping regions/countries.
     Args:
         df: DataFrame with trade data
         metric: The column name to sum and visualize
@@ -189,23 +188,44 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
 
     # Set grouping field based on data type
     if is_intracountry:
+        # Check if origin_country_name exists
+        if 'origin_country_name' not in filtered_df.columns:
+            # Return empty figure if column doesn't exist
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No intracountry data available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16)
+            )
+            return fig
         group_field = 'origin_country_name'
-        chart_title = f'Intracountry {title_suffix} by Year, Vessel Type, and Origin Country (2019+)'
+        chart_title = f'Intracountry {title_suffix} by Year and Origin Country (2019+)'
         legend_title = 'Origin Country'
     else:
+        # Check if required columns exist
+        if 'origin_shipping_region' not in filtered_df.columns or 'destination_shipping_region' not in filtered_df.columns:
+            # Return empty figure if columns don't exist
+            fig = go.Figure()
+            fig.add_annotation(
+                text="Required shipping region data not available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16)
+            )
+            return fig
         # Create a new column combining origin and destination regions
         filtered_df['region_pair'] = filtered_df['origin_shipping_region'] + ' → ' + filtered_df[
             'destination_shipping_region']
         group_field = 'region_pair'
-        chart_title = f'{title_suffix} by Year, Vessel Type, and Shipping Regions (2019+)'
+        chart_title = f'{title_suffix} by Year and Shipping Regions (2019+)'
         legend_title = 'Shipping Regions (Origin → Destination)'
 
-    # Aggregate the filtered data
-    stacked_data = filtered_df.groupby(['year', 'vessel_type', group_field])[metric].sum().reset_index()
+    # Aggregate the filtered data (vessel_type removed)
+    stacked_data = filtered_df.groupby(['year', group_field])[metric].sum().reset_index()
 
     # Get unique values
     years = sorted(stacked_data['year'].unique())
-    vessel_types = sorted(stacked_data['vessel_type'].unique())
     group_values = sorted(stacked_data[group_field].unique())
 
     # Create figure
@@ -214,108 +234,54 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
     # Create a dictionary to keep track of the legend items added
     legend_items = set()
 
-    # Calculate position for each year-vessel combination
-    group_width = 0.8  # Width for all bars in a year-vessel group
-    year_spacing = 0.2  # Space between different years
-    bar_width = group_width / len(vessel_types)
-
-    # Calculate positions for the x-axis
-    x_positions = {}
-    for y_idx, year in enumerate(years):
-        for v_idx, vessel in enumerate(vessel_types):
-            x_pos = y_idx * (1 + year_spacing) + v_idx * bar_width
-            x_positions[(year, vessel)] = x_pos
+    # Calculate position for each year
+    bar_width = 0.8
+    year_spacing = 0.2
 
     # Create a dictionary to store the cumulative stack values
-    stack_values = {(year, vessel): 0 for year in years for vessel in vessel_types}
+    stack_values = {year: 0 for year in years}
 
     # Create the stacked bars
     for i, group_value in enumerate(group_values):
         color = distinct_colors[i % len(distinct_colors)]
 
-        for year in years:
-            for vessel in vessel_types:
-                # Filter data for this combination
-                data = stacked_data[(stacked_data['year'] == year) &
-                                    (stacked_data['vessel_type'] == vessel) &
-                                    (stacked_data[group_field] == group_value)]
+        for y_idx, year in enumerate(years):
+            # Filter data for this combination
+            data = stacked_data[(stacked_data['year'] == year) &
+                                (stacked_data[group_field] == group_value)]
 
-                if not data.empty:
-                    value = data[metric].values[0]
-                    x_pos = x_positions[(year, vessel)]
+            if not data.empty:
+                value = data[metric].values[0]
+                x_pos = y_idx * (1 + year_spacing)
 
-                    # Add a trace for this segment of the stacked bar
-                    showlegend = group_value not in legend_items
-                    if showlegend:
-                        legend_items.add(group_value)
+                # Add a trace for this segment of the stacked bar
+                showlegend = group_value not in legend_items
+                if showlegend:
+                    legend_items.add(group_value)
 
-                    fig.add_trace(go.Bar(
-                        x=[x_pos],
-                        y=[value],
-                        name=group_value,
-                        marker_color=color,
-                        showlegend=showlegend,
-                        base=stack_values[(year, vessel)],
-                        width=bar_width * 0.95,  # Make bars slightly narrower than the allocated space
-                        hovertemplate='%{y:,.0f}<extra></extra>'  # Show only y-value in hover
-                    ))
+                fig.add_trace(go.Bar(
+                    x=[x_pos],
+                    y=[value],
+                    name=group_value,
+                    marker_color=color,
+                    showlegend=showlegend,
+                    base=stack_values[year],
+                    width=bar_width,
+                    hovertemplate='%{y:,.0f}<extra></extra>'  # Show only y-value in hover
+                ))
 
-                    # Update the stack value for the next segment
-                    stack_values[(year, vessel)] += value
+                # Update the stack value for the next segment
+                stack_values[year] += value
 
     # Create custom x-axis ticks and labels
     x_ticks = []
     x_labels = []
 
-    # Add year labels at the center of each year group
+    # Add year labels
     for y_idx, year in enumerate(years):
-        year_center = y_idx * (1 + year_spacing) + (len(vessel_types) * bar_width) / 2 - bar_width / 2
-        x_ticks.append(year_center)
+        x_pos = y_idx * (1 + year_spacing)
+        x_ticks.append(x_pos)
         x_labels.append(str(year))
-
-    # Add vessel type abbreviations below each bar
-    vessel_annotations = []
-    for y_idx, year in enumerate(years):
-        for v_idx, vessel in enumerate(vessel_types):
-            x_pos = x_positions[(year, vessel)]
-
-            # Extract first 2 letters of vessel type for the annotation
-            vessel_abbr = vessel[:2] if len(vessel) >= 2 else vessel
-
-            vessel_annotations.append(
-                dict(
-                    x=x_pos,
-                    y=0,
-                    text=vessel_abbr,
-                    showarrow=False,
-                    xanchor='center',
-                    yanchor='top',
-                    yshift=-20,  # Position below x-axis
-                    font=dict(size=8, color='#6b7280'),  # Small, subtle text
-                    textangle=0,  # Keep horizontal for readability
-                    xref='x',
-                    yref='y'
-                )
-            )
-
-    # Add a table-like annotation for vessel type abbreviations
-    vessel_abbrs = [vessel[:2] if len(vessel) >= 2 else vessel for vessel in vessel_types]
-    vessel_info = '<br>'.join([f"{abbr}: {full}" for abbr, full in zip(vessel_abbrs, vessel_types)])
-    vessel_legend = dict(
-        x=0.01,
-        y=0,
-        text=f"<b>Vessel Types:</b><br>{vessel_info}",
-        showarrow=False,
-        xanchor='left',
-        yanchor='bottom',
-        bordercolor='black',
-        borderwidth=1,
-        bgcolor='white',
-        font=dict(size=10),
-        xshift=10,
-        yshift=10,
-        align='left'
-    )
 
     # Update layout with professional styling from dash_style.md
     fig.update_layout(
@@ -328,7 +294,7 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
             xanchor='center',
             pad=dict(b=20)
         ),
-        
+
         # X-Axis Professional Styling
         xaxis=dict(
             title=dict(text='Year', font=dict(size=13, color='#4A4A4A')),
@@ -343,7 +309,7 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
             linewidth=1,
             tickfont=dict(size=11, color='#666666')
         ),
-        
+
         # Y-Axis Professional Styling
         yaxis=dict(
             title=dict(text=title_suffix, font=dict(size=13, color='#4A4A4A')),
@@ -357,9 +323,9 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
             zerolinecolor='rgba(150, 150, 150, 0.4)',
             zerolinewidth=1
         ),
-        
+
         barmode='stack',
-        
+
         # Professional Legend Positioning (horizontal below chart as per dash_style.md)
         legend=dict(
             orientation='h',  # Horizontal layout
@@ -375,15 +341,13 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
             itemsizing='constant',
             itemwidth=30
         ),
-        
-        annotations=vessel_annotations,
-        
+
         # Professional Background and Margins (following dash_style.md standards)
         plot_bgcolor='rgba(248, 249, 250, 0.5)',  # Subtle background
         paper_bgcolor='white',
         height=600,  # Standard height as per dash_style.md
-        margin=dict(l=70, r=70, t=80, b=180),  # Professional margins with extra bottom for legend
-        
+        margin=dict(l=70, r=70, t=80, b=120),  # Professional margins with extra bottom for legend
+
         # Enhanced Interactivity
         hovermode='x unified',
         hoverlabel=dict(
@@ -392,479 +356,28 @@ def create_stacked_bar_chart(df, metric, title_suffix, selected_statuses=None, i
             font=dict(size=11, color='#2C3E50'),
             align='left'
         ),
-        
+
         # Smooth Animations
         transition=dict(duration=300, easing='cubic-in-out'),
         autosize=True
     )
-    
-    # Create vessel types footnote information
-    vessel_abbrs = [vessel[:2] if len(vessel) >= 2 else vessel for vessel in vessel_types]
-    vessel_footnote = ' | '.join([f"{abbr}: {full}" for abbr, full in zip(vessel_abbrs, vessel_types)])
-    
-    return fig, vessel_footnote
+
+    return fig
 
 
-def global_shipping_balance(aggregation_level='monthly', life_expectancy=20, lng_view='demand', utilization_rate=0.85):
+def global_shipping_balance(aggregation_level='monthly', life_expectancy=20, lng_view='demand', utilization_rate=0.85, window_end_date=None):
     """
-        aggregation_level (str): Time aggregation level. Options:
-            'monthly' - Year+Month (default)
-            'quarterly' - Year+Quarter
-            'seasonal' - Year+Season
-            'yearly' - Year only
+    Wrapper function that calls the refactored global_shipping_balance from fundamentals.
+    Maintains backward compatibility for existing code.
     """
-    # ------------ step 1: read demand from Woodmack, using net imports which is conservative compared to gross imports ----#
-    # Optimized single query with all transformations in SQL
-    direction_mapping = {
-        'demand': 'Import',
-        'supply': 'Export'
-    }
-    
-    if lng_view not in direction_mapping:
-        raise ValueError(f"Invalid lng_view: {lng_view}. Must be 'demand' or 'supply'")
-    
-    direction = direction_mapping[lng_view]
-    
-    wm_query = '''
-    WITH latest_short_term AS (
-        SELECT 
-            country_name,
-            start_date::DATE as start_date,
-            SUM(metric_value) / 12 * 1000 * 2222 AS value,
-            publication_date,
-            'Short Term' as source
-        FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
-        WHERE publication_date = (
-            SELECT MAX(publication_date) 
-            FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa 
-            WHERE release_type = 'Short Term Outlook'
-        )
-        AND release_type = 'Short Term Outlook'
-        AND direction = %(direction)s
-        AND metric_name = 'Flow'
-        AND start_date<'2036-01-01'
-        GROUP BY country_name, start_date, publication_date
-        HAVING SUM(metric_value) > 0
-    ),
-    short_term_max_date AS (
-        SELECT MAX(start_date) as max_date
-        FROM latest_short_term
-    ),
-    latest_long_term AS (
-        SELECT 
-            country_name,
-            start_date::DATE as start_date,
-            SUM(metric_value) / 12 * 1000 * 2222 AS value,
-            publication_date,
-            'Long Term' as source
-        FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
-        WHERE publication_date = (
-            SELECT MAX(publication_date) 
-            FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa 
-            WHERE release_type = 'Long Term Outlook'
-        )
-        AND release_type = 'Long Term Outlook'
-        AND direction = %(direction)s
-        AND metric_name = 'Flow'
-        AND start_date::DATE > (SELECT max_date FROM short_term_max_date)
-        AND start_date<'2036-01-01'
-        GROUP BY country_name, start_date, publication_date
-        HAVING SUM(metric_value) > 0
-    ),
-    combined_data AS (
-        SELECT * FROM latest_short_term
-        UNION ALL
-        SELECT * FROM latest_long_term
-    ),
-    enriched_data AS (
-        SELECT 
-            country_name AS "Country",
-            start_date AS "Date",
-            value,
-            source,
-            CASE 
-                WHEN EXTRACT(MONTH FROM start_date) IN (10, 11, 12, 1, 2, 3) THEN 'W'
-                ELSE 'S'
-            END AS season,
-            'Q' || EXTRACT(QUARTER FROM start_date)::TEXT AS quarter,
-            EXTRACT(YEAR FROM start_date)::INTEGER AS year
-        FROM combined_data
+    return calc_global_shipping_balance(
+        engine=engine,
+        aggregation_level=aggregation_level,
+        life_expectancy=life_expectancy,
+        lng_view=lng_view,
+        utilization_rate=utilization_rate,
+        window_end_date=window_end_date
     )
-    SELECT 
-        ed."Country",
-        ed."Date",
-        ed.value,
-        ed.season,
-        ed.quarter,
-        ed.year,
-        ed.source,
-        mc.shipping_region
-    FROM enriched_data ed
-    LEFT JOIN at_lng.mappings_country mc 
-        ON ed."Country" = mc.country
-    ORDER BY ed."Country", ed."Date"
-    '''
-    
-    try:
-        # Secure parameterized query execution
-        wm_net_imports_mcm = pd.read_sql(wm_query, engine, params={'direction': direction},parse_dates='Date')
-         
-    except Exception as e:
-        print(f"Error fetching WoodMac data: {str(e)}")
-        # Return empty DataFrame on error to allow continuation
-        wm_net_imports_mcm = pd.DataFrame()
-
-    # ------------ step 2: kpler metrics by country --------------------------------------------#
-    query_max_hist_date = '''
-        select max("end") as hist_date_max
-        from at_lng.kpler_trades
-        where status='Delivered'
-        and upload_timestamp_utc = (select max(upload_timestamp_utc) from at_lng.kpler_trades)
-    '''
-    hist_date_max = pd.read_sql(query_max_hist_date, engine)
-    hist_date_max = pd.to_datetime(hist_date_max.hist_date_max.dt.date[0]).replace(day=1)
-
-    _, df_trades_shipping_region = kpler_analysis(engine)
-
-    # Define weighted mean function
-    wm = lambda x, df, weight_col: np.round(np.average(x, weights=df.loc[x.index, weight_col]), 1)
-
-    # Calculate metrics for current year (2024+)
-    recent_df_laden = df_trades_shipping_region[(df_trades_shipping_region.status == 'laden') &
-                                                (df_trades_shipping_region.year >= 2024)]
-    recent_df_nonladen = df_trades_shipping_region[(df_trades_shipping_region.status == 'non_laden') &
-                                                   (df_trades_shipping_region.year >= 2024)]
-
-    # Calculate weighted metrics
-    mean_shipping_days_laden = recent_df_laden.groupby(['destination_shipping_region', 'season', 'quarter']).agg(
-        {'mean_delivery_days': lambda x: wm(x, recent_df_laden, "count_trades")}
-    ).reset_index().rename(columns={'mean_delivery_days': 'mean_laden_days'})
-
-    mean_shipping_days_nonladen = recent_df_nonladen.groupby(['origin_shipping_region', 'season', 'quarter']).agg(
-        {'mean_delivery_days': lambda x: wm(x, recent_df_nonladen, "count_trades")}
-    ).reset_index().rename(columns={'mean_delivery_days': 'mean_nonladen_days'})
-
-    median_cargo_volumes = recent_df_laden.groupby(['destination_shipping_region', 'season', 'quarter']).agg(
-        {'median_cargo_destination_cubic_meters': lambda x: wm(x, recent_df_laden, "count_trades")}
-    ).reset_index()
-
-    # Calculate metrics for all years
-    # Generate calculations by year for historical data
-    metrics_by_year = []
-    for status, dest_field, field_name in [
-        ('laden', 'destination_shipping_region', 'mean_laden_days'),
-        ('non_laden', 'origin_shipping_region', 'mean_nonladen_days')
-    ]:
-        df_filtered = df_trades_shipping_region[df_trades_shipping_region.status == status]
-        metric_calc = df_filtered.groupby([dest_field, 'season', 'year', 'quarter']).agg(
-            {'mean_delivery_days': lambda x: wm(x, df_filtered, "count_trades")}
-        ).reset_index()
-        metric_calc = metric_calc.rename(columns={
-            'mean_delivery_days': field_name,
-            dest_field: 'shipping_region'
-        })
-        metrics_by_year.append(metric_calc)
-
-    # Calculate cargo volumes by year
-    cargo_volumes_by_year = df_trades_shipping_region[df_trades_shipping_region.status == 'laden'].groupby(
-        ['destination_shipping_region', 'season', 'year', 'quarter']
-    ).agg(
-        {'median_cargo_destination_cubic_meters': lambda x: wm(x, df_trades_shipping_region[
-            df_trades_shipping_region.status == 'laden'], "count_trades")}
-    ).reset_index().rename(columns={'destination_shipping_region': 'shipping_region'})
-
-    # Split data into historical and future
-    wm_net_imports_mcm_hist = wm_net_imports_mcm[wm_net_imports_mcm.Date < hist_date_max]
-    wm_net_imports_mcm_fut = wm_net_imports_mcm[wm_net_imports_mcm.Date >= hist_date_max]
-
-    # Process historical data
-    df_shipping_country_hist = wm_net_imports_mcm_hist.copy()
-    for metric_df in metrics_by_year + [cargo_volumes_by_year]:
-        df_shipping_country_hist = pd.merge(
-            df_shipping_country_hist,
-            metric_df,
-            how='left',
-            on=['shipping_region', 'season', 'year', 'quarter']
-        )
-
-    # Calculate ships demand for historical data
-    df_shipping_country_hist['ships_demand'] = np.round(
-        (df_shipping_country_hist['value'] / df_shipping_country_hist['median_cargo_destination_cubic_meters']) *
-        (df_shipping_country_hist['mean_laden_days'] + df_shipping_country_hist['mean_nonladen_days']) /
-        df_shipping_country_hist['Date'].dt.days_in_month, 1
-    )
-
-    df_shipping_country_hist = df_shipping_country_hist.dropna()
-
-    # Calculate weighted aggregates for historical data
-    wm_value = lambda x: np.round(np.average(x, weights=df_shipping_country_hist.loc[x.index, "value"]), 1)
-
-    df_shipping_demand_hist = df_shipping_country_hist.groupby('Date').agg({
-        'ships_demand': 'sum',
-        'value': 'sum',
-        'median_cargo_destination_cubic_meters': wm_value,
-        'mean_laden_days': wm_value,
-        'mean_nonladen_days': wm_value
-    }).reset_index()
-
-    # Process future data - similar structure as historical
-    df_shipping_country_fut = pd.merge(
-        wm_net_imports_mcm_fut,
-        mean_shipping_days_laden.rename(columns={'destination_shipping_region': 'shipping_region'}),
-        how='left',
-        on=['shipping_region', 'season', 'quarter']
-    )
-
-    df_shipping_country_fut = pd.merge(
-        df_shipping_country_fut,
-        mean_shipping_days_nonladen.rename(columns={'origin_shipping_region': 'shipping_region'}),
-        how='left',
-        on=['shipping_region', 'season', 'quarter']
-    )
-
-    df_shipping_country_fut = pd.merge(
-        df_shipping_country_fut,
-        median_cargo_volumes.rename(columns={'destination_shipping_region': 'shipping_region'}),
-        how='left',
-        on=['shipping_region', 'season', 'quarter']
-    )
-
-    # Calculate ships demand for future data
-    df_shipping_country_fut['ships_demand'] = np.round(
-        (df_shipping_country_fut['value'] / df_shipping_country_fut['median_cargo_destination_cubic_meters']) *
-        (df_shipping_country_fut['mean_laden_days'] + df_shipping_country_fut['mean_nonladen_days']) /
-        df_shipping_country_fut['Date'].dt.days_in_month, 1
-    )
-
-    df_shipping_country_fut = df_shipping_country_fut.dropna()
-
-    # Calculate weighted aggregates for future data
-    wm_value = lambda x: np.round(np.average(x, weights=df_shipping_country_fut.loc[x.index, "value"]), 1)
-
-    df_shipping_demand_fut = df_shipping_country_fut.groupby('Date').agg({
-        'ships_demand': 'sum',
-        'value': 'sum',
-        'median_cargo_destination_cubic_meters': wm_value,
-        'mean_laden_days': wm_value,
-        'mean_nonladen_days': wm_value
-    }).reset_index()
-
-    # Combine historical and future data
-    df_shipping_demand = pd.concat([df_shipping_demand_fut, df_shipping_demand_hist])
-
-    # ------------ step 3: Import from syy new ships coming online -------------------------------------------------#
-    # Get vessel data
-    query_syy = '''
-        select distinct "Name" as vessel_name,
-            'In construction' as vessel_status,
-            extract('year' from "Delivery") as vessel_build_year,
-            "Delivery" as vessel_delivery_date,
-            "Capacity" as vessel_capacity_cubic_meters,
-            upload_timestamp_utc
-        from at_lng.syy_newbuilds
-        where upload_timestamp_utc = (select max(upload_timestamp_utc) from at_lng.syy_newbuilds)
-    '''
-    df_syy = pd.read_sql(query_syy, engine)
-    
-    query_kpler = '''
-        select *
-        from at_lng.kpler_vessels_info
-        where (vessel_status ='Active' or (vessel_status ='Inactive' and last_port_call_end is not null))
-            and vessel_build_year is not null
-            and is_floating_storage=FALSE
-            and upload_timestamp_utc = (select max(upload_timestamp_utc) from at_lng.kpler_vessels_info)
-    '''
-    df_kpler = pd.read_sql(query_kpler, engine)
-    df_kpler['vessel_delivery_date'] = df_kpler.apply(lambda v: dt.datetime(int(v.vessel_build_year), 6, 1), axis=1)
-
-    # Combine vessel data
-    vessels_df = pd.concat([df_kpler, df_syy])
-
-    # Calculate retirement dates
-    vessels_df['theorical_retirement_date'] = pd.to_datetime(vessels_df.vessel_build_year + life_expectancy, format='%Y')
-    vessels_df.loc[
-        vessels_df.theorical_retirement_date < dt.datetime(2025, 2, 1), 'theorical_retirement_date'] = dt.datetime(2025,
-                                                                                                                   2, 1)
-
-    # Distribute retirement dates to avoid all vessels retiring at once  
-    # Group and process each group separately to distribute retirement dates
-    grouped = vessels_df.groupby('theorical_retirement_date', group_keys=False)
-    dfs = []
-    for retirement_date, group in grouped:
-        n = len(group)
-        months = np.linspace(0, 11, n, dtype=int)
-        group = group.copy()
-        group['theorical_retirement_date'] = [retirement_date + pd.DateOffset(months=int(m)) for m in months]
-        dfs.append(group)
-    
-    # Combine all groups back together
-    vessels_df = pd.concat(dfs, ignore_index=True) if dfs else vessels_df
-
-    # Ensure timezone consistency before comparison
-    # Handle mixed timezone-aware/naive timestamps in upload_timestamp_utc
-    vessels_df['upload_timestamp_utc'] = pd.to_datetime(vessels_df['upload_timestamp_utc'], utc=True).dt.tz_localize(None)
-    vessels_df['theorical_retirement_date'] = pd.to_datetime(vessels_df['theorical_retirement_date']).dt.tz_localize(None)
-    
-    # Calculate final retirement date
-    vessels_df['retirement_date'] = np.where(
-        vessels_df['vessel_status'] != 'Inactive',
-        vessels_df[['upload_timestamp_utc', 'theorical_retirement_date']].max(axis=1),
-        vessels_df['last_port_call_end']
-    )
-
-    # Normalize dates to first day of month
-    vessels_df['retirement_date'] = vessels_df['retirement_date'].dt.to_period('M').dt.to_timestamp()
-    vessels_df['vessel_delivery_date'] = vessels_df['vessel_delivery_date'].dt.to_period('M').dt.to_timestamp()
-
-    # Calculate vessel statistics by month
-    results = []
-    for date_i in pd.date_range(start='1/1/2000', end='1/1/2040', freq='MS'):
-        # Ships active previously and not removed in the month
-        ships_before_month = vessels_df[(vessels_df['vessel_delivery_date'] < date_i) &
-                                        (vessels_df['retirement_date'] > date_i)]
-
-        # Ships delivered in the month
-        ships_during_month = vessels_df[(vessels_df['vessel_delivery_date'] == date_i)]
-
-        # Ships removed in the month
-        ships_removed_during_month = vessels_df[(vessels_df['retirement_date'] == date_i)]
-
-        # Calculate statistics
-        total_active_ships = len(ships_before_month) + len(ships_during_month)
-
-        if total_active_ships > 0:
-            avg_ship_size = ((ships_before_month['vessel_capacity_cubic_meters'].sum() +
-                              ships_during_month['vessel_capacity_cubic_meters'].sum()) /
-                             total_active_ships).astype(int)
-        else:
-            avg_ship_size = 0
-
-        results.append({
-           'date': date_i,
-            'total_active_ships': total_active_ships,
-            'ships_added': len(ships_during_month),
-            'ships_removed': len(ships_removed_during_month),
-            'average_size_cubic_meters': avg_ship_size
-        })
-
-    # Create DataFrame with results
-    ship_analysis_df = pd.DataFrame(results)
-
-    # Merge shipping demand with vessel statistics
-    df_global_shipping_balance = pd.merge(
-        df_shipping_demand.rename(columns={'Date': 'date'}),
-        ship_analysis_df,
-        how='left',
-        on='date'
-    )
-
-    # Calculate final metrics
-    df_global_shipping_balance['ships_demand_total'] = np.round(
-        (df_global_shipping_balance['value'] / (df_global_shipping_balance['average_size_cubic_meters'] * utilization_rate)) *
-        (df_global_shipping_balance['mean_laden_days'] + df_global_shipping_balance['mean_nonladen_days']) /
-        df_global_shipping_balance['date'].dt.days_in_month, 1
-    )
-
-    df_global_shipping_balance['net'] = df_global_shipping_balance['total_active_ships'] - df_global_shipping_balance[
-        'ships_demand']
-    df_global_shipping_balance['net_new'] = df_global_shipping_balance['total_active_ships'] - \
-                                            df_global_shipping_balance['ships_demand_total']
-
-    # Add additional time-based columns for aggregation
-    df_global_shipping_balance['year'] = df_global_shipping_balance['date'].dt.year
-    df_global_shipping_balance['quarter'] = df_global_shipping_balance['date'].dt.quarter
-    df_global_shipping_balance['month'] = df_global_shipping_balance['date'].dt.month
-    df_global_shipping_balance['season'] = np.where(
-        df_global_shipping_balance['date'].dt.month.isin([10, 11, 12, 1, 2, 3]),
-        'W', 'S'
-    )
-
-    # Apply time aggregation
-    if aggregation_level == 'monthly':
-        # No additional aggregation needed - already at month level
-        return df_global_shipping_balance.sort_values('date')
-
-    elif aggregation_level == 'quarterly':
-        # Group by year and quarter
-        agg_dict = {
-            'total_active_ships': 'mean',
-            'ships_demand': 'mean',
-            'ships_demand_total': 'mean',
-            'net': 'mean',
-            'net_new': 'mean',
-            'value': 'sum',
-            'median_cargo_destination_cubic_meters': 'mean',
-            'mean_laden_days': 'mean',
-            'mean_nonladen_days': 'mean',
-            'average_size_cubic_meters': 'mean',
-            'ships_added': 'sum',
-            'ships_removed': 'sum'
-        }
-
-        quarterly_df = df_global_shipping_balance.groupby(['year', 'quarter']).agg(agg_dict).reset_index()
-
-        # Create a date column for the first day of each quarter
-        quarterly_df['date'] = quarterly_df.apply(
-            lambda row: pd.Timestamp(int(row['year']), int((row['quarter'] - 1) * 3 + 1), 1),
-            axis=1
-        )
-
-        return quarterly_df.sort_values('date')
-
-    elif aggregation_level == 'seasonal':
-        # Group by year and season
-        agg_dict = {
-            'total_active_ships': 'mean',
-            'ships_demand': 'mean',
-            'ships_demand_total': 'mean',
-            'net': 'mean',
-            'net_new': 'mean',
-            'value': 'sum',
-            'median_cargo_destination_cubic_meters': 'mean',
-            'mean_laden_days': 'mean',
-            'mean_nonladen_days': 'mean',
-            'average_size_cubic_meters': 'mean',
-            'ships_added': 'sum',
-            'ships_removed': 'sum'
-        }
-
-        seasonal_df = df_global_shipping_balance.groupby(['year', 'season']).agg(agg_dict).reset_index()
-
-        # Create a date column - Winter (Jan 1) or Summer (Jul 1)
-        seasonal_df['date'] = seasonal_df.apply(
-            lambda row: pd.Timestamp(int(row['year']), 1 if row['season'] == 'W' else 7, 1),
-            axis=1
-        )
-
-        return seasonal_df.sort_values('date')
-
-    elif aggregation_level == 'yearly':
-        # Group by year only
-        agg_dict = {
-            'total_active_ships': 'mean',
-            'ships_demand': 'mean',
-            'ships_demand_total': 'mean',
-            'net': 'mean',
-            'net_new': 'mean',
-            'value': 'sum',
-            'median_cargo_destination_cubic_meters': 'mean',
-            'mean_laden_days': 'mean',
-            'mean_nonladen_days': 'mean',
-            'average_size_cubic_meters': 'mean',
-            'ships_added': 'sum',
-            'ships_removed': 'sum'
-        }
-
-        yearly_df = df_global_shipping_balance.groupby('year').agg(agg_dict).reset_index()
-
-        # Create a date column for January 1st of each year
-        yearly_df['date'] = yearly_df['year'].apply(lambda year: pd.Timestamp(int(year), 1, 1))
-
-        return yearly_df.sort_values('date')
-
-    else:
-        # Default to monthly if invalid aggregation level
-        return df_global_shipping_balance.sort_values('date')
 
 
 def create_datatable(data, index_field):
@@ -942,134 +455,362 @@ def create_datatable(data, index_field):
 
 # Dashboard layout
 layout = html.Div([
-    # Store components for caching data
-    dcc.Store(id='trades-shipping-data-store', storage_type='local'),
-    dcc.Store(id='shipping-balance-data-store', storage_type='local'),
-    dcc.Store(id='shipping-balance-supply-data-store', storage_type='local'),
-    dcc.Store(id='dropdown-options-store', storage_type='local'),
-    dcc.Store(id='refresh-timestamp-store', storage_type='local'),
-    dcc.Store(id='intracountry-data-store', storage_type='local'),
+    # Store components for caching data (using session storage to avoid stale data issues)
+    dcc.Store(id='trades-shipping-data-store', storage_type='session'),
+    dcc.Store(id='shipping-balance-data-store', storage_type='session'),
+    dcc.Store(id='shipping-balance-supply-data-store', storage_type='session'),
+    dcc.Store(id='shipping-balance-regional-data-store', storage_type='session'),
+    dcc.Store(id='shipping-balance-supply-regional-data-store', storage_type='session'),
+    dcc.Store(id='vessel-type-options-store', storage_type='session'),
+    dcc.Store(id='dropdown-options-store', storage_type='session'),
+    dcc.Store(id='refresh-timestamp-store', storage_type='session'),
+    dcc.Store(id='intracountry-data-store', storage_type='session'),
+    dcc.Download(id='download-demand-metrics-excel'),
+    dcc.Download(id='download-supply-metrics-excel'),
+    dcc.Download(id='download-intracountry-count-excel'),
+    dcc.Download(id='download-intracountry-tonmiles-excel'),
+    dcc.Download(id='download-fleet-stats-excel'),
 
-    # Global Shipping Balance Overview Section - Enterprise Standard with Inline Controls
+    # Global Shipping Balance Overview Section - Sticky Professional Header
     html.Div([
-        # Enterprise Standard Inline Section Header with Controls
         html.Div([
-            html.H3('Global Shipping Balance Overview', className="section-title-inline"),
-            html.Label("Aggregation:", className="inline-filter-label"),
-            dcc.Dropdown(
-                id='aggregation-dropdown',
-                options=[
-                    {'label': 'Year+Quarter', 'value': 'quarterly'},
-                    {'label': 'Year+Month', 'value': 'monthly'},
-                    {'label': 'Year+Season', 'value': 'seasonal'},
-                    {'label': 'Year', 'value': 'yearly'}
-                ],
-                value='quarterly',
-                clearable=False,
-                className='inline-dropdown'
-            ),
-            html.Label("Vessel displacement age:", className="inline-filter-label"),
-            dcc.Input(
-                id='vessel-age-input',
-                type='number',
-                value=20,
-                min=1,
-                max=50,
-                step=1,
-                className='filter-input',
-                style={'width': '80px', 'height': '34px', 'fontSize': '14px', 'padding': '6px 8px'}
-            ),
-            html.Div(id='last-refresh-indicator', className='text-tertiary', style={'fontSize': '13px'})
-        ], className="inline-section-header"),
-        
-        # Charts Container with Professional Layout
+
+            # --- Group 1: Title ---
+            html.Div([
+                html.Div("Overview", className='filter-group-header'),
+                html.Div('Global Shipping Balance', style={'fontWeight': '600', 'fontSize': '15px', 'color': '#1e3a5f'}),
+            ], className='filter-section filter-section-destination'),
+
+            # --- Group 2: Scenario Settings ---
+            html.Div([
+                html.Div("Scenario Settings", className='filter-group-header'),
+                html.Div([
+                    html.Div([
+                        html.Label("Aggregation:", className='filter-label'),
+                        dcc.Dropdown(
+                            id='aggregation-dropdown',
+                            options=[
+                                {'label': 'Year+Quarter', 'value': 'quarterly'},
+                                {'label': 'Year+Month', 'value': 'monthly'},
+                                {'label': 'Year+Season', 'value': 'seasonal'},
+                                {'label': 'Year', 'value': 'yearly'}
+                            ],
+                            value='quarterly',
+                            clearable=False,
+                            className='filter-dropdown',
+                            style={'min-width': '160px'}
+                        ),
+                    ], className='filter-group'),
+                    html.Div([
+                        html.Label("Scenario Window End:", className='filter-label'),
+                        dcc.Input(
+                            id='window-end-date-input',
+                            type='text',
+                            placeholder='YYYY-MM-DD',
+                            value=(pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%d'),
+                            className='filter-input',
+                            style={'width': '120px', 'height': '36px', 'fontSize': '13px', 'padding': '6px 8px'}
+                        ),
+                    ], className='filter-group'),
+                ], style={'display': 'flex', 'gap': '12px', 'alignItems': 'flex-end'}),
+            ], className='filter-section filter-section-analysis'),
+
+            # --- Group 3: Vessel Parameters ---
+            html.Div([
+                html.Div("Vessel Parameters", className='filter-group-header'),
+                html.Div([
+                    html.Div([
+                        html.Label("Age (years):", className='filter-label'),
+                        dcc.Input(
+                            id='vessel-age-input',
+                            type='number',
+                            value=20,
+                            min=1,
+                            max=50,
+                            step=1,
+                            className='filter-input',
+                            style={'width': '80px', 'height': '36px', 'fontSize': '13px', 'padding': '6px 8px'}
+                        ),
+                    ], className='filter-group'),
+                    html.Div([
+                        html.Label("Utilization (%):", className='filter-label'),
+                        dcc.Input(
+                            id='utilization-rate-input',
+                            type='number',
+                            value=85,
+                            min=0,
+                            max=100,
+                            step=1,
+                            className='filter-input',
+                            style={'width': '80px', 'height': '36px', 'fontSize': '13px', 'padding': '6px 8px'}
+                        ),
+                    ], className='filter-group'),
+                    html.Div([
+                        dcc.Checklist(
+                            id='use-kpler-historical-checkbox',
+                            options=[{'label': ' Kpler Historical', 'value': 'kpler'}],
+                            value=[],
+                            labelStyle={'fontSize': '13px'}
+                        ),
+                    ], className='filter-group', style={'alignSelf': 'flex-end', 'paddingBottom': '4px'}),
+                ], style={'display': 'flex', 'gap': '12px', 'alignItems': 'flex-end'}),
+            ], className='filter-section filter-section-origin'),
+
+            # --- Group 4: Status Info ---
+            html.Div([
+                html.Div("Status", className='filter-group-header'),
+                html.Div([
+                    html.Div(id='last-refresh-indicator', className='text-tertiary', style={'fontSize': '12px', 'whiteSpace': 'nowrap'}),
+                    html.Div(id='window-info-text', className='text-tertiary', style={'fontSize': '12px', 'whiteSpace': 'nowrap'}),
+                ], style={'display': 'flex', 'flexDirection': 'column', 'gap': '4px'}),
+            ], className='filter-section filter-section-analysis'),
+
+        ], className='filter-bar-grouped')
+    ], className='professional-section-header'),
+
+    # Charts Container with Professional Layout
+    html.Div([
         html.Div([
             # Left column - Demand View
             html.Div([
                 html.Div([
                     html.H4('Demand View', className="subheader-title-inline"),
+                    html.Button(
+                        'Export to Excel',
+                        id='export-demand-metrics-button',
+                        n_clicks=0,
+                        style={
+                            'marginLeft': '20px',
+                            'padding': '5px 15px',
+                            'backgroundColor': '#28a745',
+                            'color': 'white',
+                            'border': 'none',
+                            'borderRadius': '4px',
+                            'cursor': 'pointer',
+                            'fontWeight': 'bold',
+                            'fontSize': '12px'
+                        }
+                    ),
                 ], className="inline-subheader", style={'marginBottom': '12px'}),
                 dcc.Graph(id='global-shipping-balance', style={'height': '400px'}),
+                # Regional Breakdown Section
+                html.Div([
+                    html.H5('Regional Breakdown', style={'marginTop': '24px', 'marginBottom': '12px', 'color': '#2C3E50'}),
+                    html.Div([
+                        html.Label("Aggregation:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                        dcc.Dropdown(
+                            id='demand-regional-aggregation-dropdown',
+                            options=[
+                                {'label': 'Year+Quarter', 'value': 'quarterly'},
+                                {'label': 'Year+Month', 'value': 'monthly'},
+                                {'label': 'Year+Season', 'value': 'seasonal'},
+                                {'label': 'Year', 'value': 'yearly'}
+                            ],
+                            value='quarterly',
+                            clearable=False,
+                            style={'width': '150px', 'display': 'inline-block', 'marginRight': '20px'}
+                        ),
+                        html.Label("Year:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                        dcc.Dropdown(
+                            id='demand-regional-year-dropdown',
+                            clearable=False,
+                            style={'width': '120px', 'display': 'inline-block', 'marginRight': '20px'}
+                        ),
+                        html.Label("Period:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                        dcc.Dropdown(
+                            id='demand-regional-period-dropdown',
+                            clearable=False,
+                            style={'width': '120px', 'display': 'inline-block', 'marginRight': '20px'}
+                        ),
+                        html.Label("Vessel Type:", style={'marginRight': '8px', 'fontSize': '13px', 'display': 'none'}),
+                        dcc.Dropdown(
+                            id='demand-regional-vessel-type-dropdown',
+                            multi=True,
+                            placeholder='All Vessel Types',
+                            style={'width': '200px', 'display': 'none'}
+                        )
+                    ], style={'marginBottom': '12px'}),
+                    html.Div(id='demand-regional-table-container', style={'overflow-x': 'auto'}),
+
+                    # Laden Days Chart
+                    html.Div([
+                        html.H6('Laden Days Trends by Route', style={'marginTop': '20px', 'marginBottom': '12px', 'color': '#2C3E50'}),
+                        html.Div([
+                            html.Label("Origin Regions:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                            dcc.Dropdown(
+                                id='demand-regional-laden-origin-filter',
+                                multi=True,
+                                placeholder='All Origins',
+                                style={'width': '250px', 'display': 'inline-block', 'marginRight': '20px'}
+                            ),
+                            html.Label("Destination Regions:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                            dcc.Dropdown(
+                                id='demand-regional-laden-dest-filter',
+                                multi=True,
+                                placeholder='All Destinations',
+                                style={'width': '250px', 'display': 'inline-block'}
+                            ),
+                        ], style={'marginBottom': '12px'}),
+                        dcc.Graph(id='demand-regional-laden-chart', style={'height': '450px'})
+                    ]),
+
+                    # Ballast Days Chart
+                    html.Div([
+                        html.H6('Ballast Days Trends by Route', style={'marginTop': '20px', 'marginBottom': '12px', 'color': '#2C3E50'}),
+                        html.Div([
+                            html.Label("Origin Regions:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                            dcc.Dropdown(
+                                id='demand-regional-ballast-origin-filter',
+                                multi=True,
+                                placeholder='All Origins',
+                                style={'width': '250px', 'display': 'inline-block', 'marginRight': '20px'}
+                            ),
+                            html.Label("Destination Regions:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                            dcc.Dropdown(
+                                id='demand-regional-ballast-dest-filter',
+                                multi=True,
+                                placeholder='All Destinations',
+                                style={'width': '250px', 'display': 'inline-block'}
+                            ),
+                        ], style={'marginBottom': '12px'}),
+                        dcc.Graph(id='demand-regional-ballast-chart', style={'height': '450px'})
+                    ])
+                ])
             ], style={'flex': '1', 'paddingRight': '12px'}),
-            
-            # Right column - Supply View  
+
+            # Right column - Supply View
             html.Div([
                 html.Div([
                     html.H4('Supply View', className="subheader-title-inline"),
+                    html.Button(
+                        'Export to Excel',
+                        id='export-supply-metrics-button',
+                        n_clicks=0,
+                        style={
+                            'marginLeft': '20px',
+                            'padding': '5px 15px',
+                            'backgroundColor': '#28a745',
+                            'color': 'white',
+                            'border': 'none',
+                            'borderRadius': '4px',
+                            'cursor': 'pointer',
+                            'fontWeight': 'bold',
+                            'fontSize': '12px'
+                        }
+                    ),
                 ], className="inline-subheader", style={'marginBottom': '12px'}),
                 dcc.Graph(id='global-shipping-balance-supply', style={'height': '400px'}),
+                # Regional Breakdown Section
+                html.Div([
+                    html.H5('Regional Breakdown', style={'marginTop': '24px', 'marginBottom': '12px', 'color': '#2C3E50'}),
+                    html.Div([
+                        html.Label("Aggregation:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                        dcc.Dropdown(
+                            id='supply-regional-aggregation-dropdown',
+                            options=[
+                                {'label': 'Year+Quarter', 'value': 'quarterly'},
+                                {'label': 'Year+Month', 'value': 'monthly'},
+                                {'label': 'Year+Season', 'value': 'seasonal'},
+                                {'label': 'Year', 'value': 'yearly'}
+                            ],
+                            value='quarterly',
+                            clearable=False,
+                            style={'width': '150px', 'display': 'inline-block', 'marginRight': '20px'}
+                        ),
+                        html.Label("Year:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                        dcc.Dropdown(
+                            id='supply-regional-year-dropdown',
+                            clearable=False,
+                            style={'width': '120px', 'display': 'inline-block', 'marginRight': '20px'}
+                        ),
+                        html.Label("Period:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                        dcc.Dropdown(
+                            id='supply-regional-period-dropdown',
+                            clearable=False,
+                            style={'width': '120px', 'display': 'inline-block', 'marginRight': '20px'}
+                        ),
+                        html.Label("Vessel Type:", style={'marginRight': '8px', 'fontSize': '13px', 'display': 'none'}),
+                        dcc.Dropdown(
+                            id='supply-regional-vessel-type-dropdown',
+                            multi=True,
+                            placeholder='All Vessel Types',
+                            style={'width': '200px', 'display': 'none'}
+                        )
+                    ], style={'marginBottom': '12px'}),
+                    html.Div(id='supply-regional-table-container', style={'overflow-x': 'auto'}),
+
+                    # Laden Days Chart
+                    html.Div([
+                        html.H6('Laden Days Trends by Route', style={'marginTop': '20px', 'marginBottom': '12px', 'color': '#2C3E50'}),
+                        html.Div([
+                            html.Label("Origin Regions:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                            dcc.Dropdown(
+                                id='supply-regional-laden-origin-filter',
+                                multi=True,
+                                placeholder='All Origins',
+                                style={'width': '250px', 'display': 'inline-block', 'marginRight': '20px'}
+                            ),
+                            html.Label("Destination Regions:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                            dcc.Dropdown(
+                                id='supply-regional-laden-dest-filter',
+                                multi=True,
+                                placeholder='All Destinations',
+                                style={'width': '250px', 'display': 'inline-block'}
+                            ),
+                        ], style={'marginBottom': '12px'}),
+                        dcc.Graph(id='supply-regional-laden-chart', style={'height': '450px'})
+                    ]),
+
+                    # Ballast Days Chart
+                    html.Div([
+                        html.H6('Ballast Days Trends by Route', style={'marginTop': '20px', 'marginBottom': '12px', 'color': '#2C3E50'}),
+                        html.Div([
+                            html.Label("Origin Regions:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                            dcc.Dropdown(
+                                id='supply-regional-ballast-origin-filter',
+                                multi=True,
+                                placeholder='All Origins',
+                                style={'width': '250px', 'display': 'inline-block', 'marginRight': '20px'}
+                            ),
+                            html.Label("Destination Regions:", style={'marginRight': '8px', 'fontSize': '13px'}),
+                            dcc.Dropdown(
+                                id='supply-regional-ballast-dest-filter',
+                                multi=True,
+                                placeholder='All Destinations',
+                                style={'width': '250px', 'display': 'inline-block'}
+                            ),
+                        ], style={'marginBottom': '12px'}),
+                        dcc.Graph(id='supply-regional-ballast-chart', style={'height': '450px'})
+                    ])
+                ])
             ], style={'flex': '1', 'paddingLeft': '12px'}),
         ], style={'display': 'flex', 'gap': '24px'})
     ], className='section-container'),
 
-    # Trade Analysis by Region Pairs Section - Enterprise Standard
+    # Fleet Statistics Section
     html.Div([
-        # Enterprise Standard Inline Section Header with All Controls
         html.Div([
-            html.H3('Trade Analysis by Region Pairs', className="section-title-inline"),
-            html.Label("Select Metric:", className="inline-filter-label"),
-            dcc.Dropdown(
-                id='trade-metric-selector',
-                options=[
-                    {'label': 'Count Trades', 'value': 'count_trades'},
-                    {'label': 'Ton Miles', 'value': 'ton_miles'},
-                    {'label': 'Median Delivery Days', 'value': 'median_delivery_days'},
-                    {'label': 'Median Mileage (Nautical Miles)', 'value': 'median_mileage_nautical_miles'},
-                    {'label': 'Median Ton Miles', 'value': 'median_ton_miles'},
-                    {'label': 'Median Utilization Rate', 'value': 'median_utilization_rate'},
-                    {'label': 'Median Cargo Volume (m³)', 'value': 'median_cargo_destination_cubic_meters'},
-                    {'label': 'Median Vessel Capacity (m³)', 'value': 'median_vessel_capacity_cubic_meters'}
-                ],
-                value='count_trades',
-                clearable=False,
-                className='inline-dropdown'
-            ),
-            html.Label("Origin Region:", className="inline-filter-label"),
-            dcc.Dropdown(
-                id='region-dropdown',
-                options=[{'label': 'All Regions', 'value': 'All Regions'}],
-                value=['All Regions'],
-                multi=True,
-                clearable=False,
-                className='inline-dropdown-multi'
-            ),
-            html.Label("Year:", className="inline-filter-label"),
-            dcc.Dropdown(
-                id='year-dropdown',
-                options=[{'label': 'All Years', 'value': 'All Years'}],
-                value=None,
-                clearable=False,
-                className='inline-dropdown'
-            ),
-            html.Label("Status:", className="inline-filter-label"),
-            dcc.Dropdown(
-                id='region-status-dropdown',
-                options=[{'label': 'All Statuses', 'value': 'All Statuses'}],
-                value=['All Statuses'],
-                multi=True,
-                clearable=False,
-                className='inline-dropdown-multi'
+            html.H3('Fleet Statistics', className="section-title-inline"),
+            html.Button(
+                'Export to Excel',
+                id='export-fleet-stats-button',
+                n_clicks=0,
+                style={
+                    'marginLeft': '20px',
+                    'padding': '5px 15px',
+                    'backgroundColor': '#28a745',
+                    'color': 'white',
+                    'border': 'none',
+                    'borderRadius': '4px',
+                    'cursor': 'pointer',
+                    'fontWeight': 'bold',
+                    'fontSize': '12px'
+                }
             ),
         ], className="inline-section-header"),
-        
-        # Vessel Types Information (Enterprise Standard Subheader Style)
-        html.Div([
-            html.P([
-                html.Span("Vessel Types: ", className="inline-filter-label"),
-                html.Span(id='vessel-types-info', style={'color': '#6b7280', 'fontSize': '13px'})
-            ], style={'margin': '0'})
-        ], className="inline-subheader", style={'marginTop': '8px', 'marginBottom': '20px'}),
-        
-        # Single Chart Container
-        html.Div([
-            dcc.Graph(id='trade-analysis-visualization', style={'height': '600px'})
-        ], style={'marginTop': '0px'}),
-        
-        # Single Table Container
-        html.Div([
-            html.Div(id='trade-analysis-table-container', style={'overflow-x': 'auto'})
-        ], style={'marginTop': '24px'})
+        dcc.Graph(id='fleet-stats-chart', style={'height': '400px', 'marginTop': '16px'})
     ], className='section-container'),
+
 
     # Intracountry Trade Analysis Section
     html.Div([
@@ -1077,7 +818,7 @@ layout = html.Div([
             html.H2("Intracountry Trade Analysis", className='section-title-inline'),
             html.P("Analysis of domestic shipping patterns by origin country", className='section-subtitle')
         ], className='header-content'),
-        
+
         html.Div([
             html.Div([
                 html.Label("Filter by Year:", className='filter-label'),
@@ -1089,7 +830,7 @@ layout = html.Div([
                     className='inline-dropdown'
                 )
             ], className='filter-group'),
-            
+
             html.Div([
                 html.Label("Filter by Status:", className='filter-label'),
                 dcc.Dropdown(
@@ -1106,83 +847,165 @@ layout = html.Div([
 
     # Intracountry Trade Visualizations Section - Enterprise Standard
     html.Div([
-        # Enterprise Standard Inline Section Header
-        html.Div([
-            html.H3('Intracountry Trade Visualizations', className="section-title-inline"),
-        ], className="inline-section-header"),
-        
         # Chart Container with Professional Layout
         html.Div([
             # Left column - Trade Count
             html.Div([
                 html.Div([
                     html.H4('Count of Intracountry Trades', className="subheader-title-inline"),
+                    html.Button(
+                        'Export to Excel',
+                        id='export-intracountry-count-button',
+                        n_clicks=0,
+                        style={
+                            'marginLeft': '20px',
+                            'padding': '5px 15px',
+                            'backgroundColor': '#28a745',
+                            'color': 'white',
+                            'border': 'none',
+                            'borderRadius': '4px',
+                            'cursor': 'pointer',
+                            'fontWeight': 'bold',
+                            'fontSize': '12px'
+                        }
+                    ),
                 ], className="inline-subheader"),
                 dcc.Graph(id='intracountry-count-visualization', style={'height': '600px'})
             ], style={'flex': '1', 'paddingRight': '12px'}),
-            
+
             # Right column - Ton Miles
             html.Div([
                 html.Div([
                     html.H4('Intracountry Ton Miles', className="subheader-title-inline"),
+                    html.Button(
+                        'Export to Excel',
+                        id='export-intracountry-tonmiles-button',
+                        n_clicks=0,
+                        style={
+                            'marginLeft': '20px',
+                            'padding': '5px 15px',
+                            'backgroundColor': '#28a745',
+                            'color': 'white',
+                            'border': 'none',
+                            'borderRadius': '4px',
+                            'cursor': 'pointer',
+                            'fontWeight': 'bold',
+                            'fontSize': '12px'
+                        }
+                    ),
                 ], className="inline-subheader"),
                 dcc.Graph(id='intracountry-tonmiles-visualization', style={'height': '600px'})
             ], style={'flex': '1', 'paddingLeft': '12px'})
         ], style={'display': 'flex', 'gap': '24px', 'marginTop': '16px'})
     ], className='section-container'),
 
-    # Intracountry Data Tables - Enterprise Standard
-    html.Div([
-        # Enterprise Standard Inline Section Header
-        html.Div([
-            html.H3('Intracountry Trade Data Tables', className="section-title-inline"),
-        ], className="inline-section-header"),
-        
-        # Tables Container
-        html.Div([
-            html.Div([
-                html.Div([
-                    html.H4('Trade Count Data', className="subheader-title-inline"),
-                ], className="inline-subheader"),
-                html.Div(id='intracountry-count-table-container', style={'overflow-x': 'auto'})
-            ], className='section-container', style={'flex': '1', 'marginRight': '12px'}),
-            
-            html.Div([
-                html.Div([
-                    html.H4('Ton Miles Data', className="subheader-title-inline"),
-                ], className="inline-subheader"),
-                html.Div(id='intracountry-tonmiles-table-container', style={'overflow-x': 'auto'})
-            ], className='section-container', style={'flex': '1', 'marginLeft': '12px'})
-        ], style={'display': 'flex', 'gap': '24px', 'marginTop': '16px'})
-    ], style={'marginBottom': '32px'}),
-
 ])
 
 
 # Callbacks
-# Update the refresh_data callback to include the aggregation dropdown
+# Update the refresh_data callback to include the aggregation dropdown and window date picker
 @callback(
     Output('trades-shipping-data-store', 'data'),
     Output('shipping-balance-data-store', 'data'),
     Output('shipping-balance-supply-data-store', 'data'),
+    Output('shipping-balance-regional-data-store', 'data'),
+    Output('shipping-balance-supply-regional-data-store', 'data'),
+    Output('vessel-type-options-store', 'data'),
     Output('dropdown-options-store', 'data'),
     Output('refresh-timestamp-store', 'data'),
     Output('intracountry-data-store', 'data'),
+    Output('window-info-text', 'children'),
+    Output('window-end-date-input', 'placeholder'),
+    Output('window-end-date-input', 'min'),
+    Output('window-end-date-input', 'value'),
     Input('global-refresh-button', 'n_clicks'),
     Input('aggregation-dropdown', 'value'),
-    Input('vessel-age-input', 'value'),  # Add this input
+    Input('vessel-age-input', 'value'),
+    Input('utilization-rate-input', 'value'),
+    Input('window-end-date-input', 'value'),
+    Input('use-kpler-historical-checkbox', 'value'),
     prevent_initial_call=False
 )
-def refresh_data(n_clicks, aggregation_level='monthly', vessel_age=20):
+def refresh_data(n_clicks, aggregation_level='monthly', vessel_age=20, utilization_rate=85, window_end_date=None, use_kpler_checked=None):
     """Fetch and prepare all data needed for the dashboard."""
-    # Fetch shipping balance data with selected aggregation and vessel age
-    df_global_shipping_balance = global_shipping_balance(aggregation_level, vessel_age)
-    # Fetch shipping balance supply data (same parameters but with lng_view='supply')
-    df_global_shipping_balance_supply = global_shipping_balance(aggregation_level, vessel_age, lng_view='supply')
+    # Parse window_end_date if it's provided as a string
+    if window_end_date and isinstance(window_end_date, str) and window_end_date.strip():
+        try:
+            window_end_date = pd.to_datetime(window_end_date)
+        except:
+            window_end_date = None
+    elif not window_end_date or (isinstance(window_end_date, str) and not window_end_date.strip()):
+        window_end_date = None
+
+    # Get the date range from Kpler trades for date picker limits
+    query_date_range = '''
+        SELECT MIN("end") as min_date, MAX("end") as max_date
+        FROM at_lng.kpler_trades
+        WHERE status = 'Delivered' AND "end" IS NOT NULL
+    '''
+    date_range = pd.read_sql(query_date_range, engine)
+    min_date = date_range['min_date'].iloc[0]
+    max_date = date_range['max_date'].iloc[0]
+
+    # Set default window_end_date to yesterday if not provided
+    if window_end_date is None:
+        yesterday = pd.Timestamp.now() - pd.Timedelta(days=1)
+        # Use yesterday or max_date, whichever is earlier
+        window_end_date = min(yesterday, pd.to_datetime(max_date)) if max_date else yesterday
+
+    # Create window info text
+    if window_end_date:
+        window_end_dt = pd.to_datetime(window_end_date)
+        window_start_dt = window_end_dt - pd.Timedelta(days=365)
+        window_info = f"📊 Using patterns from {window_start_dt.strftime('%Y-%m-%d')} to {window_end_dt.strftime('%Y-%m-%d')} for future projections"
+    else:
+        window_info = "📊 Using default recent patterns (2024+) for future projections"
+
+    # Convert utilization rate from percentage to decimal
+    utilization_rate_decimal = utilization_rate / 100.0
+
+    # Determine if Kpler historical data should be used
+    use_kpler_historical = 'kpler' in (use_kpler_checked or [])
+
+    # Fetch shipping balance data with selected parameters including window - with regional data
+    df_regional_demand, df_global_shipping_balance = calc_global_shipping_balance(
+        engine=engine,
+        aggregation_level=aggregation_level,
+        life_expectancy=vessel_age,
+        lng_view='demand',
+        utilization_rate=utilization_rate_decimal,
+        window_end_date=window_end_date,
+        return_regional=True,
+        use_kpler_historical=use_kpler_historical
+    )
+
+    # Fetch shipping balance supply data with window - with regional data
+    df_regional_supply, df_global_shipping_balance_supply = calc_global_shipping_balance(
+        engine=engine,
+        aggregation_level=aggregation_level,
+        life_expectancy=vessel_age,
+        lng_view='supply',
+        utilization_rate=utilization_rate_decimal,
+        window_end_date=window_end_date,
+        return_regional=True,
+        use_kpler_historical=use_kpler_historical
+    )
 
     # Rest of the function remains the same
-    # Fetch trade shipping data
-    df_intracountry_trades, df_trades_shipping_region = kpler_analysis(engine)
+    # Get the maximum historical date to limit kpler_analysis to historical data only
+    query_max_hist_date = '''
+        SELECT MAX("end") as hist_date_max
+        FROM at_lng.kpler_trades
+        WHERE status='Delivered'
+        AND upload_timestamp_utc = (SELECT MAX(upload_timestamp_utc) FROM at_lng.kpler_trades)
+    '''
+    hist_date_max_df = pd.read_sql(query_max_hist_date, engine)
+    # Return the last day of the month containing the max date
+    max_date = pd.to_datetime(hist_date_max_df.hist_date_max.dt.date[0])
+    hist_date_max = max_date + pd.offsets.MonthEnd(0)
+
+    # Fetch trade shipping data - limit to historical data only
+    df_intracountry_trades, df_trades_shipping_region = kpler_analysis(engine, end_date=hist_date_max, aggregation_level=aggregation_level)
 
     # Extract unique values for dropdown options
     # Filter for relevant years (2019+)
@@ -1217,6 +1040,9 @@ def refresh_data(n_clicks, aggregation_level='monthly', vessel_age=20):
     status_options_single = [{'label': status['label'], 'value': status['value']}
                              for status in status_options_intracountry]
 
+    # Vessel type options removed as vessel_type column no longer exists
+    vessel_type_options = []
+
     # Store options data
     options_data = {
         'region_options': region_options,
@@ -1226,19 +1052,39 @@ def refresh_data(n_clicks, aggregation_level='monthly', vessel_age=20):
         'status_options_intracountry': status_options_intracountry,
         'status_options_single': status_options_single,
         'aggregation_level': aggregation_level,  # Store the current aggregation level
-        'vessel_age': vessel_age  # Store the current vessel age
+        'vessel_age': vessel_age,  # Store the current vessel age
+        'utilization_rate': utilization_rate,  # Store the current utilization rate
+        'hist_date_max': hist_date_max.isoformat()  # Store the historical max date for current period marker
     }
 
     # Convert DataFrames to JSON for storage
     shipping_data = df_trades_shipping_region.to_json(date_format='iso', orient='split')
     shipping_balance = df_global_shipping_balance.to_json(date_format='iso', orient='split')
     shipping_balance_supply = df_global_shipping_balance_supply.to_json(date_format='iso', orient='split')
+    shipping_balance_regional = df_regional_demand.to_json(date_format='iso', orient='split')
+    shipping_balance_supply_regional = df_regional_supply.to_json(date_format='iso', orient='split')
     intracountry_data = df_intracountry_trades.to_json(date_format='iso', orient='split')
 
     # Store timestamp
     refresh_timestamp = dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    return shipping_data, shipping_balance, shipping_balance_supply, options_data, refresh_timestamp, intracountry_data
+    # Format dates for the text input
+    placeholder_text = f"YYYY-MM-DD (Max: {max_date.strftime('%Y-%m-%d')})" if max_date else "YYYY-MM-DD"
+    min_date_str = min_date.strftime('%Y-%m-%d') if min_date else ''
+
+    # Format window_end_date consistently
+    if window_end_date:
+        if hasattr(window_end_date, 'strftime'):
+            window_end_date_str = window_end_date.strftime('%Y-%m-%d')
+        else:
+            window_end_date_str = str(window_end_date)[:10]  # Take first 10 chars for YYYY-MM-DD
+    else:
+        # Default to yesterday if nothing set
+        window_end_date_str = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+
+    return (shipping_data, shipping_balance, shipping_balance_supply, shipping_balance_regional,
+            shipping_balance_supply_regional, vessel_type_options, options_data, refresh_timestamp,
+            intracountry_data, window_info, placeholder_text, min_date_str, window_end_date_str)
 
 
 @callback(
@@ -1257,21 +1103,12 @@ def update_refresh_time(timestamp):
 @callback(
     Output('global-shipping-balance', 'figure'),
     Output('global-shipping-balance-supply', 'figure'),
-    Output('region-dropdown', 'options'),
-    Output('year-dropdown', 'options'),
-    Output('year-dropdown', 'value'),
-    Output('region-status-dropdown', 'options'),
-    Output('region-status-dropdown', 'value'),
     Input('trades-shipping-data-store', 'data'),
     Input('shipping-balance-data-store', 'data'),
     Input('shipping-balance-supply-data-store', 'data'),
     Input('dropdown-options-store', 'data'),
-    Input('region-dropdown', 'value'),
-    Input('year-dropdown', 'value'),
-    Input('region-status-dropdown', 'value'),
 )
-def update_visualizations(shipping_data, shipping_balance, shipping_balance_supply, dropdown_options, selected_regions,
-                          selected_year, selected_statuses):
+def update_visualizations(shipping_data, shipping_balance, shipping_balance_supply, dropdown_options):
     """Update visualizations and tables based on selected filters."""
     # Check if data is available
     if shipping_data is None or shipping_balance is None or shipping_balance_supply is None or dropdown_options is None:
@@ -1282,19 +1119,14 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     df_global_shipping_balance = pd.read_json(StringIO(shipping_balance), orient='split')
     df_global_shipping_balance_supply = pd.read_json(StringIO(shipping_balance_supply), orient='split')
 
-    # Extract dropdown options
-    region_options = dropdown_options['region_options']
-    year_options = dropdown_options['year_options']
-    status_options = dropdown_options['status_options_region']
-    latest_year = dropdown_options['latest_year']
+    # Ensure date columns are datetime type (JSON conversion loses dtype)
+    if 'date' in df_global_shipping_balance.columns:
+        df_global_shipping_balance['date'] = pd.to_datetime(df_global_shipping_balance['date'])
+    if 'date' in df_global_shipping_balance_supply.columns:
+        df_global_shipping_balance_supply['date'] = pd.to_datetime(df_global_shipping_balance_supply['date'])
+
     # Get the aggregation level if available
     aggregation_level = dropdown_options.get('aggregation_level', 'monthly')
-
-    # Set default values if needed
-    if selected_year is None:
-        selected_year = latest_year
-    if selected_statuses is None:
-        selected_statuses = ['All Statuses']
 
 
 
@@ -1318,7 +1150,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     fig_global_shipping.add_trace(
         go.Scatter(
             x=df_global_shipping_balance['date'],
-            y=df_global_shipping_balance['ships_demand_total'],
+            y=df_global_shipping_balance['ships_demand'],
             name='Ships Demand Total',
             mode='lines+markers',
             line=dict(color='#22c55e', width=2),  # Professional green
@@ -1331,7 +1163,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     fig_global_shipping.add_trace(
         go.Bar(
             x=df_global_shipping_balance['date'],
-            y=df_global_shipping_balance['net_new'],
+            y=df_global_shipping_balance['net'],
             name='Net New',
             marker_color='rgba(239, 68, 68, 0.5)',  # Professional red with transparency
             marker_line_color='rgba(239, 68, 68, 0.8)',
@@ -1352,7 +1184,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     fig_global_shipping.update_layout(
         # No title - using external Demand View label
         title=None,
-        
+
         # Professional Legend Positioning
         legend=dict(
             orientation='h',  # Horizontal layout
@@ -1367,12 +1199,12 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
             itemsizing='constant',
             itemwidth=30
         ),
-        
+
         # Professional Background and Margins
         plot_bgcolor='rgba(248, 249, 250, 0.5)',  # Subtle background
         paper_bgcolor='white',
         margin=dict(l=70, r=70, t=70, b=90),  # Reduced vertical spacing
-        
+
         # Enhanced Interactivity
         hovermode='x unified',
         hoverlabel=dict(
@@ -1381,10 +1213,10 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
             font=dict(size=11, color='#2C3E50'),
             align='left'
         ),
-        
+
         # Bar gap for better visualization
         bargap=0.2,
-        
+
         # Height to fit container
         height=400
     )
@@ -1403,7 +1235,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
         zerolinewidth=1,
         secondary_y=False
     )
-    
+
     # Professional Y-Axis Styling - Secondary
     fig_global_shipping.update_yaxes(
         title=dict(text='Net New Ships', font=dict(size=13, color='#4A4A4A')),
@@ -1455,6 +1287,29 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     for trace in fig_global_shipping.data:
         trace.hovertemplate = hover_templates.get(aggregation_level, '%{x}<br><b>%{y:,.0f}</b><extra></extra>')
 
+    # Add vertical line for current period using historical max from Kpler
+    hist_date_max_str = dropdown_options.get('hist_date_max')
+    if hist_date_max_str:
+        hist_date_max = pd.to_datetime(hist_date_max_str)
+        fig_global_shipping.add_shape(
+            type="line",
+            x0=hist_date_max,
+            x1=hist_date_max,
+            y0=0,
+            y1=1,
+            yref="paper",
+            line=dict(color="red", width=2, dash="dash")
+        )
+        fig_global_shipping.add_annotation(
+            x=hist_date_max,
+            y=1,
+            yref="paper",
+            text="Current Period",
+            showarrow=False,
+            yanchor="bottom",
+            font=dict(color="red", size=10)
+        )
+
     # Create global shipping balance supply chart with professional formatting
     fig_global_shipping_supply = make_subplots(specs=[[{"secondary_y": True}]])
 
@@ -1475,7 +1330,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     fig_global_shipping_supply.add_trace(
         go.Scatter(
             x=df_global_shipping_balance_supply['date'],
-            y=df_global_shipping_balance_supply['ships_demand_total'],
+            y=df_global_shipping_balance_supply['ships_demand'],
             name='Ships Supply Total',
             mode='lines+markers',
             line=dict(color='#F7DC6F', width=2),  # Professional yellow/orange
@@ -1488,7 +1343,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     fig_global_shipping_supply.add_trace(
         go.Bar(
             x=df_global_shipping_balance_supply['date'],
-            y=df_global_shipping_balance_supply['net_new'],
+            y=df_global_shipping_balance_supply['net'],
             name='Net New',
             marker_color='rgba(247, 220, 111, 0.5)',  # Professional yellow with transparency
             marker_line_color='rgba(247, 220, 111, 0.8)',
@@ -1501,7 +1356,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     fig_global_shipping_supply.update_layout(
         # No title - using external Supply View label
         title=None,
-        
+
         # Professional Legend Positioning
         legend=dict(
             orientation='h',  # Horizontal layout
@@ -1516,12 +1371,12 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
             itemsizing='constant',
             itemwidth=30
         ),
-        
+
         # Professional Background and Margins
         plot_bgcolor='rgba(248, 249, 250, 0.5)',  # Subtle background
         paper_bgcolor='white',
         margin=dict(l=70, r=70, t=70, b=90),  # Reduced vertical spacing
-        
+
         # Enhanced Interactivity
         hovermode='x unified',
         hoverlabel=dict(
@@ -1530,10 +1385,10 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
             font=dict(size=11, color='#2C3E50'),
             align='left'
         ),
-        
+
         # Bar gap for better visualization
         bargap=0.2,
-        
+
         # Height to fit container
         height=400
     )
@@ -1552,7 +1407,7 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
         zerolinewidth=1,
         secondary_y=False
     )
-    
+
     # Professional Y-Axis Styling - Secondary
     fig_global_shipping_supply.update_yaxes(
         title=dict(text='Net New Ships', font=dict(size=13, color='#4A4A4A')),
@@ -1582,117 +1437,387 @@ def update_visualizations(shipping_data, shipping_balance, shipping_balance_supp
     for trace in fig_global_shipping_supply.data:
         trace.hovertemplate = hover_templates.get(aggregation_level, '%{x}<br><b>%{y:,.0f}</b><extra></extra>')
 
+    # Add vertical line for current period using historical max from Kpler
+    if hist_date_max_str:
+        hist_date_max = pd.to_datetime(hist_date_max_str)
+        fig_global_shipping_supply.add_shape(
+            type="line",
+            x0=hist_date_max,
+            x1=hist_date_max,
+            y0=0,
+            y1=1,
+            yref="paper",
+            line=dict(color="red", width=2, dash="dash")
+        )
+        fig_global_shipping_supply.add_annotation(
+            x=hist_date_max,
+            y=1,
+            yref="paper",
+            text="Current Period",
+            showarrow=False,
+            yanchor="bottom",
+            font=dict(color="red", size=10)
+        )
 
     return (
         fig_global_shipping,
         fig_global_shipping_supply,
-        region_options,
-        year_options,
-        selected_year,
-        status_options,
-        selected_statuses,
     )
 
 
-# Trade Analysis Visualization and Table Callback
 @callback(
-    Output('trade-analysis-visualization', 'figure'),
-    Output('trade-analysis-table-container', 'children'),
-    Output('vessel-types-info', 'children'),
-    Input('trade-metric-selector', 'value'),
-    Input('trades-shipping-data-store', 'data'),
-    Input('region-dropdown', 'value'),
-    Input('year-dropdown', 'value'),
-    Input('region-status-dropdown', 'value'),
+    Output('download-demand-metrics-excel', 'data'),
+    Input('export-demand-metrics-button', 'n_clicks'),
+    State('shipping-balance-data-store', 'data'),
+    State('dropdown-options-store', 'data'),
+    prevent_initial_call=True
 )
-def update_trade_analysis_chart_and_table(selected_metric, shipping_data, selected_regions, selected_year, selected_statuses):
-    """Update the trade analysis chart and table based on selected metric."""
-    if not shipping_data:
-        # Return empty figure and table
-        empty_fig = go.Figure().update_layout(
-            title="No data available",
-            annotations=[dict(text="Please refresh data to load charts", 
-                            x=0.5, y=0.5, showarrow=False)]
-        )
-        return empty_fig, "No data available", ""
-    
-    # Default to all statuses if none selected
-    if selected_statuses is None:
-        selected_statuses = ['All Statuses']
-    
+def export_demand_metrics_to_excel(n_clicks, shipping_balance, dropdown_options):
+    """Export Demand View metrics to Excel."""
+    if not n_clicks or shipping_balance is None or dropdown_options is None:
+        raise PreventUpdate
+
+    df = pd.read_json(StringIO(shipping_balance), orient='split')
+    df['date'] = pd.to_datetime(df['date'])
+
+    aggregation_level = dropdown_options.get('aggregation_level', 'monthly')
+
+    table_data = df[['date', 'total_active_ships', 'ships_demand', 'net', 'utilization_ratio', 'value']].copy()
+    table_data = table_data.rename(columns={
+        'date': 'Date',
+        'total_active_ships': 'Total Active Ships',
+        'ships_demand': 'Ships Demand Total',
+        'net': 'Net Balance',
+        'utilization_ratio': 'Utilization (%)',
+        'value': 'Volume (M m³)'
+    })
+    table_data['Date'] = pd.to_datetime(table_data['Date'])
+    table_data['Volume (M m³)'] = (table_data['Volume (M m³)'] / 1000000).round(2)
+    if aggregation_level == 'quarterly':
+        table_data['Date'] = table_data['Date'].dt.to_period('Q').astype(str)
+    elif aggregation_level == 'seasonal':
+        table_data['Date'] = table_data['Date'].apply(lambda x: f"{x.year}-{'W' if x.month == 1 else 'S'}")
+    elif aggregation_level == 'yearly':
+        table_data['Date'] = table_data['Date'].dt.year
+    else:
+        table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m')
+    for col in ['Total Active Ships', 'Ships Demand Total', 'Net Balance']:
+        table_data[col] = table_data[col].round(1)
+    table_data['Utilization (%)'] = table_data['Utilization (%)'].round(2)
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        table_data.to_excel(writer, sheet_name='Demand Metrics', index=False)
+        for worksheet in writer.sheets.values():
+            for column_cells in worksheet.columns:
+                max_length = max((len(str(cell.value)) if cell.value is not None else 0) for cell in column_cells)
+                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max_length + 2, 50)
+    output.seek(0)
+    timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    return dcc.send_bytes(output.getvalue(), f'Demand_Metrics_{aggregation_level}_{timestamp}.xlsx')
+
+
+@callback(
+    Output('download-supply-metrics-excel', 'data'),
+    Input('export-supply-metrics-button', 'n_clicks'),
+    State('shipping-balance-supply-data-store', 'data'),
+    State('dropdown-options-store', 'data'),
+    prevent_initial_call=True
+)
+def export_supply_metrics_to_excel(n_clicks, shipping_balance_supply, dropdown_options):
+    """Export Supply View metrics to Excel."""
+    if not n_clicks or shipping_balance_supply is None or dropdown_options is None:
+        raise PreventUpdate
+
+    df = pd.read_json(StringIO(shipping_balance_supply), orient='split')
+    df['date'] = pd.to_datetime(df['date'])
+
+    aggregation_level = dropdown_options.get('aggregation_level', 'monthly')
+
+    table_data = df[['date', 'total_active_ships', 'ships_demand', 'net', 'utilization_ratio', 'value']].copy()
+    table_data = table_data.rename(columns={
+        'date': 'Date',
+        'total_active_ships': 'Total Active Ships',
+        'ships_demand': 'Ships Supply Total',
+        'net': 'Net Balance',
+        'utilization_ratio': 'Utilization (%)',
+        'value': 'Volume (M m³)'
+    })
+    table_data['Date'] = pd.to_datetime(table_data['Date'])
+    table_data['Volume (M m³)'] = (table_data['Volume (M m³)'] / 1000000).round(2)
+    if aggregation_level == 'quarterly':
+        table_data['Date'] = table_data['Date'].dt.to_period('Q').astype(str)
+    elif aggregation_level == 'seasonal':
+        table_data['Date'] = table_data['Date'].apply(lambda x: f"{x.year}-{'W' if x.month == 1 else 'S'}")
+    elif aggregation_level == 'yearly':
+        table_data['Date'] = table_data['Date'].dt.year
+    else:
+        table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m')
+    for col in ['Total Active Ships', 'Ships Supply Total', 'Net Balance']:
+        table_data[col] = table_data[col].round(1)
+    table_data['Utilization (%)'] = table_data['Utilization (%)'].round(2)
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        table_data.to_excel(writer, sheet_name='Supply Metrics', index=False)
+        for worksheet in writer.sheets.values():
+            for column_cells in worksheet.columns:
+                max_length = max((len(str(cell.value)) if cell.value is not None else 0) for cell in column_cells)
+                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max_length + 2, 50)
+    output.seek(0)
+    timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    return dcc.send_bytes(output.getvalue(), f'Supply_Metrics_{aggregation_level}_{timestamp}.xlsx')
+
+
+# Fleet Statistics Export Callback
+@callback(
+    Output('download-fleet-stats-excel', 'data'),
+    Input('export-fleet-stats-button', 'n_clicks'),
+    State('shipping-balance-data-store', 'data'),
+    State('dropdown-options-store', 'data'),
+    prevent_initial_call=True
+)
+def export_fleet_stats_to_excel(n_clicks, shipping_balance, dropdown_options):
+    """Export Fleet Statistics data to Excel."""
+    if not n_clicks or shipping_balance is None or dropdown_options is None:
+        raise PreventUpdate
+
+    df_global = pd.read_json(StringIO(shipping_balance), orient='split')
+    df_global['date'] = pd.to_datetime(df_global['date'])
+
+    aggregation_level = dropdown_options.get('aggregation_level', 'monthly')
+
+    fleet_cols = ['date', 'total_active_ships', 'average_size_cubic_meters', 'ships_added', 'ships_removed']
+    display_df = df_global[fleet_cols].copy()
+    display_df['net_change'] = display_df['ships_added'] - display_df['ships_removed']
+
+    if aggregation_level == 'monthly':
+        display_df['date_formatted'] = display_df['date'].dt.strftime('%Y-%m')
+    elif aggregation_level == 'quarterly':
+        display_df['date_formatted'] = display_df['date'].dt.year.astype(str) + '-Q' + display_df['date'].dt.quarter.astype(str)
+    elif aggregation_level == 'seasonal':
+        display_df['date_formatted'] = display_df['date'].dt.year.astype(str) + '-' + display_df['date'].dt.month.map({1: 'Winter', 7: 'Summer'})
+    elif aggregation_level == 'yearly':
+        display_df['date_formatted'] = display_df['date'].dt.year.astype(str)
+    else:
+        display_df['date_formatted'] = display_df['date'].dt.strftime('%Y-%m')
+
+    display_df = display_df.rename(columns={
+        'date_formatted': 'Period',
+        'total_active_ships': 'Total Active Ships',
+        'average_size_cubic_meters': 'Avg Capacity (m³)',
+        'ships_added': 'Ships Added',
+        'ships_removed': 'Ships Removed',
+        'net_change': 'Net Change'
+    })
+    display_df = display_df[['Period', 'Total Active Ships', 'Avg Capacity (m³)', 'Ships Added', 'Ships Removed', 'Net Change']]
+    display_df = display_df.sort_index(ascending=False)
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        display_df.to_excel(writer, sheet_name='Fleet Statistics', index=False)
+        for worksheet in writer.sheets.values():
+            for column_cells in worksheet.columns:
+                max_length = max((len(str(cell.value)) if cell.value is not None else 0) for cell in column_cells)
+                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max_length + 2, 50)
+    output.seek(0)
+    timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    return dcc.send_bytes(output.getvalue(), f'Fleet_Statistics_{aggregation_level}_{timestamp}.xlsx')
+
+
+# Fleet Statistics Chart Callback
+@callback(
+    Output('fleet-stats-chart', 'figure'),
+    Input('shipping-balance-data-store', 'data'),
+    Input('dropdown-options-store', 'data'),
+    prevent_initial_call=False
+)
+def update_fleet_statistics_chart(shipping_balance, dropdown_options):
+    """Update fleet statistics chart with dual axes."""
+    if shipping_balance is None or dropdown_options is None:
+        return {}
+
     try:
-        # Convert JSON back to DataFrame using the same method as main callback
-        from io import StringIO
-        df_trades_shipping_region = pd.read_json(StringIO(shipping_data), orient='split')
-        
-        # Check if DataFrame is empty
-        if df_trades_shipping_region.empty:
-            return go.Figure().update_layout(
-                title="No data to display",
-                annotations=[dict(text="No data available", 
-                                x=0.5, y=0.5, showarrow=False)]
-            ), "No data available", ""
-        
-        # Don't apply additional filters - use the full dataset like the original callback
-        # The filtering is handled by the table callbacks, not the chart callbacks
-        
-        # Determine metric based on selection
-        metric_mapping = {
-            'count_trades': ('count_trades', 'Count of Trades'),
-            'ton_miles': ('sum_ton_miles', 'Ton Miles'),
-            'median_delivery_days': ('median_delivery_days', 'Median Delivery Days'),
-            'median_mileage_nautical_miles': ('median_mileage_nautical_miles', 'Median Mileage (Nautical Miles)'),
-            'median_ton_miles': ('median_ton_miles', 'Median Ton Miles'),
-            'median_utilization_rate': ('median_utilization_rate', 'Median Utilization Rate'),
-            'median_cargo_destination_cubic_meters': ('median_cargo_destination_cubic_meters', 'Median Cargo Volume (m³)'),
-            'median_vessel_capacity_cubic_meters': ('median_vessel_capacity_cubic_meters', 'Median Vessel Capacity (m³)')
+        # Convert stored JSON back to DataFrame
+        df_global = pd.read_json(StringIO(shipping_balance), orient='split')
+
+        # Ensure date column is datetime
+        if 'date' in df_global.columns:
+            df_global['date'] = pd.to_datetime(df_global['date'])
+
+        # Get aggregation level
+        aggregation_level = dropdown_options.get('aggregation_level', 'monthly')
+
+        # Select relevant columns
+        fleet_cols = ['date', 'total_active_ships', 'average_size_cubic_meters']
+        display_df = df_global[fleet_cols].copy()
+
+        # Sort by date ascending for chart
+        display_df = display_df.sort_values('date')
+
+        # Create dual-axis figure
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+        # Add bar trace for Total Active Ships (primary y-axis)
+        fig.add_trace(
+            go.Bar(
+                x=display_df['date'],
+                y=display_df['total_active_ships'],
+                name='Total Active Ships',
+                marker_color='#2E86C1',
+                yaxis='y',
+                hovertemplate='%{x}<br>Total Ships: %{y:,.0f}<extra></extra>'
+            ),
+            secondary_y=False
+        )
+
+        # Add line trace for Average Capacity (secondary y-axis)
+        fig.add_trace(
+            go.Scatter(
+                x=display_df['date'],
+                y=display_df['average_size_cubic_meters'],
+                name='Avg Capacity (m³)',
+                mode='lines+markers',
+                line=dict(color='#E67E22', width=2),
+                marker=dict(size=6),
+                yaxis='y2',
+                hovertemplate='%{x}<br>Avg Capacity: %{y:,.0f} m³<extra></extra>'
+            ),
+            secondary_y=True
+        )
+
+        # Update layout
+        fig.update_layout(
+            title=None,
+            legend=dict(
+                orientation='h',
+                yanchor='top',
+                y=-0.08,
+                xanchor='center',
+                x=0.5,
+                bgcolor='rgba(255, 255, 255, 0)',
+                bordercolor='rgba(255, 255, 255, 0)',
+                borderwidth=0,
+                font=dict(size=12, color='#4A4A4A'),
+                itemsizing='constant',
+                itemwidth=30
+            ),
+            plot_bgcolor='rgba(248, 249, 250, 0.5)',
+            paper_bgcolor='white',
+            margin=dict(l=70, r=70, t=70, b=90),
+            hovermode='x unified',
+            hoverlabel=dict(
+                bgcolor='rgba(255, 255, 255, 0.95)',
+                bordercolor='rgba(200, 200, 200, 0.8)',
+                font=dict(size=11, color='#2C3E50'),
+                align='left'
+            ),
+            bargap=0.2,
+            height=400
+        )
+
+        # Primary y-axis
+        fig.update_yaxes(
+            title=dict(text='Total Active Ships', font=dict(size=13, color='#4A4A4A')),
+            showgrid=True,
+            gridcolor='rgba(200, 200, 200, 0.3)',
+            gridwidth=0.5,
+            linecolor='#CCCCCC',
+            linewidth=1,
+            tickfont=dict(size=11, color='#666666'),
+            zeroline=True,
+            zerolinecolor='rgba(150, 150, 150, 0.4)',
+            zerolinewidth=1,
+            secondary_y=False
+        )
+
+        # Secondary y-axis
+        fig.update_yaxes(
+            title=dict(text='Average Capacity (m³)', font=dict(size=13, color='#4A4A4A')),
+            showgrid=False,
+            linecolor='#CCCCCC',
+            linewidth=1,
+            tickfont=dict(size=11, color='#666666'),
+            secondary_y=True
+        )
+
+        # Aggregation-aware x-axis formatting
+        if aggregation_level == 'monthly':
+            tick_format = '%b %Y'
+            dtick = "M3"
+        elif aggregation_level == 'quarterly':
+            tick_format = '%Y Q%q'
+            dtick = "M3"
+        elif aggregation_level == 'seasonal':
+            tick_format = '%Y %b'
+            dtick = "M6"
+        else:  # yearly
+            tick_format = '%Y'
+            dtick = "M12"
+
+        fig.update_xaxes(
+            title=None,
+            tickformat=tick_format,
+            tickangle=0,
+            dtick=dtick,
+            showgrid=True,
+            gridcolor='rgba(200, 200, 200, 0.3)',
+            gridwidth=0.5,
+            linecolor='#CCCCCC',
+            linewidth=1,
+            tickfont=dict(size=11, color='#666666'),
+            tickmode='auto',
+            nticks=15
+        )
+
+        # Aggregation-aware hover templates
+        hover_templates = {
+            'monthly': '%{x|%b %Y}<br><b>%{y:,.0f}</b><extra></extra>',
+            'quarterly': '%{x|%Y Q%q}<br><b>%{y:,.0f}</b><extra></extra>',
+            'seasonal': '%{x|%Y %b}<br><b>%{y:,.0f}</b><extra></extra>',
+            'yearly': '%{x|%Y}<br><b>%{y:,.0f}</b><extra></extra>'
         }
-        
-        metric, title_suffix = metric_mapping.get(selected_metric, ('count_trades', 'Count of Trades'))
-        
-        # Create the chart
-        fig, vessel_footnote = create_stacked_bar_chart(
-            df_trades_shipping_region,
-            metric=metric,
-            title_suffix=title_suffix,
-            selected_statuses=selected_statuses,
-            is_intracountry=False
-        )
-        
-        # Create the table data using the same filtering logic as main callback
-        filtered_df = df_trades_shipping_region.copy()
-        
-        # Apply filters
-        if selected_regions and 'All Regions' not in selected_regions:
-            filtered_df = filtered_df[filtered_df['origin_shipping_region'].isin(selected_regions)]
-        
-        if selected_year and selected_year != 'All Years':
-            filtered_df = filtered_df[filtered_df['year'] == int(selected_year)]
-        
-        if selected_statuses and 'All Statuses' not in selected_statuses:
-            filtered_df = filtered_df[filtered_df['status'].isin(selected_statuses)]
-        
-        # Create table data based on selected metric
-        table_data = prepare_table_data(
-            filtered_df,
-            metric=metric,
-            selected_statuses=selected_statuses,
-            is_intracountry=False
-        )
-        
-        # Create the table
-        table = create_datatable(table_data, 'region_pair')
-        
-        return fig, table, vessel_footnote
-        
+        for trace in fig.data:
+            trace.hovertemplate = hover_templates.get(aggregation_level, '%{x}<br><b>%{y:,.0f}</b><extra></extra>')
+
+        # Add vertical line for current period using historical max from Kpler
+        hist_date_max_str = dropdown_options.get('hist_date_max')
+        if hist_date_max_str:
+            hist_date_max = pd.to_datetime(hist_date_max_str)
+            fig.add_shape(
+                type="line",
+                x0=hist_date_max,
+                x1=hist_date_max,
+                y0=0,
+                y1=1,
+                yref="paper",
+                line=dict(color="red", width=2, dash="dash")
+            )
+            fig.add_annotation(
+                x=hist_date_max,
+                y=1,
+                yref="paper",
+                text="Current Period",
+                showarrow=False,
+                yanchor="bottom",
+                font=dict(color="red", size=10)
+            )
+
+        return fig
+
     except Exception as e:
-        print(f"Error updating trade analysis chart and table: {e}")
-        error_fig = go.Figure().update_layout(
-            title="Error loading chart",
-            annotations=[dict(text=f"Error: {str(e)}", 
-                            x=0.5, y=0.5, showarrow=False)]
-        )
-        return error_fig, f"Error loading table: {str(e)}", ""
+        import traceback
+        traceback.print_exc()
+        return {
+            'data': [],
+            'layout': {
+                'title': f'Error loading chart: {str(e)}',
+                'xaxis': {'title': 'Period'},
+                'yaxis': {'title': 'Value'}
+            }
+        }
+
+
 
 
 @callback(
@@ -1702,8 +1827,6 @@ def update_trade_analysis_chart_and_table(selected_metric, shipping_data, select
     Output('intracountry-year-dropdown', 'value'),
     Output('intracountry-status-dropdown', 'options'),
     Output('intracountry-status-dropdown', 'value'),
-    Output('intracountry-count-table-container', 'children'),
-    Output('intracountry-tonmiles-table-container', 'children'),
     Input('intracountry-data-store', 'data'),
     Input('dropdown-options-store', 'data'),
     Input('intracountry-year-dropdown', 'value'),
@@ -1731,7 +1854,7 @@ def update_intracountry_visualizations(intracountry_data, dropdown_options, sele
         selected_statuses = ['All Statuses']
 
     # Create visualizations
-    fig_intracountry_count, _ = create_stacked_bar_chart(
+    fig_intracountry_count = create_stacked_bar_chart(
         df_intracountry_trades,
         metric='count_trades',
         title_suffix='Count of Trades',
@@ -1739,34 +1862,13 @@ def update_intracountry_visualizations(intracountry_data, dropdown_options, sele
         is_intracountry=True
     )
 
-    fig_intracountry_tonmiles, _ = create_stacked_bar_chart(
+    fig_intracountry_tonmiles = create_stacked_bar_chart(
         df_intracountry_trades,
         metric='sum_ton_miles',
         title_suffix='Ton Miles',
         selected_statuses=selected_statuses,
         is_intracountry=True
     )
-
-    # Prepare data for tables
-    count_table_data = prepare_table_data(
-        df_intracountry_trades,
-        'count_trades',
-        selected_year=selected_year,
-        selected_statuses=selected_statuses,
-        is_intracountry=True
-    )
-
-    ton_miles_table_data = prepare_table_data(
-        df_intracountry_trades,
-        'sum_ton_miles',
-        selected_year=selected_year,
-        selected_statuses=selected_statuses,
-        is_intracountry=True
-    )
-
-    # Create data tables
-    intracountry_count_table = create_datatable(count_table_data, 'origin_country_name')
-    intracountry_tonmiles_table = create_datatable(ton_miles_table_data, 'origin_country_name')
 
     return (
         fig_intracountry_count,
@@ -1775,9 +1877,73 @@ def update_intracountry_visualizations(intracountry_data, dropdown_options, sele
         selected_year,
         status_options,
         selected_statuses,
-        intracountry_count_table,
-        intracountry_tonmiles_table
     )
+
+
+@callback(
+    Output('download-intracountry-count-excel', 'data'),
+    Input('export-intracountry-count-button', 'n_clicks'),
+    State('intracountry-data-store', 'data'),
+    State('intracountry-year-dropdown', 'value'),
+    State('intracountry-status-dropdown', 'value'),
+    prevent_initial_call=True
+)
+def export_intracountry_count_to_excel(n_clicks, intracountry_data, selected_year, selected_statuses):
+    """Export Count of Intracountry Trades data to Excel."""
+    if not n_clicks or intracountry_data is None:
+        raise PreventUpdate
+
+    df = pd.read_json(StringIO(intracountry_data), orient='split')
+    table_data = prepare_table_data(
+        df, 'count_trades',
+        selected_year=selected_year,
+        selected_statuses=selected_statuses,
+        is_intracountry=True
+    )
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        table_data.to_excel(writer, sheet_name='Intracountry Count', index=False)
+        for worksheet in writer.sheets.values():
+            for column_cells in worksheet.columns:
+                max_length = max((len(str(cell.value)) if cell.value is not None else 0) for cell in column_cells)
+                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max_length + 2, 50)
+    output.seek(0)
+    timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    return dcc.send_bytes(output.getvalue(), f'Intracountry_Count_{timestamp}.xlsx')
+
+
+@callback(
+    Output('download-intracountry-tonmiles-excel', 'data'),
+    Input('export-intracountry-tonmiles-button', 'n_clicks'),
+    State('intracountry-data-store', 'data'),
+    State('intracountry-year-dropdown', 'value'),
+    State('intracountry-status-dropdown', 'value'),
+    prevent_initial_call=True
+)
+def export_intracountry_tonmiles_to_excel(n_clicks, intracountry_data, selected_year, selected_statuses):
+    """Export Intracountry Ton Miles data to Excel."""
+    if not n_clicks or intracountry_data is None:
+        raise PreventUpdate
+
+    df = pd.read_json(StringIO(intracountry_data), orient='split')
+    table_data = prepare_table_data(
+        df, 'sum_ton_miles',
+        selected_year=selected_year,
+        selected_statuses=selected_statuses,
+        is_intracountry=True
+    )
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        table_data.to_excel(writer, sheet_name='Intracountry Ton Miles', index=False)
+        for worksheet in writer.sheets.values():
+            for column_cells in worksheet.columns:
+                max_length = max((len(str(cell.value)) if cell.value is not None else 0) for cell in column_cells)
+                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max_length + 2, 50)
+    output.seek(0)
+    timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    return dcc.send_bytes(output.getvalue(), f'Intracountry_TonMiles_{timestamp}.xlsx')
 
 
 def prepare_custom_metrics_data(df, metric, selected_year=None, selected_status=None, region_direction=None,
@@ -1830,43 +1996,38 @@ def prepare_custom_metrics_data(df, metric, selected_year=None, selected_status=
                 'destination_shipping_region']
             index_field = 'region_pair'
         # Select only the required columns
-        keep_cols = ['year', index_field, 'vessel_type', 'status', metric]
+        keep_cols = ['year', index_field, 'status', metric]
     elif is_intracountry:
         # For intracountry data with origin_country_name
         index_field = 'origin_country_name'
         # Select only required columns
-        keep_cols = ['year', index_field, 'vessel_type', 'status', metric]
+        keep_cols = ['year', index_field, 'status', metric]
     else:
-        # For vessel metrics: We're analyzing by vessel type, so no region needed
-        index_field = 'vessel_type'
+        # For vessel metrics: analyze by year and status
+        index_field = 'year'
         # Select only required columns
-        keep_cols = ['year', 'vessel_type', 'status', metric]
+        keep_cols = ['year', 'status', metric]
     # Keep only the required columns that exist in the DataFrame
     existing_cols = [col for col in keep_cols if col in filtered_df.columns]
     filtered_df = filtered_df[existing_cols]
 
     # For vessel metrics, handle differently
     if not region_direction and not is_intracountry:
-        # For vessel metrics - aggregate the data by vessel type
-        agg_data = filtered_df.groupby(['vessel_type']).agg({
+        # For vessel metrics - aggregate the data by year
+        agg_data = filtered_df.groupby(['year']).agg({
             metric: 'mean'
         }).reset_index()
-        # Sort values by vessel_type
-        pivot_table = agg_data.sort_values('vessel_type')
+        # Sort values by year
+        pivot_table = agg_data.sort_values('year')
     else:
-        # For region or country metrics - pivot with vessel types as columns
+        # For region or country metrics - aggregate without vessel type
         try:
-            pivot_table = filtered_df.pivot_table(
-                index=[index_field, 'year', 'status'],
-                columns='vessel_type',
-                values=metric,
-                aggfunc='mean'  # Using mean for aggregation if there are multiple entries
-            ).reset_index()
+            pivot_table = filtered_df.groupby([index_field, 'year', 'status'])[metric].mean().reset_index()
             # Sort the data by the index field
             pivot_table = pivot_table.sort_values(index_field)
         except KeyError as e:
             # Handle case where expected columns aren't found
-            print(f"KeyError in pivot_table: {e}")
+            print(f"KeyError in groupby: {e}")
             # Create a simple DataFrame to show the error
             pivot_table = pd.DataFrame({
                 'Error': [f"Missing column: {e}"]
@@ -1957,9 +2118,8 @@ def update_custom_metrics_table(intracountry_data, dropdown_options, selected_ye
         # Create columns for the table
         columns = []
         for col in custom_metrics_data.columns:
-            if col in ['vessel_type', 'origin_country_name', 'year', 'status']:
+            if col in ['origin_country_name', 'year', 'status']:
                 display_name = {
-                    'vessel_type': 'Vessel Type',
                     'origin_country_name': 'Origin Country',
                     'year': 'Year',
                     'status': 'Status'
@@ -2131,33 +2291,26 @@ def update_region_metrics_table(shipping_data, selected_year, selected_status,
                 'destination_shipping_region']
             index_field = 'region_pair'
 
-        # Directly aggregate the data without using the helper function
-        agg_data = filtered_df.groupby([index_field, 'year', 'season', 'quarter', 'status', 'vessel_type'])[
+        # Directly aggregate the data without using the helper function (vessel_type removed)
+        pivot_table = filtered_df.groupby([index_field, 'year', 'season', 'quarter', 'status'])[
             selected_metric].mean().reset_index()
-        # Pivot the data for the table
-        pivot_table = agg_data.pivot_table(
-            index=[index_field, 'year', 'season', 'quarter', 'status'],
-            columns='vessel_type',
-            values=selected_metric,
-            aggfunc='mean'
-        ).reset_index()
         # Create columns for the table
         columns = []
-        # Add index columns first
-        for col in [index_field, 'year', 'season', 'quarter', 'status']:
-            display_name = {
-                'region_pair': 'Region Pair',
-                'origin_shipping_region': 'Origin Region',
-                'destination_shipping_region': 'Destination Region',
-                'year': 'Year',
-                'season': 'Season',
-                'quarter': 'Quarter',
-                'status': 'Status'
-            }.get(col, col.capitalize())
-            columns.append({"name": display_name, "id": col})
-        # Add vessel type columns
+        # Add all columns
         for col in pivot_table.columns:
-            if col not in [index_field, 'year', 'season', 'quarter', 'status']:
+            if col in [index_field, 'year', 'season', 'quarter', 'status']:
+                display_name = {
+                    'region_pair': 'Region Pair',
+                    'origin_shipping_region': 'Origin Region',
+                    'destination_shipping_region': 'Destination Region',
+                    'year': 'Year',
+                    'season': 'Season',
+                    'quarter': 'Quarter',
+                    'status': 'Status'
+                }.get(col, col.capitalize())
+                columns.append({"name": display_name, "id": col})
+            else:
+                # Metric columns
                 columns.append({
                     "name": col,
                     "id": col,
@@ -2209,4 +2362,1117 @@ def update_region_metrics_table(shipping_data, selected_year, selected_status,
             html.P(f"An error occurred: {str(e)}"),
             html.Pre(traceback_str)
         ])
- 
+
+
+# Regional Breakdown Callbacks
+@callback(
+    Output('demand-regional-year-dropdown', 'options'),
+    Output('demand-regional-year-dropdown', 'value'),
+    Output('demand-regional-period-dropdown', 'options'),
+    Output('demand-regional-period-dropdown', 'value'),
+    Input('shipping-balance-regional-data-store', 'data'),
+    Input('demand-regional-aggregation-dropdown', 'value'),
+    prevent_initial_call=False
+)
+def update_demand_regional_dropdowns(regional_data, aggregation_level):
+    """Update year and period dropdown options for demand regional table."""
+    if regional_data is None:
+        raise PreventUpdate
+
+    # Convert stored JSON back to DataFrame
+    df_regional = pd.read_json(StringIO(regional_data), orient='split')
+
+    # Extract unique years from the date column
+    df_regional['year'] = pd.to_datetime(df_regional['date']).dt.year
+    df_regional['month'] = pd.to_datetime(df_regional['date']).dt.month
+    df_regional['quarter'] = pd.to_datetime(df_regional['date']).dt.quarter
+
+    years = sorted(df_regional['year'].unique())
+    year_options = [{'label': str(year), 'value': year} for year in years]
+    default_year = years[-1] if years else None
+
+    # Create period options based on aggregation level
+    if aggregation_level == 'monthly':
+        period_options = [{'label': f'Month {i}', 'value': i} for i in range(1, 13)]
+        default_period = df_regional[df_regional['year'] == default_year]['month'].max() if default_year else 1
+    elif aggregation_level == 'quarterly':
+        period_options = [{'label': f'Q{i}', 'value': i} for i in range(1, 5)]
+        default_period = df_regional[df_regional['year'] == default_year]['quarter'].max() if default_year else 1
+    elif aggregation_level == 'seasonal':
+        period_options = [{'label': 'Winter', 'value': 1}, {'label': 'Summer', 'value': 7}]
+        default_period = df_regional[df_regional['year'] == default_year]['month'].max() if default_year else 1
+        default_period = 1 if default_period in [1, 2, 3, 4, 5, 6] else 7
+    else:  # yearly
+        period_options = [{'label': 'Full Year', 'value': 1}]
+        default_period = 1
+
+    return year_options, default_year, period_options, default_period
+
+
+@callback(
+    Output('supply-regional-year-dropdown', 'options'),
+    Output('supply-regional-year-dropdown', 'value'),
+    Output('supply-regional-period-dropdown', 'options'),
+    Output('supply-regional-period-dropdown', 'value'),
+    Input('shipping-balance-supply-regional-data-store', 'data'),
+    Input('supply-regional-aggregation-dropdown', 'value'),
+    prevent_initial_call=False
+)
+def update_supply_regional_dropdowns(regional_data, aggregation_level):
+    """Update year and period dropdown options for supply regional table."""
+    if regional_data is None:
+        raise PreventUpdate
+
+    # Convert stored JSON back to DataFrame
+    df_regional = pd.read_json(StringIO(regional_data), orient='split')
+
+    # Extract unique years from the date column
+    df_regional['year'] = pd.to_datetime(df_regional['date']).dt.year
+    df_regional['month'] = pd.to_datetime(df_regional['date']).dt.month
+    df_regional['quarter'] = pd.to_datetime(df_regional['date']).dt.quarter
+
+    years = sorted(df_regional['year'].unique())
+    year_options = [{'label': str(year), 'value': year} for year in years]
+    default_year = years[-1] if years else None
+
+    # Create period options based on aggregation level
+    if aggregation_level == 'monthly':
+        period_options = [{'label': f'Month {i}', 'value': i} for i in range(1, 13)]
+        default_period = df_regional[df_regional['year'] == default_year]['month'].max() if default_year else 1
+    elif aggregation_level == 'quarterly':
+        period_options = [{'label': f'Q{i}', 'value': i} for i in range(1, 5)]
+        default_period = df_regional[df_regional['year'] == default_year]['quarter'].max() if default_year else 1
+    elif aggregation_level == 'seasonal':
+        period_options = [{'label': 'Winter', 'value': 1}, {'label': 'Summer', 'value': 7}]
+        default_period = df_regional[df_regional['year'] == default_year]['month'].max() if default_year else 1
+        default_period = 1 if default_period in [1, 2, 3, 4, 5, 6] else 7
+    else:  # yearly
+        period_options = [{'label': 'Full Year', 'value': 1}]
+        default_period = 1
+
+    return year_options, default_year, period_options, default_period
+
+
+# Vessel Type Dropdown Callbacks
+@callback(
+    Output('demand-regional-vessel-type-dropdown', 'options'),
+    Input('vessel-type-options-store', 'data'),
+    prevent_initial_call=False
+)
+def update_demand_vessel_type_options(vessel_type_options):
+    """Update vessel type dropdown options for demand regional table."""
+    if vessel_type_options is None:
+        return []
+    return vessel_type_options
+
+
+@callback(
+    Output('supply-regional-vessel-type-dropdown', 'options'),
+    Input('vessel-type-options-store', 'data'),
+    prevent_initial_call=False
+)
+def update_supply_vessel_type_options(vessel_type_options):
+    """Update vessel type dropdown options for supply regional table."""
+    if vessel_type_options is None:
+        return []
+    return vessel_type_options
+
+
+@callback(
+    Output('demand-regional-table-container', 'children'),
+    Input('shipping-balance-regional-data-store', 'data'),
+    Input('demand-regional-aggregation-dropdown', 'value'),
+    Input('demand-regional-year-dropdown', 'value'),
+    Input('demand-regional-period-dropdown', 'value'),
+    prevent_initial_call=False
+)
+def update_demand_regional_table(regional_data, aggregation_level, selected_year, selected_period):
+    """Update demand regional breakdown table."""
+    if regional_data is None or selected_year is None or selected_period is None:
+        raise PreventUpdate
+
+    try:
+        # Convert stored JSON back to DataFrame
+        df_regional = pd.read_json(StringIO(regional_data), orient='split')
+
+        # Add time columns
+        df_regional['year'] = pd.to_datetime(df_regional['date']).dt.year
+        df_regional['month'] = pd.to_datetime(df_regional['date']).dt.month
+        df_regional['quarter'] = pd.to_datetime(df_regional['date']).dt.quarter
+
+        # Filter by year and period based on aggregation level
+        if aggregation_level == 'monthly':
+            df_filtered = df_regional[(df_regional['year'] == selected_year) & (df_regional['month'] == selected_period)]
+        elif aggregation_level == 'quarterly':
+            df_filtered = df_regional[(df_regional['year'] == selected_year) & (df_regional['quarter'] == selected_period)]
+        elif aggregation_level == 'seasonal':
+            # selected_period is 1 (Winter/Jan) or 7 (Summer/Jul)
+            df_filtered = df_regional[(df_regional['year'] == selected_year) & (df_regional['month'] == selected_period)]
+        else:  # yearly
+            df_filtered = df_regional[df_regional['year'] == selected_year]
+
+        if df_filtered.empty:
+            return html.Div("No data available for the selected period.", style={'padding': '10px', 'color': '#666'})
+
+        # Select and rename columns for display
+        # MODIFIED: Now including origin and destination shipping regions
+        # Use utilization_ratio (already in %) instead of aggregate_utilization_rate (0-1 range)
+        # Include sum_cargo and sum_vessel_capacity columns
+        cols_to_select = ['origin_shipping_region', 'destination_shipping_region', 'value', 'ships_demand',
+                         'mean_vessel_capacity', 'trade_vessel_capacity',
+                         'mean_cargo_cubic_meters', 'count_laden_trades', 'count_nonladen_trades',
+                         'sum_ton_miles', 'median_vessel_speed_laden', 'median_vessel_speed_nonladen',
+                         'utilization_ratio', 'median_laden_days', 'median_nonladen_days']
+
+        # Add optional columns if they exist
+        if 'sum_cargo' in df_filtered.columns:
+            cols_to_select.append('sum_cargo')
+        if 'sum_vessel_capacity' in df_filtered.columns:
+            cols_to_select.append('sum_vessel_capacity')
+
+        display_df = df_filtered[cols_to_select].copy()
+
+        # Convert value from m³ to M m³ (divide by 1,000,000)
+        display_df['value'] = (display_df['value'] / 1000000).round(2)
+
+        # Calculate volume percentage
+        total_volume = display_df['value'].sum()
+        display_df['volume_pct'] = (display_df['value'] / total_volume * 100).round(2) if total_volume > 0 else 0
+
+        # Convert sum_cargo and sum_vessel_capacity from m³ to M m³ if they exist
+        if 'sum_cargo' in display_df.columns:
+            display_df['sum_cargo'] = (display_df['sum_cargo'] / 1000000).round(2)
+        if 'sum_vessel_capacity' in display_df.columns:
+            display_df['sum_vessel_capacity'] = (display_df['sum_vessel_capacity'] / 1000000).round(2)
+
+        # Build rename dictionary
+        rename_dict = {
+            'origin_shipping_region': 'Origin Region',
+            'destination_shipping_region': 'Destination Region',
+            'value': 'LNG Volume (M m³)',
+            'volume_pct': 'Volume Share (%)',
+            'ships_demand': 'Ships Demand',
+            'mean_vessel_capacity': 'Fleet Avg Size (m³)',
+            'trade_vessel_capacity': 'Trade Avg Size (m³)',
+            'mean_cargo_cubic_meters': 'Avg Cargo Volume (m³)',
+            'count_laden_trades': 'Laden Trades',
+            'count_nonladen_trades': 'Ballast Trades',
+            'sum_ton_miles': 'Total Ton-Miles',
+            'median_vessel_speed_laden': 'Speed Laden (kts)',
+            'median_vessel_speed_nonladen': 'Speed Ballast (kts)',
+            'utilization_ratio': 'Utilization Rate (%)',
+            'median_laden_days': 'Laden Days',
+            'median_nonladen_days': 'Ballast Days'
+        }
+
+        # Add optional columns to rename dict if they exist
+        if 'sum_cargo' in display_df.columns:
+            rename_dict['sum_cargo'] = 'Sum Cargo (M m³)'
+        if 'sum_vessel_capacity' in display_df.columns:
+            rename_dict['sum_vessel_capacity'] = 'Sum Vessel Capacity (M m³)'
+
+        display_df = display_df.rename(columns=rename_dict)
+
+        # Sort by Ships Demand descending
+        display_df = display_df.sort_values('Ships Demand', ascending=False)
+
+        # Create DataTable
+        columns = [
+            {"name": "Origin Region", "id": "Origin Region"},
+            {"name": "Destination Region", "id": "Destination Region"},
+            {"name": "LNG Volume (M m³)", "id": "LNG Volume (M m³)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=2)},
+            {"name": "Volume Share (%)", "id": "Volume Share (%)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=2)},
+            {"name": "Ships Demand", "id": "Ships Demand", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=1)},
+            {"name": "Fleet Avg Size (m³)", "id": "Fleet Avg Size (m³)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Trade Avg Size (m³)", "id": "Trade Avg Size (m³)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Avg Cargo Volume (m³)", "id": "Avg Cargo Volume (m³)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Laden Trades", "id": "Laden Trades", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Ballast Trades", "id": "Ballast Trades", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Total Ton-Miles", "id": "Total Ton-Miles", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Speed Laden (kts)", "id": "Speed Laden (kts)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=1)},
+            {"name": "Speed Ballast (kts)", "id": "Speed Ballast (kts)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=1)},
+            {"name": "Utilization Rate (%)", "id": "Utilization Rate (%)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=2)},
+            {"name": "Laden Days", "id": "Laden Days", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=1)},
+            {"name": "Ballast Days", "id": "Ballast Days", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=1)}
+        ]
+
+        # Add optional columns to DataTable if they exist in display_df
+        if 'Sum Cargo (M m³)' in display_df.columns:
+            columns.insert(-2, {"name": "Sum Cargo (M m³)", "id": "Sum Cargo (M m³)", "type": "numeric",
+                               "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=2)})
+        if 'Sum Vessel Capacity (M m³)' in display_df.columns:
+            columns.insert(-2, {"name": "Sum Vessel Capacity (M m³)", "id": "Sum Vessel Capacity (M m³)", "type": "numeric",
+                               "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=2)})
+
+        # Calculate total LNG volume for validation against WoodMac
+        total_lng_volume = display_df['LNG Volume (M m³)'].sum()
+
+        # Fetch WoodMac data for comparison
+        try:
+            # Determine grouping and date filter based on aggregation level
+            if aggregation_level == 'monthly':
+                group_by_clause = "country_name, start_date::DATE, publication_date, source"
+                date_column = "start_date::DATE"
+                date_filter = f"EXTRACT(YEAR FROM start_date) = {selected_year} AND EXTRACT(MONTH FROM start_date) = {selected_period}"
+            elif aggregation_level == 'quarterly':
+                group_by_clause = "country_name, DATE_TRUNC('quarter', start_date::DATE), publication_date, source"
+                date_column = "DATE_TRUNC('quarter', start_date::DATE)"
+                # Filter on the truncated quarter start date
+                quarter_start_month = (selected_period - 1) * 3 + 1
+                date_filter = f"start_date = DATE '{selected_year}-{quarter_start_month:02d}-01'"
+            elif aggregation_level == 'seasonal':
+                group_by_clause = "country_name, CASE WHEN EXTRACT(MONTH FROM start_date::DATE) BETWEEN 1 AND 6 THEN DATE_TRUNC('year', start_date::DATE) ELSE DATE_TRUNC('year', start_date::DATE) + INTERVAL '6 months' END, publication_date, source"
+                date_column = "CASE WHEN EXTRACT(MONTH FROM start_date::DATE) BETWEEN 1 AND 6 THEN DATE_TRUNC('year', start_date::DATE) ELSE DATE_TRUNC('year', start_date::DATE) + INTERVAL '6 months' END"
+                date_filter = f"start_date = DATE '{selected_year}-{selected_period:02d}-01'"
+            else:  # yearly
+                group_by_clause = "country_name, DATE_TRUNC('year', start_date::DATE), publication_date, source"
+                date_column = "DATE_TRUNC('year', start_date::DATE)"
+                date_filter = f"start_date = DATE '{selected_year}-01-01'"
+
+            wm_query = f'''
+            WITH latest_short_term AS (
+                SELECT
+                    country_name,
+                    {date_column}::DATE as start_date,
+                    SUM(metric_value) / 12 * 2222*1000 AS value,
+                    publication_date,
+                    'Short Term' as source
+                FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+                WHERE market_outlook = (
+                    SELECT market_outlook
+                    FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+                    WHERE release_type = 'Short Term Outlook'
+                    GROUP BY market_outlook
+                    ORDER BY TO_DATE(
+                        (regexp_match(market_outlook, '(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{{4}})'))[1]
+                        || ' ' ||
+                        (regexp_match(market_outlook, '(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{{4}})'))[2],
+                        'Month YYYY'
+                    ) DESC, MAX(publication_date) DESC
+                    LIMIT 1
+                )
+                AND release_type = 'Short Term Outlook'
+                AND direction = 'Import'
+                AND measured_at = 'Entry'
+                AND metric_name = 'Flow'
+                AND start_date::DATE < '2036-01-01'
+                GROUP BY {group_by_clause}
+                HAVING SUM(metric_value) > 0
+            ),
+            short_term_max_date AS (
+                SELECT MAX(start_date::DATE) as max_date
+                FROM latest_short_term
+            ),
+            latest_long_term_raw AS (
+                SELECT
+                    country_name,
+                    {date_column}::DATE as start_date,
+                    SUM(metric_value) / 12 * 2222*1000 AS value,
+                    publication_date,
+                    'Long Term' as source
+                FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+                WHERE market_outlook = (
+                    SELECT market_outlook
+                    FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+                    WHERE release_type = 'Long Term Outlook'
+                    GROUP BY market_outlook
+                    ORDER BY TO_DATE(
+                        (regexp_match(market_outlook, '(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{{4}})'))[1]
+                        || ' ' ||
+                        (regexp_match(market_outlook, '(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{{4}})'))[2],
+                        'Month YYYY'
+                    ) DESC, MAX(publication_date) DESC
+                    LIMIT 1
+                )
+                AND release_type = 'Long Term Outlook'
+                AND direction = 'Import'
+                AND measured_at = 'Entry'
+                AND metric_name = 'Flow'
+                AND start_date::DATE < '2036-01-01'
+                GROUP BY {group_by_clause}
+                HAVING SUM(metric_value) > 0
+            ),
+            latest_long_term AS (
+                SELECT *
+                FROM latest_long_term_raw
+                WHERE start_date > (SELECT max_date FROM short_term_max_date)
+            ),
+            combined AS (
+                SELECT * FROM latest_short_term
+                UNION ALL
+                SELECT * FROM latest_long_term
+            ),
+            filtered AS (
+                SELECT * FROM combined WHERE {date_filter}
+            )
+            SELECT COALESCE(SUM(value) / 1000000, 0) as woodmac_total,
+                   STRING_AGG(DISTINCT source, ' + ') as sources
+            FROM filtered
+            '''
+
+            wm_result = pd.read_sql(wm_query, engine)
+            woodmac_total = wm_result['woodmac_total'].iloc[0]
+            woodmac_sources = wm_result['sources'].iloc[0] if wm_result['sources'].iloc[0] else 'N/A'
+
+            difference = total_lng_volume - woodmac_total
+            pct_diff = (difference / woodmac_total * 100) if woodmac_total > 0 else 0
+
+            # Color coding based on percentage difference
+            if abs(pct_diff) < 5:
+                diff_color = '#27AE60'  # Green
+            elif abs(pct_diff) < 10:
+                diff_color = '#F39C12'  # Orange
+            else:
+                diff_color = '#E74C3C'  # Red
+
+        except Exception as e:
+            woodmac_total = 0
+            woodmac_sources = 'Error'
+            difference = 0
+            pct_diff = 0
+            diff_color = '#999'
+
+        # Create validation summary with WoodMac comparison
+        validation_summary = html.Div([
+            html.Div([
+                html.Strong("Total LNG Volume (Demand): ", style={'fontSize': '14px'}),
+                html.Span(f"Regional: {total_lng_volume:,.2f} M m³", style={'fontSize': '14px', 'fontWeight': 'bold', 'color': '#2E86C1', 'marginRight': '15px'}),
+                html.Span(" | ", style={'fontSize': '14px', 'color': '#999'}),
+                html.Span(f"WoodMac ({woodmac_sources}): {woodmac_total:,.2f} M m³", style={'fontSize': '14px', 'fontWeight': 'bold', 'color': '#2E86C1', 'marginLeft': '15px', 'marginRight': '15px'}),
+                html.Span(" | ", style={'fontSize': '14px', 'color': '#999'}),
+                html.Span(f"Diff: {difference:+,.2f} M m³ ({pct_diff:+.1f}%)", style={'fontSize': '14px', 'fontWeight': 'bold', 'color': diff_color, 'marginLeft': '15px'})
+            ], style={'padding': '10px', 'marginBottom': '10px', 'backgroundColor': '#E8F4F8', 'borderLeft': '4px solid #2E86C1', 'borderRadius': '4px'})
+        ])
+
+        table = dash_table.DataTable(
+            columns=columns,
+            data=display_df.to_dict('records'),
+            style_table={'overflowX': 'auto', 'width': '100%'},
+            style_cell={
+                'textAlign': 'center',
+                'padding': '8px',
+                'fontSize': '12px',
+                'fontFamily': 'Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif'
+            },
+            style_header={
+                'backgroundColor': '#2E86C1',
+                'color': 'white',
+                'fontWeight': 'bold',
+                'fontSize': '12px',
+                'whiteSpace': 'normal',
+                'height': 'auto'
+            },
+            style_data_conditional=[
+                {
+                    'if': {'row_index': 'odd'},
+                    'backgroundColor': 'rgb(248, 248, 248)'
+                }
+            ],
+            page_size=15,
+            export_format='xlsx'
+        )
+
+        return html.Div([validation_summary, table])
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return html.Div(f"Error loading regional table: {str(e)}", style={'padding': '10px', 'color': 'red'})
+
+
+@callback(
+    Output('supply-regional-table-container', 'children'),
+    Input('shipping-balance-supply-regional-data-store', 'data'),
+    Input('supply-regional-aggregation-dropdown', 'value'),
+    Input('supply-regional-year-dropdown', 'value'),
+    Input('supply-regional-period-dropdown', 'value'),
+    prevent_initial_call=False
+)
+def update_supply_regional_table(regional_data, aggregation_level, selected_year, selected_period):
+    """Update supply regional breakdown table."""
+    if regional_data is None or selected_year is None or selected_period is None:
+        raise PreventUpdate
+
+    try:
+        # Convert stored JSON back to DataFrame
+        df_regional = pd.read_json(StringIO(regional_data), orient='split')
+
+        # Add time columns
+        df_regional['year'] = pd.to_datetime(df_regional['date']).dt.year
+        df_regional['month'] = pd.to_datetime(df_regional['date']).dt.month
+        df_regional['quarter'] = pd.to_datetime(df_regional['date']).dt.quarter
+
+        # Filter by year and period based on aggregation level
+        if aggregation_level == 'monthly':
+            df_filtered = df_regional[(df_regional['year'] == selected_year) & (df_regional['month'] == selected_period)]
+        elif aggregation_level == 'quarterly':
+            df_filtered = df_regional[(df_regional['year'] == selected_year) & (df_regional['quarter'] == selected_period)]
+        elif aggregation_level == 'seasonal':
+            # selected_period is 1 (Winter/Jan) or 7 (Summer/Jul)
+            df_filtered = df_regional[(df_regional['year'] == selected_year) & (df_regional['month'] == selected_period)]
+        else:  # yearly
+            df_filtered = df_regional[df_regional['year'] == selected_year]
+
+        if df_filtered.empty:
+            return html.Div("No data available for the selected period.", style={'padding': '10px', 'color': '#666'})
+
+        # Select and rename columns for display
+        # MODIFIED: Now including origin and destination shipping regions
+        # Use utilization_ratio (already in %) instead of aggregate_utilization_rate (0-1 range)
+        # Include sum_cargo and sum_vessel_capacity columns
+        cols_to_select = ['origin_shipping_region', 'destination_shipping_region', 'value', 'ships_demand',
+                         'mean_vessel_capacity', 'trade_vessel_capacity',
+                         'mean_cargo_cubic_meters', 'count_laden_trades', 'count_nonladen_trades',
+                         'sum_ton_miles', 'median_vessel_speed_laden', 'median_vessel_speed_nonladen',
+                         'utilization_ratio', 'median_laden_days', 'median_nonladen_days']
+
+        # Add optional columns if they exist
+        if 'sum_cargo' in df_filtered.columns:
+            cols_to_select.append('sum_cargo')
+        if 'sum_vessel_capacity' in df_filtered.columns:
+            cols_to_select.append('sum_vessel_capacity')
+
+        display_df = df_filtered[cols_to_select].copy()
+
+        # Convert value from m³ to M m³ (divide by 1,000,000)
+        display_df['value'] = (display_df['value'] / 1000000).round(2)
+
+        # Calculate volume percentage
+        total_volume = display_df['value'].sum()
+        display_df['volume_pct'] = (display_df['value'] / total_volume * 100).round(2) if total_volume > 0 else 0
+
+        # Convert sum_cargo and sum_vessel_capacity from m³ to M m³ if they exist
+        if 'sum_cargo' in display_df.columns:
+            display_df['sum_cargo'] = (display_df['sum_cargo'] / 1000000).round(2)
+        if 'sum_vessel_capacity' in display_df.columns:
+            display_df['sum_vessel_capacity'] = (display_df['sum_vessel_capacity'] / 1000000).round(2)
+
+        # Build rename dictionary
+        rename_dict = {
+            'origin_shipping_region': 'Origin Region',
+            'destination_shipping_region': 'Destination Region',
+            'value': 'LNG Volume (M m³)',
+            'volume_pct': 'Volume Share (%)',
+            'ships_demand': 'Ships Demand',
+            'mean_vessel_capacity': 'Fleet Avg Size (m³)',
+            'trade_vessel_capacity': 'Trade Avg Size (m³)',
+            'mean_cargo_cubic_meters': 'Avg Cargo Volume (m³)',
+            'count_laden_trades': 'Laden Trades',
+            'count_nonladen_trades': 'Ballast Trades',
+            'sum_ton_miles': 'Total Ton-Miles',
+            'median_vessel_speed_laden': 'Speed Laden (kts)',
+            'median_vessel_speed_nonladen': 'Speed Ballast (kts)',
+            'utilization_ratio': 'Utilization Rate (%)',
+            'median_laden_days': 'Laden Days',
+            'median_nonladen_days': 'Ballast Days'
+        }
+
+        # Add optional columns to rename dict if they exist
+        if 'sum_cargo' in display_df.columns:
+            rename_dict['sum_cargo'] = 'Sum Cargo (M m³)'
+        if 'sum_vessel_capacity' in display_df.columns:
+            rename_dict['sum_vessel_capacity'] = 'Sum Vessel Capacity (M m³)'
+
+        display_df = display_df.rename(columns=rename_dict)
+
+        # Sort by Ships Demand descending
+        display_df = display_df.sort_values('Ships Demand', ascending=False)
+
+        # Create DataTable
+        columns = [
+            {"name": "Origin Region", "id": "Origin Region"},
+            {"name": "Destination Region", "id": "Destination Region"},
+            {"name": "LNG Volume (M m³)", "id": "LNG Volume (M m³)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=2)},
+            {"name": "Volume Share (%)", "id": "Volume Share (%)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=2)},
+            {"name": "Ships Demand", "id": "Ships Demand", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=1)},
+            {"name": "Fleet Avg Size (m³)", "id": "Fleet Avg Size (m³)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Trade Avg Size (m³)", "id": "Trade Avg Size (m³)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Avg Cargo Volume (m³)", "id": "Avg Cargo Volume (m³)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Laden Trades", "id": "Laden Trades", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Ballast Trades", "id": "Ballast Trades", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Total Ton-Miles", "id": "Total Ton-Miles", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=0)},
+            {"name": "Speed Laden (kts)", "id": "Speed Laden (kts)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=1)},
+            {"name": "Speed Ballast (kts)", "id": "Speed Ballast (kts)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=1)},
+            {"name": "Utilization Rate (%)", "id": "Utilization Rate (%)", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=2)},
+            {"name": "Laden Days", "id": "Laden Days", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=1)},
+            {"name": "Ballast Days", "id": "Ballast Days", "type": "numeric",
+             "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=1)}
+        ]
+
+        # Add optional columns to DataTable if they exist in display_df
+        if 'Sum Cargo (M m³)' in display_df.columns:
+            columns.insert(-2, {"name": "Sum Cargo (M m³)", "id": "Sum Cargo (M m³)", "type": "numeric",
+                               "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=2)})
+        if 'Sum Vessel Capacity (M m³)' in display_df.columns:
+            columns.insert(-2, {"name": "Sum Vessel Capacity (M m³)", "id": "Sum Vessel Capacity (M m³)", "type": "numeric",
+                               "format": Format(group=Group.yes, scheme=Scheme.fixed, precision=2)})
+
+        # Calculate total LNG volume for validation against WoodMac
+        total_lng_volume = display_df['LNG Volume (M m³)'].sum()
+
+        # Fetch WoodMac data for comparison
+        try:
+            # Determine grouping and date filter based on aggregation level
+            if aggregation_level == 'monthly':
+                group_by_clause = "country_name, start_date::DATE, publication_date, source"
+                date_column = "start_date::DATE"
+                date_filter = f"EXTRACT(YEAR FROM start_date) = {selected_year} AND EXTRACT(MONTH FROM start_date) = {selected_period}"
+            elif aggregation_level == 'quarterly':
+                group_by_clause = "country_name, DATE_TRUNC('quarter', start_date::DATE), publication_date, source"
+                date_column = "DATE_TRUNC('quarter', start_date::DATE)"
+                # Filter on the truncated quarter start date
+                quarter_start_month = (selected_period - 1) * 3 + 1
+                date_filter = f"start_date = DATE '{selected_year}-{quarter_start_month:02d}-01'"
+            elif aggregation_level == 'seasonal':
+                group_by_clause = "country_name, CASE WHEN EXTRACT(MONTH FROM start_date::DATE) BETWEEN 1 AND 6 THEN DATE_TRUNC('year', start_date::DATE) ELSE DATE_TRUNC('year', start_date::DATE) + INTERVAL '6 months' END, publication_date, source"
+                date_column = "CASE WHEN EXTRACT(MONTH FROM start_date::DATE) BETWEEN 1 AND 6 THEN DATE_TRUNC('year', start_date::DATE) ELSE DATE_TRUNC('year', start_date::DATE) + INTERVAL '6 months' END"
+                date_filter = f"start_date = DATE '{selected_year}-{selected_period:02d}-01'"
+            else:  # yearly
+                group_by_clause = "country_name, DATE_TRUNC('year', start_date::DATE), publication_date, source"
+                date_column = "DATE_TRUNC('year', start_date::DATE)"
+                date_filter = f"start_date = DATE '{selected_year}-01-01'"
+
+            wm_query = f'''
+            WITH latest_short_term AS (
+                SELECT
+                    country_name,
+                    {date_column}::DATE as start_date,
+                    SUM(metric_value) / 12 * 2222*1000 AS value,
+                    publication_date,
+                    'Short Term' as source
+                FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+                WHERE market_outlook = (
+                    SELECT market_outlook
+                    FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+                    WHERE release_type = 'Short Term Outlook'
+                    GROUP BY market_outlook
+                    ORDER BY TO_DATE(
+                        (regexp_match(market_outlook, '(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{{4}})'))[1]
+                        || ' ' ||
+                        (regexp_match(market_outlook, '(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{{4}})'))[2],
+                        'Month YYYY'
+                    ) DESC, MAX(publication_date) DESC
+                    LIMIT 1
+                )
+                AND release_type = 'Short Term Outlook'
+                AND direction = 'Export'
+                AND measured_at = 'Exit'
+                AND metric_name = 'Flow'
+                AND start_date::DATE < '2036-01-01'
+                GROUP BY {group_by_clause}
+                HAVING SUM(metric_value) > 0
+            ),
+            short_term_max_date AS (
+                SELECT MAX(start_date::DATE) as max_date
+                FROM latest_short_term
+            ),
+            latest_long_term_raw AS (
+                SELECT
+                    country_name,
+                    {date_column}::DATE as start_date,
+                    SUM(metric_value) / 12 * 2222*1000 AS value,
+                    publication_date,
+                    'Long Term' as source
+                FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+                WHERE market_outlook = (
+                    SELECT market_outlook
+                    FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+                    WHERE release_type = 'Long Term Outlook'
+                    GROUP BY market_outlook
+                    ORDER BY TO_DATE(
+                        (regexp_match(market_outlook, '(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{{4}})'))[1]
+                        || ' ' ||
+                        (regexp_match(market_outlook, '(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{{4}})'))[2],
+                        'Month YYYY'
+                    ) DESC, MAX(publication_date) DESC
+                    LIMIT 1
+                )
+                AND release_type = 'Long Term Outlook'
+                AND direction = 'Export'
+                AND measured_at = 'Exit'
+                AND metric_name = 'Flow'
+                AND start_date::DATE < '2036-01-01'
+                GROUP BY {group_by_clause}
+                HAVING SUM(metric_value) > 0
+            ),
+            latest_long_term AS (
+                SELECT *
+                FROM latest_long_term_raw
+                WHERE start_date > (SELECT max_date FROM short_term_max_date)
+            ),
+            combined AS (
+                SELECT * FROM latest_short_term
+                UNION ALL
+                SELECT * FROM latest_long_term
+            ),
+            filtered AS (
+                SELECT * FROM combined WHERE {date_filter}
+            )
+            SELECT COALESCE(SUM(value) / 1000000, 0) as woodmac_total,
+                   STRING_AGG(DISTINCT source, ' + ') as sources
+            FROM filtered
+            '''
+
+            wm_result = pd.read_sql(wm_query, engine)
+            woodmac_total = wm_result['woodmac_total'].iloc[0]
+            woodmac_sources = wm_result['sources'].iloc[0] if wm_result['sources'].iloc[0] else 'N/A'
+
+            difference = total_lng_volume - woodmac_total
+            pct_diff = (difference / woodmac_total * 100) if woodmac_total > 0 else 0
+
+            # Color coding based on percentage difference
+            if abs(pct_diff) < 5:
+                diff_color = '#27AE60'  # Green
+            elif abs(pct_diff) < 10:
+                diff_color = '#F39C12'  # Orange
+            else:
+                diff_color = '#E74C3C'  # Red
+
+        except Exception as e:
+            woodmac_total = 0
+            woodmac_sources = 'Error'
+            difference = 0
+            pct_diff = 0
+            diff_color = '#999'
+
+        # Create validation summary with WoodMac comparison
+        validation_summary = html.Div([
+            html.Div([
+                html.Strong("Total LNG Volume (Supply): ", style={'fontSize': '14px'}),
+                html.Span(f"Regional: {total_lng_volume:,.2f} M m³", style={'fontSize': '14px', 'fontWeight': 'bold', 'color': '#D4AF37', 'marginRight': '15px'}),
+                html.Span(" | ", style={'fontSize': '14px', 'color': '#999'}),
+                html.Span(f"WoodMac ({woodmac_sources}): {woodmac_total:,.2f} M m³", style={'fontSize': '14px', 'fontWeight': 'bold', 'color': '#D4AF37', 'marginLeft': '15px', 'marginRight': '15px'}),
+                html.Span(" | ", style={'fontSize': '14px', 'color': '#999'}),
+                html.Span(f"Diff: {difference:+,.2f} M m³ ({pct_diff:+.1f}%)", style={'fontSize': '14px', 'fontWeight': 'bold', 'color': diff_color, 'marginLeft': '15px'})
+            ], style={'padding': '10px', 'marginBottom': '10px', 'backgroundColor': '#FEF9E7', 'borderLeft': '4px solid #F7DC6F', 'borderRadius': '4px'})
+        ])
+
+        table = dash_table.DataTable(
+            columns=columns,
+            data=display_df.to_dict('records'),
+            style_table={'overflowX': 'auto', 'width': '100%'},
+            style_cell={
+                'textAlign': 'center',
+                'padding': '8px',
+                'fontSize': '12px',
+                'fontFamily': 'Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif'
+            },
+            style_header={
+                'backgroundColor': '#F7DC6F',
+                'color': 'black',
+                'fontWeight': 'bold',
+                'fontSize': '12px',
+                'whiteSpace': 'normal',
+                'height': 'auto'
+            },
+            style_data_conditional=[
+                {
+                    'if': {'row_index': 'odd'},
+                    'backgroundColor': 'rgb(248, 248, 248)'
+                }
+            ],
+            page_size=15,
+            export_format='xlsx'
+        )
+
+        return html.Div([validation_summary, table])
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return html.Div(f"Error loading regional table: {str(e)}", style={'padding': '10px', 'color': 'red'})
+
+############################################ Regional Trends Chart Callbacks ###################################################
+
+# Demand Regional Laden Filter Options
+@callback(
+    Output('demand-regional-laden-origin-filter', 'options'),
+    Output('demand-regional-laden-dest-filter', 'options'),
+    Input('shipping-balance-regional-data-store', 'data'),
+    prevent_initial_call=False
+)
+def update_demand_regional_laden_filters(regional_data):
+    if regional_data is None:
+        return [], []
+    try:
+        df_regional = pd.read_json(StringIO(regional_data), orient='split')
+        origins = sorted(df_regional['origin_shipping_region'].unique())
+        destinations = sorted(df_regional['destination_shipping_region'].unique())
+        return [{'label': r, 'value': r} for r in origins], [{'label': r, 'value': r} for r in destinations]
+    except:
+        return [], []
+
+
+# Demand Regional Ballast Filter Options
+@callback(
+    Output('demand-regional-ballast-origin-filter', 'options'),
+    Output('demand-regional-ballast-dest-filter', 'options'),
+    Input('shipping-balance-regional-data-store', 'data'),
+    prevent_initial_call=False
+)
+def update_demand_regional_ballast_filters(regional_data):
+    if regional_data is None:
+        return [], []
+    try:
+        df_regional = pd.read_json(StringIO(regional_data), orient='split')
+        origins = sorted(df_regional['origin_shipping_region'].unique())
+        destinations = sorted(df_regional['destination_shipping_region'].unique())
+        return [{'label': r, 'value': r} for r in origins], [{'label': r, 'value': r} for r in destinations]
+    except:
+        return [], []
+
+
+# Supply Regional Laden Filter Options
+@callback(
+    Output('supply-regional-laden-origin-filter', 'options'),
+    Output('supply-regional-laden-dest-filter', 'options'),
+    Input('shipping-balance-supply-regional-data-store', 'data'),
+    prevent_initial_call=False
+)
+def update_supply_regional_laden_filters(regional_data):
+    if regional_data is None:
+        return [], []
+    try:
+        df_regional = pd.read_json(StringIO(regional_data), orient='split')
+        origins = sorted(df_regional['origin_shipping_region'].unique())
+        destinations = sorted(df_regional['destination_shipping_region'].unique())
+        return [{'label': r, 'value': r} for r in origins], [{'label': r, 'value': r} for r in destinations]
+    except:
+        return [], []
+
+
+# Supply Regional Ballast Filter Options
+@callback(
+    Output('supply-regional-ballast-origin-filter', 'options'),
+    Output('supply-regional-ballast-dest-filter', 'options'),
+    Input('shipping-balance-supply-regional-data-store', 'data'),
+    prevent_initial_call=False
+)
+def update_supply_regional_ballast_filters(regional_data):
+    if regional_data is None:
+        return [], []
+    try:
+        df_regional = pd.read_json(StringIO(regional_data), orient='split')
+        origins = sorted(df_regional['origin_shipping_region'].unique())
+        destinations = sorted(df_regional['destination_shipping_region'].unique())
+        return [{'label': r, 'value': r} for r in origins], [{'label': r, 'value': r} for r in destinations]
+    except:
+        return [], []
+
+
+# Demand Regional Laden Chart
+@callback(
+    Output('demand-regional-laden-chart', 'figure'),
+    Input('shipping-balance-regional-data-store', 'data'),
+    Input('demand-regional-laden-origin-filter', 'value'),
+    Input('demand-regional-laden-dest-filter', 'value'),
+    Input('dropdown-options-store', 'data'),
+    prevent_initial_call=False
+)
+def update_demand_regional_laden_chart(regional_data, origin_filter, dest_filter, dropdown_options):
+    if regional_data is None:
+        return {}
+    try:
+        df = pd.read_json(StringIO(regional_data), orient='split')
+
+        # Ensure date column is datetime
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+
+        if origin_filter:
+            df = df[df['origin_shipping_region'].isin(origin_filter)]
+        if dest_filter:
+            df = df[df['destination_shipping_region'].isin(dest_filter)]
+        if df.empty:
+            return {'data': [], 'layout': {'title': 'No data'}}
+
+        df['route'] = df['origin_shipping_region'] + ' → ' + df['destination_shipping_region']
+        route_totals = df.groupby('route')['value'].sum().sort_values(ascending=False)
+        df = df[df['route'].isin(route_totals.head(15).index)]
+        df = df.sort_values('date')
+
+        metric_col = 'median_laden_days'
+        title = 'Laden Days by Route Over Time'
+
+        fig = px.line(df, x='date', y=metric_col, color='route',
+                     labels={'date': 'Period', metric_col: 'Laden Days', 'route': 'Route'},
+                     title=f'{title} (Top 15 Routes)',
+                     template=copy.deepcopy(pio.templates["plotly_white"]))
+        fig.update_layout(hovermode='x unified',
+                         legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
+                         margin=dict(r=200))
+        fig.update_traces(hovertemplate='%{fullData.name}: %{y:.1f} days<extra></extra>')
+
+        # Add vertical line for current period
+        if dropdown_options:
+            hist_date_max_str = dropdown_options.get('hist_date_max')
+            if hist_date_max_str:
+                hist_date_max = pd.to_datetime(hist_date_max_str)
+                fig.add_shape(
+                    type="line",
+                    x0=hist_date_max,
+                    x1=hist_date_max,
+                    y0=0,
+                    y1=1,
+                    yref="paper",
+                    line=dict(color="red", width=2, dash="dash")
+                )
+                fig.add_annotation(
+                    x=hist_date_max,
+                    y=1,
+                    yref="paper",
+                    text="Current Period",
+                    showarrow=False,
+                    yanchor="bottom",
+                    font=dict(color="red", size=10)
+                )
+
+        return fig
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {'data': [], 'layout': {'title': f'Error: {e}'}}
+
+
+# Demand Regional Ballast Chart
+@callback(
+    Output('demand-regional-ballast-chart', 'figure'),
+    Input('shipping-balance-regional-data-store', 'data'),
+    Input('demand-regional-ballast-origin-filter', 'value'),
+    Input('demand-regional-ballast-dest-filter', 'value'),
+    Input('dropdown-options-store', 'data'),
+    prevent_initial_call=False
+)
+def update_demand_regional_ballast_chart(regional_data, origin_filter, dest_filter, dropdown_options):
+    if regional_data is None:
+        return {}
+    try:
+        df = pd.read_json(StringIO(regional_data), orient='split')
+        if origin_filter:
+            df = df[df['origin_shipping_region'].isin(origin_filter)]
+        if dest_filter:
+            df = df[df['destination_shipping_region'].isin(dest_filter)]
+        if df.empty:
+            return {'data': [], 'layout': {'title': 'No data'}}
+
+        df['route'] = df['origin_shipping_region'] + ' → ' + df['destination_shipping_region']
+        route_totals = df.groupby('route')['value'].sum().sort_values(ascending=False)
+        df = df[df['route'].isin(route_totals.head(15).index)]
+        df = df.sort_values('date')
+
+        metric_col = 'median_nonladen_days'
+        title = 'Ballast Days by Route Over Time'
+
+        fig = px.line(df, x='date', y=metric_col, color='route',
+                     labels={'date': 'Period', metric_col: 'Ballast Days', 'route': 'Route'},
+                     title=f'{title} (Top 15 Routes)',
+                     template=copy.deepcopy(pio.templates["plotly_white"]))
+        fig.update_layout(hovermode='x unified',
+                         legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
+                         margin=dict(r=200))
+        fig.update_traces(hovertemplate='%{fullData.name}: %{y:.1f} days<extra></extra>')
+
+        # Add vertical line for current period
+        if dropdown_options:
+            hist_date_max_str = dropdown_options.get('hist_date_max')
+            if hist_date_max_str:
+                hist_date_max = pd.to_datetime(hist_date_max_str)
+                fig.add_shape(
+                    type="line",
+                    x0=hist_date_max,
+                    x1=hist_date_max,
+                    y0=0,
+                    y1=1,
+                    yref="paper",
+                    line=dict(color="red", width=2, dash="dash")
+                )
+                fig.add_annotation(
+                    x=hist_date_max,
+                    y=1,
+                    yref="paper",
+                    text="Current Period",
+                    showarrow=False,
+                    yanchor="bottom",
+                    font=dict(color="red", size=10)
+                )
+
+        return fig
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {'data': [], 'layout': {'title': f'Error: {e}'}}
+
+
+# Supply Regional Laden Chart
+@callback(
+    Output('supply-regional-laden-chart', 'figure'),
+    Input('shipping-balance-supply-regional-data-store', 'data'),
+    Input('supply-regional-laden-origin-filter', 'value'),
+    Input('supply-regional-laden-dest-filter', 'value'),
+    Input('dropdown-options-store', 'data'),
+    prevent_initial_call=False
+)
+def update_supply_regional_laden_chart(regional_data, origin_filter, dest_filter, dropdown_options):
+    if regional_data is None:
+        return {}
+    try:
+        df = pd.read_json(StringIO(regional_data), orient='split')
+
+        # Ensure date column is datetime
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+
+        if origin_filter:
+            df = df[df['origin_shipping_region'].isin(origin_filter)]
+        if dest_filter:
+            df = df[df['destination_shipping_region'].isin(dest_filter)]
+        if df.empty:
+            return {'data': [], 'layout': {'title': 'No data'}}
+
+        df['route'] = df['origin_shipping_region'] + ' → ' + df['destination_shipping_region']
+        route_totals = df.groupby('route')['value'].sum().sort_values(ascending=False)
+        df = df[df['route'].isin(route_totals.head(15).index)]
+        df = df.sort_values('date')
+
+        metric_col = 'median_laden_days'
+        title = 'Laden Days by Route Over Time'
+
+        fig = px.line(df, x='date', y=metric_col, color='route',
+                     labels={'date': 'Period', metric_col: 'Laden Days', 'route': 'Route'},
+                     title=f'{title} (Top 15 Routes)',
+                     template=copy.deepcopy(pio.templates["plotly_white"]))
+        fig.update_layout(hovermode='x unified',
+                         legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
+                         margin=dict(r=200))
+        fig.update_traces(hovertemplate='%{fullData.name}: %{y:.1f} days<extra></extra>')
+
+        # Add vertical line for current period
+        if dropdown_options:
+            hist_date_max_str = dropdown_options.get('hist_date_max')
+            if hist_date_max_str:
+                hist_date_max = pd.to_datetime(hist_date_max_str)
+                fig.add_shape(
+                    type="line",
+                    x0=hist_date_max,
+                    x1=hist_date_max,
+                    y0=0,
+                    y1=1,
+                    yref="paper",
+                    line=dict(color="red", width=2, dash="dash")
+                )
+                fig.add_annotation(
+                    x=hist_date_max,
+                    y=1,
+                    yref="paper",
+                    text="Current Period",
+                    showarrow=False,
+                    yanchor="bottom",
+                    font=dict(color="red", size=10)
+                )
+
+        return fig
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {'data': [], 'layout': {'title': f'Error: {e}'}}
+
+
+# Supply Regional Ballast Chart
+@callback(
+    Output('supply-regional-ballast-chart', 'figure'),
+    Input('shipping-balance-supply-regional-data-store', 'data'),
+    Input('supply-regional-ballast-origin-filter', 'value'),
+    Input('supply-regional-ballast-dest-filter', 'value'),
+    Input('dropdown-options-store', 'data'),
+    prevent_initial_call=False
+)
+def update_supply_regional_ballast_chart(regional_data, origin_filter, dest_filter, dropdown_options):
+    if regional_data is None:
+        return {}
+    try:
+        df = pd.read_json(StringIO(regional_data), orient='split')
+
+        # Ensure date column is datetime
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+
+        if origin_filter:
+            df = df[df['origin_shipping_region'].isin(origin_filter)]
+        if dest_filter:
+            df = df[df['destination_shipping_region'].isin(dest_filter)]
+        if df.empty:
+            return {'data': [], 'layout': {'title': 'No data'}}
+
+        df['route'] = df['origin_shipping_region'] + ' → ' + df['destination_shipping_region']
+        route_totals = df.groupby('route')['value'].sum().sort_values(ascending=False)
+        df = df[df['route'].isin(route_totals.head(15).index)]
+        df = df.sort_values('date')
+
+        metric_col = 'median_nonladen_days'
+        title = 'Ballast Days by Route Over Time'
+
+        fig = px.line(df, x='date', y=metric_col, color='route',
+                     labels={'date': 'Period', metric_col: 'Ballast Days', 'route': 'Route'},
+                     title=f'{title} (Top 15 Routes)',
+                     template=copy.deepcopy(pio.templates["plotly_white"]))
+        fig.update_layout(hovermode='x unified',
+                         legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
+                         margin=dict(r=200))
+        fig.update_traces(hovertemplate='%{fullData.name}: %{y:.1f} days<extra></extra>')
+
+        # Add vertical line for current period
+        if dropdown_options:
+            hist_date_max_str = dropdown_options.get('hist_date_max')
+            if hist_date_max_str:
+                hist_date_max = pd.to_datetime(hist_date_max_str)
+                fig.add_shape(
+                    type="line",
+                    x0=hist_date_max,
+                    x1=hist_date_max,
+                    y0=0,
+                    y1=1,
+                    yref="paper",
+                    line=dict(color="red", width=2, dash="dash")
+                )
+                fig.add_annotation(
+                    x=hist_date_max,
+                    y=1,
+                    yref="paper",
+                    text="Current Period",
+                    showarrow=False,
+                    yanchor="bottom",
+                    font=dict(color="red", size=10)
+                )
+
+        return fig
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {'data': [], 'layout': {'title': f'Error: {e}'}}

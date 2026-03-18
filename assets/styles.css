@@ -743,11 +743,22 @@ button.show-hide { display: none; }
 .professional-section-header {
     background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
     border: 1px solid #e1e5e9;
-    border-radius: 12px;
+    border-radius: 0 0 12px 12px;
     padding: 24px;
-    margin-bottom: 32px;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+    margin-bottom: 0;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.10);
     transition: box-shadow 0.2s ease;
+    position: fixed;
+    top: 66px;
+    left: 0;
+    right: 0;
+    z-index: 900;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+#page-content {
+    padding-top: 158px;
 }
 
 .professional-section-header:hover {
@@ -794,6 +805,68 @@ button.show-hide { display: none; }
     flex-direction: column;
     gap: 6px;
     min-width: 140px;
+}
+
+/* Grouped filter bar container */
+.filter-bar-grouped {
+    display: flex;
+    gap: 12px;
+    align-items: stretch;
+    flex-wrap: wrap;
+}
+
+/* Individual filter section (coloured group) */
+.filter-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 16px 10px 14px;
+    border-radius: 8px;
+}
+
+.filter-section-destination {
+    background-color: #f0f7ff;
+    border: 1px solid #bfdbfe;
+}
+
+.filter-section-origin {
+    background-color: #f0fdf4;
+    border: 1px solid #bbf7d0;
+}
+
+.filter-section-analysis {
+    background-color: #f8f9fa;
+    border: 1px solid #e5e7eb;
+}
+
+/* Section header micro-label */
+.filter-group-header {
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 2px;
+}
+
+.filter-section-destination .filter-group-header { color: #1d6fa4; }
+.filter-section-origin .filter-group-header      { color: #166534; }
+.filter-section-analysis .filter-group-header    { color: #6b7280; }
+
+.filter-section-origin-exp {
+    background-color: #f0fdf4;
+    border: 1px solid #bbf7d0;
+}
+.filter-section-origin-exp .filter-group-header  { color: #166534; }
+
+/* Dependency arrow Aggregation → Destination */
+.filter-dependency-arrow {
+    font-size: 16px;
+    color: #93c5fd;
+    align-self: flex-end;
+    padding-bottom: 9px;
+    user-select: none;
+    font-weight: bold;
 }
 
 /* Filter Labels */

@@ -1702,20 +1702,6 @@ max_year = min(max_year, current_year + 30)  # Cap at 30 years from now
 default_start = max(min_year, current_year - 1)  # Ensure start is not before min_year
 default_end = max_year
 
-# Debug: Print calculated values
-print(f"=== Year Range Debug ===")
-print(f"Current year: {current_year}")
-print(f"Min year from signing dates: {min_year}")
-print(f"Max year from end dates: {max_year}")
-print(f"Default start: {default_start}")
-print(f"Default end: {default_end}")
-if 'contract_date_end' in contracts_df.columns:
-    sample_end_dates = contracts_df['contract_date_end'].dropna().head(10).tolist()
-    print(f"Sample end dates: {sample_end_dates}")
-    if end_years:
-        print(f"End years found: min={min(end_years)}, max={max(end_years)}")
-        print(f"Total contracts with end dates: {len(end_years)}")
-print(f"========================")
 
 layout = html.Div([
     # Filter Controls
