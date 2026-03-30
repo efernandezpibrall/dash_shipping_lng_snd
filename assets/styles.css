@@ -859,6 +859,12 @@ button.show-hide { display: none; }
 }
 .filter-section-origin-exp .filter-group-header  { color: #166534; }
 
+.filter-section-volume {
+    background-color: #fff8f0;
+    border: 1px solid #fed7aa;
+}
+.filter-section-volume .filter-group-header { color: #b45309; }
+
 /* Dependency arrow Aggregation → Destination */
 .filter-dependency-arrow {
     font-size: 16px;
