@@ -744,7 +744,7 @@ button.show-hide { display: none; }
     background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
     border: 1px solid #e1e5e9;
     border-radius: 0 0 12px 12px;
-    padding: 24px;
+    padding: 12px 16px;
     margin-bottom: 0;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.10);
     transition: box-shadow 0.2s ease;
@@ -758,7 +758,213 @@ button.show-hide { display: none; }
 }
 
 #page-content {
-    padding-top: 158px;
+    padding-top: 140px;
+}
+
+.balance-page-shell {
+    padding: 16px 12px 24px;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.balance-results-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    width: 100%;
+}
+
+.balance-section-card {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: var(--shadow-sm);
+    width: 100%;
+}
+
+.balance-comparison-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+        "title-left title-right"
+        "top-left top-right"
+        "table-left table-right";
+    gap: 0;
+    width: 100%;
+    align-items: stretch;
+}
+
+.balance-panel-title {
+    margin: 0;
+    padding: 12px 12px 0;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    color: #1f2937;
+}
+
+.balance-panel-title-left {
+    grid-area: title-left;
+}
+
+.balance-panel-title-right {
+    grid-area: title-right;
+    border-left: 1px solid #e5e7eb;
+}
+
+.balance-pane-summary {
+    padding: 0 12px 16px;
+}
+
+.balance-pane-top-area {
+    box-sizing: border-box;
+}
+
+.balance-pane-top-area-left {
+    grid-area: top-left;
+}
+
+.balance-pane-top-area-right {
+    grid-area: top-right;
+    border-left: 1px solid #e5e7eb;
+}
+
+.balance-section-header {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 20px 24px 14px;
+    border-bottom: 1px solid #e5e7eb;
+    background: linear-gradient(180deg, #fbfdff 0%, #f8fafc 100%);
+}
+
+.balance-section-title {
+    margin: 0;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 20px;
+    font-weight: 600;
+    color: #111827;
+}
+
+.balance-section-subtitle {
+    margin: 0;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 13px;
+    color: #6b7280;
+    line-height: 1.5;
+}
+
+.balance-summary-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    min-height: 20px;
+}
+
+.balance-summary-row span {
+    padding: 4px 10px;
+    border: 1px solid #e5e7eb;
+    border-radius: 999px;
+    background: #f8fafc;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 12px;
+    color: #4b5563;
+}
+
+.balance-metadata-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.balance-metadata-row span {
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 12px;
+    color: #475569;
+    line-height: 1.4;
+}
+
+.balance-comparison-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 12px 12px 0;
+}
+
+.balance-comparison-control-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+}
+
+.balance-table-container {
+    padding: 12px 12px 16px;
+}
+
+.balance-table-container-left {
+    grid-area: table-left;
+}
+
+.balance-table-shell {
+    min-width: 0;
+}
+
+.balance-table-shell-right {
+    grid-area: table-right;
+    border-left: 1px solid #e5e7eb;
+}
+
+.balance-table-container .dash-table-container,
+.balance-table-container .dash-spreadsheet-container {
+    width: 100% !important;
+}
+
+.balance-table-container .dash-spreadsheet-inner {
+    min-width: 100% !important;
+}
+
+.balance-empty-state {
+    padding: 24px;
+    border: 1px dashed #cbd5e1;
+    border-radius: 10px;
+    background: #f8fafc;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 13px;
+    color: #6b7280;
+    text-align: center;
+}
+
+.balance-error-banner {
+    margin: 0 24px 20px;
+    padding: 12px 16px;
+    border: 1px solid #fecaca;
+    border-radius: 10px;
+    background: #fef2f2;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 13px;
+    color: #991b1b;
+    box-shadow: var(--shadow-sm);
+}
+
+.balance-radio-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.balance-radio-group label {
+    margin: 0;
+    padding: 6px 10px;
+    border: 1px solid #d1d5db;
+    border-radius: 999px;
+    background: #ffffff;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 13px;
+    color: #374151;
 }
 
 .professional-section-header:hover {
@@ -810,18 +1016,21 @@ button.show-hide { display: none; }
 /* Grouped filter bar container */
 .filter-bar-grouped {
     display: flex;
-    gap: 12px;
+    gap: 10px;
     align-items: stretch;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    width: 100%;
 }
 
 /* Individual filter section (coloured group) */
 .filter-section {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    padding: 10px 16px 10px 14px;
+    gap: 6px;
+    padding: 8px 12px;
     border-radius: 8px;
+    flex: 1;
+    min-width: 0;
 }
 
 .filter-section-destination {
@@ -971,6 +1180,43 @@ button.show-hide { display: none; }
 
 /* Responsive Design for Section Headers */
 @media (max-width: 768px) {
+    .balance-comparison-grid {
+        grid-template-columns: 1fr;
+        grid-template-areas:
+            "title-left"
+            "top-left"
+            "table-left"
+            "title-right"
+            "top-right"
+            "table-right";
+    }
+
+    .balance-panel-title-right,
+    .balance-pane-top-area-right,
+    .balance-table-shell-right {
+        border-left: none;
+    }
+
+    .balance-panel-title-right {
+        border-top: 1px solid #e5e7eb;
+    }
+
+    .balance-page-shell {
+        padding: 12px 8px 20px;
+    }
+
+    .balance-section-header {
+        padding: 16px 16px 12px;
+    }
+
+    .balance-table-container {
+        padding: 10px;
+    }
+
+    .balance-error-banner {
+        margin: 0 16px 16px;
+    }
+
     .professional-section-header {
         padding: 16px;
         margin-bottom: 24px;

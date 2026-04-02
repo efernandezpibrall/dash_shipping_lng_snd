@@ -3,12 +3,17 @@ from dash import html, dcc, clientside_callback, ClientsideFunction, callback, c
 from dash.dependencies import Input, Output, State
 from app import app
 import pages.shipping_balance
+import pages.balance
 import pages.exporter_detail
 import pages.importer_detail
 import pages.exporters
 import pages.country_mappings
+import pages.plant_names_mapping
+import pages.train_names_mapping
 import pages.contracts
 import pages.terminals
+import pages.capacity
+import pages.production
 import pages.terminal_adjustments
 
 import pandas as pd
@@ -61,12 +66,17 @@ nav_links = html.Header([
             # Secondary navigation group
             html.Div([
                 dcc.Link('Shipping Balance', href='/shipping_balance', id='nav-shipping-balance', className='nav-link-secondary'),
+                dcc.Link('Balance', href='/balance', id='nav-balance', className='nav-link-secondary'),
                 dcc.Link('Exporters', href='/exporters', id='nav-exporters', className='nav-link-secondary'),
                 dcc.Link('Exporter Detail', href='/exporter_detail', id='nav-exporter-detail', className='nav-link-secondary'),
                 dcc.Link('Importer Detail', href='/importer_detail', id='nav-importer-detail', className='nav-link-secondary'),
                 dcc.Link('Contracts', href='/contracts', id='nav-contracts', className='nav-link-secondary'),
                 dcc.Link('Terminals', href='/terminals', id='nav-terminals', className='nav-link-secondary'),
+                dcc.Link('Production', href='/production', id='nav-production', className='nav-link-secondary'),
+                dcc.Link('Capacity', href='/capacity', id='nav-capacity', className='nav-link-secondary'),
                 dcc.Link('Country Mappings', href='/country_mappings', id='nav-country-mappings', className='nav-link-secondary'),
+                dcc.Link('Plant Names Mapping', href='/plant_names_mapping', id='nav-plant-names-mapping', className='nav-link-secondary'),
+                dcc.Link('Train Names Mapping', href='/train_names_mapping', id='nav-train-names-mapping', className='nav-link-secondary'),
             ], className='nav-group-secondary')
         ], className='main-navigation'),
         
@@ -96,6 +106,8 @@ app.layout = html.Div([
 def display_page(pathname):
     if pathname == '/' or pathname == '/shipping_balance':
         return pages.shipping_balance.layout
+    elif pathname == '/balance':
+        return pages.balance.layout
     elif pathname == '/exporters':
         return pages.exporters.layout
     elif pathname == '/exporter_detail':
@@ -106,10 +118,18 @@ def display_page(pathname):
         return pages.contracts.layout
     elif pathname == '/terminals':
         return pages.terminals.layout
+    elif pathname == '/production':
+        return pages.production.layout
+    elif pathname == '/capacity':
+        return pages.capacity.layout
     elif pathname == '/terminal_adjustments':
         return pages.terminal_adjustments.layout
     elif pathname == '/country_mappings':
         return pages.country_mappings.layout
+    elif pathname == '/plant_names_mapping':
+        return pages.plant_names_mapping.layout
+    elif pathname == '/train_names_mapping':
+        return pages.train_names_mapping.layout
     else:
         return '404 - Page not found'
 
@@ -120,6 +140,8 @@ app.clientside_callback(
         // Update page title
         if (pathname === '/' || pathname === '/shipping_balance') {
             document.title = 'LNG Shipping - Shipping Balance';
+        } else if (pathname === '/balance') {
+            document.title = 'LNG Shipping - Balance';
         } else if (pathname === '/exporters') {
             document.title = 'LNG Shipping - Exporters';
         } else if (pathname === '/exporter_detail') {
@@ -130,10 +152,18 @@ app.clientside_callback(
             document.title = 'LNG Shipping - Contracts';
         } else if (pathname === '/terminals') {
             document.title = 'LNG Shipping - Terminals';
+        } else if (pathname === '/production') {
+            document.title = 'LNG Shipping - Production';
+        } else if (pathname === '/capacity') {
+            document.title = 'LNG Shipping - Capacity';
         } else if (pathname === '/terminal_adjustments') {
             document.title = 'LNG Shipping - Terminal Adjustments';
         } else if (pathname === '/country_mappings') {
             document.title = 'LNG Shipping - Country Mappings';
+        } else if (pathname === '/plant_names_mapping') {
+            document.title = 'LNG Shipping - Plant Names Mapping';
+        } else if (pathname === '/train_names_mapping') {
+            document.title = 'LNG Shipping - Train Names Mapping';
         } else {
             document.title = 'LNG Shipping - Page Not Found';
         }
@@ -148,6 +178,8 @@ app.clientside_callback(
         let activeNavId = '';
         if (pathname === '/' || pathname === '/shipping_balance') {
             activeNavId = 'nav-shipping-balance';
+        } else if (pathname === '/balance') {
+            activeNavId = 'nav-balance';
         } else if (pathname === '/exporters') {
             activeNavId = 'nav-exporters';
         } else if (pathname === '/exporter_detail') {
@@ -158,8 +190,16 @@ app.clientside_callback(
             activeNavId = 'nav-contracts';
         } else if (pathname === '/terminals') {
             activeNavId = 'nav-terminals';
+        } else if (pathname === '/production') {
+            activeNavId = 'nav-production';
+        } else if (pathname === '/capacity') {
+            activeNavId = 'nav-capacity';
         } else if (pathname === '/country_mappings') {
             activeNavId = 'nav-country-mappings';
+        } else if (pathname === '/plant_names_mapping') {
+            activeNavId = 'nav-plant-names-mapping';
+        } else if (pathname === '/train_names_mapping') {
+            activeNavId = 'nav-train-names-mapping';
         }
         
         if (activeNavId) {

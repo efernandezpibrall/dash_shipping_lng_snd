@@ -215,7 +215,7 @@ layout = dbc.Container([
     # Return to terminals dashboard link
     dbc.Row([
         dbc.Col([
-            dcc.Link("← Return to Terminals Dashboard", href="/terminals",
+            dcc.Link("← Return to Production", href="/production",
                     className="btn btn-link mb-3")
         ])
     ]),

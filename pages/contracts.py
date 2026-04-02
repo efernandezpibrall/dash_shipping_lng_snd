@@ -94,6 +94,57 @@ def setup_database_connection():
 
 ############################################ Data Loading Functions ###################################################
 
+def normalize_flex_flag(value):
+    """Normalize WoodMac flexibility flags to canonical Y/N/Unknown values."""
+    if pd.isna(value):
+        return 'Unknown'
+
+    normalized = str(value).strip().upper()
+    if normalized in {'Y', 'YES', 'TRUE', 'T', '1'}:
+        return 'Y'
+    if normalized in {'N', 'NO', 'FALSE', 'F', '0'}:
+        return 'N'
+    return 'Unknown'
+
+
+CONTRACTS_DATA_COLUMNS = [
+    'id_contract', 'contract_name', 'id_contract_primary', 'contract_name_primary',
+    'contract_type', 'cargo_basis', 'contract_pricing_type', 'contract_date_signed',
+    'contract_year_signed', 'contract_date_start', 'contract_date_end',
+    'company_name_seller', 'country_name_hq_company_seller', 'company_category_seller',
+    'company_name_buyer', 'country_name_hq_company_buyer', 'company_category_buyer',
+    'country_name_source', 'id_lng_plant_source', 'lng_plant_name_source',
+    'id_lng_project', 'lng_project_name', 'flexibility_source', 'is_source_flexible',
+    'country_name_delivery', 'flexibility_delivery', 'is_destination_flexible',
+    'max_acq_volume', 'max_acq_volume_unit', 'contract_note', 'equity_third_party',
+    'destination_flexible_vs_end_users', 'indexation_category', 'indexation_point'
+]
+
+ANNUAL_DEMAND_DATA_COLUMNS = [
+    'id_contract', 'contract_name', 'year', 'acq_volume__mmtpa', 'metric_name',
+    'metric_value', 'unit', 'company_name_seller', 'company_name_buyer',
+    'country_name_source', 'country_name_delivery', 'cargo_basis',
+    'contract_type', 'contract_pricing_type'
+]
+
+PRICE_ASSUMPTIONS_COLUMNS = [
+    'id_contract', 'contract_name', 'indexation_category', 'indexation_point',
+    'oil_pricing_structure', 'slope', 'intercept', 'lower_inflection',
+    'slope_lower', 'intercept_lower', 'upper_inflection', 'slope_upper',
+    'intercept_upper', 'weighting', 'gas_pricing_structure', 'fixed_fee',
+    'transport_tariff', 'regas_tariff', 'linkage_percent',
+    'oil_price_in_signed_year', 'normalized_slope',
+    'oil_indexed_shipping_cost', 'gas_indexed_shipping_cost', 'other_costs'
+]
+
+PRICE_FORMULA_COLUMNS = [
+    'id_contract', 'contract_name', 'indexation_point', 'pricing_structure',
+    'indexation_category', 'index_pricing_point', 'lower_bound', 'upper_bound',
+    'coefficient_type', 'coefficient_value', 'lag_months', 'average_months',
+    'weighting'
+]
+
+
 def load_contracts_data():
     """Load main contracts data from WoodMac tables"""
     query = """
@@ -147,11 +198,15 @@ def load_contracts_data():
             if col in df.columns:
                 df.loc[df[col] == '', col] = 'Unknown'
                 df.loc[df[col].isna(), col] = 'Unknown'
+
+        for col in ['is_source_flexible', 'is_destination_flexible']:
+            if col in df.columns:
+                df[col] = df[col].apply(normalize_flex_flag)
         
         return df
     except Exception as e:
         print(f"Error loading contracts data: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=CONTRACTS_DATA_COLUMNS)
 
 def load_annual_demand_data():
     """Load annual contracted demand data with contract details"""
@@ -189,7 +244,7 @@ def load_annual_demand_data():
         return df
     except Exception as e:
         print(f"Error loading annual demand data: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=ANNUAL_DEMAND_DATA_COLUMNS)
 
 def load_price_assumptions_data():
     """Load price assumptions data"""
@@ -226,7 +281,7 @@ def load_price_assumptions_data():
         return pd.read_sql(query, engine)
     except Exception as e:
         print(f"Error loading price assumptions data: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=PRICE_ASSUMPTIONS_COLUMNS)
 
 def load_price_formula_data():
     """Load price formula data"""
@@ -252,7 +307,7 @@ def load_price_formula_data():
         return pd.read_sql(query, engine)
     except Exception as e:
         print(f"Error loading price formula data: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=PRICE_FORMULA_COLUMNS)
 
 ############################################ Helper Functions ###################################################
 
@@ -1524,10 +1579,10 @@ def create_pricing_analysis_content(contracts_df, price_assumptions_df):
     
     # Flexibility analysis
     flexibility_data = {
-        'Source Flexible': contracts_df['is_source_flexible'].value_counts().get('True', 0),
-        'Source Not Flexible': contracts_df['is_source_flexible'].value_counts().get('False', 0),
-        'Destination Flexible': contracts_df['is_destination_flexible'].value_counts().get('True', 0),
-        'Destination Not Flexible': contracts_df['is_destination_flexible'].value_counts().get('False', 0)
+        'Source Flexible': contracts_df['is_source_flexible'].value_counts().get('Y', 0),
+        'Source Not Flexible': contracts_df['is_source_flexible'].value_counts().get('N', 0),
+        'Destination Flexible': contracts_df['is_destination_flexible'].value_counts().get('Y', 0),
+        'Destination Not Flexible': contracts_df['is_destination_flexible'].value_counts().get('N', 0)
     }
     
     flexibility_fig = px.bar(
