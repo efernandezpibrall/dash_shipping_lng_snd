@@ -53,17 +53,9 @@ engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 # Professional Navigation Bar with Option B Blue System
 nav_links = html.Header([
     html.Div([
-        # Primary Navigation Section
+        # Primary navigation section
         html.Nav([
-            # Primary navigation item - LNG Shipping Analysis as main focal point
-            dcc.Link(
-                'LNG Shipping Analysis', 
-                href='/', 
-                id='nav-shipping-analysis',
-                className='nav-link-primary'
-            ),
-            
-            # Secondary navigation group
+            # Navigation group
             html.Div([
                 dcc.Link('Shipping Balance', href='/shipping_balance', id='nav-shipping-balance', className='nav-link-secondary'),
                 dcc.Link('Balance', href='/balance', id='nav-balance', className='nav-link-secondary'),
@@ -74,9 +66,7 @@ nav_links = html.Header([
                 dcc.Link('Terminals', href='/terminals', id='nav-terminals', className='nav-link-secondary'),
                 dcc.Link('Production', href='/production', id='nav-production', className='nav-link-secondary'),
                 dcc.Link('Capacity', href='/capacity', id='nav-capacity', className='nav-link-secondary'),
-                dcc.Link('Country Mappings', href='/country_mappings', id='nav-country-mappings', className='nav-link-secondary'),
-                dcc.Link('Plant Names Mapping', href='/plant_names_mapping', id='nav-plant-names-mapping', className='nav-link-secondary'),
-                dcc.Link('Train Names Mapping', href='/train_names_mapping', id='nav-train-names-mapping', className='nav-link-secondary'),
+                dcc.Link('Mappings', href='/mappings', id='nav-mappings', className='nav-link-secondary'),
             ], className='nav-group-secondary')
         ], className='main-navigation'),
         
@@ -124,6 +114,8 @@ def display_page(pathname):
         return pages.capacity.layout
     elif pathname == '/terminal_adjustments':
         return pages.terminal_adjustments.layout
+    elif pathname == '/mappings':
+        return pages.country_mappings.layout
     elif pathname == '/country_mappings':
         return pages.country_mappings.layout
     elif pathname == '/plant_names_mapping':
@@ -158,12 +150,14 @@ app.clientside_callback(
             document.title = 'LNG Shipping - Capacity';
         } else if (pathname === '/terminal_adjustments') {
             document.title = 'LNG Shipping - Terminal Adjustments';
+        } else if (pathname === '/mappings') {
+            document.title = 'LNG Shipping - Country Mappings';
         } else if (pathname === '/country_mappings') {
             document.title = 'LNG Shipping - Country Mappings';
         } else if (pathname === '/plant_names_mapping') {
-            document.title = 'LNG Shipping - Plant Names Mapping';
+            document.title = 'LNG Shipping - Plant Mapping';
         } else if (pathname === '/train_names_mapping') {
-            document.title = 'LNG Shipping - Train Names Mapping';
+            document.title = 'LNG Shipping - Train Mapping';
         } else {
             document.title = 'LNG Shipping - Page Not Found';
         }
@@ -194,12 +188,13 @@ app.clientside_callback(
             activeNavId = 'nav-production';
         } else if (pathname === '/capacity') {
             activeNavId = 'nav-capacity';
-        } else if (pathname === '/country_mappings') {
-            activeNavId = 'nav-country-mappings';
-        } else if (pathname === '/plant_names_mapping') {
-            activeNavId = 'nav-plant-names-mapping';
-        } else if (pathname === '/train_names_mapping') {
-            activeNavId = 'nav-train-names-mapping';
+        } else if (
+            pathname === '/mappings' ||
+            pathname === '/country_mappings' ||
+            pathname === '/plant_names_mapping' ||
+            pathname === '/train_names_mapping'
+        ) {
+            activeNavId = 'nav-mappings';
         }
         
         if (activeNavId) {

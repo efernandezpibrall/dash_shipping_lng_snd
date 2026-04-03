@@ -7,6 +7,7 @@ import pandas as pd
 import configparser
 import os
 from sqlalchemy import create_engine, text
+from utils.mappings_section import create_mappings_section_header
 from utils.table_styles import StandardTableStyleManager, TABLE_COLORS
 from app import app
 import dash_leaflet as dl
@@ -369,11 +370,11 @@ layout = html.Div([
     
     dcc.Interval(id='country-mappings-load-trigger', interval=1000*60*60*24, n_intervals=0, max_intervals=1),
     
-    html.Div([
-        html.H2('Country Mappings', className="page-title"),
-        html.P('Geographic and classification mapping for all countries in the system', 
-               className="text-secondary", style={'marginBottom': '20px'})
-    ], style={'marginBottom': '30px', 'padding': '20px 20px 0px 20px'}),
+    create_mappings_section_header(
+        title='Country Mappings',
+        description='Geographic and classification mapping for all countries in the system.',
+        active_href='/mappings',
+    ),
     
     html.Div(id='summary-cards-container', style={'padding': '0px 20px'}),
     

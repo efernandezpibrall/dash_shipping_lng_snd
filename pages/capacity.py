@@ -21,15 +21,15 @@ from utils.table_styles import StandardTableStyleManager, TABLE_COLORS
 
 
 EXPORT_BUTTON_STYLE = {
-    "marginLeft": "20px",
-    "padding": "5px 15px",
+    "marginLeft": "12px",
+    "padding": "3px 10px",
     "backgroundColor": "#28a745",
     "color": "white",
     "border": "none",
-    "borderRadius": "4px",
+    "borderRadius": "3px",
     "cursor": "pointer",
     "fontWeight": "bold",
-    "fontSize": "12px",
+    "fontSize": "11px",
 }
 
 TRAIN_CHANGE_CONTROL_SHELL_STYLE = {
@@ -890,6 +890,8 @@ combined_capacity AS (
     FROM annual_only_carry_forward
 )
 SELECT
+    (SELECT MAX(upload_timestamp_utc) FROM latest_monthly_capacity) AS monthly_upload_timestamp_utc,
+    (SELECT MAX(upload_timestamp_utc) FROM annual_train_bounds) AS annual_upload_timestamp_utc,
     NULLIF(
         GREATEST(
             COALESCE(
@@ -985,6 +987,7 @@ WITH latest_snapshot AS (
 )
 SELECT
     projects.publication_date,
+    MAX(projects.upload_timestamp_utc) AS upload_timestamp_utc,
     COUNT(*) AS source_rows,
     COUNT(*) FILTER (
         WHERE projects.start_date IS NOT NULL
@@ -1548,6 +1551,8 @@ def fetch_woodmac_capacity_metadata() -> dict[str, str | int | None]:
 
     row = metadata_df.iloc[0]
     return {
+        "monthly_upload_timestamp_utc": _serialize_timestamp(row.get("monthly_upload_timestamp_utc")),
+        "annual_upload_timestamp_utc": _serialize_timestamp(row.get("annual_upload_timestamp_utc")),
         "upload_timestamp_utc": _serialize_timestamp(row.get("upload_timestamp_utc")),
         "source_rows": int(row["source_rows"]) if pd.notna(row.get("source_rows")) else 0,
         "monthly_source_rows": int(row["monthly_source_rows"]) if pd.notna(row.get("monthly_source_rows")) else 0,
@@ -1714,6 +1719,7 @@ def fetch_ea_capacity_metadata() -> dict[str, str | int | None]:
     row = metadata_df.iloc[0]
     return {
         "publication_date": _serialize_timestamp(row.get("publication_date")),
+        "upload_timestamp_utc": _serialize_timestamp(row.get("upload_timestamp_utc")),
         "source_rows": int(row["source_rows"]) if pd.notna(row.get("source_rows")) else 0,
         "dated_rows": int(row["dated_rows"]) if pd.notna(row.get("dated_rows")) else 0,
         "source_countries": int(row["source_countries"]) if pd.notna(row.get("source_countries")) else 0,
@@ -1900,19 +1906,21 @@ def _resolve_country_color(country_name: str, color_index: int) -> str:
 
 
 def _format_yoy_delta(value: float) -> str:
-    return f"{value:+.1f} MTPA"
+    return f"{value:+,.0f} MTPA"
 
 
 def _format_total_capacity(value: float) -> str:
-    return f"{value:.1f} MTPA total"
+    return f"{value:,.0f} MTPA"
 
 
-def _format_yoy_percent(current_value: float, previous_value: float) -> str:
+def _format_yoy_delta_with_percent(current_value: float, previous_value: float) -> str:
+    delta_value = current_value - previous_value
+    delta_text = _format_yoy_delta(delta_value)
     if abs(previous_value) < 1e-9:
-        return "n/a vs 12m ago"
+        return delta_text
 
-    percent_change = ((current_value - previous_value) / previous_value) * 100
-    return f"{percent_change:+.1f}% vs 12m ago"
+    percent_change = (delta_value / previous_value) * 100
+    return f"{delta_text} ({percent_change:+.1f}%)"
 
 
 def _build_january_yoy_annotations(total_series: pd.Series) -> list[dict]:
@@ -1943,9 +1951,10 @@ def _build_january_yoy_annotations(total_series: pd.Series) -> list[dict]:
                 x=current_date,
                 y=current_value,
                 text=(
-                    f"{_format_total_capacity(current_value)}"
-                    f"<br>{_format_yoy_delta(delta_value)}"
-                    f"<br>{_format_yoy_percent(current_value, previous_value)}"
+                    f"<span style='color:#111827'>{_format_total_capacity(current_value)}</span>"
+                    f"<br><span style='color:{accent_color}'>"
+                    f"{_format_yoy_delta_with_percent(current_value, previous_value)}"
+                    f"</span>"
                 ),
                 showarrow=True,
                 arrowhead=0,
@@ -1959,7 +1968,7 @@ def _build_january_yoy_annotations(total_series: pd.Series) -> list[dict]:
                 borderwidth=1,
                 borderpad=4,
                 align="center",
-                font=dict(size=10, family="Arial", color=accent_color),
+                font=dict(size=10, family="Arial", color="#111827"),
             )
         )
 
@@ -2042,48 +2051,10 @@ def _rename_total_column(matrix_df: pd.DataFrame) -> pd.DataFrame:
 
 def _build_capacity_metadata_lines(metadata: dict | None) -> list[str]:
     if not metadata:
-        return [
-            f"Primary source table: {CAPACITY_SOURCE_TABLE}",
-            f"Fallback source table: {WOODMAC_ANNUAL_OUTPUT_SOURCE_TABLE}",
-        ]
+        return []
 
     metadata = metadata.get("woodmac", metadata)
-    metadata_lines = [
-        f"Primary source table: {CAPACITY_SOURCE_TABLE}",
-        f"Fallback source table: {WOODMAC_ANNUAL_OUTPUT_SOURCE_TABLE}",
-    ]
-
-    upload_timestamp = _format_metadata_timestamp(metadata.get("upload_timestamp_utc"))
-    if upload_timestamp:
-        metadata_lines.append(f"latest upload_timestamp_utc: {upload_timestamp}")
-
-    source_rows = metadata.get("source_rows")
-    monthly_source_rows = metadata.get("monthly_source_rows")
-    monthly_carry_forward_train_months = metadata.get("monthly_carry_forward_train_months")
-    annual_fallback_train_months = metadata.get("annual_fallback_train_months")
-    source_trains = metadata.get("source_trains")
-    if (
-        source_rows is not None
-        or monthly_source_rows is not None
-        or monthly_carry_forward_train_months is not None
-        or annual_fallback_train_months is not None
-        or source_trains is not None
-    ):
-        metadata_lines.append(
-            "Combined monthly rows: "
-            f"{source_rows or 0:,} | "
-            f"monthly nominal rows: {monthly_source_rows or 0:,} | "
-            f"monthly carry-forward train-months: {monthly_carry_forward_train_months or 0:,} | "
-            f"annual-only proxy/carry-forward train-months: {annual_fallback_train_months or 0:,} | "
-            f"plant/train series: {source_trains or 0:,}"
-        )
-
-    min_month = _format_metadata_timestamp(metadata.get("min_month"))
-    max_month = _format_metadata_timestamp(metadata.get("max_month"))
-    if min_month or max_month:
-        metadata_lines.append(
-            f"Combined source coverage: {(min_month or 'n/a')[:7]} to {(max_month or 'n/a')[:7]}"
-        )
+    metadata_lines = []
 
     metadata_lines.append(WOODMAC_LEGACY_CAPACITY_NOTE)
 
@@ -2095,32 +2066,10 @@ def _build_ea_capacity_metadata_lines(
     schedule_df: pd.DataFrame,
 ) -> list[str]:
     if not metadata:
-        return [f"Source table: {EA_CAPACITY_SOURCE_TABLE}", EA_SCHEDULE_CAPACITY_NOTE]
+        return [EA_SCHEDULE_CAPACITY_NOTE]
 
     metadata = metadata.get("ea", metadata)
-    metadata_lines = [f"Source table: {EA_CAPACITY_SOURCE_TABLE}"]
-
-    publication_date = _format_metadata_timestamp(metadata.get("publication_date"))
-    if publication_date:
-        metadata_lines.append(f"latest publication_date: {publication_date[:10]}")
-
-    source_rows = metadata.get("source_rows")
-    dated_rows = metadata.get("dated_rows")
-    source_countries = metadata.get("source_countries")
-    if source_rows is not None or dated_rows is not None or source_countries is not None:
-        metadata_lines.append(
-            "Latest snapshot rows: "
-            f"{source_rows or 0:,} | "
-            f"dated rows: {dated_rows or 0:,} | "
-            f"source countries: {source_countries or 0:,}"
-        )
-
-    if not schedule_df.empty:
-        min_month = pd.to_datetime(schedule_df["month"]).min().strftime("%Y-%m")
-        max_month = pd.to_datetime(schedule_df["month"]).max().strftime("%Y-%m")
-        metadata_lines.append(
-            f"Derived schedule coverage in current view: {min_month} to {max_month}"
-        )
+    metadata_lines = []
 
     metadata_lines.append(EA_SCHEDULE_CAPACITY_NOTE)
     metadata_lines.append(
@@ -2128,6 +2077,55 @@ def _build_ea_capacity_metadata_lines(
     )
 
     return metadata_lines
+
+
+def _build_capacity_status_children(metadata: dict | None) -> html.Div:
+    metadata = metadata or {}
+    woodmac_metadata = metadata.get("woodmac", {})
+    ea_metadata = metadata.get("ea", {})
+
+    status_rows = [
+        (
+            CAPACITY_SOURCE_TABLE,
+            _format_metadata_timestamp(woodmac_metadata.get("monthly_upload_timestamp_utc")),
+        ),
+        (
+            WOODMAC_ANNUAL_OUTPUT_SOURCE_TABLE,
+            _format_metadata_timestamp(woodmac_metadata.get("annual_upload_timestamp_utc")),
+        ),
+        (
+            EA_CAPACITY_SOURCE_TABLE,
+            _format_metadata_timestamp(ea_metadata.get("upload_timestamp_utc")),
+        ),
+    ]
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Span(
+                        table_name,
+                        style={
+                            "fontFamily": "SFMono-Regular, Menlo, Consolas, monospace",
+                            "color": "#0f172a",
+                        },
+                    ),
+                    html.Span(
+                        upload_timestamp or "n/a",
+                        style={"color": "#475569"},
+                    ),
+                ],
+                style={
+                    "display": "grid",
+                    "gridTemplateColumns": "minmax(0, 1fr) auto",
+                    "gap": "8px",
+                    "alignItems": "start",
+                },
+            )
+            for table_name, upload_timestamp in status_rows
+        ],
+        style={"display": "grid", "gap": "6px"},
+    )
 
 
 def _build_section_summary(
@@ -2141,37 +2139,6 @@ def _build_section_summary(
     if raw_df.empty:
         summary_children.append(
             html.Div("No source data returned.", className="balance-summary-row")
-        )
-    else:
-        month_start = (
-            matrix_df["Month"].iloc[0]
-            if not matrix_df.empty
-            else raw_df["month"].min().strftime("%Y-%m")
-        )
-        month_end = (
-            matrix_df["Month"].iloc[-1]
-            if not matrix_df.empty
-            else raw_df["month"].max().strftime("%Y-%m")
-        )
-        visible_country_count = max(len(matrix_df.columns) - 2, 0)
-        source_country_count = raw_df["country_name"].nunique()
-        visibility_note = (
-            "Other countries grouped into Rest of the World."
-            if other_countries_mode == "rest_of_world"
-            else "Only selected countries are included in the totals."
-        )
-
-        summary_children.append(
-            html.Div(
-                [
-                    html.Span(f"{len(matrix_df):,} months"),
-                    html.Span(f"{month_start} to {month_end}"),
-                    html.Span(f"{visible_country_count} visible country columns"),
-                    html.Span(f"{source_country_count} source countries"),
-                    html.Span(visibility_note),
-                ],
-                className="balance-summary-row",
-            )
         )
 
     if metadata_lines:
@@ -2188,13 +2155,9 @@ def _build_section_summary(
 def _build_train_change_summary(
     woodmac_change_df: pd.DataFrame,
     ea_change_df: pd.DataFrame,
-    metadata: dict | None = None,
     time_view: str = "monthly",
     detail_view: str = "country",
-    visible_row_count: int | None = None,
 ) -> html.Div:
-    metadata = metadata or {}
-    ea_metadata = metadata.get("ea", metadata if "publication_date" in metadata else {})
     time_view_label = TRAIN_CHANGE_TIME_VIEW_LABELS.get(time_view, "Monthly")
     detail_view_label = TRAIN_CHANGE_DETAIL_VIEW_LABELS.get(detail_view, "Country")
 
@@ -2208,35 +2171,7 @@ def _build_train_change_summary(
                 html.Div(
                     [
                         html.Span(
-                            f"Woodmac Effective Date reflects the first day of each monthly series point. Monthly nominal capacity is used first. For trains with monthly history, the last monthly capacity is carried forward after monthly coverage ends. Annual proxy is only used for trains with no monthly capacity history, and annual-only legacy trains are carried forward from {WOODMAC_ANNUAL_CARRY_FORWARD_START[:4]} onward."
-                        )
-                    ],
-                    className="balance-metadata-row",
-                ),
-                html.Div(
-                    [html.Span(WOODMAC_LEGACY_CAPACITY_NOTE)],
-                    className="balance-metadata-row",
-                ),
-                html.Div(
-                    [
-                        html.Span(
-                            "Energy Aspects Effective Date uses the month of start_date from the latest liquefaction publication snapshot. Cancelled projects are excluded from this comparison table."
-                        )
-                    ],
-                    className="balance-metadata-row",
-                ),
-                html.Div(
-                    [
-                        html.Span(
                             f"Time View aggregates changes into {time_view_label.lower()} periods. Detail View is set to {detail_view_label}. Total groups all visible countries together, Country shows one row per period-country, Plants View keeps one row per period-plant, and Plants + Trains View adds shared canonical train rows only when the visible provider changes are fully resolved at train level."
-                        )
-                    ],
-                    className="balance-metadata-row",
-                ),
-                html.Div(
-                    [
-                        html.Span(
-                            "Country names are standardized with at_lng.mappings_country, plant names are standardized with at_lng.mapping_plant_name, and train numbers are inferred directly from simple raw Train N labels before exception mappings from at_lng.mapping_plant_train_name are applied."
                         )
                     ],
                     className="balance-metadata-row",
@@ -2244,34 +2179,12 @@ def _build_train_change_summary(
             ]
         )
 
-    woodmac_total_added = woodmac_change_df.loc[
-        woodmac_change_df["Delta MTPA"] > 0, "Delta MTPA"
-    ].sum()
-    woodmac_total_reduced = woodmac_change_df.loc[
-        woodmac_change_df["Delta MTPA"] < 0, "Delta MTPA"
-    ].sum()
-    woodmac_affected_trains = woodmac_change_df["series_key"].dropna().nunique()
-    ea_total_added = ea_change_df.get("EA Adds (MTPA)", pd.Series(dtype=float)).sum()
-    ea_total_reduced = ea_change_df.get("EA Reductions (MTPA)", pd.Series(dtype=float)).sum()
-    comparison_rows = int(visible_row_count or 0)
+    return html.Div()
 
-    ea_publication_label = _format_metadata_timestamp(ea_metadata.get("publication_date"))
 
+def _build_train_change_footer_notes() -> html.Div:
     return html.Div(
         [
-            html.Div(
-                [
-                    html.Span(f"{comparison_rows:,} visible table rows"),
-                    html.Span(f"Time view: {time_view_label}"),
-                    html.Span(f"Detail view: {detail_view_label}"),
-                    html.Span(f"Woodmac: {woodmac_affected_trains:,} trains"),
-                    html.Span(f"Woodmac +{woodmac_total_added:,.1f} MTPA"),
-                    html.Span(f"Woodmac {woodmac_total_reduced:,.1f} MTPA"),
-                    html.Span(f"EA +{ea_total_added:,.1f} MTPA"),
-                    html.Span(f"EA {ea_total_reduced:,.1f} MTPA"),
-                ],
-                className="balance-summary-row",
-            ),
             html.Div(
                 [
                     html.Span(
@@ -2284,36 +2197,8 @@ def _build_train_change_summary(
                 [html.Span(WOODMAC_LEGACY_CAPACITY_NOTE)],
                 className="balance-metadata-row",
             ),
-            html.Div(
-                [
-                    html.Span(
-                        "Energy Aspects Effective Date uses the month of start_date from the latest liquefaction publication snapshot. Cancelled projects are excluded from this comparison table."
-                    )
-                ],
-                className="balance-metadata-row",
-            ),
-            html.Div(
-                [
-                    html.Span(
-                        (
-                            f"Latest EA publication_date: {ea_publication_label}. "
-                            if ea_publication_label
-                            else ""
-                        )
-                        + "Monthly keeps the existing month-by-month effective dates, while Quarterly and Yearly aggregate monthly changes into the selected period labels."
-                    )
-                ],
-                className="balance-metadata-row",
-            ),
-            html.Div(
-                [
-                    html.Span(
-                        "Country names are standardized with at_lng.mappings_country, plant names are standardized with at_lng.mapping_plant_name, and train numbers are inferred directly from simple raw Train N labels before exception mappings from at_lng.mapping_plant_train_name are applied."
-                    )
-                ],
-                className="balance-metadata-row",
-            ),
-        ]
+        ],
+        style={"paddingTop": "12px"},
     )
 
 
@@ -2325,9 +2210,13 @@ def _build_train_timeline_df(
         "Country",
         "Plant",
         "Train",
-        "Woodmac First Effective Date",
+        "Woodmac Original Plant",
+        "Woodmac Original Train",
+        "Woodmac First Date",
         "Woodmac Total Capacity Added",
-        "Energy Aspects First Effective Date",
+        "Energy Aspects Original Plant",
+        "Energy Aspects Original Train",
+        "Energy Aspects First Date",
         "Energy Aspects Total Capacity Added",
     ]
     if woodmac_change_df.empty and ea_change_df.empty:
@@ -2347,47 +2236,83 @@ def _build_train_timeline_df(
         timeline_df["Effective Date"],
         errors="coerce",
     )
-    for column_name in ["Country", "Plant", "Train"]:
+    for column_name in [
+        "Country",
+        "Plant",
+        "Train",
+        "Woodmac Original Plant",
+        "Woodmac Original Train",
+        "Energy Aspects Original Plant",
+        "Energy Aspects Original Train",
+    ]:
+        if column_name not in timeline_df.columns:
+            timeline_df[column_name] = ""
         timeline_df[column_name] = (
             timeline_df[column_name].fillna("").astype(str).str.strip()
         )
 
-    def _summarize_provider(group_df: pd.DataFrame, value_column: str) -> tuple[str | None, float | None]:
+    def _summarize_provider(
+        group_df: pd.DataFrame,
+        value_column: str,
+        original_plant_column: str,
+        original_train_column: str,
+    ) -> tuple[str | None, float | None, str | None, str | None]:
         positive_series = pd.to_numeric(
             group_df.get(value_column),
             errors="coerce",
         ).fillna(0.0)
         positive_mask = positive_series > 0
         if not positive_mask.any():
-            return None, None
+            return None, None, None, None
 
-        first_effective_date = group_df.loc[positive_mask, "Effective Date"].min()
+        positive_df = group_df.loc[positive_mask].copy()
+        first_effective_date = positive_df["Effective Date"].min()
         if pd.isna(first_effective_date):
             formatted_date = None
         else:
             formatted_date = pd.Timestamp(first_effective_date).strftime("%Y-%m-%d")
 
-        return formatted_date, round(float(positive_series[positive_mask].sum()), 2)
+        original_plant_names = _combine_distinct_text_values(
+            positive_df.get(original_plant_column, pd.Series(dtype=object))
+        ) or None
+        original_train_names = _combine_distinct_text_values(
+            positive_df.get(original_train_column, pd.Series(dtype=object))
+        ) or None
+
+        return (
+            formatted_date,
+            round(float(positive_series[positive_mask].sum()), 2),
+            original_plant_names,
+            original_train_names,
+        )
 
     summary_rows = []
     grouped_df = timeline_df.groupby(["Country", "Plant", "Train"], dropna=False, sort=False)
     for (country, plant, train), group_df in grouped_df:
-        woodmac_first_date, woodmac_total_added = _summarize_provider(
+        woodmac_first_date, woodmac_total_added, woodmac_original_plant, woodmac_original_train = _summarize_provider(
             group_df,
             "Woodmac Adds (MTPA)",
+            "Woodmac Original Plant",
+            "Woodmac Original Train",
         )
-        ea_first_date, ea_total_added = _summarize_provider(
+        ea_first_date, ea_total_added, ea_original_plant, ea_original_train = _summarize_provider(
             group_df,
             "EA Adds (MTPA)",
+            "Energy Aspects Original Plant",
+            "Energy Aspects Original Train",
         )
         summary_rows.append(
             {
                 "Country": country,
                 "Plant": plant,
                 "Train": train,
-                "Woodmac First Effective Date": woodmac_first_date,
+                "Woodmac Original Plant": woodmac_original_plant,
+                "Woodmac Original Train": woodmac_original_train,
+                "Woodmac First Date": woodmac_first_date,
                 "Woodmac Total Capacity Added": _numeric_or_blank(woodmac_total_added),
-                "Energy Aspects First Effective Date": ea_first_date,
+                "Energy Aspects Original Plant": ea_original_plant,
+                "Energy Aspects Original Train": ea_original_train,
+                "Energy Aspects First Date": ea_first_date,
                 "Energy Aspects Total Capacity Added": _numeric_or_blank(ea_total_added),
             }
         )
@@ -2414,63 +2339,7 @@ def _build_train_timeline_df(
 
 
 def _build_train_timeline_summary(timeline_df: pd.DataFrame) -> html.Div:
-    if timeline_df.empty:
-        return html.Div(
-            [
-                html.Div(
-                    "No train timeline rows available for the current selection.",
-                    className="balance-summary-row",
-                ),
-                html.Div(
-                    [
-                        html.Span(
-                            "This table follows the same Plants + Trains resolution logic as the comparison table, but summarizes positive additions only inside the selected date range."
-                        )
-                    ],
-                    className="balance-metadata-row",
-                ),
-            ]
-        )
-
-    fallback_row_count = int(timeline_df["Train"].fillna("").astype(str).str.strip().eq("").sum())
-    resolved_row_count = int(len(timeline_df) - fallback_row_count)
-    woodmac_populated = int(
-        timeline_df["Woodmac First Effective Date"].fillna("").astype(str).str.strip().ne("").sum()
-    )
-    ea_populated = int(
-        timeline_df["Energy Aspects First Effective Date"].fillna("").astype(str).str.strip().ne("").sum()
-    )
-
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.Span(f"{len(timeline_df):,} timeline rows"),
-                    html.Span(f"{resolved_row_count:,} resolved train rows"),
-                    html.Span(f"{fallback_row_count:,} fallback plant rows"),
-                    html.Span(f"{woodmac_populated:,} Woodmac rows with additions"),
-                    html.Span(f"{ea_populated:,} EA rows with additions"),
-                ],
-                className="balance-summary-row",
-            ),
-            html.Div(
-                [
-                    html.Span(
-                        "First Effective Date and Total Capacity Added use positive additions only within the current selected date range."
-                    )
-                ],
-                className="balance-metadata-row",
-            ),
-            html.Div(
-                [
-                    html.Span(
-                        "Fallback rows with blank Train mirror the Plants + Trains comparison logic whenever visible provider changes are not fully resolved at train level."
-                    )
-                ],
-                className="balance-metadata-row",
-            ),
-        ]
-    )
+    return html.Div()
 
 
 def _create_source_section(
@@ -2547,37 +2416,6 @@ def _create_train_change_section(
                 ),
                 html.Div(
                     [
-                        html.Span("Time view", style=TRAIN_CHANGE_CONTROL_LABEL_STYLE),
-                        html.Div(
-                            [
-                                dcc.RadioItems(
-                                    id="capacity-page-train-change-time-view",
-                                    options=[
-                                        {"label": "Monthly", "value": "monthly"},
-                                        {"label": "Quarterly", "value": "quarterly"},
-                                        {"label": "Yearly", "value": "yearly"},
-                                    ],
-                                    value="monthly",
-                                    inline=True,
-                                    labelStyle={
-                                        "display": "inline-flex",
-                                        "alignItems": "center",
-                                        "marginRight": "10px",
-                                        "fontSize": "12px",
-                                        "fontWeight": "600",
-                                        "color": "#334155",
-                                    },
-                                    inputStyle={"marginRight": "6px"},
-                                    style={"display": "flex", "alignItems": "center"},
-                                ),
-                            ],
-                            style={"display": "flex", "gap": "8px", "alignItems": "center"},
-                        ),
-                    ],
-                    style=TRAIN_CHANGE_CONTROL_SHELL_STYLE,
-                ),
-                html.Div(
-                    [
                         html.Span("Detail view", style=TRAIN_CHANGE_CONTROL_LABEL_STYLE),
                         html.Div(
                             [
@@ -2641,7 +2479,47 @@ def _create_train_timeline_section(
     header_children = [
         html.Div(
             [
-                html.H3(title, className="balance-section-title"),
+                html.Div(
+                    [
+                        html.H3(title, className="balance-section-title"),
+                        html.Div(
+                            [
+                                html.Span("Original names", style=TRAIN_CHANGE_CONTROL_LABEL_STYLE),
+                                html.Div(
+                                    [
+                                        dcc.RadioItems(
+                                            id="capacity-page-train-timeline-original-name-visibility",
+                                            options=[
+                                                {"label": "Hide", "value": "hide"},
+                                                {"label": "Show", "value": "show"},
+                                            ],
+                                            value="hide",
+                                            inline=True,
+                                            labelStyle={
+                                                "display": "inline-flex",
+                                                "alignItems": "center",
+                                                "marginRight": "10px",
+                                                "fontSize": "12px",
+                                                "fontWeight": "600",
+                                                "color": "#334155",
+                                            },
+                                            inputStyle={"marginRight": "6px"},
+                                            style={"display": "flex", "alignItems": "center"},
+                                        ),
+                                    ],
+                                    style={"display": "flex", "gap": "8px", "alignItems": "center"},
+                                ),
+                            ],
+                            style=TRAIN_CHANGE_CONTROL_SHELL_STYLE,
+                        ),
+                    ],
+                    style={
+                        "display": "flex",
+                        "alignItems": "center",
+                        "gap": "12px",
+                        "flexWrap": "wrap",
+                    },
+                ),
                 html.Button(
                     "Export to Excel",
                     id=export_button_id,
@@ -2650,7 +2528,13 @@ def _create_train_timeline_section(
                 ),
             ],
             className="inline-section-header",
-            style={"display": "flex", "alignItems": "center", "justifyContent": "space-between"},
+            style={
+                "display": "flex",
+                "alignItems": "center",
+                "justifyContent": "space-between",
+                "gap": "12px",
+                "flexWrap": "wrap",
+            },
         )
     ]
 
@@ -2670,8 +2554,7 @@ def _create_train_timeline_section(
 
 def _create_capacity_country_area_chart(
     matrix_df: pd.DataFrame,
-    title_prefix: str = "Cumulative Monthly LNG Capacity by Country (MTPA)",
-    y_axis_title: str = "Monthly Nominal Capacity (MTPA)",
+    y_axis_title: str = "MTPA",
 ) -> go.Figure:
     total_column_label = "Total MTPA"
     if matrix_df.empty:
@@ -2729,17 +2612,6 @@ def _create_capacity_country_area_chart(
     end_date = pivot_df.index.max()
 
     fig.update_layout(
-        title={
-            "text": (
-                f"{title_prefix} "
-                f"| {start_date.year}-{end_date.year}"
-            ),
-            "font": {"size": 20, "family": "Arial", "color": "#1f2937"},
-            "x": 0.5,
-            "xanchor": "center",
-            "y": 0.95,
-            "yanchor": "top",
-        },
         xaxis=dict(
             title="",
             range=[start_date, end_date],
@@ -2768,7 +2640,7 @@ def _create_capacity_country_area_chart(
         plot_bgcolor="white",
         paper_bgcolor="white",
         height=500,
-        margin=dict(l=80, r=40, t=110, b=135),
+        margin=dict(l=80, r=40, t=32, b=135),
         hovermode="x unified",
         hoverlabel=dict(
             bgcolor="rgba(255, 255, 255, 0.96)",
@@ -3512,7 +3384,7 @@ def _create_unmapped_plant_mapping_table(
         {"name": "Provider", "id": "provider", "editable": False},
         {"name": "Source Field", "id": "source_field", "editable": False},
         {"name": "Source Name", "id": "source_name", "editable": False},
-        {"name": "First Effective Date", "id": "first_effective_date", "editable": False},
+        {"name": "First Date", "id": "first_effective_date", "editable": False},
         {
             "name": "Visible Capacity (MTPA)",
             "id": "total_capacity_mtpa",
@@ -3604,7 +3476,7 @@ def _create_unmapped_train_mapping_table(
         {"name": "Parent Source Name", "id": "parent_source_name", "editable": False},
         {"name": "Source Field", "id": "source_field", "editable": False},
         {"name": "Source Name", "id": "source_name", "editable": False},
-        {"name": "First Effective Date", "id": "first_effective_date", "editable": False},
+        {"name": "First Date", "id": "first_effective_date", "editable": False},
         {
             "name": "Visible Capacity (MTPA)",
             "id": "total_capacity_mtpa",
@@ -3890,6 +3762,21 @@ def _numeric_or_blank(value: float | int | None) -> float | None:
     return round(value, 2)
 
 
+def _combine_distinct_text_values(values: pd.Series | list[object]) -> str:
+    unique_values: list[str] = []
+    for value in values:
+        if pd.isna(value):
+            continue
+
+        text_value = " ".join(str(value).strip().split())
+        if not text_value or text_value in unique_values:
+            continue
+
+        unique_values.append(text_value)
+
+    return "; ".join(unique_values)
+
+
 def _apply_train_change_time_view(
     df: pd.DataFrame,
     time_view: str,
@@ -3934,6 +3821,7 @@ def _prepare_woodmac_period_change_df(
         "Woodmac Activity Abs",
         "Source Field",
         "Source Name",
+        "Train Source Name",
         "Mapping Applied",
         "Train Mapping Applied",
     ]
@@ -3961,14 +3849,15 @@ def _prepare_woodmac_period_change_df(
             as_index=False,
             dropna=False,
         )
-        .agg(
+            .agg(
             {
                 "Woodmac Adds (MTPA)": "sum",
                 "Woodmac Reductions (MTPA)": "sum",
                 "Woodmac Net Delta (MTPA)": "sum",
                 "Woodmac Activity Abs": "sum",
                 "Source Field": "last",
-                "Source Name": "last",
+                "Source Name": _combine_distinct_text_values,
+                "Train Source Name": _combine_distinct_text_values,
                 "Mapping Applied": "max",
                 "Train Mapping Applied": "max",
             }
@@ -4002,6 +3891,7 @@ def _prepare_ea_period_change_df(
         "EA Activity Abs",
         "Source Field",
         "Source Name",
+        "Train Source Name",
         "Mapping Applied",
         "Train Mapping Applied",
     ]
@@ -4035,7 +3925,8 @@ def _prepare_ea_period_change_df(
                 "EA Net Delta (MTPA)": "sum",
                 "EA Activity Abs": "sum",
                 "Source Field": "last",
-                "Source Name": "last",
+                "Source Name": _combine_distinct_text_values,
+                "Train Source Name": _combine_distinct_text_values,
                 "Mapping Applied": "max",
                 "Train Mapping Applied": "max",
             }
@@ -4137,12 +4028,20 @@ def _build_flat_plants_trains_rows(
                     "Country": country,
                     "Plant": plant_name,
                     "Train": "",
+                    "Woodmac Original Plant": plant_row.get("Woodmac Original Plant"),
+                    "Woodmac Original Train": plant_row.get("Woodmac Original Train"),
                     "Woodmac Adds (MTPA)": _numeric_or_blank(plant_row.get("Woodmac Adds (MTPA)")),
                     "Woodmac Reductions (MTPA)": _numeric_or_blank(
                         plant_row.get("Woodmac Reductions (MTPA)")
                     ),
                     "Woodmac Net Delta (MTPA)": _numeric_or_blank(
                         plant_row.get("Woodmac Net Delta (MTPA)")
+                    ),
+                    "Energy Aspects Original Plant": plant_row.get(
+                        "Energy Aspects Original Plant"
+                    ),
+                    "Energy Aspects Original Train": plant_row.get(
+                        "Energy Aspects Original Train"
                     ),
                     "EA Adds (MTPA)": _numeric_or_blank(plant_row.get("EA Adds (MTPA)")),
                     "EA Reductions (MTPA)": _numeric_or_blank(plant_row.get("EA Reductions (MTPA)")),
@@ -4163,6 +4062,8 @@ def _build_flat_plants_trains_rows(
                     "Country": country,
                     "Plant": plant_name,
                     "Train": _format_train_label(train_row.get("Train")),
+                    "Woodmac Original Plant": train_row.get("Woodmac Original Plant"),
+                    "Woodmac Original Train": train_row.get("Woodmac Original Train"),
                     "Woodmac Adds (MTPA)": _numeric_or_blank(
                         train_row.get("Woodmac Adds (MTPA)")
                     ),
@@ -4171,6 +4072,12 @@ def _build_flat_plants_trains_rows(
                     ),
                     "Woodmac Net Delta (MTPA)": _numeric_or_blank(
                         train_row.get("Woodmac Net Delta (MTPA)")
+                    ),
+                    "Energy Aspects Original Plant": train_row.get(
+                        "Energy Aspects Original Plant"
+                    ),
+                    "Energy Aspects Original Train": train_row.get(
+                        "Energy Aspects Original Train"
                     ),
                     "EA Adds (MTPA)": _numeric_or_blank(train_row.get("EA Adds (MTPA)")),
                     "EA Reductions (MTPA)": _numeric_or_blank(
@@ -4205,9 +4112,13 @@ def _build_train_change_hierarchical_rows(
         "Country",
         "Plant",
         "Train",
+        "Woodmac Original Plant",
+        "Woodmac Original Train",
         "Woodmac Adds (MTPA)",
         "Woodmac Reductions (MTPA)",
         "Woodmac Net Delta (MTPA)",
+        "Energy Aspects Original Plant",
+        "Energy Aspects Original Train",
         "EA Adds (MTPA)",
         "EA Reductions (MTPA)",
         "EA Net Delta (MTPA)",
@@ -4314,6 +4225,14 @@ def _build_train_change_hierarchical_rows(
                     "Woodmac Reductions (MTPA)": "sum",
                     "Woodmac Net Delta (MTPA)": "sum",
                     "Woodmac Activity Abs": "sum",
+                    "Source Name": _combine_distinct_text_values,
+                    "Train Source Name": _combine_distinct_text_values,
+                }
+            )
+            .rename(
+                columns={
+                    "Source Name": "Woodmac Original Plant",
+                    "Train Source Name": "Woodmac Original Train",
                 }
             )
         )
@@ -4328,6 +4247,14 @@ def _build_train_change_hierarchical_rows(
                     "EA Reductions (MTPA)": "sum",
                     "EA Net Delta (MTPA)": "sum",
                     "EA Activity Abs": "sum",
+                    "Source Name": _combine_distinct_text_values,
+                    "Train Source Name": _combine_distinct_text_values,
+                }
+            )
+            .rename(
+                columns={
+                    "Source Name": "Energy Aspects Original Plant",
+                    "Train Source Name": "Energy Aspects Original Train",
                 }
             )
         )
@@ -4360,6 +4287,8 @@ def _build_train_change_hierarchical_rows(
                 "Country",
                 "Plant",
                 "Train",
+                "Source Name",
+                "Train Source Name",
                 "Woodmac Adds (MTPA)",
                 "Woodmac Reductions (MTPA)",
                 "Woodmac Net Delta (MTPA)",
@@ -4373,6 +4302,8 @@ def _build_train_change_hierarchical_rows(
                 "Country",
                 "Plant",
                 "Train",
+                "Source Name",
+                "Train Source Name",
                 "EA Adds (MTPA)",
                 "EA Reductions (MTPA)",
                 "EA Net Delta (MTPA)",
@@ -4381,6 +4312,14 @@ def _build_train_change_hierarchical_rows(
         ],
         on=["__period_start", "Effective Date", "Country", "Plant", "Train"],
         how="outer",
+    )
+    train_comparison_df = train_comparison_df.rename(
+        columns={
+            "Source Name_x": "Woodmac Original Plant",
+            "Train Source Name_x": "Woodmac Original Train",
+            "Source Name_y": "Energy Aspects Original Plant",
+            "Train Source Name_y": "Energy Aspects Original Train",
+        }
     )
     if not train_comparison_df.empty:
         train_comparison_df["__train_sort"] = pd.to_numeric(
@@ -4485,10 +4424,15 @@ def _build_train_change_hierarchical_rows(
 
 def _create_train_change_table(table_id: str, change_df: pd.DataFrame) -> dash_table.DataTable | html.Div:
     if change_df.empty:
-        return _create_empty_state("No provider capacity changes in the current selection.")
+        return html.Div(
+            [
+                _create_empty_state("No provider capacity changes in the current selection."),
+                _build_train_change_footer_notes(),
+            ]
+        )
 
     columns = [
-        {"name": ["Effective Date", ""], "id": "Effective Date", "type": "text"},
+        {"name": ["Date", ""], "id": "Effective Date", "type": "text"},
         {"name": ["Country", ""], "id": "Country", "type": "text"},
         {"name": ["Plant", ""], "id": "Plant", "type": "text"},
         {"name": ["Train", ""], "id": "Train", "type": "text"},
@@ -4621,40 +4565,6 @@ def _create_train_change_table(table_id: str, change_df: pd.DataFrame) -> dash_t
         },
     ]
 
-    legend = html.Div(
-        [
-            html.Span(
-                "Time View: Monthly, Quarterly, or Yearly",
-                style={"color": "#475569", "marginRight": "18px", "fontSize": "11px"},
-            ),
-            html.Span(
-                "Total groups all visible countries together",
-                style={"color": "#475569", "marginRight": "18px", "fontSize": "11px"},
-            ),
-            html.Span(
-                "Country shows one row per period-country",
-                style={"color": "#475569", "marginRight": "18px", "fontSize": "11px"},
-            ),
-            html.Span(
-                "Plants View keeps one row per plant; Plants + Trains adds child rows by canonical train when both providers are safely resolved",
-                style={"color": "#475569", "marginRight": "18px", "fontSize": "11px"},
-            ),
-            html.Span(
-                "Unresolved train conflicts stay at plant level only",
-                style={"color": "#475569", "marginRight": "18px", "fontSize": "11px"},
-            ),
-            html.Span(
-                "Green = additions",
-                style={"color": "#166534", "marginRight": "18px", "fontSize": "11px", "fontWeight": "600"},
-            ),
-            html.Span(
-                "Red = reductions",
-                style={"color": "#991b1b", "fontSize": "11px", "fontWeight": "600"},
-            ),
-        ],
-        style={"padding": "4px 0 12px 2px"},
-    )
-
     table = dash_table.DataTable(
         id={"type": "capacity-train-change-expandable-table", "index": 0},
         columns=columns,
@@ -4703,40 +4613,78 @@ def _create_train_change_table(table_id: str, change_df: pd.DataFrame) -> dash_t
         fill_width=False,
     )
 
-    return html.Div([legend, table])
+    return html.Div([table, _build_train_change_footer_notes()])
+
+
+def _get_train_timeline_columns(show_original_names: bool) -> list[dict]:
+    columns = [
+        {"name": ["", "Country"], "id": "Country"},
+        {"name": ["", "Plant"], "id": "Plant"},
+        {"name": ["", "Train"], "id": "Train"},
+    ]
+
+    if show_original_names:
+        columns.extend(
+            [
+                {"name": ["Woodmac", "Original Plant"], "id": "Woodmac Original Plant"},
+                {"name": ["Woodmac", "Original Train"], "id": "Woodmac Original Train"},
+            ]
+        )
+
+    columns.extend(
+        [
+            {"name": ["Woodmac", "First Date"], "id": "Woodmac First Date"},
+            {
+                "name": ["Woodmac", "Capacity"],
+                "id": "Woodmac Total Capacity Added",
+                "type": "numeric",
+                "format": Format(precision=2, scheme=Scheme.fixed),
+            },
+        ]
+    )
+
+    if show_original_names:
+        columns.extend(
+            [
+                {
+                    "name": ["Energy Aspects", "Original Plant"],
+                    "id": "Energy Aspects Original Plant",
+                },
+                {
+                    "name": ["Energy Aspects", "Original Train"],
+                    "id": "Energy Aspects Original Train",
+                },
+            ]
+        )
+
+    columns.extend(
+        [
+            {
+                "name": ["Energy Aspects", "First Date"],
+                "id": "Energy Aspects First Date",
+            },
+            {
+                "name": ["Energy Aspects", "Capacity"],
+                "id": "Energy Aspects Total Capacity Added",
+                "type": "numeric",
+                "format": Format(precision=2, scheme=Scheme.fixed),
+            },
+        ]
+    )
+
+    return columns
 
 
 def _create_train_timeline_table(
     table_id: str,
     timeline_df: pd.DataFrame,
+    show_original_names: bool = False,
 ) -> dash_table.DataTable | html.Div:
     if timeline_df.empty:
         return _create_empty_state("No train timeline rows available for the current selection.")
 
     display_df = timeline_df.copy().where(pd.notna(timeline_df), None)
-
-    columns = [
-        {"name": ["", "Country"], "id": "Country"},
-        {"name": ["", "Plant"], "id": "Plant"},
-        {"name": ["", "Train"], "id": "Train"},
-        {"name": ["Woodmac", "First Effective Date"], "id": "Woodmac First Effective Date"},
-        {
-            "name": ["Woodmac", "Total Capacity Added"],
-            "id": "Woodmac Total Capacity Added",
-            "type": "numeric",
-            "format": Format(precision=2, scheme=Scheme.fixed),
-        },
-        {
-            "name": ["Energy Aspects", "First Effective Date"],
-            "id": "Energy Aspects First Effective Date",
-        },
-        {
-            "name": ["Energy Aspects", "Total Capacity Added"],
-            "id": "Energy Aspects Total Capacity Added",
-            "type": "numeric",
-            "format": Format(precision=2, scheme=Scheme.fixed),
-        },
-    ]
+    columns = _get_train_timeline_columns(show_original_names)
 
     style_data_conditional = [
         {
@@ -4756,24 +4704,6 @@ def _create_train_timeline_table(
             "fontWeight": "700",
         },
     ]
-
-    legend = html.Div(
-        [
-            html.Span(
-                "Rows follow the same Plants + Trains resolution logic as the comparison table",
-                style={"color": "#475569", "marginRight": "18px", "fontSize": "11px"},
-            ),
-            html.Span(
-                "Blank Train = unresolved provider changes kept at plant level",
-                style={"color": "#475569", "marginRight": "18px", "fontSize": "11px"},
-            ),
-            html.Span(
-                "Totals reflect positive additions only inside the selected range",
-                style={"color": "#475569", "fontSize": "11px"},
-            ),
-        ],
-        style={"padding": "4px 0 12px 2px"},
-    )
 
     table = dash_table.DataTable(
         id=table_id,
@@ -4809,10 +4739,34 @@ def _create_train_timeline_table(
             {"if": {"column_id": "Country"}, "textAlign": "left", "minWidth": "140px", "maxWidth": "180px"},
             {"if": {"column_id": "Plant"}, "textAlign": "left", "minWidth": "220px", "maxWidth": "300px"},
             {"if": {"column_id": "Train"}, "minWidth": "90px", "maxWidth": "100px"},
-            {"if": {"column_id": "Woodmac First Effective Date"}, "minWidth": "150px", "maxWidth": "160px"},
-            {"if": {"column_id": "Energy Aspects First Effective Date"}, "minWidth": "170px", "maxWidth": "180px"},
+            {
+                "if": {"column_id": "Woodmac Original Plant"},
+                "textAlign": "left",
+                "minWidth": "220px",
+                "maxWidth": "280px",
+            },
+            {
+                "if": {"column_id": "Woodmac Original Train"},
+                "textAlign": "left",
+                "minWidth": "160px",
+                "maxWidth": "240px",
+            },
+            {"if": {"column_id": "Woodmac First Date"}, "minWidth": "150px", "maxWidth": "160px"},
+            {"if": {"column_id": "Energy Aspects First Date"}, "minWidth": "170px", "maxWidth": "180px"},
             {"if": {"column_id": "Woodmac Total Capacity Added"}, "minWidth": "150px", "maxWidth": "160px"},
             {"if": {"column_id": "Energy Aspects Total Capacity Added"}, "minWidth": "170px", "maxWidth": "180px"},
+            {
+                "if": {"column_id": "Energy Aspects Original Plant"},
+                "textAlign": "left",
+                "minWidth": "220px",
+                "maxWidth": "280px",
+            },
+            {
+                "if": {"column_id": "Energy Aspects Original Train"},
+                "textAlign": "left",
+                "minWidth": "160px",
+                "maxWidth": "240px",
+            },
         ],
         style_data_conditional=style_data_conditional,
         merge_duplicate_headers=True,
@@ -4822,7 +4776,17 @@ def _create_train_timeline_table(
         fill_width=False,
     )
 
-    return html.Div([legend, table])
+    note = html.Div(
+        [
+            html.Span(
+                "First Date and Capacity use positive additions only within the current selected date range."
+            )
+        ],
+        className="balance-metadata-row",
+        style={"paddingTop": "12px"},
+    )
+
+    return html.Div([table, note])
 
 
 def _export_matrix_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
@@ -4868,7 +4832,6 @@ layout = html.Div(
                         html.Div(
                             [
                                 html.Div("Date Range", className="filter-group-header"),
-                                html.Label("Month interval:", className="filter-label"),
                                 html.Div(
                                     [
                                         dcc.DatePickerRange(
@@ -4886,7 +4849,38 @@ layout = html.Div(
                                             number_of_months_shown=2,
                                         )
                                     ],
-                                    className="professional-date-picker",
+                                    className="professional-date-picker capacity-page-date-range-picker",
+                                ),
+                            ],
+                            className="filter-section filter-section-destination",
+                        ),
+                        html.Div(
+                            [
+                                html.Div("Time View", className="filter-group-header"),
+                                html.Div(
+                                    [
+                                        dcc.RadioItems(
+                                            id="capacity-page-train-change-time-view",
+                                            options=[
+                                                {"label": "Monthly", "value": "monthly"},
+                                                {"label": "Quarterly", "value": "quarterly"},
+                                                {"label": "Yearly", "value": "yearly"},
+                                            ],
+                                            value="monthly",
+                                            inline=True,
+                                            labelStyle={
+                                                "display": "inline-flex",
+                                                "alignItems": "center",
+                                                "marginRight": "10px",
+                                                "fontSize": "12px",
+                                                "fontWeight": "600",
+                                                "color": "#334155",
+                                            },
+                                            inputStyle={"marginRight": "6px"},
+                                            style={"display": "flex", "alignItems": "center"},
+                                        )
+                                    ],
+                                    style=TRAIN_CHANGE_CONTROL_SHELL_STYLE,
                                 ),
                             ],
                             className="filter-section filter-section-destination",
@@ -4894,7 +4888,6 @@ layout = html.Div(
                         html.Div(
                             [
                                 html.Div("Country Columns", className="filter-group-header"),
-                                html.Label("Countries:", className="filter-label"),
                                 dcc.Dropdown(
                                     id="capacity-page-country-dropdown",
                                     options=[],
@@ -4910,16 +4903,15 @@ layout = html.Div(
                         html.Div(
                             [
                                 html.Div("Other Countries", className="filter-group-header"),
-                                html.Label("Handling:", className="filter-label"),
                                 dcc.RadioItems(
                                     id="capacity-page-other-country-mode",
                                     options=[
                                         {
-                                            "label": "Include as Rest of the World",
+                                            "label": "Include",
                                             "value": "rest_of_world",
                                         },
                                         {
-                                            "label": "Exclude from the table",
+                                            "label": "Exclude",
                                             "value": "exclude",
                                         },
                                     ],
@@ -4942,7 +4934,7 @@ layout = html.Div(
                                 html.Div(
                                     id="capacity-page-meta-indicator",
                                     className="text-tertiary",
-                                    style={"fontSize": "12px", "maxWidth": "260px"},
+                                    style={"fontSize": "11px", "maxWidth": "640px", "width": "100%"},
                                 ),
                             ],
                             className="filter-section filter-section-analysis",
@@ -4995,19 +4987,29 @@ layout = html.Div(
                                         "alignItems": "start",
                                     },
                                 ),
-                                _create_train_change_section(
-                                    "Capacity Change Comparison in Selected Range",
-                                    "Compare monthly, quarterly, or yearly capacity changes across Woodmac and Energy Aspects at total, country, plant, and train detail. Woodmac annual-only legacy capacity is carried forward from 2029 onward to avoid source-timing noise in year-over-year changes.",
-                                    "capacity-page-train-change-summary",
-                                    "capacity-page-train-change-table-container",
-                                    "capacity-page-export-train-change-button",
-                                ),
-                                _create_train_timeline_section(
-                                    "Train Timeline",
-                                    "Summarize the first visible addition date and total capacity added by provider using the same Plants + Trains resolution logic as the comparison table, within the current selected date range.",
-                                    "capacity-page-train-timeline-summary",
-                                    "capacity-page-train-timeline-table-container",
-                                    "capacity-page-export-train-timeline-button",
+                                html.Div(
+                                    [
+                                        _create_train_change_section(
+                                            "Capacity Change Comparison in Selected Range",
+                                            None,
+                                            "capacity-page-train-change-summary",
+                                            "capacity-page-train-change-table-container",
+                                            "capacity-page-export-train-change-button",
+                                        ),
+                                        _create_train_timeline_section(
+                                            "Train Timeline - Monthly",
+                                            None,
+                                            "capacity-page-train-timeline-summary",
+                                            "capacity-page-train-timeline-table-container",
+                                            "capacity-page-export-train-timeline-button",
+                                        ),
+                                    ],
+                                    style={
+                                        "display": "grid",
+                                        "gridTemplateColumns": "repeat(auto-fit, minmax(520px, 1fr))",
+                                        "gap": "24px",
+                                        "alignItems": "start",
+                                    },
                                 ),
                                 html.Div(
                                     [
@@ -5211,30 +5213,10 @@ def update_capacity_date_range(woodmac_data, ea_capacity_data, current_start_dat
 @callback(
     Output("capacity-page-refresh-indicator", "children"),
     Output("capacity-page-meta-indicator", "children"),
-    Input("capacity-page-refresh-timestamp-store", "data"),
-    Input("capacity-page-country-options-store", "data"),
-    Input("capacity-page-date-range", "start_date"),
-    Input("capacity-page-date-range", "end_date"),
+    Input("capacity-page-metadata-store", "data"),
 )
-def update_capacity_status(refresh_timestamp, available_countries, start_date, end_date):
-    refresh_text = (
-        f"Last refreshed: {refresh_timestamp}"
-        if refresh_timestamp
-        else "Last refreshed: waiting for data"
-    )
-    if start_date and end_date:
-        start_label = _normalize_month_date(start_date).strftime("%Y-%m")
-        end_label = _normalize_month_date(end_date).strftime("%Y-%m")
-        range_text = f"Showing {start_label} to {end_label}."
-    else:
-        range_text = "Using the latest Woodmac and Energy Aspects comparison snapshots."
-
-    meta_text = (
-        f"{len(available_countries or []):,} source countries available. {range_text}"
-        if available_countries
-        else range_text
-    )
-    return refresh_text, meta_text
+def update_capacity_status(metadata):
+    return "", _build_capacity_status_children(metadata)
 
 
 @callback(
@@ -5367,8 +5349,7 @@ def render_ea_capacity_table(
 
     ea_chart = _create_capacity_country_area_chart(
         ea_matrix,
-        title_prefix="Cumulative Scheduled LNG Capacity by Country (MTPA)",
-        y_axis_title="Scheduled Capacity (MTPA)",
+        y_axis_title="MTPA",
     )
     ea_table = _create_capacity_table("capacity-page-ea-table", ea_matrix)
     return ea_summary, ea_chart, ea_table
@@ -5379,7 +5360,6 @@ def render_ea_capacity_table(
     Output("capacity-page-train-change-table-container", "children"),
     Input("capacity-page-train-capacity-data-store", "data"),
     Input("capacity-page-ea-capacity-data-store", "data"),
-    Input("capacity-page-metadata-store", "data"),
     Input("capacity-page-country-dropdown", "value"),
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
@@ -5392,7 +5372,6 @@ def render_ea_capacity_table(
 def render_train_capacity_change_table(
     train_capacity_data,
     ea_capacity_data,
-    metadata,
     selected_countries,
     other_countries_mode,
     start_date,
@@ -5411,10 +5390,8 @@ def render_train_capacity_change_table(
             _build_train_change_summary(
                 empty_df,
                 empty_df,
-                metadata,
                 time_view=time_view,
                 detail_view=detail_view,
-                visible_row_count=0,
             ),
             _create_train_change_table("capacity-page-train-change-table", empty_df),
         )
@@ -5465,10 +5442,8 @@ def render_train_capacity_change_table(
         _build_train_change_summary(
             woodmac_change_df,
             ea_change_df,
-            metadata,
             time_view=time_view,
             detail_view=detail_view,
-            visible_row_count=len(hierarchical_df),
         ),
         _create_train_change_table("capacity-page-train-change-table", hierarchical_df),
     )
@@ -5483,6 +5458,7 @@ def render_train_capacity_change_table(
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
+    Input("capacity-page-train-timeline-original-name-visibility", "value"),
 )
 def render_train_timeline_table(
     train_capacity_data,
@@ -5491,15 +5467,21 @@ def render_train_timeline_table(
     other_countries_mode,
     start_date,
     end_date,
+    original_name_visibility,
 ):
     train_raw_df = _deserialize_dataframe(train_capacity_data)
     ea_raw_df = _deserialize_dataframe(ea_capacity_data)
+    show_original_names = original_name_visibility == "show"
 
     if train_raw_df.empty and ea_raw_df.empty:
         empty_df = pd.DataFrame()
         return (
             _build_train_timeline_summary(empty_df),
-            _create_train_timeline_table("capacity-page-train-timeline-table", empty_df),
+            _create_train_timeline_table(
+                "capacity-page-train-timeline-table",
+                empty_df,
+                show_original_names=show_original_names,
+            ),
         )
 
     country_scope_frames = []
@@ -5539,7 +5521,11 @@ def render_train_timeline_table(
 
     return (
         _build_train_timeline_summary(timeline_df),
-        _create_train_timeline_table("capacity-page-train-timeline-table", timeline_df),
+        _create_train_timeline_table(
+            "capacity-page-train-timeline-table",
+            timeline_df,
+            show_original_names=show_original_names,
+        ),
     )
 
 
@@ -6267,6 +6253,7 @@ def export_train_change_excel(
     State("capacity-page-other-country-mode", "value"),
     State("capacity-page-date-range", "start_date"),
     State("capacity-page-date-range", "end_date"),
+    State("capacity-page-train-timeline-original-name-visibility", "value"),
     prevent_initial_call=True,
 )
 def export_train_timeline_excel(
@@ -6277,6 +6264,7 @@ def export_train_timeline_excel(
     other_countries_mode,
     start_date,
     end_date,
+    original_name_visibility,
 ):
     if not n_clicks:
         raise PreventUpdate
@@ -6315,6 +6303,10 @@ def export_train_timeline_excel(
         end_date,
     )
     export_df = _build_train_timeline_df(woodmac_change_df, ea_change_df)
+    if original_name_visibility != "show":
+        export_df = export_df[
+            [column["id"] for column in _get_train_timeline_columns(show_original_names=False)]
+        ]
 
     if export_df.empty:
         raise PreventUpdate

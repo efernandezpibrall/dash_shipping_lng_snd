@@ -8,6 +8,7 @@ import configparser
 import os
 from sqlalchemy import create_engine, text
 
+from utils.mappings_section import create_mappings_section_header
 from utils.table_styles import StandardTableStyleManager
 
 
@@ -276,16 +277,10 @@ layout = html.Div(
             n_intervals=0,
             max_intervals=1,
         ),
-        html.Div(
-            [
-                html.H2("Plant Names Mapping", className="page-title"),
-                html.P(
-                    "Canonical mapping layer used to reconcile Woodmac plant_name and Energy Aspects project_name into a shared plant name.",
-                    className="text-secondary",
-                    style={"marginBottom": "20px"},
-                ),
-            ],
-            style={"marginBottom": "30px", "padding": "20px 20px 0px 20px"},
+        create_mappings_section_header(
+            title="Plant Mapping",
+            description="Canonical mapping layer used to reconcile Woodmac plant_name and Energy Aspects project_name into a shared plant name.",
+            active_href="/plant_names_mapping",
         ),
         html.Div(id="plant-name-mappings-summary-cards-container", style={"padding": "0px 20px"}),
         html.Div(

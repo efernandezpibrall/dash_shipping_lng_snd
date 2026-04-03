@@ -9,6 +9,7 @@ import math
 import os
 from sqlalchemy import create_engine, text
 
+from utils.mappings_section import create_mappings_section_header
 from utils.table_styles import StandardTableStyleManager
 
 
@@ -353,16 +354,10 @@ layout = html.Div(
             n_intervals=0,
             max_intervals=1,
         ),
-        html.Div(
-            [
-                html.H2("Train Names Mapping", className="page-title"),
-                html.P(
-                    "Canonical train mapping layer used to reconcile Woodmac lng_train_name_short and Energy Aspects train_name into plant-scoped numeric trains.",
-                    className="text-secondary",
-                    style={"marginBottom": "20px"},
-                ),
-            ],
-            style={"marginBottom": "30px", "padding": "20px 20px 0px 20px"},
+        create_mappings_section_header(
+            title="Train Mapping",
+            description="Canonical train mapping layer used to reconcile Woodmac lng_train_name_short and Energy Aspects train_name into plant-scoped numeric trains.",
+            active_href="/train_names_mapping",
         ),
         html.Div(id="train-name-mappings-summary-cards-container", style={"padding": "0px 20px"}),
         html.Div(
