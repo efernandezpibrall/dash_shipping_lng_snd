@@ -1147,6 +1147,14 @@ button.show-hide { display: none; }
     border: 1px solid #e5e7eb;
 }
 
+.filter-section-scenario {
+    background-color: #f4faf6;
+    border: 1px solid #d7e6dd;
+    padding: 8px 12px;
+    border-radius: 8px;
+    box-shadow: none;
+}
+
 /* Section header micro-label */
 .filter-group-header {
     font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
@@ -1160,6 +1168,52 @@ button.show-hide { display: none; }
 .filter-section-destination .filter-group-header { color: #1d6fa4; }
 .filter-section-origin .filter-group-header      { color: #166534; }
 .filter-section-analysis .filter-group-header    { color: #6b7280; }
+.filter-section-scenario .filter-group-header    { color: #5d7468; }
+
+.capacity-scenario-sticky-shell {
+    display: block;
+    width: 100%;
+    padding: 0;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+.capacity-scenario-sticky-dropdown {
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 13px;
+    width: 100%;
+}
+
+.capacity-scenario-sticky-dropdown .Select-control {
+    min-height: 36px;
+    border: 1px solid #c7d3dd !important;
+    border-radius: 999px;
+    background-color: #ffffff;
+    box-shadow: none !important;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.capacity-scenario-sticky-dropdown .Select-control:hover {
+    border-color: #9fb3a6 !important;
+    box-shadow: none !important;
+}
+
+.capacity-scenario-sticky-dropdown .Select-control.is-focused {
+    border-color: #94ada1 !important;
+    box-shadow: 0 0 0 3px rgba(148, 173, 161, 0.14) !important;
+}
+
+.capacity-scenario-sticky-dropdown .Select-value-label,
+.capacity-scenario-sticky-dropdown .Select-single-value {
+    color: #374151;
+    font-weight: 500;
+}
+
+.capacity-scenario-sticky-dropdown .Select-placeholder {
+    color: #9ca3af;
+}
 
 .filter-section-origin-exp {
     background-color: #f0fdf4;

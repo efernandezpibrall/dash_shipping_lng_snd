@@ -1,14 +1,26 @@
+import base64
 from io import BytesIO, StringIO
 import datetime as dt
+import hashlib
 import re
 
 import pandas as pd
 import plotly.graph_objects as go
-from dash import dcc, html, dash_table, callback, Input, Output, State, ALL, ctx, no_update
+import dash_ag_grid as dag
+from dash import dcc, html, dash_table, callback, Input, Output, State, no_update, ctx
 from dash.dash_table.Format import Format, Scheme
 from dash.exceptions import PreventUpdate
+from openpyxl.styles import Border, Side
 from sqlalchemy import text
 
+from fundamentals.terminals.capacity_scenario_utils import (
+    create_capacity_scenario_from_source,
+    delete_capacity_scenario,
+    duplicate_capacity_scenario,
+    fetch_capacity_scenario_rows,
+    get_available_capacity_scenarios,
+    save_capacity_scenario_rows,
+)
 from utils.export_flow_data import (
     COUNTRY_MAPPING_CTE,
     DB_SCHEMA,
@@ -62,17 +74,6 @@ PRIMARY_CONTROL_BUTTON_STYLE = {
     "fontSize": "12px",
 }
 
-SECONDARY_CONTROL_BUTTON_STYLE = {
-    "padding": "7px 14px",
-    "backgroundColor": "#ffffff",
-    "color": "#334155",
-    "border": "1px solid #cbd5e1",
-    "borderRadius": "999px",
-    "cursor": "pointer",
-    "fontWeight": "600",
-    "fontSize": "12px",
-}
-
 CAPACITY_SOURCE_TABLE = f"{DB_SCHEMA}.woodmac_lng_plant_monthly_capacity_nominal_mta"
 WOODMAC_ANNUAL_OUTPUT_SOURCE_TABLE = f"{DB_SCHEMA}.woodmac_lng_plant_train_annual_output_mta"
 EA_CAPACITY_SOURCE_TABLE = f"{DB_SCHEMA}.ea_lng_liquefaction_projects"
@@ -90,6 +91,26 @@ EA_SCHEDULE_CAPACITY_NOTE = (
     "Derived cumulative schedule from the latest Energy Aspects snapshot using start_date month; "
     "this is not a historical monthly capacity feed."
 )
+TRAIN_TIMELINE_CHART_SOURCE_CONFIG = {
+    "woodmac": {
+        "label": "Woodmac",
+        "date_column": "Woodmac First Date",
+        "capacity_column": "Woodmac Capacity Change",
+        "out_of_range_flag": "__woodmac_out_of_range",
+    },
+    "energy_aspects": {
+        "label": "Energy Aspects",
+        "date_column": "Energy Aspects First Date",
+        "capacity_column": "Energy Aspects Capacity Change",
+        "out_of_range_flag": "__ea_out_of_range",
+    },
+    "internal_scenario": {
+        "label": "Internal Scenario",
+        "date_column": "Scenario First Date",
+        "capacity_column": "Scenario Capacity",
+        "out_of_range_flag": "__scenario_out_of_range",
+    },
+}
 
 COUNTRY_COLORS = {
     "United States": "#003A6C",
@@ -122,8 +143,21 @@ FALLBACK_COLORS = [
 TRAIN_CHANGE_TIME_VIEW_LABELS = {
     "monthly": "Monthly",
     "quarterly": "Quarterly",
+    "seasonally": "Seasonally",
     "yearly": "Yearly",
 }
+
+TRAIN_CHANGE_TIME_VIEW_PERIOD_LABELS = {
+    "monthly": "monthly",
+    "quarterly": "quarterly",
+    "seasonally": "seasonal",
+    "yearly": "yearly",
+}
+
+SEASONAL_TIME_VIEW_TOOLTIP = (
+    "Seasonally: Summer (Y-S) runs from April to September of year Y. "
+    "Winter (Y-W) runs from October to December of year Y and January to March of year Y+1."
+)
 
 TRAIN_CHANGE_DETAIL_VIEW_LABELS = {
     "total": "Total",
@@ -131,6 +165,51 @@ TRAIN_CHANGE_DETAIL_VIEW_LABELS = {
     "plants": "Plants View",
     "plants_trains": "Plants + Trains View",
 }
+TRAIN_TIMELINE_SHEET_NAME = "Train Timeline"
+TRAIN_TIMELINE_IMPORT_META_SHEET_NAME = "__TrainTimelineImportMeta"
+TRAIN_TIMELINE_IMPORT_TEMPLATE_VERSION = "train_timeline_upload_v1"
+TRAIN_TIMELINE_IMPORT_KEY_COLUMN = "__scenario_row_key"
+TRAIN_TIMELINE_IMPORT_EXPORT_ROW_COLUMN = "__export_row_number"
+TRAIN_TIMELINE_IMPORT_HAS_SCENARIO_ROW_COLUMN = "__has_saved_scenario_row"
+TRAIN_TIMELINE_IMPORT_META_COLUMNS = {
+    "__template_version",
+    "__scenario_id",
+    "__scenario_name",
+    "__original_name_visibility",
+    TRAIN_TIMELINE_IMPORT_HAS_SCENARIO_ROW_COLUMN,
+    TRAIN_TIMELINE_IMPORT_EXPORT_ROW_COLUMN,
+    TRAIN_TIMELINE_IMPORT_KEY_COLUMN,
+}
+TRAIN_TIMELINE_EDITABLE_COLUMNS = {
+    "Scenario First Date",
+    "Scenario Capacity",
+    "Scenario Note",
+}
+TRAIN_TIMELINE_PROVIDER_COLUMNS = {
+    "Woodmac Original Name",
+    "Woodmac First Date",
+    "Woodmac Capacity Change",
+    "Energy Aspects Original Plant",
+    "Energy Aspects Original Train",
+    "Energy Aspects First Date",
+    "Energy Aspects Capacity Change",
+}
+TRAIN_TIMELINE_DATE_COLUMNS = {
+    "Woodmac First Date",
+    "Energy Aspects First Date",
+    "Scenario First Date",
+}
+TRAIN_TIMELINE_NUMERIC_COLUMNS = {
+    "Woodmac Capacity Change",
+    "Energy Aspects Capacity Change",
+    "Scenario Capacity",
+}
+INTERNAL_SCENARIO_ADDS_COLUMN = "Internal Scenario Adds (MTPA)"
+INTERNAL_SCENARIO_REDUCTIONS_COLUMN = "Internal Scenario Reductions (MTPA)"
+INTERNAL_SCENARIO_NET_COLUMN = "Internal Scenario Net Delta (MTPA)"
+INTERNAL_SCENARIO_EMPTY_MESSAGE = (
+    "Select or create an internal scenario from Train Timeline to populate this section."
+)
 
 WOODMAC_CAPACITY_QUERY = f"""
 WITH latest_plant_summary AS (
@@ -421,6 +500,13 @@ latest_capacity AS (
             CONCAT('Plant ', source_row.id_plant::text)
         ) AS plant_name,
         COALESCE(
+            NULLIF(BTRIM(train_metadata.train_json ->> 'lng_train_name'), ''),
+            NULLIF(BTRIM(train_metadata.train_json ->> 'lng_train_name_short'), ''),
+            NULLIF(BTRIM(to_jsonb(source_row) ->> 'lng_train_name'), ''),
+            NULLIF(BTRIM(to_jsonb(source_row) ->> 'lng_train_name_short'), ''),
+            CONCAT('Train ', source_row.id_lng_train::text)
+        ) AS lng_train_name,
+        COALESCE(
             NULLIF(BTRIM(train_metadata.train_json ->> 'lng_train_name_short'), ''),
             NULLIF(BTRIM(train_metadata.train_json ->> 'lng_train_name'), ''),
             NULLIF(BTRIM(to_jsonb(source_row) ->> 'lng_train_name_short'), ''),
@@ -475,6 +561,13 @@ latest_annual_output AS (
             CONCAT('Plant ', annual_row.id_plant::text)
         ) AS plant_name,
         COALESCE(
+            NULLIF(BTRIM(train_metadata.train_json ->> 'lng_train_name'), ''),
+            NULLIF(BTRIM(train_metadata.train_json ->> 'lng_train_name_short'), ''),
+            NULLIF(BTRIM(annual_row.lng_train_name), ''),
+            NULLIF(BTRIM(annual_row.lng_train_name_short), ''),
+            CONCAT('Train ', annual_row.id_lng_train::text)
+        ) AS lng_train_name,
+        COALESCE(
             NULLIF(BTRIM(train_metadata.train_json ->> 'lng_train_name_short'), ''),
             NULLIF(BTRIM(train_metadata.train_json ->> 'lng_train_name'), ''),
             NULLIF(BTRIM(annual_row.lng_train_name_short), ''),
@@ -508,6 +601,7 @@ annual_train_bounds AS (
         annual_row.id_lng_train,
         MAX(annual_row.country_name) AS country_name,
         MAX(annual_row.plant_name) AS plant_name,
+        MAX(annual_row.lng_train_name) AS lng_train_name,
         MAX(annual_row.lng_train_name_short) AS lng_train_name_short,
         MIN(
             CASE
@@ -544,6 +638,7 @@ monthly_carry_forward_base AS (
         monthly_row.id_lng_train,
         monthly_row.country_name,
         monthly_row.plant_name,
+        monthly_row.lng_train_name,
         monthly_row.lng_train_name_short,
         monthly_row.capacity_mtpa,
         monthly_bounds.last_monthly_month
@@ -560,6 +655,7 @@ monthly_carry_forward AS (
         month_series.month::date AS month,
         monthly_row.country_name,
         monthly_row.plant_name,
+        monthly_row.lng_train_name,
         monthly_row.lng_train_name_short,
         monthly_row.capacity_mtpa
     FROM monthly_carry_forward_base AS monthly_row
@@ -581,6 +677,7 @@ annual_only_fallback_base AS (
         annual_row.id_lng_train,
         annual_row.country_name,
         annual_row.plant_name,
+        annual_row.lng_train_name,
         annual_row.lng_train_name_short,
         annual_row.capacity_mtpa,
         annual_row.first_active_month,
@@ -598,6 +695,7 @@ annual_only_fallback AS (
         month_series.month::date AS month,
         annual_row.country_name,
         annual_row.plant_name,
+        annual_row.lng_train_name,
         annual_row.lng_train_name_short,
         annual_row.capacity_mtpa
     FROM annual_only_fallback_base AS annual_row
@@ -619,6 +717,7 @@ annual_only_carry_forward AS (
         month_series.month::date AS month,
         annual_row.country_name,
         annual_row.plant_name,
+        annual_row.lng_train_name,
         annual_row.lng_train_name_short,
         annual_row.capacity_mtpa
     FROM annual_only_fallback_base AS annual_row
@@ -644,6 +743,7 @@ combined_capacity AS (
         month,
         country_name,
         plant_name,
+        lng_train_name,
         lng_train_name_short,
         capacity_mtpa
     FROM latest_capacity
@@ -656,6 +756,7 @@ combined_capacity AS (
         month,
         country_name,
         plant_name,
+        lng_train_name,
         lng_train_name_short,
         capacity_mtpa
     FROM monthly_carry_forward
@@ -668,6 +769,7 @@ combined_capacity AS (
         month,
         country_name,
         plant_name,
+        lng_train_name,
         lng_train_name_short,
         capacity_mtpa
     FROM annual_only_fallback
@@ -680,6 +782,7 @@ combined_capacity AS (
         month,
         country_name,
         plant_name,
+        lng_train_name,
         lng_train_name_short,
         capacity_mtpa
     FROM annual_only_carry_forward
@@ -688,12 +791,13 @@ SELECT
     month,
     country_name,
     plant_name,
+    lng_train_name,
     lng_train_name_short,
     id_plant,
     id_lng_train,
     capacity_mtpa
 FROM combined_capacity
-ORDER BY month, country_name, plant_name, lng_train_name_short
+ORDER BY month, country_name, plant_name, lng_train_name
 """
 
 WOODMAC_CAPACITY_METADATA_QUERY = f"""
@@ -1520,6 +1624,31 @@ def _format_train_label(value: object) -> str:
         return str(value).strip()
 
 
+def _coerce_positive_train_label(
+    value: object,
+    field_name: str = "Train",
+) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str) and value.strip() == "":
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    numeric_value = pd.to_numeric([value], errors="coerce")[0]
+    if pd.isna(numeric_value):
+        raise ValueError(f"{field_name} must be blank or a positive whole number.")
+
+    numeric_value = float(numeric_value)
+    if numeric_value <= 0 or not numeric_value.is_integer():
+        raise ValueError(f"{field_name} must be blank or a positive whole number.")
+
+    return str(int(numeric_value))
+
+
 def fetch_woodmac_capacity_raw_data(
     country_mapping_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
@@ -1581,9 +1710,11 @@ def fetch_woodmac_train_capacity_raw_data(
                 "plant_name",
                 "plant_mapping_applied",
                 "raw_train_name",
+                "raw_train_display_name",
                 "train",
                 "allocation_share",
                 "train_mapping_applied",
+                "lng_train_name",
                 "lng_train_name_short",
                 "id_plant",
                 "id_lng_train",
@@ -1592,7 +1723,7 @@ def fetch_woodmac_train_capacity_raw_data(
         )
 
     raw_df["month"] = pd.to_datetime(raw_df["month"])
-    for column_name in ["country_name", "plant_name", "lng_train_name_short"]:
+    for column_name in ["country_name", "plant_name", "lng_train_name", "lng_train_name_short"]:
         raw_df[column_name] = (
             raw_df[column_name]
             .fillna("Unknown")
@@ -1604,8 +1735,11 @@ def fetch_woodmac_train_capacity_raw_data(
     raw_df["capacity_mtpa"] = pd.to_numeric(raw_df["capacity_mtpa"], errors="coerce").fillna(0.0)
     raw_df["id_plant"] = pd.to_numeric(raw_df["id_plant"], errors="coerce")
     raw_df["id_lng_train"] = pd.to_numeric(raw_df["id_lng_train"], errors="coerce")
+    if "lng_train_name" not in raw_df.columns:
+        raw_df["lng_train_name"] = raw_df.get("lng_train_name_short", "Unknown")
     raw_df["raw_plant_name"] = raw_df["plant_name"]
     raw_df["raw_train_name"] = raw_df["lng_train_name_short"]
+    raw_df["raw_train_display_name"] = raw_df["lng_train_name"]
 
     raw_df = _standardize_country_names(raw_df, country_mapping_df)
     raw_df = _standardize_plant_names(
@@ -1840,9 +1974,38 @@ def _get_date_bounds(dataframes: list[pd.DataFrame]) -> tuple[str | None, str | 
 
 def _get_default_interval_window() -> tuple[pd.Timestamp, pd.Timestamp]:
     current_year = pd.Timestamp.now().year
-    default_start = pd.Timestamp(year=current_year, month=1, day=1)
+    default_start = pd.Timestamp(year=current_year - 1, month=12, day=1)
     default_end = pd.Timestamp(year=current_year + 5, month=12, day=1)
     return default_start, default_end
+
+
+def _build_lng_season_periods(
+    dates: pd.Series,
+) -> tuple[pd.Series, pd.Series]:
+    normalized_dates = pd.to_datetime(dates, errors="coerce").dt.to_period("M").dt.to_timestamp()
+    is_summer = normalized_dates.dt.month.between(4, 9)
+    season_year = (
+        normalized_dates.dt.year - normalized_dates.dt.month.isin([1, 2, 3]).astype(int)
+    ).astype("Int64")
+
+    season_start_month = pd.Series(10, index=normalized_dates.index, dtype="int64")
+    season_start_month.loc[is_summer] = 4
+
+    season_code = pd.Series("W", index=normalized_dates.index, dtype="object")
+    season_code.loc[is_summer] = "S"
+
+    season_start = pd.to_datetime(
+        {
+            "year": season_year,
+            "month": season_start_month,
+            "day": 1,
+        },
+        errors="coerce",
+    )
+    season_label = season_year.astype(str)
+    season_label = season_label.where(normalized_dates.notna(), "")
+    season_label = season_label + "-" + season_code.where(normalized_dates.notna(), "")
+    return season_start, season_label
 
 
 def _filter_by_date_range(
@@ -1865,6 +2028,35 @@ def _filter_by_date_range(
         filtered_df = filtered_df[filtered_df["month"] <= end_month]
 
     return filtered_df
+
+
+def _apply_capacity_time_view(matrix_df: pd.DataFrame, time_view: str) -> pd.DataFrame:
+    if matrix_df.empty:
+        return matrix_df.copy()
+
+    view_df = matrix_df.copy()
+    view_df["__axis_date"] = pd.to_datetime(
+        view_df["Month"].astype(str),
+        errors="coerce",
+    ).dt.to_period("M").dt.to_timestamp()
+    view_df = view_df.dropna(subset=["__axis_date"]).sort_values("__axis_date").reset_index(drop=True)
+
+    if time_view == "quarterly":
+        view_df = view_df[view_df["__axis_date"].dt.month.isin([3, 6, 9, 12])].copy()
+        view_df["Month"] = (
+            view_df["__axis_date"].dt.year.astype(str)
+            + "-Q"
+            + view_df["__axis_date"].dt.quarter.astype(str)
+        )
+    elif time_view == "seasonally":
+        view_df = view_df[view_df["__axis_date"].dt.month.isin([3, 9])].copy()
+        _, season_labels = _build_lng_season_periods(view_df["__axis_date"])
+        view_df["Month"] = season_labels
+    elif time_view == "yearly":
+        view_df = view_df[view_df["__axis_date"].dt.month.eq(12)].copy()
+        view_df["Month"] = view_df["__axis_date"].dt.year.astype(str)
+
+    return view_df.reset_index(drop=True)
 
 
 def _create_empty_state(message: str) -> html.Div:
@@ -1923,18 +2115,18 @@ def _format_yoy_delta_with_percent(current_value: float, previous_value: float) 
     return f"{delta_text} ({percent_change:+.1f}%)"
 
 
-def _build_january_yoy_annotations(total_series: pd.Series) -> list[dict]:
+def _build_december_yoy_annotations(total_series: pd.Series) -> list[dict]:
     if total_series.empty:
         return []
 
-    january_points = total_series[total_series.index.month == 1]
-    if january_points.empty:
+    december_points = total_series[total_series.index.month == 12]
+    if december_points.empty:
         return []
 
     annotations = []
     offset_pattern = [-34, -48, -34, -48]
 
-    for annotation_index, (current_date, current_value) in enumerate(january_points.items()):
+    for annotation_index, (current_date, current_value) in enumerate(december_points.items()):
         previous_date = current_date - pd.DateOffset(years=1)
         if previous_date not in total_series.index:
             continue
@@ -1992,7 +2184,7 @@ def _format_table_cell_value(value) -> str:
         return ""
 
     if isinstance(value, (int, float)):
-        return f"{float(value):.2f}"
+        return f"{float(value):.1f}"
 
     return str(value)
 
@@ -2006,11 +2198,11 @@ def _build_responsive_column_styles(df: pd.DataFrame) -> list[dict]:
         max_length = max([header_length] + value_lengths.tolist()) if not df.empty else header_length
 
         if column_name == "Month":
-            width_px = max(92, min((max_length * 8) + 24, 120))
+            width_px = max(82, min((max_length * 7) + 18, 108))
         elif str(column_name).startswith("Total "):
-            width_px = max(96, min((max_length * 9) + 28, 140))
+            width_px = max(88, min((max_length * 7) + 18, 112))
         else:
-            width_px = max(72, min((max_length * 9) + 28, 220))
+            width_px = max(64, min((max_length * 6) + 16, 112))
 
         style_entry = {
             "if": {"column_id": column_name},
@@ -2063,7 +2255,6 @@ def _build_capacity_metadata_lines(metadata: dict | None) -> list[str]:
 
 def _build_ea_capacity_metadata_lines(
     metadata: dict | None,
-    schedule_df: pd.DataFrame,
 ) -> list[str]:
     if not metadata:
         return [EA_SCHEDULE_CAPACITY_NOTE]
@@ -2130,8 +2321,6 @@ def _build_capacity_status_children(metadata: dict | None) -> html.Div:
 
 def _build_section_summary(
     raw_df: pd.DataFrame,
-    matrix_df: pd.DataFrame,
-    other_countries_mode: str,
     metadata_lines: list[str] | None = None,
 ) -> html.Div:
     summary_children = []
@@ -2159,6 +2348,7 @@ def _build_train_change_summary(
     detail_view: str = "country",
 ) -> html.Div:
     time_view_label = TRAIN_CHANGE_TIME_VIEW_LABELS.get(time_view, "Monthly")
+    time_view_period_label = TRAIN_CHANGE_TIME_VIEW_PERIOD_LABELS.get(time_view, "monthly")
     detail_view_label = TRAIN_CHANGE_DETAIL_VIEW_LABELS.get(detail_view, "Country")
 
     if woodmac_change_df.empty and ea_change_df.empty:
@@ -2171,7 +2361,7 @@ def _build_train_change_summary(
                 html.Div(
                     [
                         html.Span(
-                            f"Time View aggregates changes into {time_view_label.lower()} periods. Detail View is set to {detail_view_label}. Total groups all visible countries together, Country shows one row per period-country, Plants View keeps one row per period-plant, and Plants + Trains View adds shared canonical train rows only when the visible provider changes are fully resolved at train level."
+                            f"Time View aggregates changes into {time_view_period_label} periods. Detail View is set to {detail_view_label}. Total groups all visible countries together, Country shows one row per period-country, Plants View keeps one row per period-plant, and Plants + Trains View adds shared canonical train rows only when the visible provider changes are fully resolved at train level."
                         )
                     ],
                     className="balance-metadata-row",
@@ -2202,144 +2392,1305 @@ def _build_train_change_footer_notes() -> html.Div:
     )
 
 
-def _build_train_timeline_df(
-    woodmac_change_df: pd.DataFrame,
-    ea_change_df: pd.DataFrame,
+def _build_capacity_scenario_row_key(
+    country_name: object,
+    plant_name: object,
+    train_label: object,
+    effective_date: object | None = None,
+    capacity_value: object | None = None,
+    provider: str | None = None,
+) -> str:
+    normalized_parts = [
+        " ".join(str(country_name or "").strip().split()).casefold(),
+        " ".join(str(plant_name or "").strip().split()).casefold(),
+        " ".join(str(train_label or "").strip().split()).casefold(),
+    ]
+    if effective_date is not None:
+        normalized_effective_date = pd.to_datetime(effective_date, errors="coerce")
+        normalized_parts.append(
+            ""
+            if pd.isna(normalized_effective_date)
+            else normalized_effective_date.strftime("%Y-%m-%d")
+        )
+    if capacity_value is not None:
+        numeric_capacity = pd.to_numeric([capacity_value], errors="coerce")[0]
+        normalized_parts.append("" if pd.isna(numeric_capacity) else f"{float(numeric_capacity):.6f}")
+    if provider is not None:
+        normalized_parts.append(" ".join(str(provider).strip().split()).casefold())
+    digest = hashlib.sha1("|".join(normalized_parts).encode("utf-8")).hexdigest()[:16]
+    return f"capacity-scenario-{digest}"
+
+
+def _normalize_capacity_change_direction(value: object) -> str | None:
+    numeric_value = pd.to_numeric([value], errors="coerce")[0]
+    if pd.isna(numeric_value) or round(float(numeric_value), 6) == 0:
+        return None
+    return "reduction" if float(numeric_value) < 0 else "addition"
+
+
+def _build_train_timeline_reference_key(
+    country_name: object,
+    plant_name: object,
+    train_label: object,
+    effective_date: object,
+    capacity_value: object,
+    aggregate_from_date: str | None = None,
+) -> str | None:
+    normalized_effective_date = pd.to_datetime(effective_date, errors="coerce")
+    direction = _normalize_capacity_change_direction(capacity_value)
+    if pd.isna(normalized_effective_date) or direction is None:
+        return None
+
+    split_month = _normalize_month_date(aggregate_from_date)
+    bucket_kind = (
+        "future"
+        if split_month is not None and normalized_effective_date >= split_month
+        else "history"
+    )
+
+    normalized_parts = [
+        " ".join(str(country_name or "").strip().split()).casefold(),
+        " ".join(str(plant_name or "").strip().split()).casefold(),
+        " ".join(str(train_label or "").strip().split()).casefold(),
+        bucket_kind,
+        direction,
+    ]
+    if bucket_kind == "history":
+        normalized_parts.append(normalized_effective_date.strftime("%Y-%m-%d"))
+
+    digest = hashlib.sha1("|".join(normalized_parts).encode("utf-8")).hexdigest()[:16]
+    return f"capacity-timeline-{digest}"
+
+
+def _prepare_provider_timeline_event_rows(
+    change_df: pd.DataFrame,
+    provider: str,
 ) -> pd.DataFrame:
     columns = [
         "Country",
         "Plant",
         "Train",
-        "Woodmac Original Plant",
-        "Woodmac Original Train",
+        "Original Plant",
+        "Original Train",
+        "Effective Date",
+        "Capacity Change",
+        "timeline_direction",
+        "display_sort_country",
+        "display_sort_plant",
+        "display_sort_train",
+    ]
+    if change_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    provider_key = provider.strip().casefold()
+    provider_df = change_df.copy()
+    provider_df["Country"] = provider_df["Country"].fillna("").astype(str).str.strip()
+    provider_df["Plant"] = provider_df["Plant"].fillna("").astype(str).str.strip()
+    provider_df["Train"] = provider_df.get("Train").map(_format_train_label)
+    provider_df["Effective Date"] = pd.to_datetime(
+        provider_df["Effective Date"],
+        errors="coerce",
+    )
+    provider_df["display_sort_train"] = pd.to_numeric(
+        provider_df["Train"],
+        errors="coerce",
+    )
+
+    if provider_key == "woodmac":
+        provider_df["Capacity Change"] = pd.to_numeric(
+            provider_df["Delta MTPA"],
+            errors="coerce",
+        ).fillna(0.0)
+        provider_df["Original Plant"] = provider_df.get("Source Name", "").fillna("").astype(str).str.strip()
+        provider_df["Original Train"] = (
+            provider_df.get("Train Display Source Name", provider_df.get("Train Source Name", ""))
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+    elif provider_key == "energy_aspects":
+        provider_df["Capacity Change"] = pd.to_numeric(
+            provider_df["EA Net Delta (MTPA)"],
+            errors="coerce",
+        ).fillna(0.0)
+        provider_df["Original Plant"] = provider_df.get("Source Name", "").fillna("").astype(str).str.strip()
+        provider_df["Original Train"] = provider_df.get("Train Source Name", "").fillna("").astype(str).str.strip()
+    else:
+        raise ValueError(f"Unsupported provider '{provider}'.")
+
+    provider_df = provider_df[
+        provider_df["Effective Date"].notna()
+        & provider_df["Capacity Change"].round(6).ne(0)
+    ].copy()
+    if provider_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    provider_df = (
+        provider_df.groupby(
+            ["Country", "Plant", "Train", "Effective Date"],
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            {
+                "Capacity Change": "sum",
+                "display_sort_train": "last",
+                "Original Plant": _combine_distinct_text_values,
+                "Original Train": _combine_distinct_text_values,
+            }
+        )
+    )
+    provider_df = provider_df[
+        provider_df["Capacity Change"].round(6).ne(0)
+    ].copy()
+    if provider_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    provider_df["timeline_direction"] = provider_df["Capacity Change"].map(
+        _normalize_capacity_change_direction
+    )
+    provider_df = provider_df[provider_df["timeline_direction"].notna()].copy()
+    if provider_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    provider_df["display_sort_country"] = provider_df["Country"]
+    provider_df["display_sort_plant"] = provider_df["Plant"]
+    provider_df["Capacity Change"] = pd.to_numeric(
+        provider_df["Capacity Change"],
+        errors="coerce",
+    ).round(6)
+    return provider_df[columns]
+
+
+def _build_provider_timeline_snapshot(
+    change_df: pd.DataFrame,
+    provider: str,
+    aggregate_from_date: str | None = None,
+) -> pd.DataFrame:
+    columns = [
+        "timeline_reference_key",
+        "scenario_row_key",
+        "Country",
+        "Plant",
+        "Train",
+        "Original Plant",
+        "Original Train",
+        "First Date",
+        "Capacity Change",
+        "timeline_direction",
+        "display_sort_country",
+        "display_sort_plant",
+        "display_sort_train",
+        "display_sort_effective_date",
+        "display_sort_direction",
+    ]
+    provider_df = _prepare_provider_timeline_event_rows(change_df, provider)
+    if provider_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    split_month = _normalize_month_date(aggregate_from_date)
+    historical_df = provider_df.copy()
+    future_df = pd.DataFrame(columns=provider_df.columns)
+    if split_month is not None:
+        historical_df = provider_df[provider_df["Effective Date"] < split_month].copy()
+        future_source_df = provider_df[provider_df["Effective Date"] >= split_month].copy()
+        if not future_source_df.empty:
+            future_df = (
+                future_source_df.groupby(
+                    ["Country", "Plant", "Train", "timeline_direction"],
+                    as_index=False,
+                    dropna=False,
+                )
+                .agg(
+                    {
+                        "Capacity Change": "sum",
+                        "Effective Date": "min",
+                        "display_sort_train": "last",
+                        "Original Plant": _combine_distinct_text_values,
+                        "Original Train": _combine_distinct_text_values,
+                        "display_sort_country": "last",
+                        "display_sort_plant": "last",
+                    }
+                )
+            )
+
+    snapshot_df = pd.concat([historical_df, future_df], ignore_index=True, sort=False)
+    snapshot_df = snapshot_df[
+        snapshot_df["Capacity Change"].round(6).ne(0)
+        & snapshot_df["timeline_direction"].notna()
+    ].copy()
+    if snapshot_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    snapshot_df["timeline_reference_key"] = snapshot_df.apply(
+        lambda row: _build_train_timeline_reference_key(
+            row["Country"],
+            row["Plant"],
+            row["Train"],
+            row["Effective Date"],
+            row["Capacity Change"],
+            aggregate_from_date,
+        ),
+        axis=1,
+    )
+    snapshot_df["scenario_row_key"] = snapshot_df["timeline_reference_key"]
+    snapshot_df["First Date"] = snapshot_df["Effective Date"].dt.strftime("%Y-%m-%d")
+    snapshot_df["display_sort_country"] = snapshot_df["Country"]
+    snapshot_df["display_sort_plant"] = snapshot_df["Plant"]
+    snapshot_df["display_sort_effective_date"] = snapshot_df["Effective Date"]
+    snapshot_df["display_sort_direction"] = snapshot_df["timeline_direction"].map(
+        {"reduction": 0, "addition": 1}
+    ).fillna(2)
+    snapshot_df["__train_blank_sort"] = snapshot_df["Train"].eq("").astype(int)
+    snapshot_df = snapshot_df.sort_values(
+        [
+            "display_sort_country",
+            "display_sort_plant",
+            "__train_blank_sort",
+            "display_sort_train",
+            "Train",
+            "display_sort_effective_date",
+            "display_sort_direction",
+        ],
+        ascending=[True, True, False, True, True, True, True],
+        na_position="last",
+    ).drop(columns=["__train_blank_sort"], errors="ignore").reset_index(drop=True)
+    return snapshot_df[columns]
+
+
+def _build_provider_scenario_rows_from_change_log(
+    change_df: pd.DataFrame,
+    provider: str,
+    aggregate_from_date: str | None = None,
+) -> pd.DataFrame:
+    columns = _get_capacity_scenario_row_columns()
+    provider_key = provider.strip().casefold()
+    snapshot_df = _build_provider_timeline_snapshot(
+        change_df,
+        provider,
+        aggregate_from_date=aggregate_from_date,
+    )
+    if snapshot_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    snapshot_df["scenario_row_key"] = snapshot_df.apply(
+        lambda row: _build_capacity_scenario_row_key(
+            row["Country"],
+            row["Plant"],
+            row["Train"],
+            effective_date=row["First Date"],
+            capacity_value=row["Capacity Change"],
+            provider=provider_key,
+        ),
+        axis=1,
+    )
+
+    scenario_rows_df = pd.DataFrame(
+        {
+            "scenario_row_key": snapshot_df["scenario_row_key"],
+            "country_name": snapshot_df["Country"],
+            "plant_name": snapshot_df["Plant"],
+            "train_label": snapshot_df["Train"],
+            "base_provider": provider_key,
+            "base_first_date": pd.to_datetime(snapshot_df["First Date"], errors="coerce"),
+            "base_capacity_mtpa": pd.to_numeric(snapshot_df["Capacity Change"], errors="coerce").round(6),
+            "scenario_first_date": pd.to_datetime(snapshot_df["First Date"], errors="coerce"),
+            "scenario_capacity_mtpa": pd.to_numeric(snapshot_df["Capacity Change"], errors="coerce").round(6),
+            "scenario_note": "",
+            "display_sort_country": snapshot_df["display_sort_country"],
+            "display_sort_plant": snapshot_df["display_sort_plant"],
+            "display_sort_train": snapshot_df["display_sort_train"],
+        }
+    )
+    return _prepare_capacity_scenario_rows_df(scenario_rows_df)
+
+
+def _month_distance_to_boundary(
+    start_value,
+    end_value,
+) -> int | None:
+    month_delta = _month_difference(start_value, end_value)
+    if month_delta is None:
+        return None
+    return abs(int(month_delta))
+
+
+def _select_train_timeline_out_of_range_candidates(
+    event_df: pd.DataFrame,
+    identity_columns: list[str],
+    start_month: pd.Timestamp | None,
+    end_month: pd.Timestamp | None,
+    effective_date_column: str = "Effective Date",
+) -> pd.DataFrame:
+    if event_df.empty:
+        return event_df.copy()
+
+    candidate_frames = []
+    if start_month is not None:
+        before_df = event_df[event_df[effective_date_column] < start_month].copy()
+        if not before_df.empty:
+            before_df = before_df.sort_values(
+                identity_columns + [effective_date_column],
+                ascending=[True] * len(identity_columns) + [False],
+                na_position="last",
+            ).drop_duplicates(identity_columns, keep="first")
+            before_df["lookup_bucket"] = "before_range"
+            before_df["lookup_month_distance"] = before_df[effective_date_column].map(
+                lambda value: _month_distance_to_boundary(value, start_month)
+            )
+            candidate_frames.append(before_df)
+
+    if end_month is not None:
+        after_df = event_df[event_df[effective_date_column] > end_month].copy()
+        if not after_df.empty:
+            after_df = after_df.sort_values(
+                identity_columns + [effective_date_column],
+                ascending=[True] * len(identity_columns) + [True],
+                na_position="last",
+            ).drop_duplicates(identity_columns, keep="first")
+            after_df["lookup_bucket"] = "after_range"
+            after_df["lookup_month_distance"] = after_df[effective_date_column].map(
+                lambda value: _month_distance_to_boundary(end_month, value)
+            )
+            candidate_frames.append(after_df)
+
+    if not candidate_frames:
+        return event_df.iloc[0:0].copy()
+
+    outside_df = pd.concat(candidate_frames, ignore_index=True, sort=False)
+    outside_df["__lookup_bucket_sort"] = outside_df["lookup_bucket"].map(
+        {"before_range": 0, "after_range": 1}
+    ).fillna(2)
+    outside_df = outside_df.sort_values(
+        identity_columns + ["lookup_month_distance", "__lookup_bucket_sort"],
+        ascending=[True] * len(identity_columns) + [True, True],
+        na_position="last",
+    ).drop_duplicates(identity_columns, keep="first")
+    return outside_df.drop(columns=["__lookup_bucket_sort"], errors="ignore").reset_index(drop=True)
+
+
+def _build_provider_timeline_lookup_snapshot(
+    change_df: pd.DataFrame,
+    provider: str,
+    start_date: str | None,
+    end_date: str | None,
+) -> pd.DataFrame:
+    columns = [
+        "Country",
+        "Plant",
+        "Train",
+        "timeline_direction",
+        "First Date",
+        "Capacity Change",
+        "Original Plant",
+        "Original Train",
+        "lookup_bucket",
+        "lookup_is_out_of_range",
+        "display_sort_country",
+        "display_sort_plant",
+        "display_sort_train",
+        "display_sort_effective_date",
+        "display_sort_direction",
+    ]
+    event_df = _prepare_provider_timeline_event_rows(change_df, provider)
+    if event_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    start_month = _normalize_month_date(start_date)
+    end_month = _normalize_month_date(end_date)
+    if start_month is None:
+        start_month = event_df["Effective Date"].min()
+    if end_month is None:
+        end_month = event_df["Effective Date"].max()
+
+    identity_columns = ["Country", "Plant", "Train", "timeline_direction"]
+    in_range_df = event_df[
+        (event_df["Effective Date"] >= start_month)
+        & (event_df["Effective Date"] <= end_month)
+    ].copy()
+    if not in_range_df.empty:
+        in_range_df = (
+            in_range_df.groupby(identity_columns, as_index=False, dropna=False)
+            .agg(
+                {
+                    "Capacity Change": "sum",
+                    "Effective Date": "min",
+                    "display_sort_country": "last",
+                    "display_sort_plant": "last",
+                    "display_sort_train": "last",
+                    "Original Plant": _combine_distinct_text_values,
+                    "Original Train": _combine_distinct_text_values,
+                }
+            )
+        )
+        in_range_df["lookup_bucket"] = "in_range"
+        in_range_df["lookup_is_out_of_range"] = False
+    else:
+        in_range_df = pd.DataFrame(columns=identity_columns + ["lookup_bucket", "lookup_is_out_of_range"])
+
+    outside_df = _select_train_timeline_out_of_range_candidates(
+        event_df,
+        identity_columns,
+        start_month,
+        end_month,
+    )
+    if not outside_df.empty:
+        outside_df["lookup_is_out_of_range"] = True
+        outside_df = outside_df[
+            ~outside_df.set_index(identity_columns).index.isin(
+                in_range_df.set_index(identity_columns).index
+            )
+        ].copy()
+
+    lookup_df = pd.concat([in_range_df, outside_df], ignore_index=True, sort=False)
+    if lookup_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    lookup_df["First Date"] = pd.to_datetime(
+        lookup_df["Effective Date"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+    lookup_df["display_sort_effective_date"] = pd.to_datetime(
+        lookup_df["Effective Date"],
+        errors="coerce",
+    )
+    lookup_df["display_sort_direction"] = lookup_df["timeline_direction"].map(
+        {"reduction": 0, "addition": 1}
+    ).fillna(2)
+    lookup_df["Capacity Change"] = pd.to_numeric(
+        lookup_df["Capacity Change"],
+        errors="coerce",
+    ).round(6)
+    return lookup_df[columns]
+
+
+def _build_train_timeline_df(
+    woodmac_change_df: pd.DataFrame,
+    ea_change_df: pd.DataFrame,
+    aggregate_from_date: str | None = None,
+) -> pd.DataFrame:
+    columns = [
+        "scenario_row_key",
+        "timeline_reference_key",
+        "Country",
+        "Plant",
+        "Train",
+        "Woodmac Original Name",
         "Woodmac First Date",
-        "Woodmac Total Capacity Added",
+        "Woodmac Capacity Change",
         "Energy Aspects Original Plant",
         "Energy Aspects Original Train",
         "Energy Aspects First Date",
-        "Energy Aspects Total Capacity Added",
+        "Energy Aspects Capacity Change",
+        "timeline_direction",
+        "display_sort_country",
+        "display_sort_plant",
+        "display_sort_train",
+        "display_sort_effective_date",
+        "display_sort_direction",
     ]
     if woodmac_change_df.empty and ea_change_df.empty:
         return pd.DataFrame(columns=columns)
 
-    hierarchical_df = _build_train_change_hierarchical_rows(
+    woodmac_snapshot_df = _build_provider_timeline_snapshot(
         woodmac_change_df,
-        ea_change_df,
-        time_view="monthly",
-        detail_view="plants_trains",
+        "woodmac",
+        aggregate_from_date=aggregate_from_date,
     )
-    if hierarchical_df.empty:
+    ea_snapshot_df = _build_provider_timeline_snapshot(
+        ea_change_df,
+        "energy_aspects",
+        aggregate_from_date=aggregate_from_date,
+    )
+    if woodmac_snapshot_df.empty and ea_snapshot_df.empty:
         return pd.DataFrame(columns=columns)
 
-    timeline_df = hierarchical_df.copy()
-    timeline_df["Effective Date"] = pd.to_datetime(
-        timeline_df["Effective Date"],
-        errors="coerce",
+    merged_df = pd.merge(
+        woodmac_snapshot_df.rename(
+            columns={
+                "scenario_row_key": "scenario_row_key_woodmac",
+                "Original Train": "Woodmac Original Name",
+                "First Date": "Woodmac First Date",
+                "Capacity Change": "Woodmac Capacity Change",
+                "timeline_direction": "timeline_direction_woodmac",
+                "display_sort_country": "display_sort_country_woodmac",
+                "display_sort_plant": "display_sort_plant_woodmac",
+                "display_sort_train": "display_sort_train_woodmac",
+                "display_sort_effective_date": "display_sort_effective_date_woodmac",
+                "display_sort_direction": "display_sort_direction_woodmac",
+            }
+        ),
+        ea_snapshot_df.rename(
+            columns={
+                "scenario_row_key": "scenario_row_key_ea",
+                "Original Plant": "Energy Aspects Original Plant",
+                "Original Train": "Energy Aspects Original Train",
+                "First Date": "Energy Aspects First Date",
+                "Capacity Change": "Energy Aspects Capacity Change",
+                "timeline_direction": "timeline_direction_ea",
+                "display_sort_country": "display_sort_country_ea",
+                "display_sort_plant": "display_sort_plant_ea",
+                "display_sort_train": "display_sort_train_ea",
+                "display_sort_effective_date": "display_sort_effective_date_ea",
+                "display_sort_direction": "display_sort_direction_ea",
+            }
+        ),
+        on=[
+            "timeline_reference_key",
+            "Country",
+            "Plant",
+            "Train",
+        ],
+        how="outer",
     )
+
+    merged_df["scenario_row_key"] = merged_df["timeline_reference_key"]
+    merged_df["timeline_direction"] = (
+        merged_df.get("timeline_direction_woodmac")
+        .combine_first(merged_df.get("timeline_direction_ea"))
+    )
+    merged_df["display_sort_country"] = (
+        merged_df.get("display_sort_country_woodmac")
+        .combine_first(merged_df.get("display_sort_country_ea"))
+        .combine_first(merged_df["Country"])
+    )
+    merged_df["display_sort_plant"] = (
+        merged_df.get("display_sort_plant_woodmac")
+        .combine_first(merged_df.get("display_sort_plant_ea"))
+        .combine_first(merged_df["Plant"])
+    )
+    merged_df["display_sort_train"] = (
+        pd.to_numeric(merged_df.get("display_sort_train_woodmac"), errors="coerce")
+        .combine_first(pd.to_numeric(merged_df.get("display_sort_train_ea"), errors="coerce"))
+    )
+    merged_df["display_sort_effective_date"] = pd.concat(
+        [
+            pd.to_datetime(merged_df.get("display_sort_effective_date_woodmac"), errors="coerce"),
+            pd.to_datetime(merged_df.get("display_sort_effective_date_ea"), errors="coerce"),
+        ],
+        axis=1,
+    ).min(axis=1)
+    merged_df["display_sort_direction"] = (
+        pd.to_numeric(merged_df.get("display_sort_direction_woodmac"), errors="coerce")
+        .combine_first(pd.to_numeric(merged_df.get("display_sort_direction_ea"), errors="coerce"))
+    )
+
+    for column_name in columns:
+        if column_name not in merged_df.columns:
+            merged_df[column_name] = None
+
+    merged_df["__train_blank_sort"] = merged_df["Train"].fillna("").astype(str).eq("").astype(int)
+    merged_df = merged_df.sort_values(
+        [
+            "display_sort_country",
+            "display_sort_plant",
+            "__train_blank_sort",
+            "display_sort_train",
+            "Train",
+            "display_sort_effective_date",
+            "display_sort_direction",
+        ],
+        ascending=[True, True, False, True, True, True, True],
+        na_position="last",
+    ).drop(columns=["__train_blank_sort"], errors="ignore").reset_index(drop=True)
+    return merged_df[columns]
+
+
+def _get_capacity_scenario_row_columns() -> list[str]:
+    return [
+        "scenario_row_key",
+        "country_name",
+        "plant_name",
+        "train_label",
+        "base_provider",
+        "base_first_date",
+        "base_capacity_mtpa",
+        "scenario_first_date",
+        "scenario_capacity_mtpa",
+        "scenario_note",
+        "display_sort_country",
+        "display_sort_plant",
+        "display_sort_train",
+    ]
+
+
+def _prepare_capacity_scenario_rows_df(rows_df: pd.DataFrame | None) -> pd.DataFrame:
+    columns = _get_capacity_scenario_row_columns()
+    if rows_df is None or rows_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    prepared_df = rows_df.copy()
+    for column_name in columns:
+        if column_name not in prepared_df.columns:
+            prepared_df[column_name] = None
+
     for column_name in [
+        "scenario_row_key",
+        "country_name",
+        "plant_name",
+        "train_label",
+        "base_provider",
+        "display_sort_country",
+        "display_sort_plant",
+    ]:
+        prepared_df[column_name] = (
+            prepared_df[column_name]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+    prepared_df["scenario_note"] = (
+        prepared_df["scenario_note"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    for column_name in ["base_first_date", "scenario_first_date"]:
+        prepared_df[column_name] = pd.to_datetime(
+            prepared_df[column_name],
+            errors="coerce",
+        ).dt.to_period("M").dt.to_timestamp()
+
+    for column_name in ["base_capacity_mtpa", "scenario_capacity_mtpa", "display_sort_train"]:
+        prepared_df[column_name] = pd.to_numeric(
+            prepared_df[column_name],
+            errors="coerce",
+        )
+
+    prepared_df = prepared_df.drop_duplicates(
+        subset=["scenario_row_key"],
+        keep="last",
+    ).reset_index(drop=True)
+    return prepared_df[columns]
+
+
+def _build_capacity_scenario_rows_from_snapshot(
+    snapshot_df: pd.DataFrame,
+    base_provider: str,
+) -> pd.DataFrame:
+    columns = _get_capacity_scenario_row_columns()
+    if snapshot_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    scenario_rows_df = pd.DataFrame(
+        {
+            "scenario_row_key": snapshot_df["scenario_row_key"],
+            "country_name": snapshot_df["Country"],
+            "plant_name": snapshot_df["Plant"],
+            "train_label": snapshot_df["Train"],
+            "base_provider": base_provider,
+            "base_first_date": snapshot_df["First Date"],
+            "base_capacity_mtpa": snapshot_df["Capacity Change"],
+            "scenario_first_date": snapshot_df["First Date"],
+            "scenario_capacity_mtpa": snapshot_df["Capacity Change"],
+            "scenario_note": "",
+            "display_sort_country": snapshot_df["display_sort_country"],
+            "display_sort_plant": snapshot_df["display_sort_plant"],
+            "display_sort_train": snapshot_df["display_sort_train"],
+        }
+    )
+    return _prepare_capacity_scenario_rows_df(scenario_rows_df)
+
+
+def _build_capacity_scenario_rows_from_internal_rows(
+    source_rows_df: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = _get_capacity_scenario_row_columns()
+    source_rows_df = _prepare_capacity_scenario_rows_df(source_rows_df)
+    if source_rows_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    duplicated_rows_df = source_rows_df.copy()
+    duplicated_rows_df["base_provider"] = "internal_scenario"
+    duplicated_rows_df["base_first_date"] = duplicated_rows_df["scenario_first_date"]
+    duplicated_rows_df["base_capacity_mtpa"] = duplicated_rows_df["scenario_capacity_mtpa"]
+    return duplicated_rows_df[columns]
+
+
+def _build_new_capacity_scenario_rows(
+    base_type: str,
+    train_raw_df: pd.DataFrame,
+    ea_raw_df: pd.DataFrame,
+    source_scenario_id: int | None = None,
+    aggregate_from_date: str | None = None,
+) -> pd.DataFrame:
+    normalized_base_type = (base_type or "").strip().casefold()
+    if normalized_base_type == "woodmac":
+        return _build_provider_scenario_rows_from_change_log(
+            _build_train_change_log(
+                train_raw_df,
+                None,
+                "rest_of_world",
+                None,
+                None,
+            ),
+            "woodmac",
+            aggregate_from_date=aggregate_from_date,
+        )
+
+    if normalized_base_type == "energy_aspects":
+        return _build_provider_scenario_rows_from_change_log(
+            _build_ea_change_log(
+                ea_raw_df,
+                None,
+                "rest_of_world",
+                None,
+                None,
+            ),
+            "energy_aspects",
+            aggregate_from_date=aggregate_from_date,
+        )
+
+    if normalized_base_type == "internal_scenario":
+        if source_scenario_id is None:
+            return pd.DataFrame(columns=_get_capacity_scenario_row_columns())
+        return _build_capacity_scenario_rows_from_internal_rows(
+            fetch_capacity_scenario_rows(int(source_scenario_id), engine)
+        )
+
+    return pd.DataFrame(columns=_get_capacity_scenario_row_columns())
+
+
+def _build_internal_scenario_monthly_schedule(
+    scenario_rows_df: pd.DataFrame,
+    start_date: str | None,
+    end_date: str | None,
+) -> pd.DataFrame:
+    empty_df = pd.DataFrame(columns=["month", "country_name", "total_mmtpa"])
+    scenario_rows_df = _prepare_capacity_scenario_rows_df(scenario_rows_df)
+    if scenario_rows_df.empty:
+        return empty_df
+
+    schedule_rows_df = scenario_rows_df.copy()
+    schedule_rows_df = schedule_rows_df[
+        schedule_rows_df["scenario_first_date"].notna()
+        & schedule_rows_df["scenario_capacity_mtpa"].fillna(0.0).round(6).ne(0)
+    ].copy()
+    if schedule_rows_df.empty:
+        return empty_df
+
+    start_month = _normalize_month_date(start_date) or schedule_rows_df["scenario_first_date"].min()
+    end_month = _normalize_month_date(end_date) or schedule_rows_df["scenario_first_date"].max()
+    if start_month is None or end_month is None or start_month > end_month:
+        return empty_df
+
+    expanded_frames = []
+    for row in schedule_rows_df.itertuples(index=False):
+        active_start = max(pd.Timestamp(row.scenario_first_date), start_month)
+        if active_start > end_month:
+            continue
+        expanded_months = pd.date_range(active_start, end_month, freq="MS")
+        if expanded_months.empty:
+            continue
+        expanded_frames.append(
+            pd.DataFrame(
+                {
+                    "month": expanded_months,
+                    "country_name": row.country_name,
+                    "total_mmtpa": float(row.scenario_capacity_mtpa),
+                }
+            )
+        )
+
+    if not expanded_frames:
+        return empty_df
+
+    schedule_df = pd.concat(expanded_frames, ignore_index=True)
+    schedule_df = (
+        schedule_df.groupby(["month", "country_name"], as_index=False)["total_mmtpa"]
+        .sum()
+        .sort_values(["month", "country_name"])
+        .reset_index(drop=True)
+    )
+    return schedule_df
+
+
+def _build_internal_scenario_change_log(
+    scenario_rows_df: pd.DataFrame,
+    selected_countries: list[str] | None,
+    other_countries_mode: str,
+    start_date: str | None,
+    end_date: str | None,
+) -> pd.DataFrame:
+    columns = [
+        "Effective Date",
         "Country",
         "Plant",
         "Train",
-        "Woodmac Original Plant",
-        "Woodmac Original Train",
-        "Energy Aspects Original Plant",
-        "Energy Aspects Original Train",
-    ]:
-        if column_name not in timeline_df.columns:
-            timeline_df[column_name] = ""
-        timeline_df[column_name] = (
-            timeline_df[column_name].fillna("").astype(str).str.strip()
-        )
-
-    def _summarize_provider(
-        group_df: pd.DataFrame,
-        value_column: str,
-        original_plant_column: str,
-        original_train_column: str,
-    ) -> tuple[str | None, float | None, str | None, str | None]:
-        positive_series = pd.to_numeric(
-            group_df.get(value_column),
-            errors="coerce",
-        ).fillna(0.0)
-        positive_mask = positive_series > 0
-        if not positive_mask.any():
-            return None, None, None, None
-
-        positive_df = group_df.loc[positive_mask].copy()
-        first_effective_date = positive_df["Effective Date"].min()
-        if pd.isna(first_effective_date):
-            formatted_date = None
-        else:
-            formatted_date = pd.Timestamp(first_effective_date).strftime("%Y-%m-%d")
-
-        original_plant_names = _combine_distinct_text_values(
-            positive_df.get(original_plant_column, pd.Series(dtype=object))
-        ) or None
-        original_train_names = _combine_distinct_text_values(
-            positive_df.get(original_train_column, pd.Series(dtype=object))
-        ) or None
-
-        return (
-            formatted_date,
-            round(float(positive_series[positive_mask].sum()), 2),
-            original_plant_names,
-            original_train_names,
-        )
-
-    summary_rows = []
-    grouped_df = timeline_df.groupby(["Country", "Plant", "Train"], dropna=False, sort=False)
-    for (country, plant, train), group_df in grouped_df:
-        woodmac_first_date, woodmac_total_added, woodmac_original_plant, woodmac_original_train = _summarize_provider(
-            group_df,
-            "Woodmac Adds (MTPA)",
-            "Woodmac Original Plant",
-            "Woodmac Original Train",
-        )
-        ea_first_date, ea_total_added, ea_original_plant, ea_original_train = _summarize_provider(
-            group_df,
-            "EA Adds (MTPA)",
-            "Energy Aspects Original Plant",
-            "Energy Aspects Original Train",
-        )
-        summary_rows.append(
-            {
-                "Country": country,
-                "Plant": plant,
-                "Train": train,
-                "Woodmac Original Plant": woodmac_original_plant,
-                "Woodmac Original Train": woodmac_original_train,
-                "Woodmac First Date": woodmac_first_date,
-                "Woodmac Total Capacity Added": _numeric_or_blank(woodmac_total_added),
-                "Energy Aspects Original Plant": ea_original_plant,
-                "Energy Aspects Original Train": ea_original_train,
-                "Energy Aspects First Date": ea_first_date,
-                "Energy Aspects Total Capacity Added": _numeric_or_blank(ea_total_added),
-            }
-        )
-
-    if not summary_rows:
+        INTERNAL_SCENARIO_ADDS_COLUMN,
+        INTERNAL_SCENARIO_REDUCTIONS_COLUMN,
+        INTERNAL_SCENARIO_NET_COLUMN,
+        "Internal Scenario Activity Abs",
+    ]
+    scenario_rows_df = _prepare_capacity_scenario_rows_df(scenario_rows_df)
+    if scenario_rows_df.empty:
         return pd.DataFrame(columns=columns)
 
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df["__train_numeric_sort"] = pd.to_numeric(
-        summary_df["Train"],
-        errors="coerce",
-    )
-    summary_df["__train_blank_sort"] = summary_df["Train"].eq("").astype(int)
-    summary_df = summary_df.sort_values(
-        ["Country", "Plant", "__train_blank_sort", "__train_numeric_sort", "Train"],
-        ascending=[True, True, False, True, True],
-        na_position="last",
-    ).drop(
-        columns=["__train_numeric_sort", "__train_blank_sort"],
-        errors="ignore",
+    change_df = scenario_rows_df.copy()
+    change_df = change_df[
+        change_df["scenario_first_date"].notna()
+        & change_df["scenario_capacity_mtpa"].fillna(0.0).round(6).ne(0)
+    ].copy()
+    if change_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    if selected_countries:
+        if other_countries_mode == "exclude":
+            change_df = change_df[change_df["country_name"].isin(selected_countries)].copy()
+    elif other_countries_mode == "exclude":
+        return pd.DataFrame(columns=columns)
+
+    start_month = _normalize_month_date(start_date)
+    end_month = _normalize_month_date(end_date)
+    if start_month is not None:
+        change_df = change_df[change_df["scenario_first_date"] >= start_month].copy()
+    if end_month is not None:
+        change_df = change_df[change_df["scenario_first_date"] <= end_month].copy()
+    if change_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    change_df["Effective Date"] = change_df["scenario_first_date"].dt.strftime("%Y-%m-%d")
+    change_df["Country"] = change_df["country_name"]
+    change_df["Plant"] = change_df["plant_name"]
+    change_df["Train"] = pd.to_numeric(change_df["train_label"], errors="coerce").astype("Int64")
+    change_df[INTERNAL_SCENARIO_ADDS_COLUMN] = change_df["scenario_capacity_mtpa"].clip(lower=0).round(2)
+    change_df[INTERNAL_SCENARIO_REDUCTIONS_COLUMN] = change_df["scenario_capacity_mtpa"].where(
+        change_df["scenario_capacity_mtpa"] < 0,
+        0.0,
+    ).round(2)
+    change_df[INTERNAL_SCENARIO_NET_COLUMN] = change_df["scenario_capacity_mtpa"].round(2)
+    change_df["Internal Scenario Activity Abs"] = change_df["scenario_capacity_mtpa"].abs().round(2)
+
+    change_df = change_df.sort_values(
+        ["scenario_first_date", "Country", "Plant", "Train"],
+        ascending=[True, True, True, True],
     ).reset_index(drop=True)
+    return change_df[columns]
 
-    return summary_df[columns]
+
+def _prepare_internal_period_change_df(
+    change_df: pd.DataFrame,
+    time_view: str,
+) -> pd.DataFrame:
+    columns = [
+        "__period_start",
+        "Effective Date",
+        "Country",
+        "Plant",
+        "Train",
+        INTERNAL_SCENARIO_ADDS_COLUMN,
+        INTERNAL_SCENARIO_REDUCTIONS_COLUMN,
+        INTERNAL_SCENARIO_NET_COLUMN,
+        "Internal Scenario Activity Abs",
+    ]
+    if change_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    internal_df = _apply_train_change_time_view(change_df, time_view)
+    internal_df = (
+        internal_df.groupby(
+            ["__period_start", "Effective Date", "Country", "Plant", "Train"],
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            {
+                INTERNAL_SCENARIO_ADDS_COLUMN: "sum",
+                INTERNAL_SCENARIO_REDUCTIONS_COLUMN: "sum",
+                INTERNAL_SCENARIO_NET_COLUMN: "sum",
+                "Internal Scenario Activity Abs": "sum",
+            }
+        )
+    )
+    internal_df["__train_sort"] = pd.to_numeric(internal_df["Train"], errors="coerce")
+    internal_df = internal_df.sort_values(
+        ["__period_start", "Country", "Plant", "__train_sort", "Internal Scenario Activity Abs"],
+        ascending=[True, True, True, True, False],
+    ).drop(columns=["__train_sort"], errors="ignore").reset_index(drop=True)
+    return internal_df[columns]
 
 
-def _build_train_timeline_summary(timeline_df: pd.DataFrame) -> html.Div:
-    return html.Div()
+def _serialize_capacity_scenario_options(options_df: pd.DataFrame) -> list[dict]:
+    if options_df is None or options_df.empty:
+        return []
+
+    serialized_df = options_df.copy()
+    for column_name in ["created_at", "updated_at"]:
+        if column_name in serialized_df.columns:
+            serialized_df[column_name] = serialized_df[column_name].map(_serialize_timestamp)
+
+    return serialized_df.to_dict("records")
+
+
+def _get_capacity_scenario_option_map(options_data: list[dict] | None) -> dict[int, dict]:
+    option_map: dict[int, dict] = {}
+    for option in options_data or []:
+        scenario_id = pd.to_numeric(option.get("scenario_id"), errors="coerce")
+        if pd.isna(scenario_id):
+            continue
+        option_map[int(scenario_id)] = option
+    return option_map
+
+
+def _build_capacity_scenario_badge_text(
+    selected_scenario_id: int | None,
+    options_data: list[dict] | None,
+) -> str:
+    if selected_scenario_id is None:
+        return "No internal scenario selected"
+
+    option_map = _get_capacity_scenario_option_map(options_data)
+    option = option_map.get(int(selected_scenario_id))
+    if not option:
+        return "No internal scenario selected"
+
+    return str(option.get("scenario_name") or "Scenario")
+
+
+def _build_capacity_scenario_dirty_label(
+    dirty_data: dict | None,
+) -> str:
+    if (
+        dirty_data
+        and dirty_data.get("dirty")
+        and str(dirty_data.get("source") or "").casefold() in {"grid", "working"}
+    ):
+        return "Unsaved edits"
+    return "Saved"
+
+
+def _build_capacity_scenario_message(
+    text_value: str,
+    tone: str = "neutral",
+) -> html.Div:
+    tone_styles = {
+        "success": {"color": "#166534", "backgroundColor": "#f0fdf4", "borderColor": "#bbf7d0"},
+        "warning": {"color": "#9a3412", "backgroundColor": "#fff7ed", "borderColor": "#fed7aa"},
+        "error": {"color": "#991b1b", "backgroundColor": "#fef2f2", "borderColor": "#fecaca"},
+        "neutral": {"color": "#334155", "backgroundColor": "#f8fafc", "borderColor": "#e2e8f0"},
+    }
+    style = tone_styles.get(tone, tone_styles["neutral"])
+    return html.Div(
+        text_value,
+        style={
+            "padding": "10px 12px",
+            "borderRadius": "12px",
+            "border": f"1px solid {style['borderColor']}",
+            "backgroundColor": style["backgroundColor"],
+            "color": style["color"],
+            "fontSize": "12px",
+            "fontWeight": "600",
+        },
+    )
+
+
+def _normalize_grid_event_value(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    numeric_value = pd.to_numeric([value], errors="coerce")[0]
+    if pd.notna(numeric_value):
+        return round(float(numeric_value), 6)
+    return value
+
+
+def _is_user_scenario_cell_edit(cell_event) -> bool:
+    if not isinstance(cell_event, dict):
+        return False
+
+    column_id = cell_event.get("colId") or cell_event.get("columnId") or cell_event.get("field")
+    if column_id not in {"Scenario First Date", "Scenario Capacity", "Scenario Note"}:
+        return False
+
+    old_value = _normalize_grid_event_value(cell_event.get("oldValue"))
+    new_value = _normalize_grid_event_value(
+        cell_event.get("value", cell_event.get("newValue"))
+    )
+    return old_value != new_value
+
+
+def _capacity_scenario_rows_match_base(rows_df: pd.DataFrame) -> bool:
+    rows_df = _prepare_capacity_scenario_rows_df(rows_df)
+    if rows_df.empty:
+        return True
+
+    base_dates = rows_df["base_first_date"].fillna(pd.Timestamp("1900-01-01"))
+    scenario_dates = rows_df["scenario_first_date"].fillna(pd.Timestamp("1900-01-01"))
+    base_caps = rows_df["base_capacity_mtpa"].fillna(-999999.0).round(6)
+    scenario_caps = rows_df["scenario_capacity_mtpa"].fillna(-999999.0).round(6)
+    scenario_notes = rows_df["scenario_note"].fillna("").astype(str).str.strip()
+    return bool(
+        base_dates.eq(scenario_dates).all()
+        and base_caps.eq(scenario_caps).all()
+        and scenario_notes.eq("").all()
+    )
+
+
+def _maybe_rebuild_legacy_capacity_scenario_rows(
+    scenario_id: int | None,
+    rows_df: pd.DataFrame,
+    options_data: list[dict] | None,
+    train_raw_df: pd.DataFrame,
+    ea_raw_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, bool]:
+    normalized_scenario_id = pd.to_numeric(scenario_id, errors="coerce")
+    if pd.isna(normalized_scenario_id):
+        return _prepare_capacity_scenario_rows_df(rows_df), False
+
+    rows_df = _prepare_capacity_scenario_rows_df(rows_df)
+    if rows_df.empty or not _capacity_scenario_rows_match_base(rows_df):
+        return rows_df, False
+
+    option = _get_capacity_scenario_option_map(options_data).get(int(normalized_scenario_id))
+    if not option:
+        return rows_df, False
+
+    base_type = str(option.get("base_type") or "").strip().casefold()
+    if base_type not in {"woodmac", "energy_aspects"}:
+        return rows_df, False
+
+    identity_columns = ["country_name", "plant_name", "train_label"]
+    if rows_df.duplicated(subset=identity_columns, keep=False).any():
+        return rows_df, False
+    if pd.to_numeric(rows_df["scenario_capacity_mtpa"], errors="coerce").lt(0).any():
+        return rows_df, False
+
+    rebuilt_rows_df = _build_new_capacity_scenario_rows(
+        base_type,
+        train_raw_df,
+        ea_raw_df,
+        None,
+    )
+    return rebuilt_rows_df, not rebuilt_rows_df.empty
+
+
+def _coerce_timeline_row_date(value: object) -> pd.Timestamp | None:
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    return timestamp.to_period("M").to_timestamp()
+
+
+def _coerce_timeline_row_capacity(value: object) -> float | None:
+    numeric_value = pd.to_numeric([value], errors="coerce")[0]
+    if pd.isna(numeric_value):
+        return None
+    return round(float(numeric_value), 6)
+
+
+def _coerce_timeline_row_note(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def _resolve_grid_row_base_provider(row: dict) -> str:
+    woodmac_capacity = _coerce_timeline_row_capacity(row.get("Woodmac Capacity Change"))
+    woodmac_date = _coerce_timeline_row_date(row.get("Woodmac First Date"))
+    if woodmac_capacity is not None or woodmac_date is not None:
+        return "woodmac"
+
+    ea_capacity = _coerce_timeline_row_capacity(row.get("Energy Aspects Capacity Change"))
+    ea_date = _coerce_timeline_row_date(row.get("Energy Aspects First Date"))
+    if ea_capacity is not None or ea_date is not None:
+        return "energy_aspects"
+
+    return "internal_scenario"
+
+
+def _resolve_grid_row_base_date(row: dict) -> pd.Timestamp | None:
+    return (
+        _coerce_timeline_row_date(row.get("Woodmac First Date"))
+        or _coerce_timeline_row_date(row.get("Energy Aspects First Date"))
+    )
+
+
+def _resolve_grid_row_base_capacity(row: dict) -> float | None:
+    return (
+        _coerce_timeline_row_capacity(row.get("Woodmac Capacity Change"))
+        if _coerce_timeline_row_capacity(row.get("Woodmac Capacity Change")) is not None
+        else _coerce_timeline_row_capacity(row.get("Energy Aspects Capacity Change"))
+    )
+
+
+def _update_working_scenario_rows_from_grid(
+    working_rows_df: pd.DataFrame,
+    grid_row_data: list[dict] | None,
+) -> pd.DataFrame:
+    working_rows_df = _prepare_capacity_scenario_rows_df(working_rows_df)
+    grid_df = pd.DataFrame(grid_row_data or [])
+    if grid_df.empty:
+        return working_rows_df
+
+    if "scenario_row_key" not in grid_df.columns:
+        return working_rows_df
+
+    edited_df = grid_df.copy()
+    edited_df["scenario_row_key"] = edited_df["scenario_row_key"].fillna("").astype(str).str.strip()
+    edited_df = edited_df[edited_df["scenario_row_key"] != ""].copy()
+    if edited_df.empty:
+        return working_rows_df
+
+    edited_df["__scenario_first_date"] = edited_df["Scenario First Date"].map(_coerce_timeline_row_date)
+    edited_df["__scenario_capacity"] = edited_df["Scenario Capacity"].map(_coerce_timeline_row_capacity)
+    if "Scenario Note" not in edited_df.columns:
+        edited_df["Scenario Note"] = ""
+    edited_df["__scenario_note"] = edited_df["Scenario Note"].map(_coerce_timeline_row_note)
+
+    if working_rows_df.empty:
+        base_df = pd.DataFrame(columns=_get_capacity_scenario_row_columns())
+    else:
+        base_df = working_rows_df.copy()
+
+    if not base_df.empty:
+        base_df = base_df.set_index("scenario_row_key", drop=False)
+
+    for row in edited_df.to_dict("records"):
+        key = row["scenario_row_key"]
+        if key in base_df.index:
+            existing_base_date = base_df.at[key, "base_first_date"]
+            existing_base_capacity = base_df.at[key, "base_capacity_mtpa"]
+            if (
+                row["__scenario_first_date"] is None
+                and row["__scenario_capacity"] is None
+                and row["__scenario_note"] == ""
+                and pd.isna(existing_base_date)
+                and pd.isna(existing_base_capacity)
+            ):
+                base_df = base_df.drop(index=key)
+                continue
+            base_df.at[key, "scenario_first_date"] = row["__scenario_first_date"]
+            base_df.at[key, "scenario_capacity_mtpa"] = row["__scenario_capacity"]
+            base_df.at[key, "scenario_note"] = row["__scenario_note"]
+            continue
+
+        if (
+            row["__scenario_first_date"] is None
+            and row["__scenario_capacity"] is None
+            and row["__scenario_note"] == ""
+        ):
+            continue
+
+        normalized_train_label = _format_train_label(row.get("Train"))
+
+        new_record = {
+            "scenario_row_key": key,
+            "country_name": " ".join(str(row.get("Country") or "").strip().split()),
+            "plant_name": " ".join(str(row.get("Plant") or "").strip().split()),
+            "train_label": normalized_train_label,
+            "base_provider": _resolve_grid_row_base_provider(row),
+            "base_first_date": _resolve_grid_row_base_date(row),
+            "base_capacity_mtpa": _resolve_grid_row_base_capacity(row),
+            "scenario_first_date": row["__scenario_first_date"],
+            "scenario_capacity_mtpa": row["__scenario_capacity"],
+            "scenario_note": row["__scenario_note"],
+            "display_sort_country": " ".join(str(row.get("Country") or "").strip().split()),
+            "display_sort_plant": " ".join(str(row.get("Plant") or "").strip().split()),
+            "display_sort_train": pd.to_numeric([normalized_train_label], errors="coerce")[0],
+        }
+        if base_df.empty:
+            base_df = pd.DataFrame([new_record]).set_index("scenario_row_key", drop=False)
+        else:
+            base_df.loc[key] = new_record
+
+    return _prepare_capacity_scenario_rows_df(base_df.reset_index(drop=True))
+
+
+def _resolve_active_capacity_scenario_rows(
+    working_store_data,
+    dirty_store: dict | None = None,
+    timeline_row_data: list[dict] | None = None,
+) -> pd.DataFrame:
+    rows_df = _prepare_capacity_scenario_rows_df(_deserialize_dataframe(working_store_data))
+    dirty_payload = dirty_store if isinstance(dirty_store, dict) else {"dirty": False}
+    if (
+        not dirty_payload.get("dirty")
+        or dirty_payload.get("source") in {"rebuild", "working"}
+        or not timeline_row_data
+    ):
+        return rows_df
+
+    try:
+        return _update_working_scenario_rows_from_grid(rows_df, timeline_row_data)
+    except Exception:
+        return rows_df
+
+
+def _append_manual_capacity_scenario_row(
+    rows_df: pd.DataFrame,
+    country_name: object,
+    plant_name: object,
+    train_label: object,
+    first_date: object,
+    capacity_value: object,
+) -> tuple[pd.DataFrame, str]:
+    normalized_country = " ".join(str(country_name or "").strip().split())
+    normalized_plant = " ".join(str(plant_name or "").strip().split())
+    normalized_train = _coerce_positive_train_label(train_label)
+    scenario_first_date = _coerce_timeline_row_date(first_date)
+    scenario_capacity = _coerce_timeline_row_capacity(capacity_value)
+
+    if not normalized_country:
+        raise ValueError("Country is required.")
+    if not normalized_plant:
+        raise ValueError("Plant is required.")
+    if scenario_first_date is None:
+        raise ValueError("First Date must be a valid month like 2026-01.")
+    if scenario_capacity is None or scenario_capacity <= 0:
+        raise ValueError("Capacity must be greater than 0.")
+
+    scenario_row_key = _build_capacity_scenario_row_key(
+        normalized_country,
+        normalized_plant,
+        normalized_train,
+        effective_date=scenario_first_date,
+        capacity_value=scenario_capacity,
+        provider="manual",
+    )
+
+    rows_df = _prepare_capacity_scenario_rows_df(rows_df)
+    if not rows_df.empty and rows_df["scenario_row_key"].eq(scenario_row_key).any():
+        raise ValueError("This internal scenario row already exists.")
+
+    new_row = pd.DataFrame(
+        [
+            {
+                "scenario_row_key": scenario_row_key,
+                "country_name": normalized_country,
+                "plant_name": normalized_plant,
+                "train_label": normalized_train,
+                "base_provider": "internal_scenario",
+                "base_first_date": None,
+                "base_capacity_mtpa": None,
+                "scenario_first_date": scenario_first_date,
+                "scenario_capacity_mtpa": scenario_capacity,
+                "scenario_note": "",
+                "display_sort_country": normalized_country,
+                "display_sort_plant": normalized_plant,
+                "display_sort_train": pd.to_numeric([normalized_train], errors="coerce")[0],
+            }
+        ]
+    )
+
+    return (
+        _prepare_capacity_scenario_rows_df(pd.concat([rows_df, new_row], ignore_index=True, sort=False)),
+        scenario_row_key,
+    )
 
 
 def _create_source_section(
@@ -2354,21 +3705,35 @@ def _create_source_section(
     header_children = [
         html.Div(
             [
-                html.H3(
-                    title,
-                    className="balance-section-title",
-                    title=title_note,
-                    style={"cursor": "help"} if title_note else None,
+                html.Div(
+                    html.H3(
+                        title,
+                        className="balance-section-title",
+                        title=title_note or title,
+                        style={
+                            "cursor": "help" if title_note else None,
+                            "whiteSpace": "nowrap",
+                            "overflow": "hidden",
+                            "textOverflow": "ellipsis",
+                        },
+                    ),
+                    style={"flex": "1 1 auto", "minWidth": "0"},
                 ),
                 html.Button(
                     "Export to Excel",
                     id=export_button_id,
                     n_clicks=0,
-                    style=EXPORT_BUTTON_STYLE,
+                    style={**EXPORT_BUTTON_STYLE, "flexShrink": "0"},
                 ),
             ],
             className="inline-section-header",
-            style={"display": "flex", "alignItems": "center"},
+            style={
+                "display": "flex",
+                "alignItems": "center",
+                "justifyContent": "space-between",
+                "gap": "12px",
+                "flexWrap": "nowrap",
+            },
         )
     ]
 
@@ -2377,7 +3742,16 @@ def _create_source_section(
 
     return html.Div(
         [
-            html.Div(header_children, className="balance-section-header"),
+            html.Div(
+                header_children,
+                className="balance-section-header",
+                style={
+                    "padding": "0",
+                    "gap": "0",
+                    "borderBottom": "none",
+                    "background": "transparent",
+                },
+            ),
             dcc.Graph(
                 id=chart_id,
                 figure=_create_empty_capacity_figure("Loading capacity chart..."),
@@ -2394,6 +3768,189 @@ def _create_source_section(
             ),
         ],
         className="balance-section-card",
+    )
+
+
+def _create_internal_scenario_section(
+    title: str,
+    summary_id: str,
+    chart_id: str,
+    table_container_id: str,
+    export_button_id: str,
+) -> html.Div:
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        html.H3(
+                            title,
+                            className="balance-section-title",
+                            title=title,
+                            style={
+                                "whiteSpace": "nowrap",
+                                "overflow": "hidden",
+                                "textOverflow": "ellipsis",
+                            },
+                        ),
+                        style={
+                            "display": "flex",
+                            "alignItems": "center",
+                            "gap": "12px",
+                            "flexWrap": "nowrap",
+                            "flex": "1 1 auto",
+                            "minWidth": "0",
+                        },
+                    ),
+                    html.Button(
+                        "Export to Excel",
+                        id=export_button_id,
+                        n_clicks=0,
+                        style={**EXPORT_BUTTON_STYLE, "flexShrink": "0"},
+                    ),
+                ],
+                className="inline-section-header",
+                style={
+                    "display": "flex",
+                    "alignItems": "center",
+                    "justifyContent": "space-between",
+                    "gap": "12px",
+                    "flexWrap": "nowrap",
+                },
+            ),
+            dcc.Graph(
+                id=chart_id,
+                figure=_create_empty_capacity_figure(INTERNAL_SCENARIO_EMPTY_MESSAGE),
+                config={"displayModeBar": True, "displaylogo": False},
+                style={"height": "100%", "marginBottom": "16px"},
+            ),
+            html.Div(id=table_container_id, className="balance-table-container"),
+            html.Div(
+                id=summary_id,
+                style={
+                    "padding": "12px 16px 16px",
+                    "borderTop": "1px solid #e5e7eb",
+                },
+            ),
+        ],
+        className="balance-section-card",
+    )
+
+
+def _create_top_capacity_selector_region() -> html.Div:
+    control_label_style = {
+        "fontSize": "12px",
+        "fontWeight": "700",
+        "letterSpacing": "0.04em",
+        "textTransform": "uppercase",
+        "color": "#64748b",
+        "marginBottom": "8px",
+    }
+    radio_label_style = {
+        "display": "inline-flex",
+        "alignItems": "center",
+        "marginRight": "12px",
+        "fontSize": "12px",
+        "fontWeight": "600",
+        "color": "#334155",
+    }
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        "Capacity Controls",
+                        style={
+                            "fontSize": "12px",
+                            "fontWeight": "800",
+                            "letterSpacing": "0.08em",
+                            "textTransform": "uppercase",
+                            "color": "#1d4ed8",
+                        },
+                    ),
+                ],
+                style={"display": "grid", "gap": "4px", "marginBottom": "14px"},
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("Country Columns", style=control_label_style),
+                            dcc.Dropdown(
+                                id="capacity-page-country-dropdown",
+                                options=[],
+                                value=None,
+                                multi=True,
+                                placeholder="Select countries to keep as separate columns",
+                                className="filter-dropdown",
+                                style={"minWidth": "320px"},
+                            ),
+                        ],
+                        style={"minWidth": "0"},
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Other Countries", style=control_label_style),
+                            html.Div(
+                                [
+                                    dcc.RadioItems(
+                                        id="capacity-page-other-country-mode",
+                                        options=[
+                                            {"label": "Include", "value": "rest_of_world"},
+                                            {"label": "Exclude", "value": "exclude"},
+                                        ],
+                                        value="rest_of_world",
+                                        inline=True,
+                                        labelStyle=radio_label_style,
+                                        inputStyle={"marginRight": "6px"},
+                                        style={"display": "flex", "alignItems": "center"},
+                                    )
+                                ],
+                                style=TRAIN_CHANGE_CONTROL_SHELL_STYLE,
+                            ),
+                        ],
+                        style={"minWidth": "0"},
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Table Values", style=control_label_style),
+                            html.Div(
+                                [
+                                    dcc.RadioItems(
+                                        id="capacity-page-top-table-view",
+                                        options=[
+                                            {"label": "Absolute", "value": "absolute"},
+                                            {"label": "Change", "value": "change"},
+                                        ],
+                                        value="absolute",
+                                        inline=True,
+                                        labelStyle=radio_label_style,
+                                        inputStyle={"marginRight": "6px"},
+                                        style={"display": "flex", "alignItems": "center"},
+                                    )
+                                ],
+                                style=TRAIN_CHANGE_CONTROL_SHELL_STYLE,
+                            ),
+                        ],
+                        style={"minWidth": "0"},
+                    ),
+                ],
+                style={
+                    "display": "grid",
+                    "gridTemplateColumns": "repeat(auto-fit, minmax(220px, 1fr))",
+                    "gap": "16px",
+                    "alignItems": "end",
+                },
+            ),
+        ],
+        style={
+            "padding": "16px 18px",
+            "border": "1px solid #dbe7f4",
+            "borderRadius": "16px",
+            "background": "linear-gradient(180deg, #f8fbff 0%, #f1f7ff 100%)",
+            "boxShadow": "0 8px 24px rgba(15, 23, 42, 0.05)",
+        },
     )
 
 
@@ -2463,7 +4020,17 @@ def _create_train_change_section(
     return html.Div(
         [
             html.Div(header_children, className="balance-section-header"),
-            html.Div(id=table_container_id, className="balance-table-container"),
+            html.Div(
+                _create_train_timeline_table(
+                    "capacity-page-train-timeline-table",
+                    pd.DataFrame(),
+                    scenario_rows_df=pd.DataFrame(),
+                    show_original_names=False,
+                    enable_editing=False,
+                ),
+                id=table_container_id,
+                className="balance-table-container",
+            ),
         ],
         className="balance-section-card",
     )
@@ -2472,10 +4039,61 @@ def _create_train_change_section(
 def _create_train_timeline_section(
     title: str,
     subtitle: str,
-    summary_id: str,
     table_container_id: str,
     export_button_id: str = "",
 ) -> html.Div:
+    action_button_style = {
+        "padding": "7px 12px",
+        "borderRadius": "999px",
+        "border": "1px solid #cbd5e1",
+        "backgroundColor": "#ffffff",
+        "color": "#0f172a",
+        "fontSize": "12px",
+        "fontWeight": "700",
+        "cursor": "pointer",
+    }
+    control_label_style = {
+        "fontSize": "11px",
+        "fontWeight": "700",
+        "letterSpacing": "0.06em",
+        "textTransform": "uppercase",
+        "color": "#64748b",
+        "marginBottom": "6px",
+    }
+    control_card_title_style = {
+        "fontSize": "12px",
+        "fontWeight": "800",
+        "letterSpacing": "0.08em",
+        "textTransform": "uppercase",
+        "marginBottom": "12px",
+    }
+    create_card_style = {
+        "display": "grid",
+        "gap": "12px",
+        "padding": "18px 20px",
+        "border": "1px solid #cfe0f6",
+        "borderRadius": "16px",
+        "background": "linear-gradient(180deg, #f8fbff 0%, #f4f8ff 100%)",
+        "boxShadow": "0 8px 24px rgba(15, 23, 42, 0.04)",
+    }
+    selected_card_style = {
+        "display": "grid",
+        "gap": "14px",
+        "padding": "18px 20px",
+        "border": "1px solid #d7eadc",
+        "borderRadius": "16px",
+        "background": "linear-gradient(180deg, #f8fcf8 0%, #f3faf4 100%)",
+        "boxShadow": "0 8px 24px rgba(15, 23, 42, 0.04)",
+    }
+    add_row_card_style = {
+        "display": "grid",
+        "gap": "12px",
+        "padding": "18px 20px",
+        "border": "1px solid #dbe4ee",
+        "borderRadius": "16px",
+        "background": "#fbfcfe",
+        "boxShadow": "0 8px 24px rgba(15, 23, 42, 0.03)",
+    }
     header_children = [
         html.Div(
             [
@@ -2541,7 +4159,329 @@ def _create_train_timeline_section(
     if subtitle:
         header_children.append(html.P(subtitle, className="balance-section-subtitle"))
 
-    header_children.append(html.Div(id=summary_id))
+    header_children.extend(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div(
+                                        "Create New Scenario",
+                                        style={**control_card_title_style, "color": "#1d5fa7", "marginBottom": "0"},
+                                    ),
+                                    html.Button(
+                                        "Create Scenario",
+                                        id="capacity-page-capacity-scenario-create-button",
+                                        n_clicks=0,
+                                        style={
+                                            **action_button_style,
+                                            "backgroundColor": "#1d4ed8",
+                                            "borderColor": "#1d4ed8",
+                                            "color": "white",
+                                        },
+                                    ),
+                                ],
+                                style={
+                                    "display": "flex",
+                                    "alignItems": "center",
+                                    "justifyContent": "space-between",
+                                    "gap": "12px",
+                                    "flexWrap": "wrap",
+                                },
+                            ),
+                            html.Div(
+                                [
+                                    dcc.Input(
+                                        id="capacity-page-capacity-scenario-create-name",
+                                        type="text",
+                                        placeholder="Scenario name",
+                                        style={
+                                            "minWidth": "240px",
+                                            "flex": "1 1 auto",
+                                            "padding": "8px 10px",
+                                            "border": "1px solid #cbd5e1",
+                                            "borderRadius": "10px",
+                                        },
+                                    ),
+                                ],
+                                style={
+                                    "display": "flex",
+                                    "gap": "10px",
+                                    "flexWrap": "wrap",
+                                    "alignItems": "center",
+                                },
+                            ),
+                            html.Div(
+                                [
+                                    html.Div(
+                                        "Create from",
+                                        style={**control_label_style, "marginBottom": "0"},
+                                    ),
+                                ],
+                            ),
+                            html.Div(
+                                [
+                                    dcc.Dropdown(
+                                        id="capacity-page-capacity-scenario-create-base-type",
+                                        options=[
+                                            {"label": "Woodmac", "value": "woodmac"},
+                                            {"label": "Energy Aspects", "value": "energy_aspects"},
+                                            {"label": "Current Scenario", "value": "current_scenario"},
+                                            {"label": "Existing Internal Scenario", "value": "internal_scenario"},
+                                        ],
+                                        value="woodmac",
+                                        clearable=False,
+                                        style={"width": "190px"},
+                                    ),
+                                    dcc.Dropdown(
+                                        id="capacity-page-capacity-scenario-create-source-dropdown",
+                                        options=[],
+                                        value=None,
+                                        placeholder="Source internal scenario",
+                                        style={"width": "220px", "opacity": "0.55"},
+                                    ),
+                                ],
+                                style={
+                                    "display": "flex",
+                                    "gap": "10px",
+                                    "flexWrap": "wrap",
+                                    "alignItems": "center",
+                                },
+                            ),
+                        ],
+                        style=create_card_style,
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div(
+                                        "Selected Scenario",
+                                        style={
+                                            **control_card_title_style,
+                                            "color": "#2f7a48",
+                                            "marginBottom": "0",
+                                        },
+                                    ),
+                                    html.Div(
+                                        id="capacity-page-train-timeline-current-scenario-label",
+                                        children="No internal scenario selected",
+                                        style={
+                                            "display": "inline-flex",
+                                            "alignItems": "center",
+                                            "justifyContent": "center",
+                                            "padding": "6px 10px",
+                                            "borderRadius": "999px",
+                                            "backgroundColor": "#e2e8f0",
+                                            "color": "#334155",
+                                            "fontSize": "12px",
+                                            "fontWeight": "700",
+                                        },
+                                    ),
+                                ],
+                                style={
+                                    "display": "flex",
+                                    "gap": "10px",
+                                    "flexWrap": "wrap",
+                                    "alignItems": "center",
+                                    "justifyContent": "space-between",
+                                },
+                            ),
+                            html.Div(
+                                [
+                                    html.Div(
+                                        id="capacity-page-capacity-scenario-dirty-indicator",
+                                        style={
+                                            "display": "inline-flex",
+                                            "alignItems": "center",
+                                            "justifyContent": "center",
+                                            "padding": "8px 12px",
+                                            "borderRadius": "999px",
+                                            "backgroundColor": "#ecfeff",
+                                            "color": "#155e75",
+                                            "fontSize": "12px",
+                                            "fontWeight": "700",
+                                        },
+                                    ),
+                                ],
+                                style={
+                                    "display": "flex",
+                                    "gap": "10px",
+                                    "flexWrap": "wrap",
+                                    "alignItems": "center",
+                                },
+                            ),
+                            html.Div(
+                                [
+                                    html.Button(
+                                        "Save",
+                                        id="capacity-page-capacity-scenario-save-button",
+                                        n_clicks=0,
+                                        style={
+                                            **action_button_style,
+                                            "backgroundColor": "#166534",
+                                            "borderColor": "#166534",
+                                            "color": "white",
+                                        },
+                                    ),
+                                    html.Button(
+                                        "Revert",
+                                        id="capacity-page-capacity-scenario-revert-button",
+                                        n_clicks=0,
+                                        style=action_button_style,
+                                    ),
+                                    html.Button(
+                                        "Delete",
+                                        id="capacity-page-capacity-scenario-delete-button",
+                                        n_clicks=0,
+                                        style={
+                                            **action_button_style,
+                                            "backgroundColor": "#fff1f2",
+                                            "borderColor": "#fecdd3",
+                                            "color": "#be123c",
+                                        },
+                                    ),
+                                    dcc.Upload(
+                                        id="capacity-page-capacity-scenario-upload",
+                                        children=html.Button(
+                                            "Upload Train Timeline Excel",
+                                            id="capacity-page-capacity-scenario-upload-button",
+                                            type="button",
+                                            disabled=True,
+                                            style={
+                                                **action_button_style,
+                                                "backgroundColor": "#fff7ed",
+                                                "borderColor": "#fdba74",
+                                                "color": "#9a3412",
+                                                "opacity": "0.55",
+                                                "cursor": "not-allowed",
+                                            },
+                                        ),
+                                        multiple=False,
+                                        disabled=True,
+                                    ),
+                                ],
+                                style={
+                                    "display": "flex",
+                                    "gap": "10px",
+                                    "flexWrap": "wrap",
+                                    "alignItems": "center",
+                                },
+                            ),
+                            html.Div(
+                                "Upload only a Train Timeline workbook exported from this section. Only internal-scenario columns are editable for existing rows, Train can be blank but must be a positive whole number when provided, and uploaded changes still require Save.",
+                                className="balance-metadata-row",
+                                style={"fontSize": "11px"},
+                            ),
+                        ],
+                        style=selected_card_style,
+                    ),
+                ],
+                style={
+                    "display": "grid",
+                    "gridTemplateColumns": "repeat(auto-fit, minmax(360px, 1fr))",
+                    "gap": "16px",
+                    "padding": "0 16px 16px",
+                },
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        "Add Row to Selected Scenario",
+                        style={**control_card_title_style, "color": "#5a6d88", "marginBottom": "0"},
+                    ),
+                    html.Div(
+                        [
+                            dcc.Input(
+                                id="capacity-page-scenario-add-country",
+                                type="text",
+                                placeholder="Country",
+                                style={
+                                    "width": "150px",
+                                    "padding": "8px 10px",
+                                    "border": "1px solid #cbd5e1",
+                                    "borderRadius": "10px",
+                                },
+                            ),
+                            dcc.Input(
+                                id="capacity-page-scenario-add-plant",
+                                type="text",
+                                placeholder="Plant",
+                                style={
+                                    "width": "210px",
+                                    "padding": "8px 10px",
+                                    "border": "1px solid #cbd5e1",
+                                    "borderRadius": "10px",
+                                },
+                            ),
+                            dcc.Input(
+                                id="capacity-page-scenario-add-train",
+                                type="number",
+                                placeholder="Train (optional)",
+                                min=1,
+                                step=1,
+                                style={
+                                    "width": "140px",
+                                    "padding": "8px 10px",
+                                    "border": "1px solid #cbd5e1",
+                                    "borderRadius": "10px",
+                                },
+                            ),
+                            dcc.Input(
+                                id="capacity-page-scenario-add-first-date",
+                                type="text",
+                                placeholder="First Date (YYYY-MM)",
+                                style={
+                                    "width": "150px",
+                                    "padding": "8px 10px",
+                                    "border": "1px solid #cbd5e1",
+                                    "borderRadius": "10px",
+                                },
+                            ),
+                            dcc.Input(
+                                id="capacity-page-scenario-add-capacity",
+                                type="number",
+                                placeholder="Capacity",
+                                style={
+                                    "width": "120px",
+                                    "padding": "8px 10px",
+                                    "border": "1px solid #cbd5e1",
+                                    "borderRadius": "10px",
+                                },
+                            ),
+                            html.Button(
+                                "Add Row",
+                                id="capacity-page-scenario-add-row-button",
+                                n_clicks=0,
+                                style={
+                                    **action_button_style,
+                                    "backgroundColor": "#0f766e",
+                                    "borderColor": "#0f766e",
+                                    "color": "white",
+                                },
+                            ),
+                        ],
+                        style={
+                            "display": "flex",
+                            "gap": "10px",
+                            "flexWrap": "wrap",
+                            "alignItems": "center",
+                        },
+                    ),
+                ],
+                style={
+                    **add_row_card_style,
+                    "margin": "0 16px 12px",
+                },
+            ),
+            html.Div(
+                id="capacity-page-capacity-scenario-message",
+                style={"padding": "0 16px 12px"},
+            ),
+        ]
+    )
 
     return html.Div(
         [
@@ -2552,9 +4492,121 @@ def _create_train_timeline_section(
     )
 
 
+def _create_train_timeline_comparison_chart_section() -> html.Div:
+    control_label_style = {
+        "fontSize": "9px",
+        "fontWeight": "700",
+        "letterSpacing": "0.06em",
+        "textTransform": "uppercase",
+        "color": "#475569",
+        "marginBottom": "4px",
+    }
+    dropdown_style = {"minWidth": "220px", "width": "100%"}
+    header_shell_style = {
+        "display": "flex",
+        "flexDirection": "row",
+        "alignItems": "flex-start",
+        "justifyContent": "flex-start",
+        "gap": "14px",
+        "flexWrap": "nowrap",
+        "padding": "12px 18px 10px",
+        "border": "1px solid #dbe7f4",
+        "borderRadius": "18px",
+        "background": "linear-gradient(180deg, #fbfdff 0%, #f3f8ff 100%)",
+        "boxShadow": "0 10px 26px rgba(15, 23, 42, 0.05)",
+    }
+    header_controls_style = {
+        "display": "flex",
+        "gap": "12px",
+        "flexWrap": "nowrap",
+        "alignItems": "flex-start",
+        "minWidth": "460px",
+        "marginLeft": "auto",
+        "flex": "0 0 auto",
+    }
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        html.H3(
+                            "LNG Train Timeline",
+                            className="balance-section-title",
+                            style={
+                                "margin": "0",
+                                "fontSize": "24px",
+                                "lineHeight": "1.15",
+                                "textAlign": "left",
+                            },
+                        ),
+                        style={
+                            "minWidth": "0",
+                            "flex": "1 1 auto",
+                            "display": "flex",
+                            "justifyContent": "flex-start",
+                            "alignSelf": "flex-start",
+                        },
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Source", style=control_label_style),
+                                    dcc.Dropdown(
+                                        id="capacity-page-train-timeline-chart-source",
+                                        options=[
+                                            {"label": "Woodmac", "value": "woodmac"},
+                                            {"label": "Energy Aspects", "value": "energy_aspects"},
+                                        ],
+                                        value="woodmac",
+                                        clearable=False,
+                                        style=dropdown_style,
+                                    ),
+                                ],
+                                style={"minWidth": "0"},
+                            ),
+                            html.Div(
+                                [
+                                    html.Div("Compare To", style=control_label_style),
+                                    dcc.Dropdown(
+                                        id="capacity-page-train-timeline-chart-compare",
+                                        options=[
+                                            {"label": "Woodmac", "value": "woodmac"},
+                                            {"label": "Energy Aspects", "value": "energy_aspects"},
+                                        ],
+                                        value="energy_aspects",
+                                        clearable=False,
+                                        style=dropdown_style,
+                                    ),
+                                ],
+                                style={"minWidth": "0"},
+                            ),
+                        ],
+                        style={**header_controls_style, "alignSelf": "flex-start"},
+                    ),
+                ],
+                className="balance-section-header",
+                style={
+                    **header_shell_style,
+                    "borderBottom": "none",
+                },
+            ),
+            dcc.Graph(
+                id="capacity-page-train-timeline-comparison-graph",
+                figure=_create_empty_capacity_figure("Loading LNG train timeline..."),
+                config={"displayModeBar": True, "displaylogo": False},
+                style={"height": "100%", "marginTop": "6px"},
+            ),
+        ],
+        className="balance-section-card",
+    )
+
+
 def _create_capacity_country_area_chart(
     matrix_df: pd.DataFrame,
     y_axis_title: str = "MTPA",
+    time_view: str = "monthly",
 ) -> go.Figure:
     total_column_label = "Total MTPA"
     if matrix_df.empty:
@@ -2563,7 +4615,7 @@ def _create_capacity_country_area_chart(
     country_columns = [
         column_name
         for column_name in matrix_df.columns
-        if column_name not in {"Month", total_column_label}
+        if column_name not in {"Month", total_column_label, "__axis_date"}
     ]
 
     if not country_columns:
@@ -2572,7 +4624,11 @@ def _create_capacity_country_area_chart(
         )
 
     plot_df = matrix_df.copy()
-    plot_df["date"] = pd.to_datetime(plot_df["Month"] + "-01")
+    if "__axis_date" in plot_df.columns:
+        plot_df["date"] = pd.to_datetime(plot_df["__axis_date"], errors="coerce")
+    else:
+        plot_df["date"] = pd.to_datetime(plot_df["Month"].astype(str) + "-01", errors="coerce")
+    plot_df = plot_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     pivot_df = plot_df.set_index("date")[country_columns]
     pivot_df = pivot_df[pivot_df.sum(axis=1) > 0]
 
@@ -2582,9 +4638,21 @@ def _create_capacity_country_area_chart(
     column_totals = pivot_df.sum().sort_values(ascending=False)
     pivot_df = pivot_df[column_totals.index]
     total_series = plot_df.set_index("date")[total_column_label].reindex(pivot_df.index).fillna(0.0)
+    period_labels = (
+        plot_df.drop_duplicates(subset=["date"])
+        .set_index("date")["Month"]
+        .reindex(pivot_df.index)
+        .fillna("")
+        .astype(str)
+    )
     max_total = float(total_series.max()) if not total_series.empty else 0.0
     annotation_headroom = max(max_total * 0.12, 8.0)
-    january_annotations = _build_january_yoy_annotations(total_series)
+    use_period_labels = time_view in {"quarterly", "seasonally", "yearly"}
+    annotations = (
+        _build_december_yoy_annotations(total_series)
+        if time_view == "monthly"
+        else []
+    )
 
     fig = go.Figure()
     for color_index, group_name in enumerate(pivot_df.columns):
@@ -2593,7 +4661,7 @@ def _create_capacity_country_area_chart(
 
         fig.add_trace(
             go.Scatter(
-                x=pivot_df.index,
+                x=period_labels.tolist() if use_period_labels else pivot_df.index,
                 y=pivot_df[group_name],
                 mode="lines",
                 name=group_name,
@@ -2601,7 +4669,10 @@ def _create_capacity_country_area_chart(
                 fill="tonexty",
                 fillcolor=f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, 0.78)",
                 hovertemplate=(
-                    f"<b>{group_name}</b><br>Date: %{{x|%b %Y}}"
+                    f"<b>{group_name}</b><br>Date: %{{x}}"
+                    "<br>Capacity: %{y:.1f} MTPA<extra></extra>"
+                    if use_period_labels
+                    else f"<b>{group_name}</b><br>Date: %{{x|%b %Y}}"
                     "<br>Capacity: %{y:.1f} MTPA<extra></extra>"
                 ),
                 stackgroup="one",
@@ -2612,17 +4683,31 @@ def _create_capacity_country_area_chart(
     end_date = pivot_df.index.max()
 
     fig.update_layout(
-        xaxis=dict(
-            title="",
-            range=[start_date, end_date],
-            type="date",
-            tickformat="%b\n%Y",
-            dtick="M3",
-            tickfont=dict(size=10, family="Arial", color="#475569"),
-            showgrid=True,
-            gridcolor="rgba(148, 163, 184, 0.18)",
-            showline=False,
-            zeroline=False,
+        xaxis=(
+            dict(
+                title="",
+                type="category",
+                categoryorder="array",
+                categoryarray=period_labels.tolist(),
+                tickfont=dict(size=10, family="Arial", color="#475569"),
+                showgrid=True,
+                gridcolor="rgba(148, 163, 184, 0.18)",
+                showline=False,
+                zeroline=False,
+            )
+            if use_period_labels
+            else dict(
+                title="",
+                range=[start_date, end_date],
+                type="date",
+                tickformat="%b\n%Y",
+                dtick="M3",
+                tickfont=dict(size=10, family="Arial", color="#475569"),
+                showgrid=True,
+                gridcolor="rgba(148, 163, 184, 0.18)",
+                showline=False,
+                zeroline=False,
+            )
         ),
         yaxis=dict(
             title=dict(
@@ -2647,7 +4732,7 @@ def _create_capacity_country_area_chart(
             bordercolor="rgba(203, 213, 225, 0.9)",
             font=dict(size=11, family="Arial", color="#0f172a"),
         ),
-        annotations=january_annotations,
+        annotations=annotations,
         legend=dict(
             orientation="h",
             yanchor="top",
@@ -2660,6 +4745,648 @@ def _create_capacity_country_area_chart(
             itemwidth=70,
             itemsizing="constant",
         ),
+    )
+
+    return fig
+
+
+def _get_train_timeline_chart_options(
+    selected_scenario_id,
+    scenario_options_data,
+) -> list[dict]:
+    options = [
+        {"label": "Woodmac", "value": "woodmac"},
+        {"label": "Energy Aspects", "value": "energy_aspects"},
+    ]
+    scenario_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    if pd.notna(scenario_value):
+        selected_option = _get_capacity_scenario_option_map(scenario_options_data).get(
+            int(scenario_value),
+            {},
+        )
+        options.append(
+            {
+                "label": selected_option.get("scenario_name", "Internal Scenario"),
+                "value": "internal_scenario",
+            }
+        )
+    return options
+
+
+def _coerce_train_timeline_chart_value(
+    current_value: object,
+    valid_values: set[str],
+    fallback_value: str,
+) -> str:
+    normalized_value = str(current_value or "").strip().casefold()
+    if normalized_value in valid_values:
+        return normalized_value
+    return fallback_value
+
+
+def _get_train_timeline_chart_option_label(
+    options: list[dict] | None,
+    option_value: str,
+) -> str:
+    normalized_value = str(option_value or "").strip().casefold()
+    for option in options or []:
+        if str(option.get("value") or "").strip().casefold() == normalized_value:
+            return str(option.get("label") or option_value)
+
+    return TRAIN_TIMELINE_CHART_SOURCE_CONFIG.get(
+        normalized_value,
+        {"label": str(option_value or "").strip() or "Source"},
+    )["label"]
+
+
+def _build_train_timeline_chart_rows(
+    timeline_row_data: list[dict] | None,
+    source_key: str,
+    compare_key: str | None = None,
+) -> pd.DataFrame:
+    columns = [
+        "Country",
+        "Plant",
+        "Train",
+        "timeline_direction",
+        "source_date",
+        "source_capacity",
+        "source_month_start",
+        "source_out_of_range",
+        "compare_date",
+        "compare_out_of_range",
+        "compare_missing",
+        "train_display",
+        "missing_train_label",
+        "display_sort_country",
+        "display_sort_plant",
+        "display_sort_train",
+    ]
+    if not timeline_row_data:
+        return pd.DataFrame(columns=columns)
+
+    source_config = TRAIN_TIMELINE_CHART_SOURCE_CONFIG.get(str(source_key or "").strip().casefold())
+    if not source_config:
+        return pd.DataFrame(columns=columns)
+
+    compare_config = TRAIN_TIMELINE_CHART_SOURCE_CONFIG.get(str(compare_key or "").strip().casefold())
+    rows_df = pd.DataFrame(timeline_row_data).copy()
+    if rows_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    if "Country" not in rows_df.columns:
+        rows_df["Country"] = ""
+    if "Plant" not in rows_df.columns:
+        rows_df["Plant"] = ""
+    if "Train" not in rows_df.columns:
+        rows_df["Train"] = ""
+    rows_df["Country"] = rows_df["Country"].fillna("").astype(str).str.strip()
+    rows_df["Plant"] = rows_df["Plant"].fillna("").astype(str).str.strip()
+    rows_df["Train"] = rows_df["Train"].fillna("").astype(str).str.strip()
+    rows_df["train_display"] = rows_df["Train"].where(rows_df["Train"].ne(""), "(No Train)")
+    rows_df["display_sort_country"] = rows_df.get("display_sort_country", rows_df["Country"]).fillna("")
+    rows_df["display_sort_country"] = rows_df["display_sort_country"].where(
+        rows_df["display_sort_country"].astype(str).str.strip().ne(""),
+        rows_df["Country"],
+    )
+    rows_df["display_sort_plant"] = rows_df.get("display_sort_plant", rows_df["Plant"]).fillna("")
+    rows_df["display_sort_plant"] = rows_df["display_sort_plant"].where(
+        rows_df["display_sort_plant"].astype(str).str.strip().ne(""),
+        rows_df["Plant"],
+    )
+    rows_df["display_sort_train"] = pd.to_numeric(
+        rows_df.get("display_sort_train"),
+        errors="coerce",
+    ).combine_first(pd.to_numeric(rows_df["Train"], errors="coerce"))
+    rows_df["source_date"] = pd.to_datetime(
+        rows_df.get(source_config["date_column"]),
+        errors="coerce",
+    )
+    rows_df["source_capacity"] = pd.to_numeric(
+        rows_df.get(source_config["capacity_column"]),
+        errors="coerce",
+    ).round(6)
+    if source_config["out_of_range_flag"] in rows_df.columns:
+        rows_df["source_out_of_range"] = rows_df[source_config["out_of_range_flag"]].map(
+            _coerce_train_timeline_import_bool
+        )
+    else:
+        rows_df["source_out_of_range"] = False
+
+    source_direction = rows_df["source_capacity"].map(_normalize_capacity_change_direction)
+    if "timeline_direction" in rows_df.columns:
+        rows_df["timeline_direction"] = rows_df["timeline_direction"].where(
+            rows_df["timeline_direction"].notna(),
+            source_direction,
+        )
+    else:
+        rows_df["timeline_direction"] = source_direction
+    rows_df["timeline_direction"] = rows_df["timeline_direction"].where(
+        source_direction.isna(),
+        source_direction,
+    )
+
+    if compare_config:
+        rows_df["compare_date"] = pd.to_datetime(
+            rows_df.get(compare_config["date_column"]),
+            errors="coerce",
+        )
+        if compare_config["out_of_range_flag"] in rows_df.columns:
+            rows_df["compare_out_of_range"] = rows_df[compare_config["out_of_range_flag"]].map(
+                _coerce_train_timeline_import_bool
+            )
+        else:
+            rows_df["compare_out_of_range"] = False
+    else:
+        rows_df["compare_date"] = pd.NaT
+        rows_df["compare_out_of_range"] = False
+    rows_df["compare_missing"] = rows_df["compare_date"].isna()
+    rows_df["missing_train_label"] = rows_df["train_display"].where(
+        rows_df["compare_missing"],
+        "",
+    )
+
+    visible_mask = (
+        rows_df["Country"].ne("")
+        & rows_df["Plant"].ne("")
+        & rows_df["source_date"].notna()
+        & rows_df["source_capacity"].notna()
+        & rows_df["source_capacity"].round(6).ne(0)
+        & rows_df["timeline_direction"].notna()
+        & ~rows_df["source_out_of_range"]
+    )
+    rows_df = rows_df[visible_mask].copy()
+    if rows_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows_df["source_month_start"] = rows_df["source_date"].dt.to_period("M").dt.to_timestamp()
+    rows_df["__train_blank_sort"] = rows_df["Train"].eq("").astype(int)
+    rows_df = rows_df.sort_values(
+        [
+            "display_sort_country",
+            "display_sort_plant",
+            "__train_blank_sort",
+            "display_sort_train",
+            "Train",
+            "source_date",
+        ],
+        ascending=[True, True, False, True, True, True],
+        na_position="last",
+    ).drop(columns=["__train_blank_sort"], errors="ignore").reset_index(drop=True)
+
+    return rows_df[columns]
+
+
+def _create_train_timeline_comparison_figure(
+    timeline_row_data: list[dict] | None,
+    source_key: str,
+    compare_key: str,
+    start_date: str | None,
+    end_date: str | None,
+    source_label: str,
+    compare_label: str,
+) -> go.Figure:
+    event_df = _build_train_timeline_chart_rows(
+        timeline_row_data,
+        source_key=source_key,
+        compare_key=compare_key,
+    )
+    if event_df.empty:
+        return _create_empty_capacity_figure(
+            f"No valid {source_label} train timeline rows are available for the current selection."
+        )
+
+    start_month = _normalize_month_date(start_date) or event_df["source_month_start"].min()
+    end_month = _normalize_month_date(end_date) or event_df["source_month_start"].max()
+    if start_month is None or end_month is None:
+        return _create_empty_capacity_figure("No valid train timeline rows are available.")
+
+    chart_start_date = start_month - pd.DateOffset(days=15)
+    chart_end_date = end_month + pd.offsets.MonthEnd(1) + pd.DateOffset(days=15)
+    title_date_range = f"{start_month.strftime('%B %Y')} - {end_month.strftime('%B %Y')}"
+    compare_differs = str(source_key or "").strip().casefold() != str(compare_key or "").strip().casefold()
+
+    monthly_df = (
+        event_df.groupby(
+            ["Country", "Plant", "source_month_start", "timeline_direction"],
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            {
+                "source_capacity": "sum",
+                "source_date": "count",
+                "compare_missing": "sum",
+                "missing_train_label": _combine_distinct_text_values,
+                "display_sort_country": "last",
+                "display_sort_plant": "last",
+                "display_sort_train": "last",
+            }
+        )
+        .rename(
+            columns={
+                "source_month_start": "month_start",
+                "source_capacity": "capacity",
+                "source_date": "train_count",
+            }
+        )
+    )
+    monthly_df = monthly_df[monthly_df["capacity"].round(6).ne(0)].copy()
+    if monthly_df.empty:
+        return _create_empty_capacity_figure(
+            f"No valid {source_label} train timeline rows are available for the current selection."
+        )
+    monthly_df["missing_count"] = pd.to_numeric(
+        monthly_df["compare_missing"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+    monthly_df["train_count"] = pd.to_numeric(
+        monthly_df["train_count"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+    monthly_df["missing_train_label"] = monthly_df["missing_train_label"].fillna("").astype(str).str.strip()
+    monthly_df["__all_missing_in_compare"] = (
+        monthly_df["missing_count"].gt(0)
+        & monthly_df["missing_count"].eq(monthly_df["train_count"])
+    )
+    monthly_df["__mixed_missing_in_compare"] = (
+        monthly_df["missing_count"].gt(0)
+        & monthly_df["missing_count"].lt(monthly_df["train_count"])
+    )
+
+    plants_df = (
+        monthly_df[
+            [
+                "Country",
+                "Plant",
+                "display_sort_country",
+                "display_sort_plant",
+            ]
+        ]
+        .drop_duplicates()
+        .sort_values(
+            ["display_sort_country", "display_sort_plant", "Country", "Plant"],
+            ascending=[True, True, True, True],
+            na_position="last",
+        )
+        .reset_index(drop=True)
+    )
+
+    max_abs_capacity = float(monthly_df["capacity"].abs().max()) if not monthly_df.empty else 0.0
+    lane_half_height = max(max_abs_capacity * 1.15, 4.0)
+    row_spacing = max(lane_half_height * 2.8, 14.0)
+    annotation_padding = max(lane_half_height * 0.12, 0.8)
+    count_offset = lane_half_height * 0.62
+    arrow_offset = lane_half_height * 0.78
+    missing_badge_offset = lane_half_height * 0.34
+    missing_outline_color = "#d97706"
+    has_missing_compare = bool(monthly_df["missing_count"].gt(0).any())
+
+    fig = go.Figure()
+    plant_to_y: dict[tuple[str, str], float] = {}
+    y_ticks: list[float] = []
+    y_labels: list[str] = []
+    y_position = 0.0
+
+    for _, plant_info in plants_df.iterrows():
+        plant_key = (plant_info["Country"], plant_info["Plant"])
+        plant_to_y[plant_key] = y_position
+        y_ticks.append(y_position)
+        y_labels.append(plant_info["Plant"])
+
+        plant_months = monthly_df[
+            (monthly_df["Country"] == plant_info["Country"])
+            & (monthly_df["Plant"] == plant_info["Plant"])
+        ]
+        color = _resolve_country_color(plant_info["Country"], len(plant_to_y) - 1)
+
+        for _, month_data in plant_months.iterrows():
+            capacity = float(month_data["capacity"])
+            month_date = pd.Timestamp(month_data["month_start"])
+            missing_count = int(month_data["missing_count"])
+            train_count = int(month_data["train_count"])
+            missing_train_summary = str(month_data["missing_train_label"] or "").strip()
+            hover_missing_line = f"<br>Missing in {compare_label}: No"
+            if missing_count > 0 and compare_differs:
+                hover_missing_line = (
+                    f"<br>Missing in {compare_label}: Yes ({missing_count}/{train_count})"
+                )
+                if missing_train_summary:
+                    hover_missing_line += f"<br>Missing trains: {missing_train_summary}"
+            fig.add_trace(
+                go.Bar(
+                    x=[month_date],
+                    y=[capacity],
+                    base=y_position,
+                    width=10 * 24 * 60 * 60 * 1000,
+                    marker=dict(
+                        color=color,
+                        line=dict(
+                            color=missing_outline_color if bool(month_data["__all_missing_in_compare"]) and compare_differs else color,
+                            width=2.0 if bool(month_data["__all_missing_in_compare"]) and compare_differs else 0,
+                        ),
+                        opacity=0.85,
+                    ),
+                    orientation="v",
+                    showlegend=False,
+                    hovertemplate=(
+                        f"<b>{plant_info['Plant']}</b><br>{plant_info['Country']}"
+                        f"<br>Source: {source_label}"
+                        f"<br>Direction: {str(month_data['timeline_direction']).title()}"
+                        "<br>Capacity: %{y:.1f} MTPA"
+                        "<br>Date: %{x|%b %Y}"
+                        + hover_missing_line
+                        + "<extra></extra>"
+                    ),
+                )
+            )
+
+            if abs(capacity) >= 3.0:
+                label_y = y_position + capacity + (annotation_padding if capacity >= 0 else -annotation_padding)
+                fig.add_annotation(
+                    x=month_date,
+                    y=label_y,
+                    text=f"{capacity:.1f}",
+                    showarrow=False,
+                    font=dict(size=9, color=color, family="Arial", weight="bold"),
+                    xanchor="center",
+                    yanchor="bottom" if capacity >= 0 else "top",
+                )
+
+            if int(month_data["train_count"]) > 1:
+                fig.add_annotation(
+                    x=month_date,
+                    y=y_position - count_offset if capacity >= 0 else y_position + count_offset,
+                    text=str(int(month_data["train_count"])),
+                    showarrow=False,
+                    font=dict(size=7, color=color, family="Arial"),
+                    xanchor="center",
+                    yanchor="top" if capacity >= 0 else "bottom",
+                    opacity=0.9,
+                )
+
+            if bool(month_data["__mixed_missing_in_compare"]) and compare_differs:
+                missing_badge_y = (
+                    y_position + capacity + (annotation_padding + missing_badge_offset)
+                    if capacity >= 0
+                    else y_position + capacity - (annotation_padding + missing_badge_offset)
+                )
+                fig.add_annotation(
+                    x=month_date,
+                    y=missing_badge_y,
+                    text=str(missing_count),
+                    showarrow=False,
+                    font=dict(size=8, color=missing_outline_color, family="Arial", weight="bold"),
+                    bgcolor="rgba(251, 191, 36, 0.18)",
+                    bordercolor=missing_outline_color,
+                    borderwidth=0.8,
+                    borderpad=2,
+                    xanchor="center",
+                    yanchor="bottom" if capacity >= 0 else "top",
+                )
+
+        y_position += row_spacing
+
+    for idx, (_, plant_info) in enumerate(plants_df.iterrows()):
+        color = _resolve_country_color(plant_info["Country"], idx)
+        y_center = y_ticks[idx]
+        y_top = y_center - row_spacing / 2 if idx == 0 else (y_ticks[idx - 1] + y_ticks[idx]) / 2
+        y_bottom = y_center + row_spacing / 2 if idx == len(y_ticks) - 1 else (y_ticks[idx] + y_ticks[idx + 1]) / 2
+        fig.add_shape(
+            type="rect",
+            x0=chart_start_date,
+            x1=chart_end_date,
+            y0=y_top,
+            y1=y_bottom,
+            fillcolor=color,
+            opacity=0.05,
+            line_width=0,
+            layer="below",
+        )
+        fig.add_shape(
+            type="line",
+            x0=chart_start_date,
+            x1=chart_end_date,
+            y0=y_center,
+            y1=y_center,
+            line=dict(color="rgba(148, 163, 184, 0.25)", width=0.6),
+            layer="below",
+        )
+
+    for year in range(start_month.year, end_month.year + 1):
+        year_start = pd.Timestamp(f"{year}-01-01")
+        if chart_start_date <= year_start <= chart_end_date:
+            fig.add_shape(
+                type="line",
+                x0=year_start,
+                x1=year_start,
+                y0=(y_ticks[0] - row_spacing / 2) if y_ticks else 0,
+                y1=(y_ticks[-1] + row_spacing / 2) if y_ticks else 1,
+                line=dict(color="#999999", width=1, dash="solid"),
+                opacity=0.35,
+                layer="below",
+            )
+
+    first_of_month = pd.Timestamp.now().to_period("M").to_timestamp()
+    if chart_start_date <= first_of_month <= chart_end_date and y_ticks:
+        fig.add_shape(
+            type="line",
+            x0=first_of_month,
+            x1=first_of_month,
+            y0=y_ticks[0] - row_spacing / 2,
+            y1=y_ticks[-1] + row_spacing / 2,
+            line=dict(color="#E74C3C", width=2, dash="dash"),
+            layer="above",
+        )
+        fig.add_annotation(
+            x=first_of_month,
+            y=y_ticks[-1] + row_spacing * 0.42,
+            text="Today",
+            showarrow=False,
+            font=dict(size=10, color="#E74C3C", family="Arial", weight="bold"),
+            bgcolor="white",
+            bordercolor="#E74C3C",
+            borderwidth=1,
+            borderpad=3,
+        )
+
+    if compare_differs:
+        arrow_df = event_df[
+            event_df["compare_date"].notna()
+            & ~event_df["compare_out_of_range"]
+            & event_df["source_date"].ne(event_df["compare_date"])
+        ].copy()
+        if not arrow_df.empty:
+            visible_arrow_mask = (
+                (arrow_df["source_date"] >= chart_start_date)
+                & (arrow_df["source_date"] <= chart_end_date)
+                & (arrow_df["compare_date"] >= chart_start_date)
+                & (arrow_df["compare_date"] <= chart_end_date)
+            )
+            arrow_df = arrow_df[visible_arrow_mask].copy()
+
+        for _, row in arrow_df.iterrows():
+            y_pos = plant_to_y.get((row["Country"], row["Plant"]))
+            if y_pos is None:
+                continue
+
+            source_date = pd.Timestamp(row["source_date"])
+            compare_date = pd.Timestamp(row["compare_date"])
+            moved_earlier = source_date < compare_date
+            arrow_color = "#2E8B57" if moved_earlier else "#B22222"
+            arrow_y = y_pos - arrow_offset if row["timeline_direction"] == "addition" else y_pos + arrow_offset
+            label_y = arrow_y + annotation_padding if row["timeline_direction"] == "addition" else arrow_y - annotation_padding
+            days_diff = abs((source_date - compare_date).days)
+            months_diff = max(1, round(days_diff / 30.44))
+
+            fig.add_annotation(
+                x=source_date,
+                y=arrow_y,
+                ax=compare_date,
+                ay=arrow_y,
+                xref="x",
+                yref="y",
+                axref="x",
+                ayref="y",
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1.5,
+                arrowwidth=2,
+                arrowcolor=arrow_color,
+                opacity=0.82,
+            )
+            fig.add_annotation(
+                x=compare_date + (source_date - compare_date) / 2,
+                y=label_y,
+                text=f"{months_diff:.0f}m",
+                showarrow=False,
+                font=dict(size=8, color=arrow_color, family="Arial", weight="bold"),
+                bgcolor="white",
+                bordercolor=arrow_color,
+                borderwidth=0.5,
+                borderpad=2,
+                opacity=0.9,
+                yanchor="bottom" if row["timeline_direction"] == "addition" else "top",
+            )
+
+    month_span = (_month_difference(start_month, end_month) or 0) + 1
+    if month_span <= 18:
+        dtick = "M3"
+        tickformat = "%b\n%Y"
+    elif month_span <= 48:
+        dtick = "M6"
+        tickformat = "%b\n%Y"
+    else:
+        dtick = "M12"
+        tickformat = "%Y"
+
+    y_min = y_ticks[0] - row_spacing / 2 if y_ticks else -10
+    y_max = y_ticks[-1] + row_spacing / 2 if y_ticks else 10
+    note_text = (
+        "Bars show the selected source in MTPA • Reductions are drawn downward • "
+        "Numbers near bars indicate multiple train rows in the same plant/month/sign bucket"
+    )
+    if compare_differs:
+        note_text += f" • Arrows show date shifts from {compare_label} to {source_label}"
+        if has_missing_compare:
+            note_text += f" • Amber outline / badge = present in {source_label} but missing in {compare_label}"
+
+    fig.update_layout(
+        xaxis=dict(
+            title="",
+            range=[chart_start_date, chart_end_date],
+            type="date",
+            tickformat=tickformat,
+            dtick=dtick,
+            tickfont=dict(size=10, family="Arial", color="#333333"),
+            tickangle=0,
+            showgrid=False,
+            showline=True,
+            linewidth=1,
+            linecolor="#CCCCCC",
+            zeroline=False,
+        ),
+        yaxis=dict(
+            title="",
+            range=[y_min, y_max],
+            tickmode="array",
+            tickvals=y_ticks,
+            ticktext=y_labels,
+            tickfont=dict(size=11, family="Arial", color="#333333"),
+            showgrid=False,
+            showline=True,
+            linewidth=1,
+            linecolor="#CCCCCC",
+            zeroline=False,
+            side="left",
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=max(820, len(y_ticks) * 56),
+        margin=dict(l=220, r=180, t=24, b=95),
+        hovermode="closest",
+        showlegend=False,
+        bargap=0,
+        barmode="overlay",
+        uirevision="capacity-train-timeline-chart",
+        dragmode="pan",
+    )
+
+    current_country = None
+    country_start_idx = 0
+    for idx, (_, plant_info) in enumerate(plants_df.iterrows()):
+        country = plant_info["Country"]
+        if country != current_country:
+            if current_country is not None:
+                mid_y = (y_ticks[country_start_idx] + y_ticks[idx - 1]) / 2
+                fig.add_annotation(
+                    x=1.005,
+                    y=mid_y,
+                    xref="paper",
+                    yref="y",
+                    text=current_country,
+                    showarrow=False,
+                    font=dict(
+                        size=12,
+                        color=_resolve_country_color(current_country, country_start_idx),
+                        family="Arial",
+                        weight="bold",
+                    ),
+                    xanchor="left",
+                    yanchor="middle",
+                )
+            current_country = country
+            country_start_idx = idx
+
+    if current_country is not None and y_ticks:
+        mid_y = (y_ticks[country_start_idx] + y_ticks[-1]) / 2
+        fig.add_annotation(
+            x=1.005,
+            y=mid_y,
+            xref="paper",
+            yref="y",
+            text=current_country,
+            showarrow=False,
+            font=dict(
+                size=12,
+                color=_resolve_country_color(current_country, country_start_idx),
+                family="Arial",
+                weight="bold",
+            ),
+            xanchor="left",
+            yanchor="middle",
+        )
+
+    fig.add_annotation(
+        x=0,
+        y=-0.08,
+        xref="paper",
+        yref="paper",
+        text=note_text,
+        showarrow=False,
+        font=dict(size=9, color="#666666", family="Arial", style="italic"),
+        xanchor="left",
+        yanchor="top",
     )
 
     return fig
@@ -2686,6 +5413,7 @@ def _build_train_change_log(
         "Parent Source Name",
         "Train Source Field",
         "Train Source Name",
+        "Train Display Source Name",
         "Mapping Applied",
         "Train Mapping Applied",
     ]
@@ -2727,6 +5455,15 @@ def _build_train_change_log(
     )
     train_df["raw_train_name"] = (
         train_df.get("raw_train_name", train_df.get("lng_train_name_short"))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    train_df["raw_train_display_name"] = (
+        train_df.get(
+            "raw_train_display_name",
+            train_df.get("lng_train_name", train_df.get("raw_train_name", train_df.get("lng_train_name_short"))),
+        )
         .fillna("")
         .astype(str)
         .str.strip()
@@ -2779,6 +5516,7 @@ def _build_train_change_log(
                 "raw_plant_name": "last",
                 "plant_mapping_applied": "max",
                 "raw_train_name": "last",
+                "raw_train_display_name": "last",
                 "train": "last",
                 "train_mapping_applied": "max",
                 "train_series_key": "last",
@@ -2798,6 +5536,7 @@ def _build_train_change_log(
                 "raw_plant_name": "last",
                 "plant_mapping_applied": "last",
                 "raw_train_name": "last",
+                "raw_train_display_name": "last",
                 "train": "last",
                 "train_mapping_applied": "last",
             }
@@ -2837,7 +5576,7 @@ def _build_train_change_log(
     )
     expanded_df["delta_mtpa"] = (
         expanded_df["capacity_mtpa"] - expanded_df["previous_capacity_mtpa"]
-    ).round(2)
+    )
 
     change_df = expanded_df[
         (expanded_df["month"] >= start_month)
@@ -2852,7 +5591,7 @@ def _build_train_change_log(
     change_df["Country"] = change_df["country_name"]
     change_df["Plant"] = change_df["plant_name"]
     change_df["Train"] = change_df["train"]
-    change_df["Delta MTPA"] = change_df["delta_mtpa"].round(2)
+    change_df["Delta MTPA"] = change_df["delta_mtpa"].round(6)
     change_df["Abs Delta"] = change_df["Delta MTPA"].abs()
     change_df["Source Field"] = "plant_name"
     change_df["Source Name"] = change_df["raw_plant_name"].where(
@@ -2866,6 +5605,10 @@ def _build_train_change_log(
     )
     change_df["Train Source Field"] = "lng_train_name_short"
     change_df["Train Source Name"] = change_df["raw_train_name"]
+    change_df["Train Display Source Name"] = change_df["raw_train_display_name"].where(
+        change_df["raw_train_display_name"].notna() & change_df["raw_train_display_name"].ne(""),
+        change_df["Train Source Name"],
+    )
     change_df["Mapping Applied"] = (
         change_df["plant_mapping_applied"].fillna(False).astype(bool)
     )
@@ -2952,11 +5695,11 @@ def _build_ea_change_log(
         return pd.DataFrame(columns=empty_columns)
 
     negative_mask = ea_df["status_key"].isin(EA_NEGATIVE_STATUSES)
-    ea_df["EA Adds (MTPA)"] = ea_df["capacity_mtpa"].where(~negative_mask, 0.0).round(2)
-    ea_df["EA Reductions (MTPA)"] = (-ea_df["capacity_mtpa"]).where(negative_mask, 0.0).round(2)
+    ea_df["EA Adds (MTPA)"] = ea_df["capacity_mtpa"].where(~negative_mask, 0.0).round(6)
+    ea_df["EA Reductions (MTPA)"] = (-ea_df["capacity_mtpa"]).where(negative_mask, 0.0).round(6)
     ea_df["EA Net Delta (MTPA)"] = (
         ea_df["EA Adds (MTPA)"] + ea_df["EA Reductions (MTPA)"]
-    ).round(2)
+    ).round(6)
     ea_df["EA Abs Delta"] = ea_df["EA Net Delta (MTPA)"].abs()
     ea_df["Effective Date"] = ea_df["month"].dt.strftime("%Y-%m-%d")
     ea_df["Country"] = ea_df["country_name"]
@@ -3668,12 +6411,42 @@ def _create_unmapped_train_mapping_section(
     )
 
 
-def _create_capacity_table(table_id: str, df: pd.DataFrame) -> dash_table.DataTable | html.Div:
+def _build_capacity_table_delta_view(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    delta_df = df.copy()
+    numeric_columns = [column for column in delta_df.columns if column not in {"Month", "__axis_date"}]
+    if not numeric_columns:
+        return delta_df
+
+    delta_df[numeric_columns] = (
+        delta_df[numeric_columns]
+        .apply(pd.to_numeric, errors="coerce")
+        .diff()
+    )
+    delta_df.loc[delta_df.index[0], numeric_columns] = pd.NA
+    return delta_df
+
+
+def _apply_capacity_table_view(df: pd.DataFrame, table_view: str) -> pd.DataFrame:
+    if table_view == "change":
+        return _build_capacity_table_delta_view(df)
+
+    return df.copy()
+
+
+def _create_capacity_table(
+    table_id: str,
+    df: pd.DataFrame,
+    table_view: str = "absolute",
+) -> dash_table.DataTable | html.Div:
     if df.empty:
         return _create_empty_state("No data available for the current selection.")
 
+    display_df = df.drop(columns=["__axis_date"], errors="ignore").copy()
     base_config = StandardTableStyleManager.get_base_datatable_config()
-    numeric_columns = [column for column in df.columns if column != "Month"]
+    numeric_columns = [column for column in display_df.columns if column != "Month"]
 
     columns = [{"name": "Month", "id": "Month"}]
     columns.extend(
@@ -3681,7 +6454,7 @@ def _create_capacity_table(table_id: str, df: pd.DataFrame) -> dash_table.DataTa
             "name": column_name,
             "id": column_name,
             "type": "numeric",
-            "format": Format(precision=2, scheme=Scheme.fixed),
+            "format": Format(precision=1, scheme=Scheme.fixed),
         }
         for column_name in numeric_columns
     )
@@ -3715,10 +6488,40 @@ def _create_capacity_table(table_id: str, df: pd.DataFrame) -> dash_table.DataTa
                 }
             )
 
+    if table_view == "change":
+        for column_name in numeric_columns:
+            style_data_conditional.extend(
+                [
+                    {
+                        "if": {
+                            "column_id": column_name,
+                            "filter_query": f"{{{column_name}}} > 0",
+                        },
+                        "color": "#166534",
+                        "fontWeight": "700",
+                    },
+                    {
+                        "if": {
+                            "column_id": column_name,
+                            "filter_query": f"{{{column_name}}} < 0",
+                        },
+                        "color": "#991b1b",
+                        "fontWeight": "700",
+                    },
+                    {
+                        "if": {
+                            "column_id": column_name,
+                            "filter_query": f"{{{column_name}}} = 0",
+                        },
+                        "color": "#64748b",
+                    },
+                ]
+            )
+
     return dash_table.DataTable(
         id=table_id,
         columns=columns,
-        data=df.to_dict("records"),
+        data=display_df.to_dict("records"),
         sort_action="native",
         page_action="none",
         fill_width=False,
@@ -3740,15 +6543,9 @@ def _create_capacity_table(table_id: str, df: pd.DataFrame) -> dash_table.DataTa
             "border": f"1px solid {TABLE_COLORS['border_light']}",
             "padding": "6px 8px",
         },
-        style_cell_conditional=_build_responsive_column_styles(df),
+        style_cell_conditional=_build_responsive_column_styles(display_df),
         style_data_conditional=style_data_conditional,
     )
-
-
-def _format_capacity_value(value: float, signed: bool = False) -> str:
-    if signed:
-        return f"{value:+,.2f}"
-    return f"{value:,.2f}"
 
 
 def _numeric_or_blank(value: float | int | None) -> float | None:
@@ -3795,6 +6592,10 @@ def _apply_train_change_time_view(
             period_df["__period_start"].dt.year.astype(str)
             + "-Q"
             + period_df["__period_start"].dt.quarter.astype(str)
+        )
+    elif time_view == "seasonally":
+        period_df["__period_start"], period_df["Effective Date"] = _build_lng_season_periods(
+            period_dates
         )
     elif time_view == "yearly":
         period_df["__period_start"] = period_dates.dt.to_period("Y").dt.start_time
@@ -4046,6 +6847,15 @@ def _build_flat_plants_trains_rows(
                     "EA Adds (MTPA)": _numeric_or_blank(plant_row.get("EA Adds (MTPA)")),
                     "EA Reductions (MTPA)": _numeric_or_blank(plant_row.get("EA Reductions (MTPA)")),
                     "EA Net Delta (MTPA)": _numeric_or_blank(plant_row.get("EA Net Delta (MTPA)")),
+                    INTERNAL_SCENARIO_ADDS_COLUMN: _numeric_or_blank(
+                        plant_row.get(INTERNAL_SCENARIO_ADDS_COLUMN)
+                    ),
+                    INTERNAL_SCENARIO_REDUCTIONS_COLUMN: _numeric_or_blank(
+                        plant_row.get(INTERNAL_SCENARIO_REDUCTIONS_COLUMN)
+                    ),
+                    INTERNAL_SCENARIO_NET_COLUMN: _numeric_or_blank(
+                        plant_row.get(INTERNAL_SCENARIO_NET_COLUMN)
+                    ),
                     "Type": "plant",
                     "country_group_key": "",
                     "plant_group_key": "",
@@ -4086,6 +6896,15 @@ def _build_flat_plants_trains_rows(
                     "EA Net Delta (MTPA)": _numeric_or_blank(
                         train_row.get("EA Net Delta (MTPA)")
                     ),
+                    INTERNAL_SCENARIO_ADDS_COLUMN: _numeric_or_blank(
+                        train_row.get(INTERNAL_SCENARIO_ADDS_COLUMN)
+                    ),
+                    INTERNAL_SCENARIO_REDUCTIONS_COLUMN: _numeric_or_blank(
+                        train_row.get(INTERNAL_SCENARIO_REDUCTIONS_COLUMN)
+                    ),
+                    INTERNAL_SCENARIO_NET_COLUMN: _numeric_or_blank(
+                        train_row.get(INTERNAL_SCENARIO_NET_COLUMN)
+                    ),
                     "Type": "train",
                     "country_group_key": "",
                     "plant_group_key": "",
@@ -4100,12 +6919,10 @@ def _build_flat_plants_trains_rows(
 def _build_train_change_hierarchical_rows(
     woodmac_change_df: pd.DataFrame,
     ea_change_df: pd.DataFrame,
-    expanded_country_groups: list[str] | None = None,
-    expanded_plant_groups: list[str] | None = None,
+    internal_change_df: pd.DataFrame | None = None,
     woodmac_detail_df: pd.DataFrame | None = None,
     time_view: str = "monthly",
     detail_view: str = "country",
-    view_mode: str | None = None,
 ) -> pd.DataFrame:
     columns = [
         "Effective Date",
@@ -4122,32 +6939,30 @@ def _build_train_change_hierarchical_rows(
         "EA Adds (MTPA)",
         "EA Reductions (MTPA)",
         "EA Net Delta (MTPA)",
+        INTERNAL_SCENARIO_ADDS_COLUMN,
+        INTERNAL_SCENARIO_REDUCTIONS_COLUMN,
+        INTERNAL_SCENARIO_NET_COLUMN,
         "Type",
         "country_group_key",
         "plant_group_key",
         "month_group_key",
         "month_group_end",
     ]
-    if woodmac_change_df.empty and ea_change_df.empty:
+    internal_change_df = pd.DataFrame() if internal_change_df is None else internal_change_df.copy()
+    if woodmac_change_df.empty and ea_change_df.empty and internal_change_df.empty:
         return pd.DataFrame(columns=columns)
-
-    # Backward compatibility for any still-live callback path that passes the
-    # old `view_mode` keyword from the pre-refactor table controls.
-    if view_mode is not None:
-        detail_view = {
-            "summary": "country",
-            "country": "country",
-            "total": "total",
-            "plants": "plants",
-            "plants_trains": "plants_trains",
-        }.get(view_mode, detail_view)
 
     woodmac_detail_df = woodmac_change_df.copy() if woodmac_detail_df is None else woodmac_detail_df.copy()
 
     woodmac_period_df = _prepare_woodmac_period_change_df(woodmac_change_df, time_view)
     woodmac_detail_period_df = _prepare_woodmac_period_change_df(woodmac_detail_df, time_view)
     ea_period_df = _prepare_ea_period_change_df(ea_change_df, time_view)
-    unresolved_plant_keys = _collect_unresolved_train_keys(woodmac_period_df, ea_period_df)
+    internal_period_df = _prepare_internal_period_change_df(internal_change_df, time_view)
+    unresolved_plant_keys = _collect_unresolved_train_keys(
+        woodmac_period_df,
+        ea_period_df,
+        internal_period_df,
+    )
 
     woodmac_total_df = pd.DataFrame(columns=["__period_start", "Effective Date"])
     if not woodmac_period_df.empty:
@@ -4175,9 +6990,28 @@ def _build_train_change_hierarchical_rows(
             )
         )
 
+    internal_total_df = pd.DataFrame(columns=["__period_start", "Effective Date"])
+    if not internal_period_df.empty:
+        internal_total_df = (
+            internal_period_df.groupby(["__period_start", "Effective Date"], as_index=False)
+            .agg(
+                {
+                    INTERNAL_SCENARIO_ADDS_COLUMN: "sum",
+                    INTERNAL_SCENARIO_REDUCTIONS_COLUMN: "sum",
+                    INTERNAL_SCENARIO_NET_COLUMN: "sum",
+                }
+            )
+        )
+
     total_comparison_df = pd.merge(
         woodmac_total_df,
         ea_total_df,
+        on=["__period_start", "Effective Date"],
+        how="outer",
+    )
+    total_comparison_df = pd.merge(
+        total_comparison_df,
+        internal_total_df,
         on=["__period_start", "Effective Date"],
         how="outer",
     ).sort_values(["__period_start"]).reset_index(drop=True)
@@ -4208,9 +7042,28 @@ def _build_train_change_hierarchical_rows(
             )
         )
 
+    internal_country_df = pd.DataFrame(columns=["__period_start", "Effective Date", "Country"])
+    if not internal_period_df.empty:
+        internal_country_df = (
+            internal_period_df.groupby(["__period_start", "Effective Date", "Country"], as_index=False)
+            .agg(
+                {
+                    INTERNAL_SCENARIO_ADDS_COLUMN: "sum",
+                    INTERNAL_SCENARIO_REDUCTIONS_COLUMN: "sum",
+                    INTERNAL_SCENARIO_NET_COLUMN: "sum",
+                }
+            )
+        )
+
     country_comparison_df = pd.merge(
         woodmac_country_df,
         ea_country_df,
+        on=["__period_start", "Effective Date", "Country"],
+        how="outer",
+    )
+    country_comparison_df = pd.merge(
+        country_comparison_df,
+        internal_country_df,
         on=["__period_start", "Effective Date", "Country"],
         how="outer",
     ).sort_values(["__period_start", "Country"]).reset_index(drop=True)
@@ -4259,9 +7112,29 @@ def _build_train_change_hierarchical_rows(
             )
         )
 
+    internal_plant_df = pd.DataFrame(columns=["__period_start", "Effective Date", "Country", "Plant"])
+    if not internal_period_df.empty:
+        internal_plant_df = (
+            internal_period_df.groupby(["__period_start", "Effective Date", "Country", "Plant"], as_index=False)
+            .agg(
+                {
+                    INTERNAL_SCENARIO_ADDS_COLUMN: "sum",
+                    INTERNAL_SCENARIO_REDUCTIONS_COLUMN: "sum",
+                    INTERNAL_SCENARIO_NET_COLUMN: "sum",
+                    "Internal Scenario Activity Abs": "sum",
+                }
+            )
+        )
+
     plant_comparison_df = pd.merge(
         woodmac_plant_df,
         ea_plant_df,
+        on=["__period_start", "Effective Date", "Country", "Plant"],
+        how="outer",
+    )
+    plant_comparison_df = pd.merge(
+        plant_comparison_df,
+        internal_plant_df,
         on=["__period_start", "Effective Date", "Country", "Plant"],
         how="outer",
     )
@@ -4269,6 +7142,7 @@ def _build_train_change_hierarchical_rows(
         plant_comparison_df["__sort_abs"] = (
             plant_comparison_df.get("Woodmac Activity Abs", pd.Series(dtype=float)).fillna(0.0)
             + plant_comparison_df.get("EA Activity Abs", pd.Series(dtype=float)).fillna(0.0)
+            + plant_comparison_df.get("Internal Scenario Activity Abs", pd.Series(dtype=float)).fillna(0.0)
         )
         plant_comparison_df = plant_comparison_df.sort_values(
             ["__period_start", "Country", "__sort_abs", "Plant"],
@@ -4279,6 +7153,7 @@ def _build_train_change_hierarchical_rows(
         woodmac_detail_period_df["Train"].notna()
     ].copy()
     ea_train_df = ea_period_df[ea_period_df["Train"].notna()].copy()
+    internal_train_df = internal_period_df[internal_period_df["Train"].notna()].copy()
     train_comparison_df = pd.merge(
         woodmac_train_df[
             [
@@ -4308,6 +7183,24 @@ def _build_train_change_hierarchical_rows(
                 "EA Reductions (MTPA)",
                 "EA Net Delta (MTPA)",
                 "EA Activity Abs",
+            ]
+        ],
+        on=["__period_start", "Effective Date", "Country", "Plant", "Train"],
+        how="outer",
+    )
+    train_comparison_df = pd.merge(
+        train_comparison_df,
+        internal_train_df[
+            [
+                "__period_start",
+                "Effective Date",
+                "Country",
+                "Plant",
+                "Train",
+                INTERNAL_SCENARIO_ADDS_COLUMN,
+                INTERNAL_SCENARIO_REDUCTIONS_COLUMN,
+                INTERNAL_SCENARIO_NET_COLUMN,
+                "Internal Scenario Activity Abs",
             ]
         ],
         on=["__period_start", "Effective Date", "Country", "Plant", "Train"],
@@ -4344,6 +7237,9 @@ def _build_train_change_hierarchical_rows(
                 "EA Adds (MTPA)": _numeric_or_blank(row.get("EA Adds (MTPA)")),
                 "EA Reductions (MTPA)": _numeric_or_blank(row.get("EA Reductions (MTPA)")),
                 "EA Net Delta (MTPA)": _numeric_or_blank(row.get("EA Net Delta (MTPA)")),
+                INTERNAL_SCENARIO_ADDS_COLUMN: _numeric_or_blank(row.get(INTERNAL_SCENARIO_ADDS_COLUMN)),
+                INTERNAL_SCENARIO_REDUCTIONS_COLUMN: _numeric_or_blank(row.get(INTERNAL_SCENARIO_REDUCTIONS_COLUMN)),
+                INTERNAL_SCENARIO_NET_COLUMN: _numeric_or_blank(row.get(INTERNAL_SCENARIO_NET_COLUMN)),
                 "Type": "total",
                 "country_group_key": "",
                 "plant_group_key": "",
@@ -4365,6 +7261,9 @@ def _build_train_change_hierarchical_rows(
                 "EA Adds (MTPA)": _numeric_or_blank(row.get("EA Adds (MTPA)")),
                 "EA Reductions (MTPA)": _numeric_or_blank(row.get("EA Reductions (MTPA)")),
                 "EA Net Delta (MTPA)": _numeric_or_blank(row.get("EA Net Delta (MTPA)")),
+                INTERNAL_SCENARIO_ADDS_COLUMN: _numeric_or_blank(row.get(INTERNAL_SCENARIO_ADDS_COLUMN)),
+                INTERNAL_SCENARIO_REDUCTIONS_COLUMN: _numeric_or_blank(row.get(INTERNAL_SCENARIO_REDUCTIONS_COLUMN)),
+                INTERNAL_SCENARIO_NET_COLUMN: _numeric_or_blank(row.get(INTERNAL_SCENARIO_NET_COLUMN)),
                 "Type": "country",
                 "country_group_key": "",
                 "plant_group_key": "",
@@ -4401,6 +7300,9 @@ def _build_train_change_hierarchical_rows(
                     "EA Adds (MTPA)": _numeric_or_blank(plant_row.get("EA Adds (MTPA)")),
                     "EA Reductions (MTPA)": _numeric_or_blank(plant_row.get("EA Reductions (MTPA)")),
                     "EA Net Delta (MTPA)": _numeric_or_blank(plant_row.get("EA Net Delta (MTPA)")),
+                    INTERNAL_SCENARIO_ADDS_COLUMN: _numeric_or_blank(plant_row.get(INTERNAL_SCENARIO_ADDS_COLUMN)),
+                    INTERNAL_SCENARIO_REDUCTIONS_COLUMN: _numeric_or_blank(plant_row.get(INTERNAL_SCENARIO_REDUCTIONS_COLUMN)),
+                    INTERNAL_SCENARIO_NET_COLUMN: _numeric_or_blank(plant_row.get(INTERNAL_SCENARIO_NET_COLUMN)),
                     "Type": "plant",
                     "country_group_key": "",
                     "plant_group_key": "",
@@ -4422,7 +7324,10 @@ def _build_train_change_hierarchical_rows(
     return hierarchical_df
 
 
-def _create_train_change_table(table_id: str, change_df: pd.DataFrame) -> dash_table.DataTable | html.Div:
+def _create_train_change_table(
+    change_df: pd.DataFrame,
+    internal_scenario_label: str | None = None,
+) -> dash_table.DataTable | html.Div:
     if change_df.empty:
         return html.Div(
             [
@@ -4437,32 +7342,8 @@ def _create_train_change_table(table_id: str, change_df: pd.DataFrame) -> dash_t
         {"name": ["Plant", ""], "id": "Plant", "type": "text"},
         {"name": ["Train", ""], "id": "Train", "type": "text"},
         {
-            "name": ["Woodmac", "Adds"],
-            "id": "Woodmac Adds (MTPA)",
-            "type": "numeric",
-            "format": {"specifier": ".2f"},
-        },
-        {
-            "name": ["Woodmac", "Reductions"],
-            "id": "Woodmac Reductions (MTPA)",
-            "type": "numeric",
-            "format": {"specifier": ".2f"},
-        },
-        {
             "name": ["Woodmac", "Net Delta"],
             "id": "Woodmac Net Delta (MTPA)",
-            "type": "numeric",
-            "format": {"specifier": ".2f"},
-        },
-        {
-            "name": ["Energy Aspects", "Adds"],
-            "id": "EA Adds (MTPA)",
-            "type": "numeric",
-            "format": {"specifier": ".2f"},
-        },
-        {
-            "name": ["Energy Aspects", "Reductions"],
-            "id": "EA Reductions (MTPA)",
             "type": "numeric",
             "format": {"specifier": ".2f"},
         },
@@ -4472,12 +7353,29 @@ def _create_train_change_table(table_id: str, change_df: pd.DataFrame) -> dash_t
             "type": "numeric",
             "format": {"specifier": ".2f"},
         },
+    ]
+
+    if internal_scenario_label:
+        columns.extend(
+            [
+                {
+                    "name": [internal_scenario_label, "Net Delta"],
+                    "id": INTERNAL_SCENARIO_NET_COLUMN,
+                    "type": "numeric",
+                    "format": {"specifier": ".2f"},
+                },
+            ]
+        )
+
+    columns.extend(
+        [
         {"name": ["Meta", "Type"], "id": "Type", "type": "text"},
         {"name": ["Meta", "country_group_key"], "id": "country_group_key", "type": "text"},
         {"name": ["Meta", "plant_group_key"], "id": "plant_group_key", "type": "text"},
         {"name": ["Meta", "month_group_key"], "id": "month_group_key", "type": "text"},
         {"name": ["Meta", "month_group_end"], "id": "month_group_end", "type": "text"},
-    ]
+        ]
+    )
 
     style_data_conditional = [
         {
@@ -4520,36 +7418,12 @@ def _create_train_change_table(table_id: str, change_df: pd.DataFrame) -> dash_t
             "cursor": "pointer",
         },
         {
-            "if": {"column_id": "Woodmac Adds (MTPA)", "filter_query": "{Woodmac Adds (MTPA)} > 0"},
-            "backgroundColor": "rgba(22, 101, 52, 0.08)",
-            "color": "#166534",
-            "fontWeight": "700",
-        },
-        {
-            "if": {"column_id": "Woodmac Reductions (MTPA)", "filter_query": "{Woodmac Reductions (MTPA)} < 0"},
-            "backgroundColor": "rgba(153, 27, 27, 0.08)",
-            "color": "#991b1b",
-            "fontWeight": "700",
-        },
-        {
             "if": {"column_id": "Woodmac Net Delta (MTPA)", "filter_query": "{Woodmac Net Delta (MTPA)} > 0"},
             "color": "#166534",
             "fontWeight": "700",
         },
         {
             "if": {"column_id": "Woodmac Net Delta (MTPA)", "filter_query": "{Woodmac Net Delta (MTPA)} < 0"},
-            "color": "#991b1b",
-            "fontWeight": "700",
-        },
-        {
-            "if": {"column_id": "EA Adds (MTPA)", "filter_query": "{EA Adds (MTPA)} > 0"},
-            "backgroundColor": "rgba(22, 101, 52, 0.08)",
-            "color": "#166534",
-            "fontWeight": "700",
-        },
-        {
-            "if": {"column_id": "EA Reductions (MTPA)", "filter_query": "{EA Reductions (MTPA)} < 0"},
-            "backgroundColor": "rgba(153, 27, 27, 0.08)",
             "color": "#991b1b",
             "fontWeight": "700",
         },
@@ -4565,12 +7439,36 @@ def _create_train_change_table(table_id: str, change_df: pd.DataFrame) -> dash_t
         },
     ]
 
+    if internal_scenario_label:
+        style_data_conditional.extend(
+            [
+                {
+                    "if": {
+                        "column_id": INTERNAL_SCENARIO_NET_COLUMN,
+                        "filter_query": f"{{{INTERNAL_SCENARIO_NET_COLUMN}}} > 0",
+                    },
+                    "color": "#166534",
+                    "fontWeight": "700",
+                },
+                {
+                    "if": {
+                        "column_id": INTERNAL_SCENARIO_NET_COLUMN,
+                        "filter_query": f"{{{INTERNAL_SCENARIO_NET_COLUMN}}} < 0",
+                    },
+                    "color": "#991b1b",
+                    "fontWeight": "700",
+                },
+            ]
+        )
+
     table = dash_table.DataTable(
-        id={"type": "capacity-train-change-expandable-table", "index": 0},
+        id="capacity-page-train-change-table",
         columns=columns,
         data=change_df.to_dict("records"),
+        fixed_rows={"headers": True},
         style_table={
             "overflowX": "auto",
+            "overflowY": "auto",
             "borderRadius": "4px",
             "border": "1px solid #e2e8f0",
             "maxHeight": "620px",
@@ -4616,7 +7514,249 @@ def _create_train_change_table(table_id: str, change_df: pd.DataFrame) -> dash_t
     return html.Div([table, _build_train_change_footer_notes()])
 
 
-def _get_train_timeline_columns(show_original_names: bool) -> list[dict]:
+def _filter_capacity_scenario_rows_by_scope(
+    scenario_rows_df: pd.DataFrame,
+    selected_countries: list[str] | None,
+    other_countries_mode: str,
+) -> pd.DataFrame:
+    scenario_rows_df = _prepare_capacity_scenario_rows_df(scenario_rows_df)
+    if scenario_rows_df.empty:
+        return scenario_rows_df
+
+    visible_df = scenario_rows_df.copy()
+    if selected_countries:
+        if other_countries_mode == "exclude":
+            visible_df = visible_df[visible_df["country_name"].isin(selected_countries)].copy()
+    elif other_countries_mode == "exclude":
+        return pd.DataFrame(columns=visible_df.columns)
+
+    return visible_df.reset_index(drop=True)
+
+
+def _build_internal_scenario_timeline_event_rows(
+    scenario_rows_df: pd.DataFrame,
+    selected_countries: list[str] | None,
+    other_countries_mode: str,
+) -> pd.DataFrame:
+    columns = [
+        "scenario_row_key",
+        "Country",
+        "Plant",
+        "Train",
+        "reference_effective_date",
+        "reference_capacity_mtpa",
+        "Effective Date",
+        "Capacity Change",
+        "Scenario Note",
+        "timeline_direction",
+        "base_provider",
+        "base_first_date",
+        "base_capacity_mtpa",
+        "display_sort_country",
+        "display_sort_plant",
+        "display_sort_train",
+    ]
+    scenario_rows_df = _filter_capacity_scenario_rows_by_scope(
+        scenario_rows_df,
+        selected_countries,
+        other_countries_mode,
+    )
+    if scenario_rows_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    event_df = scenario_rows_df.copy()
+    event_df["Country"] = event_df["country_name"].fillna("").astype(str).str.strip()
+    event_df["Plant"] = event_df["plant_name"].fillna("").astype(str).str.strip()
+    event_df["Train"] = event_df["train_label"].fillna("").astype(str).str.strip()
+    event_df["reference_effective_date"] = pd.to_datetime(
+        event_df["scenario_first_date"],
+        errors="coerce",
+    ).combine_first(
+        pd.to_datetime(event_df["base_first_date"], errors="coerce")
+    )
+    event_df["reference_capacity_mtpa"] = pd.to_numeric(
+        event_df["scenario_capacity_mtpa"],
+        errors="coerce",
+    ).combine_first(
+        pd.to_numeric(event_df["base_capacity_mtpa"], errors="coerce")
+    ).round(6)
+    event_df["Effective Date"] = pd.to_datetime(
+        event_df["scenario_first_date"],
+        errors="coerce",
+    )
+    event_df["Capacity Change"] = pd.to_numeric(
+        event_df["scenario_capacity_mtpa"],
+        errors="coerce",
+    ).round(6)
+    event_df["Scenario Note"] = event_df["scenario_note"].fillna("").astype(str).str.strip()
+    event_df["timeline_direction"] = event_df["reference_capacity_mtpa"].map(
+        _normalize_capacity_change_direction
+    )
+    event_df = event_df[
+        event_df["reference_effective_date"].notna()
+        & event_df["timeline_direction"].notna()
+    ].copy()
+    if event_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    event_df["display_sort_country"] = event_df["display_sort_country"].where(
+        event_df["display_sort_country"].notna() & event_df["display_sort_country"].ne(""),
+        event_df["Country"],
+    )
+    event_df["display_sort_plant"] = event_df["display_sort_plant"].where(
+        event_df["display_sort_plant"].notna() & event_df["display_sort_plant"].ne(""),
+        event_df["Plant"],
+    )
+    event_df["display_sort_train"] = pd.to_numeric(
+        event_df["display_sort_train"],
+        errors="coerce",
+    ).combine_first(pd.to_numeric(event_df["Train"], errors="coerce"))
+    return event_df[columns]
+
+
+def _build_internal_scenario_lookup_snapshot(
+    scenario_rows_df: pd.DataFrame,
+    selected_countries: list[str] | None,
+    other_countries_mode: str,
+    start_date: str | None,
+    end_date: str | None,
+) -> pd.DataFrame:
+    columns = [
+        "scenario_row_key",
+        "Country",
+        "Plant",
+        "Train",
+        "timeline_direction",
+        "Scenario First Date",
+        "Scenario Capacity",
+        "Scenario Note",
+        "__scenario_overridden",
+        "base_provider",
+        "base_first_date",
+        "base_capacity_mtpa",
+        "lookup_bucket",
+        "lookup_is_out_of_range",
+        "display_sort_country",
+        "display_sort_plant",
+        "display_sort_train",
+        "display_sort_effective_date",
+        "display_sort_direction",
+    ]
+    event_df = _build_internal_scenario_timeline_event_rows(
+        scenario_rows_df,
+        selected_countries,
+        other_countries_mode,
+    )
+    if event_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    start_month = _normalize_month_date(start_date)
+    end_month = _normalize_month_date(end_date)
+    if start_month is None:
+        start_month = event_df["reference_effective_date"].min()
+    if end_month is None:
+        end_month = event_df["reference_effective_date"].max()
+
+    identity_columns = ["Country", "Plant", "Train", "timeline_direction"]
+    in_range_df = event_df[
+        (event_df["reference_effective_date"] >= start_month)
+        & (event_df["reference_effective_date"] <= end_month)
+    ].copy()
+    if not in_range_df.empty:
+        in_range_df = in_range_df.sort_values(
+            identity_columns + ["reference_effective_date"],
+            ascending=[True] * len(identity_columns) + [True],
+            na_position="last",
+        ).drop_duplicates(identity_columns, keep="first")
+        in_range_df["lookup_bucket"] = "in_range"
+        in_range_df["lookup_is_out_of_range"] = False
+    else:
+        in_range_df = pd.DataFrame(columns=identity_columns + ["lookup_bucket", "lookup_is_out_of_range"])
+
+    outside_df = _select_train_timeline_out_of_range_candidates(
+        event_df,
+        identity_columns,
+        start_month,
+        end_month,
+        effective_date_column="reference_effective_date",
+    )
+    if not outside_df.empty:
+        outside_df["lookup_is_out_of_range"] = True
+        outside_df = outside_df[
+            ~outside_df.set_index(identity_columns).index.isin(
+                in_range_df.set_index(identity_columns).index
+            )
+        ].copy()
+
+    lookup_df = pd.concat([in_range_df, outside_df], ignore_index=True, sort=False)
+    if lookup_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    lookup_df["Scenario First Date"] = pd.to_datetime(
+        lookup_df["Effective Date"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+    lookup_df["Scenario First Date"] = lookup_df["Scenario First Date"].where(
+        pd.to_datetime(lookup_df["Effective Date"], errors="coerce").notna(),
+        None,
+    )
+    lookup_df["Scenario Capacity"] = pd.to_numeric(
+        lookup_df["Capacity Change"],
+        errors="coerce",
+    ).round(2)
+    lookup_df["Scenario Capacity"] = lookup_df["Scenario Capacity"].where(
+        pd.to_numeric(lookup_df["Capacity Change"], errors="coerce").notna(),
+        None,
+    )
+    lookup_df["__scenario_overridden"] = (
+        pd.to_datetime(lookup_df["base_first_date"], errors="coerce").fillna(pd.Timestamp("1900-01-01"))
+        != pd.to_datetime(lookup_df["Effective Date"], errors="coerce").fillna(pd.Timestamp("1900-01-01"))
+    ) | (
+        pd.to_numeric(lookup_df["base_capacity_mtpa"], errors="coerce").fillna(-999999.0).round(6)
+        != pd.to_numeric(lookup_df["Capacity Change"], errors="coerce").fillna(-999999.0).round(6)
+    )
+    lookup_df["display_sort_effective_date"] = pd.to_datetime(
+        lookup_df["reference_effective_date"],
+        errors="coerce",
+    )
+    lookup_df["display_sort_direction"] = lookup_df["timeline_direction"].map(
+        {"reduction": 0, "addition": 1}
+    ).fillna(2)
+    return lookup_df[columns]
+
+
+def _filter_visible_capacity_scenario_rows(
+    scenario_rows_df: pd.DataFrame,
+    selected_countries: list[str] | None,
+    other_countries_mode: str,
+    start_date: str | None,
+    end_date: str | None,
+) -> pd.DataFrame:
+    visible_df = _filter_capacity_scenario_rows_by_scope(
+        scenario_rows_df,
+        selected_countries,
+        other_countries_mode,
+    )
+    if visible_df.empty:
+        return visible_df
+
+    visibility_date = visible_df["scenario_first_date"].fillna(visible_df["base_first_date"])
+    visibility_mask = pd.Series(True, index=visible_df.index)
+    start_month = _normalize_month_date(start_date)
+    end_month = _normalize_month_date(end_date)
+    if start_month is not None:
+        visibility_mask &= visibility_date >= start_month
+    if end_month is not None:
+        visibility_mask &= visibility_date <= end_month
+    visible_df = visible_df[visibility_mask].copy()
+
+    return visible_df.reset_index(drop=True)
+
+
+def _get_train_timeline_columns(
+    show_original_names: bool,
+    include_scenario: bool = False,
+) -> list[dict]:
     columns = [
         {"name": ["", "Country"], "id": "Country"},
         {"name": ["", "Plant"], "id": "Plant"},
@@ -4626,8 +7766,7 @@ def _get_train_timeline_columns(show_original_names: bool) -> list[dict]:
     if show_original_names:
         columns.extend(
             [
-                {"name": ["Woodmac", "Original Plant"], "id": "Woodmac Original Plant"},
-                {"name": ["Woodmac", "Original Train"], "id": "Woodmac Original Train"},
+                {"name": ["Woodmac", "Original Name"], "id": "Woodmac Original Name"},
             ]
         )
 
@@ -4635,8 +7774,8 @@ def _get_train_timeline_columns(show_original_names: bool) -> list[dict]:
         [
             {"name": ["Woodmac", "First Date"], "id": "Woodmac First Date"},
             {
-                "name": ["Woodmac", "Capacity"],
-                "id": "Woodmac Total Capacity Added",
+                "name": ["Woodmac", "Capacity Change"],
+                "id": "Woodmac Capacity Change",
                 "type": "numeric",
                 "format": Format(precision=2, scheme=Scheme.fixed),
             },
@@ -4664,148 +7803,1261 @@ def _get_train_timeline_columns(show_original_names: bool) -> list[dict]:
                 "id": "Energy Aspects First Date",
             },
             {
-                "name": ["Energy Aspects", "Capacity"],
-                "id": "Energy Aspects Total Capacity Added",
+                "name": ["Energy Aspects", "Capacity Change"],
+                "id": "Energy Aspects Capacity Change",
                 "type": "numeric",
                 "format": Format(precision=2, scheme=Scheme.fixed),
             },
         ]
     )
 
+    if include_scenario:
+        columns.extend(
+            [
+                {
+                    "name": ["Internal Scenario", "First Date"],
+                    "id": "Scenario First Date",
+                },
+                {
+                    "name": ["Internal Scenario", "Capacity"],
+                    "id": "Scenario Capacity",
+                    "type": "numeric",
+                    "format": Format(precision=2, scheme=Scheme.fixed),
+                },
+                {
+                    "name": ["Internal Scenario", "Note"],
+                    "id": "Scenario Note",
+                },
+            ]
+        )
+
     return columns
+
+
+def _month_difference(start_value, end_value) -> int | None:
+    start_ts = pd.to_datetime(start_value, errors="coerce")
+    end_ts = pd.to_datetime(end_value, errors="coerce")
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        return None
+    return int((end_ts.year - start_ts.year) * 12 + (end_ts.month - start_ts.month))
+
+
+def _build_scenario_timeline_reference_key(
+    row: pd.Series,
+    aggregate_from_date: str | None,
+) -> str | None:
+    base_provider = str(row.get("base_provider") or "").strip().casefold()
+    if base_provider not in {"woodmac", "energy_aspects"}:
+        return None
+
+    base_first_date = pd.to_datetime(row.get("base_first_date"), errors="coerce")
+    base_capacity = pd.to_numeric([row.get("base_capacity_mtpa")], errors="coerce")[0]
+    if pd.isna(base_first_date) or pd.isna(base_capacity) or round(float(base_capacity), 6) == 0:
+        return None
+
+    return _build_train_timeline_reference_key(
+        row.get("country_name"),
+        row.get("plant_name"),
+        row.get("train_label"),
+        base_first_date,
+        base_capacity,
+        aggregate_from_date,
+    )
+
+
+def _is_blank_timeline_value(value: object) -> bool:
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    if isinstance(value, str):
+        return value.strip() == ""
+    return False
+
+
+def _blank_timeline_value_mask(series: pd.Series) -> pd.Series:
+    return series.map(_is_blank_timeline_value)
+
+
+def _apply_train_timeline_provider_backfill(
+    grid_df: pd.DataFrame,
+    lookup_df: pd.DataFrame,
+    provider_prefix: str,
+    flag_column: str,
+    original_name_column_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    if grid_df.empty:
+        return grid_df
+
+    grid_df[flag_column] = grid_df.get(flag_column, False).fillna(False).astype(bool)
+    if lookup_df is None or lookup_df.empty:
+        return grid_df
+
+    if original_name_column_map is None:
+        original_name_column_map = {
+            "Original Plant": f"{provider_prefix} Original Plant",
+            "Original Train": f"{provider_prefix} Original Train",
+        }
+
+    identity_columns = ["Country", "Plant", "Train", "timeline_direction"]
+    provider_lookup_df = lookup_df[
+        identity_columns
+        + [
+            "First Date",
+            "Capacity Change",
+            *original_name_column_map.keys(),
+            "lookup_is_out_of_range",
+        ]
+    ].rename(
+        columns=(
+            {
+                "First Date": f"__lookup_{provider_prefix}_first_date",
+                "Capacity Change": f"__lookup_{provider_prefix}_capacity_change",
+                "lookup_is_out_of_range": f"__lookup_{provider_prefix}_out_of_range",
+            }
+            | {
+                source_column: f"__lookup_{provider_prefix}_{target_column.casefold().replace(' ', '_')}"
+                for source_column, target_column in original_name_column_map.items()
+            }
+        )
+    )
+    merged_df = pd.merge(
+        grid_df,
+        provider_lookup_df,
+        on=identity_columns,
+        how="left",
+    )
+
+    fill_masks = []
+    column_map = {
+        f"{provider_prefix} First Date": f"__lookup_{provider_prefix}_first_date",
+        f"{provider_prefix} Capacity Change": f"__lookup_{provider_prefix}_capacity_change",
+    }
+    column_map.update(
+        {
+            target_column: f"__lookup_{provider_prefix}_{target_column.casefold().replace(' ', '_')}"
+            for target_column in original_name_column_map.values()
+        }
+    )
+    for target_column, lookup_column in column_map.items():
+        if target_column not in merged_df.columns or lookup_column not in merged_df.columns:
+            continue
+        blank_mask = _blank_timeline_value_mask(merged_df[target_column])
+        lookup_present_mask = ~_blank_timeline_value_mask(merged_df[lookup_column])
+        fill_mask = blank_mask & lookup_present_mask
+        merged_df[target_column] = merged_df[target_column].where(~fill_mask, merged_df[lookup_column])
+        fill_masks.append(fill_mask)
+
+    if fill_masks:
+        any_fill_mask = fill_masks[0].copy()
+        for mask in fill_masks[1:]:
+            any_fill_mask |= mask
+        merged_df[flag_column] = merged_df[flag_column] | (
+            any_fill_mask
+            & merged_df[f"__lookup_{provider_prefix}_out_of_range"].fillna(False).astype(bool)
+        )
+
+    return merged_df.drop(
+        columns=[
+            f"__lookup_{provider_prefix}_first_date",
+            f"__lookup_{provider_prefix}_capacity_change",
+            f"__lookup_{provider_prefix}_original_plant",
+            f"__lookup_{provider_prefix}_original_train",
+            f"__lookup_{provider_prefix}_out_of_range",
+        ],
+        errors="ignore",
+    )
+
+
+def _apply_train_timeline_scenario_backfill(
+    grid_df: pd.DataFrame,
+    lookup_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if grid_df.empty:
+        return grid_df
+
+    grid_df["__scenario_out_of_range"] = grid_df.get("__scenario_out_of_range", False).fillna(False).astype(bool)
+    if lookup_df is None or lookup_df.empty:
+        return grid_df
+
+    identity_columns = ["Country", "Plant", "Train", "timeline_direction"]
+    scenario_lookup_df = lookup_df[
+        identity_columns
+        + [
+            "scenario_row_key",
+            "Scenario First Date",
+            "Scenario Capacity",
+            "Scenario Note",
+            "__scenario_overridden",
+            "lookup_is_out_of_range",
+        ]
+    ].rename(
+        columns={
+            "scenario_row_key": "__lookup_scenario_row_key",
+            "Scenario First Date": "__lookup_scenario_first_date",
+            "Scenario Capacity": "__lookup_scenario_capacity",
+            "Scenario Note": "__lookup_scenario_note",
+            "__scenario_overridden": "__lookup_scenario_overridden",
+            "lookup_is_out_of_range": "__lookup_scenario_out_of_range",
+        }
+    )
+    merged_df = pd.merge(
+        grid_df,
+        scenario_lookup_df,
+        on=identity_columns,
+        how="left",
+    )
+
+    scenario_value_blank_mask = (
+        _blank_timeline_value_mask(merged_df["Scenario First Date"])
+        & _blank_timeline_value_mask(merged_df["Scenario Capacity"])
+    )
+    fill_masks = []
+    column_map = {
+        "Scenario First Date": "__lookup_scenario_first_date",
+        "Scenario Capacity": "__lookup_scenario_capacity",
+        "Scenario Note": "__lookup_scenario_note",
+    }
+    for target_column, lookup_column in column_map.items():
+        blank_mask = _blank_timeline_value_mask(merged_df[target_column])
+        lookup_present_mask = ~_blank_timeline_value_mask(merged_df[lookup_column])
+        fill_mask = blank_mask & lookup_present_mask
+        merged_df[target_column] = merged_df[target_column].where(~fill_mask, merged_df[lookup_column])
+        fill_masks.append(fill_mask)
+
+    scenario_identity_fill_mask = (
+        scenario_value_blank_mask
+        & ~_blank_timeline_value_mask(merged_df["__lookup_scenario_row_key"])
+    )
+    merged_df["scenario_row_key"] = merged_df["scenario_row_key"].where(
+        ~scenario_identity_fill_mask,
+        merged_df["__lookup_scenario_row_key"],
+    )
+
+    if fill_masks:
+        any_fill_mask = fill_masks[0].copy()
+        for mask in fill_masks[1:]:
+            any_fill_mask |= mask
+        merged_df["__scenario_overridden"] = merged_df["__scenario_overridden"].where(
+            ~any_fill_mask,
+            merged_df["__lookup_scenario_overridden"].fillna(False),
+        )
+        merged_df["__scenario_out_of_range"] = merged_df["__scenario_out_of_range"] | (
+            any_fill_mask
+            & merged_df["__lookup_scenario_out_of_range"].fillna(False).astype(bool)
+        )
+
+    return merged_df.drop(
+        columns=[
+            "__lookup_scenario_row_key",
+            "__lookup_scenario_first_date",
+            "__lookup_scenario_capacity",
+            "__lookup_scenario_note",
+            "__lookup_scenario_overridden",
+            "__lookup_scenario_out_of_range",
+        ],
+        errors="ignore",
+    )
+
+
+def _build_train_timeline_grid_rows(
+    timeline_df: pd.DataFrame,
+    scenario_rows_df: pd.DataFrame | None = None,
+    aggregate_from_date: str | None = None,
+    woodmac_lookup_df: pd.DataFrame | None = None,
+    ea_lookup_df: pd.DataFrame | None = None,
+    scenario_lookup_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    reference_identity_columns = [
+        "Country",
+        "Plant",
+        "Train",
+        "timeline_direction",
+    ]
+    reference_value_columns = [
+        "Woodmac Original Name",
+        "Woodmac First Date",
+        "Woodmac Capacity Change",
+        "Energy Aspects Original Plant",
+        "Energy Aspects Original Train",
+        "Energy Aspects First Date",
+        "Energy Aspects Capacity Change",
+        "timeline_reference_key",
+        "display_sort_country",
+        "display_sort_plant",
+        "display_sort_train",
+        "display_sort_effective_date",
+        "display_sort_direction",
+    ]
+    reference_df = timeline_df.copy()
+    scenario_rows_df = _prepare_capacity_scenario_rows_df(scenario_rows_df)
+
+    if reference_df.empty and scenario_rows_df.empty:
+        return pd.DataFrame()
+
+    if not reference_df.empty:
+        reference_df = reference_df.copy()
+        reference_df["Country"] = reference_df["Country"].fillna("").astype(str).str.strip()
+        reference_df["Plant"] = reference_df["Plant"].fillna("").astype(str).str.strip()
+        reference_df["Train"] = reference_df["Train"].fillna("").astype(str).str.strip()
+        reference_df["timeline_reference_key"] = reference_df.get("timeline_reference_key").fillna("").astype(str)
+        reference_df["display_sort_country"] = reference_df.get("display_sort_country", reference_df["Country"])
+        reference_df["display_sort_plant"] = reference_df.get("display_sort_plant", reference_df["Plant"])
+        reference_df["timeline_direction"] = reference_df.get("timeline_direction").combine_first(
+            pd.to_numeric(reference_df.get("Woodmac Capacity Change"), errors="coerce").map(
+                _normalize_capacity_change_direction
+            )
+        ).combine_first(
+            pd.to_numeric(reference_df.get("Energy Aspects Capacity Change"), errors="coerce").map(
+                _normalize_capacity_change_direction
+            )
+        )
+        reference_df["display_sort_train"] = pd.to_numeric(
+            reference_df.get("display_sort_train"),
+            errors="coerce",
+        )
+        reference_df["display_sort_effective_date"] = pd.to_datetime(
+            reference_df.get("display_sort_effective_date"),
+            errors="coerce",
+        )
+        reference_df["display_sort_direction"] = pd.to_numeric(
+            reference_df.get("display_sort_direction"),
+            errors="coerce",
+        )
+
+    if not scenario_rows_df.empty:
+        scenario_display_df = scenario_rows_df.rename(
+            columns={
+                "country_name": "Country",
+                "plant_name": "Plant",
+                "train_label": "Train",
+            }
+        ).copy()
+        scenario_direction_source = pd.to_numeric(
+            scenario_display_df["scenario_capacity_mtpa"],
+            errors="coerce",
+        ).combine_first(
+            pd.to_numeric(scenario_display_df["base_capacity_mtpa"], errors="coerce")
+        )
+        scenario_display_df["timeline_direction"] = scenario_direction_source.map(
+            _normalize_capacity_change_direction
+        )
+        scenario_display_df["timeline_reference_key"] = scenario_rows_df.apply(
+            lambda row: _build_scenario_timeline_reference_key(row, aggregate_from_date),
+            axis=1,
+        )
+        scenario_display_df["Scenario First Date"] = scenario_display_df["scenario_first_date"].dt.strftime("%Y-%m-%d")
+        scenario_display_df["Scenario First Date"] = scenario_display_df["Scenario First Date"].where(
+            scenario_display_df["scenario_first_date"].notna(),
+            None,
+        )
+        scenario_display_df["Scenario Capacity"] = scenario_display_df["scenario_capacity_mtpa"].round(2)
+        scenario_display_df["Scenario Note"] = scenario_display_df["scenario_note"].fillna("").astype(str).str.strip()
+        scenario_display_df["__scenario_overridden"] = (
+            scenario_display_df["base_first_date"].fillna(pd.Timestamp("1900-01-01"))
+            != scenario_display_df["scenario_first_date"].fillna(pd.Timestamp("1900-01-01"))
+        ) | (
+            scenario_display_df["base_capacity_mtpa"].fillna(-999999.0).round(6)
+            != scenario_display_df["scenario_capacity_mtpa"].fillna(-999999.0).round(6)
+        )
+        scenario_display_df["display_sort_effective_date"] = pd.to_datetime(
+            scenario_display_df["Scenario First Date"],
+            errors="coerce",
+        ).combine_first(pd.to_datetime(scenario_display_df["base_first_date"], errors="coerce"))
+        scenario_display_df["display_sort_direction"] = scenario_display_df["timeline_direction"].map(
+            {"reduction": 0, "addition": 1}
+        ).fillna(2)
+        scenario_display_df = scenario_display_df[
+            [
+                "scenario_row_key",
+                "timeline_reference_key",
+                "Country",
+                "Plant",
+                "Train",
+                "timeline_direction",
+                "Scenario First Date",
+                "Scenario Capacity",
+                "Scenario Note",
+                "__scenario_overridden",
+                "display_sort_country",
+                "display_sort_plant",
+                "display_sort_train",
+                "display_sort_effective_date",
+                "display_sort_direction",
+            ]
+        ]
+    else:
+        scenario_display_df = pd.DataFrame(
+            columns=[
+                "scenario_row_key",
+                "timeline_reference_key",
+                "Country",
+                "Plant",
+                "Train",
+                "timeline_direction",
+                "Scenario First Date",
+                "Scenario Capacity",
+                "Scenario Note",
+                "__scenario_overridden",
+                "display_sort_country",
+                "display_sort_plant",
+                "display_sort_train",
+                "display_sort_effective_date",
+                "display_sort_direction",
+            ]
+        )
+
+    if reference_df.empty:
+        grid_df = scenario_display_df.copy()
+        for column_name in [
+            "Woodmac Original Name",
+            "Woodmac First Date",
+            "Woodmac Capacity Change",
+            "Energy Aspects Original Plant",
+            "Energy Aspects Original Train",
+            "Energy Aspects First Date",
+            "Energy Aspects Capacity Change",
+            "timeline_reference_key",
+        ]:
+            grid_df[column_name] = None
+    elif scenario_display_df.empty:
+        grid_df = reference_df.copy()
+        grid_df["Scenario First Date"] = None
+        grid_df["Scenario Capacity"] = None
+        grid_df["Scenario Note"] = ""
+        grid_df["__scenario_overridden"] = False
+    else:
+        reference_meta_df = reference_df[
+            ["scenario_row_key"]
+            + reference_identity_columns
+            + reference_value_columns
+        ].drop_duplicates(reference_identity_columns).rename(
+            columns={
+                "scenario_row_key": "reference_row_key",
+                "display_sort_country": "reference_display_sort_country",
+                "display_sort_plant": "reference_display_sort_plant",
+                "display_sort_train": "reference_display_sort_train",
+                "display_sort_effective_date": "reference_display_sort_effective_date",
+                "display_sort_direction": "reference_display_sort_direction",
+            }
+        )
+        scenario_with_reference_df = pd.merge(
+            scenario_display_df,
+            reference_meta_df,
+            on=reference_identity_columns,
+            how="left",
+        )
+        for column_name in [
+            "display_sort_country",
+            "display_sort_plant",
+            "display_sort_train",
+            "display_sort_effective_date",
+            "display_sort_direction",
+        ]:
+            scenario_with_reference_df[column_name] = scenario_with_reference_df[column_name].combine_first(
+                scenario_with_reference_df[f"reference_{column_name}"]
+            )
+        scenario_with_reference_df["scenario_row_key"] = scenario_with_reference_df["scenario_row_key"].fillna(
+            scenario_with_reference_df["reference_row_key"]
+        )
+        scenario_with_reference_df = scenario_with_reference_df.drop(
+            columns=[
+                "reference_row_key",
+                "reference_display_sort_country",
+                "reference_display_sort_plant",
+                "reference_display_sort_train",
+                "reference_display_sort_effective_date",
+                "reference_display_sort_direction",
+            ],
+            errors="ignore",
+        )
+
+        scenario_identity_df = scenario_display_df[reference_identity_columns].drop_duplicates()
+        reference_only_df = pd.merge(
+            reference_meta_df,
+            scenario_identity_df.assign(__scenario_present=True),
+            on=reference_identity_columns,
+            how="left",
+        )
+        reference_only_df = reference_only_df[
+            reference_only_df["__scenario_present"].isna()
+        ].copy()
+        reference_only_df = reference_only_df.drop(
+            columns=["__scenario_present"],
+            errors="ignore",
+        )
+        reference_only_df["Scenario First Date"] = pd.Series(
+            [None] * len(reference_only_df),
+            index=reference_only_df.index,
+            dtype="object",
+        )
+        reference_only_df["Scenario Capacity"] = pd.Series(
+            [float("nan")] * len(reference_only_df),
+            index=reference_only_df.index,
+            dtype="float64",
+        )
+        reference_only_df["Scenario Note"] = pd.Series(
+            [""] * len(reference_only_df),
+            index=reference_only_df.index,
+            dtype="object",
+        )
+        reference_only_df["__scenario_overridden"] = pd.Series(
+            False,
+            index=reference_only_df.index,
+            dtype="bool",
+        )
+        reference_only_df = reference_only_df.rename(
+            columns={
+                "reference_row_key": "scenario_row_key",
+                "reference_display_sort_country": "display_sort_country",
+                "reference_display_sort_plant": "display_sort_plant",
+                "reference_display_sort_train": "display_sort_train",
+                "reference_display_sort_effective_date": "display_sort_effective_date",
+                "reference_display_sort_direction": "display_sort_direction",
+            }
+        )
+
+        grid_df = pd.concat(
+            [scenario_with_reference_df, reference_only_df],
+            ignore_index=True,
+            sort=False,
+        )
+        grid_df["__scenario_overridden"] = grid_df["__scenario_overridden"].fillna(False)
+
+    grid_df["__woodmac_out_of_range"] = False
+    grid_df["__ea_out_of_range"] = False
+    grid_df["__scenario_out_of_range"] = False
+    grid_df = _apply_train_timeline_provider_backfill(
+        grid_df,
+        woodmac_lookup_df if woodmac_lookup_df is not None else pd.DataFrame(),
+        "Woodmac",
+        "__woodmac_out_of_range",
+        {"Original Train": "Woodmac Original Name"},
+    )
+    grid_df = _apply_train_timeline_provider_backfill(
+        grid_df,
+        ea_lookup_df if ea_lookup_df is not None else pd.DataFrame(),
+        "Energy Aspects",
+        "__ea_out_of_range",
+    )
+    grid_df = _apply_train_timeline_scenario_backfill(
+        grid_df,
+        scenario_lookup_df if scenario_lookup_df is not None else pd.DataFrame(),
+    )
+
+    grid_df["__train_blank_sort"] = grid_df["Train"].fillna("").astype(str).eq("").astype(int)
+    grid_df["__row_sort_date"] = pd.to_datetime(
+        grid_df.get("Scenario First Date"),
+        errors="coerce",
+    ).combine_first(
+        pd.to_datetime(grid_df.get("display_sort_effective_date"), errors="coerce")
+    )
+    grid_df = grid_df.sort_values(
+        [
+            "display_sort_country",
+            "display_sort_plant",
+            "__train_blank_sort",
+            "display_sort_train",
+            "Train",
+            "__row_sort_date",
+            "display_sort_direction",
+        ],
+        ascending=[True, True, False, True, True, True, True],
+        na_position="last",
+    ).drop(
+        columns=["__train_blank_sort", "__row_sort_date"],
+        errors="ignore",
+    ).reset_index(drop=True)
+
+    return grid_df.where(pd.notna(grid_df), None)
+
+
+def _get_train_timeline_grid_column_defs(
+    show_original_names: bool,
+    enable_editing: bool,
+) -> list[dict]:
+    value_formatter = {
+        "function": "params.value != null && params.value !== '' ? d3.format(',.2f')(params.value) : ''"
+    }
+    out_of_range_cell_style = lambda flag_column: {
+        "styleConditions": [
+            {
+                "condition": f"params.data && params.data.{flag_column} === true",
+                "style": {
+                    "backgroundColor": "rgba(245, 158, 11, 0.14)",
+                    "color": "#92400e",
+                    "fontWeight": "600",
+                },
+            }
+        ]
+    }
+
+    column_defs = [
+        {"field": "Country", "headerName": "Country", "pinned": "left", "minWidth": 140, "editable": False},
+        {"field": "Plant", "headerName": "Plant", "pinned": "left", "minWidth": 220, "editable": False},
+        {"field": "Train", "headerName": "Train", "pinned": "left", "width": 90, "editable": False},
+        {
+            "headerName": "Woodmac",
+            "children": [
+                {
+                    "field": "Woodmac First Date",
+                    "headerName": "First Date",
+                    "minWidth": 105,
+                    "maxWidth": 125,
+                    "editable": False,
+                    "cellStyle": out_of_range_cell_style("__woodmac_out_of_range"),
+                },
+                {
+                    "field": "Woodmac Capacity Change",
+                    "headerName": "Capacity Change",
+                    "minWidth": 105,
+                    "maxWidth": 140,
+                    "editable": False,
+                    "type": "numericColumn",
+                    "valueFormatter": value_formatter,
+                    "cellStyle": out_of_range_cell_style("__woodmac_out_of_range"),
+                },
+            ],
+        },
+        {
+            "headerName": "Energy Aspects",
+            "children": [
+                {
+                    "field": "Energy Aspects First Date",
+                    "headerName": "First Date",
+                    "minWidth": 105,
+                    "maxWidth": 125,
+                    "editable": False,
+                    "cellStyle": out_of_range_cell_style("__ea_out_of_range"),
+                },
+                {
+                    "field": "Energy Aspects Capacity Change",
+                    "headerName": "Capacity Change",
+                    "minWidth": 105,
+                    "maxWidth": 140,
+                    "editable": False,
+                    "type": "numericColumn",
+                    "valueFormatter": value_formatter,
+                    "cellStyle": out_of_range_cell_style("__ea_out_of_range"),
+                },
+            ],
+        },
+    ]
+
+    if show_original_names:
+        column_defs[3]["children"] = [
+            {
+                "field": "Woodmac Original Name",
+                "headerName": "Original Name",
+                "minWidth": 130,
+                "maxWidth": 320,
+                "editable": False,
+            },
+            *column_defs[3]["children"],
+        ]
+        column_defs[4]["children"] = [
+            {
+                "field": "Energy Aspects Original Plant",
+                "headerName": "Original Plant",
+                "minWidth": 130,
+                "maxWidth": 280,
+                "editable": False,
+            },
+            {
+                "field": "Energy Aspects Original Train",
+                "headerName": "Original Train",
+                "minWidth": 120,
+                "maxWidth": 220,
+                "editable": False,
+            },
+            *column_defs[4]["children"],
+        ]
+
+    if enable_editing:
+        column_defs.append(
+            {
+                "headerName": "Internal Scenario",
+                "children": [
+                    {
+                        "field": "Scenario First Date",
+                        "headerName": "First Date",
+                        "minWidth": 105,
+                        "maxWidth": 125,
+                        "editable": True,
+                        "cellDataType": "dateString",
+                        "cellEditor": "agDateStringCellEditor",
+                        "cellStyle": out_of_range_cell_style("__scenario_out_of_range"),
+                    },
+                    {
+                        "field": "Scenario Capacity",
+                        "headerName": "Capacity",
+                        "minWidth": 100,
+                        "maxWidth": 135,
+                        "editable": True,
+                        "cellEditor": "agNumberCellEditor",
+                        "cellEditorParams": {"precision": 2, "step": 0.1},
+                        "type": "numericColumn",
+                        "valueFormatter": value_formatter,
+                        "cellStyle": out_of_range_cell_style("__scenario_out_of_range"),
+                    },
+                    {
+                        "field": "Scenario Note",
+                        "headerName": "Note",
+                        "minWidth": 140,
+                        "maxWidth": 360,
+                        "editable": True,
+                        "cellEditor": "agLargeTextCellEditor",
+                        "cellEditorPopup": True,
+                        "cellEditorParams": {"maxLength": 500, "rows": 6, "cols": 42},
+                        "tooltipField": "Scenario Note",
+                        "cellStyle": out_of_range_cell_style("__scenario_out_of_range"),
+                    },
+                ],
+            }
+        )
+
+    return column_defs
 
 
 def _create_train_timeline_table(
     table_id: str,
     timeline_df: pd.DataFrame,
+    scenario_rows_df: pd.DataFrame | None = None,
     show_original_names: bool = False,
-) -> dash_table.DataTable | html.Div:
-    if timeline_df.empty:
-        return _create_empty_state("No train timeline rows available for the current selection.")
-
-    display_df = timeline_df.copy().where(pd.notna(timeline_df), None)
-    columns = _get_train_timeline_columns(show_original_names)
-
-    style_data_conditional = [
-        {
-            "if": {"filter_query": "{Train} = \"\""},
-            "backgroundColor": "#f8fafc",
-        },
-        {
-            "if": {"column_id": "Woodmac Total Capacity Added", "filter_query": "{Woodmac Total Capacity Added} > 0"},
-            "backgroundColor": "rgba(22, 101, 52, 0.08)",
-            "color": "#166534",
-            "fontWeight": "700",
-        },
-        {
-            "if": {"column_id": "Energy Aspects Total Capacity Added", "filter_query": "{Energy Aspects Total Capacity Added} > 0"},
-            "backgroundColor": "rgba(22, 101, 52, 0.08)",
-            "color": "#166534",
-            "fontWeight": "700",
-        },
-    ]
-
-    table = dash_table.DataTable(
-        id=table_id,
-        columns=columns,
-        data=display_df.to_dict("records"),
-        style_table={
-            "overflowX": "auto",
-            "borderRadius": "4px",
-            "border": "1px solid #e2e8f0",
-            "maxHeight": "620px",
-        },
-        style_header={
-            "backgroundColor": "#1e293b",
-            "color": "white",
-            "fontWeight": "700",
-            "fontSize": "11px",
-            "textAlign": "center",
-            "textTransform": "uppercase",
-            "letterSpacing": "0.05em",
-            "padding": "10px 8px",
-        },
-        style_cell={
-            "textAlign": "center",
-            "fontSize": "12px",
-            "padding": "7px 10px",
-            "minWidth": "90px",
-            "maxWidth": "180px",
-            "border": "1px solid #f1f5f9",
-            "whiteSpace": "normal",
-            "height": "auto",
-        },
-        style_cell_conditional=[
-            {"if": {"column_id": "Country"}, "textAlign": "left", "minWidth": "140px", "maxWidth": "180px"},
-            {"if": {"column_id": "Plant"}, "textAlign": "left", "minWidth": "220px", "maxWidth": "300px"},
-            {"if": {"column_id": "Train"}, "minWidth": "90px", "maxWidth": "100px"},
-            {
-                "if": {"column_id": "Woodmac Original Plant"},
-                "textAlign": "left",
-                "minWidth": "220px",
-                "maxWidth": "280px",
-            },
-            {
-                "if": {"column_id": "Woodmac Original Train"},
-                "textAlign": "left",
-                "minWidth": "160px",
-                "maxWidth": "240px",
-            },
-            {"if": {"column_id": "Woodmac First Date"}, "minWidth": "150px", "maxWidth": "160px"},
-            {"if": {"column_id": "Energy Aspects First Date"}, "minWidth": "170px", "maxWidth": "180px"},
-            {"if": {"column_id": "Woodmac Total Capacity Added"}, "minWidth": "150px", "maxWidth": "160px"},
-            {"if": {"column_id": "Energy Aspects Total Capacity Added"}, "minWidth": "170px", "maxWidth": "180px"},
-            {
-                "if": {"column_id": "Energy Aspects Original Plant"},
-                "textAlign": "left",
-                "minWidth": "220px",
-                "maxWidth": "280px",
-            },
-            {
-                "if": {"column_id": "Energy Aspects Original Train"},
-                "textAlign": "left",
-                "minWidth": "160px",
-                "maxWidth": "240px",
-            },
-        ],
-        style_data_conditional=style_data_conditional,
-        merge_duplicate_headers=True,
-        sort_action="native",
-        filter_action="native",
-        page_action="none",
-        fill_width=False,
+    enable_editing: bool = False,
+    aggregate_from_date: str | None = None,
+    woodmac_lookup_df: pd.DataFrame | None = None,
+    ea_lookup_df: pd.DataFrame | None = None,
+    scenario_lookup_df: pd.DataFrame | None = None,
+) -> dag.AgGrid | html.Div:
+    grid_df = _build_train_timeline_grid_rows(
+        timeline_df,
+        scenario_rows_df,
+        aggregate_from_date=aggregate_from_date,
+        woodmac_lookup_df=woodmac_lookup_df,
+        ea_lookup_df=ea_lookup_df,
+        scenario_lookup_df=scenario_lookup_df,
+    )
+    empty_state = (
+        _create_empty_state("No train timeline rows available for the current selection.")
+        if grid_df.empty
+        else None
     )
 
     note = html.Div(
         [
             html.Span(
-                "First Date and Capacity use positive additions only within the current selected date range."
+                "Rows still come from signed in-range activity. Highlighted source cells were backfilled from outside the selected Date Range using the nearest same-sign row for that train, while internal scenario rows remain editable signed event rows."
             )
         ],
         className="balance-metadata-row",
         style={"paddingTop": "12px"},
     )
 
-    return html.Div([table, note])
+    grid = dag.AgGrid(
+        id=table_id,
+        rowData=grid_df.to_dict("records") if not grid_df.empty else [],
+        columnDefs=_get_train_timeline_grid_column_defs(show_original_names, enable_editing),
+        columnSize="autoSize",
+        columnSizeOptions={"skipHeader": False},
+        defaultColDef={
+            "sortable": True,
+            "resizable": True,
+            "filter": True,
+            "wrapHeaderText": True,
+            "autoHeaderHeight": True,
+        },
+        dashGridOptions={
+            "animateRows": False,
+            "rowSelection": "multiple",
+            "undoRedoCellEditing": True,
+            "undoRedoCellEditingLimit": 30,
+            "stopEditingWhenCellsLoseFocus": True,
+            "ensureDomOrder": True,
+            "enableCellTextSelection": True,
+            "autoSizeStrategy": {"type": "fitCellContents"},
+            "rowHeight": 38,
+        },
+        getRowId="params.data.scenario_row_key",
+        getRowStyle={
+            "styleConditions": [
+                {
+                    "condition": (
+                        "params.data && params.data['Woodmac First Date'] && params.data['Scenario First Date'] "
+                        "&& params.data['Woodmac First Date'] !== params.data['Scenario First Date']"
+                    ),
+                    "style": {"boxShadow": "inset 0 0 0 1px #dc2626"},
+                },
+                {
+                    "condition": "params.data.__scenario_overridden === true",
+                    "style": {"backgroundColor": "rgba(59, 130, 246, 0.08)"},
+                },
+                {
+                    "condition": "params.data.Train == null || params.data.Train === ''",
+                    "style": {"backgroundColor": "#f8fafc"},
+                },
+            ]
+        },
+        className="ag-theme-alpine capacity-train-timeline-grid",
+        style={"width": "100%", "height": "620px"},
+    )
+
+    children = [grid, note]
+    if empty_state is not None:
+        children.insert(0, empty_state)
+    return html.Div(children)
+
+
+def _autosize_excel_worksheet(worksheet) -> None:
+    for column_cells in worksheet.columns:
+        max_length = 0
+        column_letter = column_cells[0].column_letter
+        for cell in column_cells:
+            cell_value = "" if cell.value is None else str(cell.value)
+            if len(cell_value) > max_length:
+                max_length = len(cell_value)
+        worksheet.column_dimensions[column_letter].width = min(max_length + 2, 24)
+
+
+def _apply_train_timeline_excel_mismatch_borders(
+    worksheet,
+    export_df: pd.DataFrame,
+) -> None:
+    required_columns = {"Woodmac First Date", "Scenario First Date"}
+    if export_df.empty or not required_columns.issubset(export_df.columns):
+        return
+
+    woodmac_dates = export_df["Woodmac First Date"].fillna("").astype(str).str.strip()
+    scenario_dates = export_df["Scenario First Date"].fillna("").astype(str).str.strip()
+    mismatch_rows = export_df.index[
+        woodmac_dates.ne("")
+        & scenario_dates.ne("")
+        & woodmac_dates.ne(scenario_dates)
+    ]
+    if len(mismatch_rows) == 0:
+        return
+
+    visible_column_indexes = [
+        export_df.columns.get_loc(column_name) + 1
+        for column_name in export_df.columns
+        if column_name != TRAIN_TIMELINE_IMPORT_KEY_COLUMN
+    ]
+    if not visible_column_indexes:
+        return
+
+    first_visible_column = min(visible_column_indexes)
+    last_visible_column = max(visible_column_indexes)
+    red_side = Side(style="thin", color="FFDC2626")
+
+    for row_index in mismatch_rows:
+        excel_row_number = int(row_index) + 2
+        for column_index in visible_column_indexes:
+            cell = worksheet.cell(row=excel_row_number, column=column_index)
+            cell.border = Border(
+                left=red_side if column_index == first_visible_column else cell.border.left,
+                right=red_side if column_index == last_visible_column else cell.border.right,
+                top=red_side,
+                bottom=red_side,
+            )
 
 
 def _export_matrix_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name=sheet_name, index=False)
-
-        worksheet = writer.sheets[sheet_name]
-        for column_cells in worksheet.columns:
-            max_length = 0
-            column_letter = column_cells[0].column_letter
-            for cell in column_cells:
-                cell_value = "" if cell.value is None else str(cell.value)
-                if len(cell_value) > max_length:
-                    max_length = len(cell_value)
-            worksheet.column_dimensions[column_letter].width = min(max_length + 2, 24)
+        _autosize_excel_worksheet(writer.sheets[sheet_name])
 
     output.seek(0)
     return output.getvalue()
+
+
+def _build_train_timeline_upload_metadata_df(
+    export_df: pd.DataFrame,
+    selected_scenario_id: int,
+    scenario_name: str,
+    original_name_visibility: str,
+    current_rows_df: pd.DataFrame,
+) -> pd.DataFrame:
+    metadata_df = export_df.copy()
+    current_row_keys = set(
+        _prepare_capacity_scenario_rows_df(current_rows_df)["scenario_row_key"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .tolist()
+    )
+    metadata_df.insert(
+        0,
+        TRAIN_TIMELINE_IMPORT_HAS_SCENARIO_ROW_COLUMN,
+        metadata_df[TRAIN_TIMELINE_IMPORT_KEY_COLUMN].fillna("").astype(str).str.strip().isin(current_row_keys),
+    )
+    metadata_df.insert(
+        0,
+        TRAIN_TIMELINE_IMPORT_EXPORT_ROW_COLUMN,
+        range(2, len(metadata_df) + 2),
+    )
+    metadata_df.insert(0, "__original_name_visibility", str(original_name_visibility or "").strip())
+    metadata_df.insert(0, "__scenario_name", str(scenario_name or "").strip())
+    metadata_df.insert(0, "__scenario_id", int(selected_scenario_id))
+    metadata_df.insert(0, "__template_version", TRAIN_TIMELINE_IMPORT_TEMPLATE_VERSION)
+    return metadata_df
+
+
+def _export_train_timeline_workbook_bytes(
+    export_df: pd.DataFrame,
+    metadata_df: pd.DataFrame,
+) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        export_df.to_excel(writer, sheet_name=TRAIN_TIMELINE_SHEET_NAME, index=False)
+        metadata_df.to_excel(writer, sheet_name=TRAIN_TIMELINE_IMPORT_META_SHEET_NAME, index=False)
+
+        main_sheet = writer.sheets[TRAIN_TIMELINE_SHEET_NAME]
+        metadata_sheet = writer.sheets[TRAIN_TIMELINE_IMPORT_META_SHEET_NAME]
+        _apply_train_timeline_excel_mismatch_borders(main_sheet, export_df)
+        _autosize_excel_worksheet(main_sheet)
+        _autosize_excel_worksheet(metadata_sheet)
+
+        if TRAIN_TIMELINE_IMPORT_KEY_COLUMN in export_df.columns:
+            hidden_column_index = export_df.columns.get_loc(TRAIN_TIMELINE_IMPORT_KEY_COLUMN) + 1
+            hidden_column_letter = main_sheet.cell(row=1, column=hidden_column_index).column_letter
+            main_sheet.column_dimensions[hidden_column_letter].hidden = True
+
+        metadata_sheet.sheet_state = "hidden"
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def _normalize_train_timeline_import_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def _normalize_train_timeline_import_value(
+    column_name: str,
+    value: object,
+):
+    if column_name == "Train":
+        return _coerce_positive_train_label(value)
+    if column_name in TRAIN_TIMELINE_DATE_COLUMNS:
+        normalized_date = _coerce_timeline_row_date(value)
+        return None if normalized_date is None else normalized_date.strftime("%Y-%m-%d")
+    if column_name in TRAIN_TIMELINE_NUMERIC_COLUMNS:
+        numeric_value = _coerce_timeline_row_capacity(value)
+        return None if numeric_value is None else round(float(numeric_value), 6)
+    if column_name == "Scenario Note":
+        return _coerce_timeline_row_note(value)
+    return _normalize_train_timeline_import_text(value)
+
+
+def _coerce_train_timeline_import_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    normalized = str(value).strip().casefold()
+    if normalized in {"true", "1", "yes", "y"}:
+        return True
+    if normalized in {"false", "0", "no", "n", ""}:
+        return False
+    return False
+
+
+def _compose_train_timeline_upload_error(errors: list[str]) -> str:
+    if not errors:
+        return "Train Timeline upload failed."
+    visible_errors = errors[:8]
+    if len(errors) > 8:
+        visible_errors.append(f"{len(errors) - 8} more issue(s) found.")
+    return "Train Timeline upload failed: " + " | ".join(visible_errors)
+
+
+def _build_train_timeline_upload_rows_df(
+    main_df: pd.DataFrame,
+    metadata_df: pd.DataFrame,
+    selected_scenario_id: int,
+    current_rows_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    if TRAIN_TIMELINE_IMPORT_KEY_COLUMN not in main_df.columns:
+        raise ValueError(
+            f"Missing required hidden column '{TRAIN_TIMELINE_IMPORT_KEY_COLUMN}'. Export a fresh Train Timeline workbook and try again."
+        )
+    required_main_columns = {
+        "Country",
+        "Plant",
+        "Train",
+        "Scenario First Date",
+        "Scenario Capacity",
+        "Scenario Note",
+    }
+    missing_main_columns = [
+        column_name
+        for column_name in required_main_columns
+        if column_name not in main_df.columns
+    ]
+    if missing_main_columns:
+        raise ValueError(
+            "Upload sheet is missing required column(s): "
+            + ", ".join(sorted(missing_main_columns))
+            + ". Export a fresh Train Timeline workbook and try again."
+        )
+
+    required_meta_columns = TRAIN_TIMELINE_IMPORT_META_COLUMNS | set(main_df.columns)
+    missing_meta_columns = [
+        column_name
+        for column_name in required_meta_columns
+        if column_name not in metadata_df.columns
+    ]
+    if missing_meta_columns:
+        raise ValueError(
+            "Upload metadata is incomplete. Missing column(s): "
+            + ", ".join(sorted(missing_meta_columns))
+            + ". Export a fresh Train Timeline workbook and try again."
+        )
+
+    if metadata_df.empty:
+        raise ValueError("Upload metadata is empty. Export a fresh Train Timeline workbook and try again.")
+
+    template_values = {
+        _normalize_train_timeline_import_text(value)
+        for value in metadata_df["__template_version"].tolist()
+        if _normalize_train_timeline_import_text(value)
+    }
+    if template_values != {TRAIN_TIMELINE_IMPORT_TEMPLATE_VERSION}:
+        raise ValueError("Unsupported Train Timeline upload template. Export a fresh workbook from the page and try again.")
+
+    scenario_id_values = {
+        int(pd.to_numeric(value, errors="coerce"))
+        for value in metadata_df["__scenario_id"].tolist()
+        if pd.notna(pd.to_numeric(value, errors="coerce"))
+    }
+    if scenario_id_values != {int(selected_scenario_id)}:
+        raise ValueError("This workbook belongs to a different internal scenario than the one currently selected.")
+
+    metadata_records: dict[str, dict] = {}
+    duplicate_metadata_keys: set[str] = set()
+    for row in metadata_df.to_dict("records"):
+        row_key = _normalize_train_timeline_import_text(row.get(TRAIN_TIMELINE_IMPORT_KEY_COLUMN))
+        if not row_key:
+            continue
+        if row_key in metadata_records:
+            duplicate_metadata_keys.add(row_key)
+            continue
+        metadata_records[row_key] = row
+    if duplicate_metadata_keys:
+        raise ValueError("Upload metadata contains duplicate row keys. Export a fresh Train Timeline workbook and try again.")
+
+    current_rows_df = _prepare_capacity_scenario_rows_df(current_rows_df)
+    current_row_keys = set(
+        current_rows_df["scenario_row_key"].fillna("").astype(str).str.strip().tolist()
+    )
+
+    allowed_new_row_columns = {"Country", "Plant", "Train"} | TRAIN_TIMELINE_EDITABLE_COLUMNS
+    immutable_columns = [
+        column_name
+        for column_name in main_df.columns
+        if column_name not in TRAIN_TIMELINE_EDITABLE_COLUMNS | {TRAIN_TIMELINE_IMPORT_KEY_COLUMN}
+    ]
+
+    errors: list[str] = []
+    seen_existing_keys: set[str] = set()
+    deleted_existing_keys: list[str] = []
+    upload_grid_rows: list[dict] = []
+    update_count = 0
+    addition_count = 0
+
+    normalized_uploaded_keys: set[str] = set()
+    prepared_main_records = main_df.to_dict("records")
+    for excel_row_number, row in enumerate(prepared_main_records, start=2):
+        row_key = _normalize_train_timeline_import_text(row.get(TRAIN_TIMELINE_IMPORT_KEY_COLUMN))
+        visible_values = {
+            column_name: row.get(column_name)
+            for column_name in main_df.columns
+            if column_name != TRAIN_TIMELINE_IMPORT_KEY_COLUMN
+        }
+        if (
+            not row_key
+            and all(
+                _normalize_train_timeline_import_text(value) == ""
+                for value in visible_values.values()
+            )
+        ):
+            continue
+
+        try:
+            normalized_train = _coerce_positive_train_label(row.get("Train"))
+        except ValueError as exc:
+            errors.append(f"Row {excel_row_number} has invalid Train '{row.get('Train')}'. {exc}")
+            continue
+
+        if row_key:
+            if row_key not in metadata_records:
+                errors.append(
+                    f"Row {excel_row_number} has an unknown hidden key. Export a fresh Train Timeline workbook and try again."
+                )
+                continue
+            if row_key in seen_existing_keys:
+                errors.append(f"Row {excel_row_number} duplicates an existing exported row key.")
+                continue
+
+            seen_existing_keys.add(row_key)
+            normalized_uploaded_keys.add(row_key)
+            metadata_row = metadata_records[row_key]
+            for column_name in immutable_columns:
+                try:
+                    uploaded_value = _normalize_train_timeline_import_value(column_name, row.get(column_name))
+                    original_value = _normalize_train_timeline_import_value(column_name, metadata_row.get(column_name))
+                except ValueError as exc:
+                    errors.append(f"Row {excel_row_number} has invalid {column_name}: {exc}")
+                    break
+                if uploaded_value != original_value:
+                    errors.append(f"Row {excel_row_number} changed read-only column '{column_name}'.")
+                    break
+            else:
+                scenario_changed = any(
+                    _normalize_train_timeline_import_value(column_name, row.get(column_name))
+                    != _normalize_train_timeline_import_value(column_name, metadata_row.get(column_name))
+                    for column_name in TRAIN_TIMELINE_EDITABLE_COLUMNS
+                    if column_name in main_df.columns
+                )
+                if scenario_changed:
+                    update_count += 1
+
+                prepared_row = {column_name: row.get(column_name) for column_name in main_df.columns}
+                prepared_row["Train"] = normalized_train
+                prepared_row[TRAIN_TIMELINE_IMPORT_KEY_COLUMN] = row_key
+                prepared_row["scenario_row_key"] = row_key
+                upload_grid_rows.append(prepared_row)
+            continue
+
+        row_errors = []
+        normalized_country = _normalize_train_timeline_import_text(row.get("Country"))
+        normalized_plant = _normalize_train_timeline_import_text(row.get("Plant"))
+        if not normalized_country:
+            row_errors.append("Country is required.")
+        if not normalized_plant:
+            row_errors.append("Plant is required.")
+
+        scenario_first_date = _coerce_timeline_row_date(row.get("Scenario First Date"))
+        if scenario_first_date is None:
+            row_errors.append("Scenario First Date must be a valid month.")
+
+        scenario_capacity = _coerce_timeline_row_capacity(row.get("Scenario Capacity"))
+        if scenario_capacity is None or round(float(scenario_capacity), 6) == 0:
+            row_errors.append("Scenario Capacity must be a non-zero number.")
+
+        disallowed_columns = [
+            column_name
+            for column_name in TRAIN_TIMELINE_PROVIDER_COLUMNS
+            if column_name in main_df.columns
+            and _normalize_train_timeline_import_text(row.get(column_name)) != ""
+        ]
+        if disallowed_columns:
+            row_errors.append(
+                "new rows must keep provider columns blank: " + ", ".join(disallowed_columns)
+            )
+
+        unexpected_columns = [
+            column_name
+            for column_name in main_df.columns
+            if column_name not in allowed_new_row_columns | {TRAIN_TIMELINE_IMPORT_KEY_COLUMN}
+            and _normalize_train_timeline_import_text(row.get(column_name)) != ""
+        ]
+        if unexpected_columns:
+            row_errors.append(
+                "new rows contain unsupported values in: " + ", ".join(unexpected_columns)
+            )
+
+        if row_errors:
+            errors.append(f"Row {excel_row_number} is invalid: {' '.join(row_errors)}")
+            continue
+
+        new_row_key = _build_capacity_scenario_row_key(
+            normalized_country,
+            normalized_plant,
+            normalized_train,
+            effective_date=scenario_first_date,
+            capacity_value=scenario_capacity,
+            provider="manual",
+        )
+        if new_row_key in current_row_keys or any(
+            existing_row.get("scenario_row_key") == new_row_key
+            for existing_row in upload_grid_rows
+        ):
+            errors.append(f"Row {excel_row_number} already exists in the selected scenario.")
+            continue
+
+        upload_grid_rows.append(
+            {
+                "scenario_row_key": new_row_key,
+                TRAIN_TIMELINE_IMPORT_KEY_COLUMN: new_row_key,
+                "Country": normalized_country,
+                "Plant": normalized_plant,
+                "Train": normalized_train,
+                "Woodmac Original Name": None,
+                "Woodmac First Date": None,
+                "Woodmac Capacity Change": None,
+                "Energy Aspects Original Plant": None,
+                "Energy Aspects Original Train": None,
+                "Energy Aspects First Date": None,
+                "Energy Aspects Capacity Change": None,
+                "Scenario First Date": scenario_first_date.strftime("%Y-%m-%d"),
+                "Scenario Capacity": round(float(scenario_capacity), 6),
+                "Scenario Note": _coerce_timeline_row_note(row.get("Scenario Note")),
+            }
+        )
+        addition_count += 1
+
+    if errors:
+        raise ValueError(_compose_train_timeline_upload_error(errors))
+
+    for row_key, metadata_row in metadata_records.items():
+        if row_key in normalized_uploaded_keys:
+            continue
+        export_row_numeric = pd.to_numeric(
+            metadata_row.get(TRAIN_TIMELINE_IMPORT_EXPORT_ROW_COLUMN),
+            errors="coerce",
+        )
+        export_row_number = int(export_row_numeric) if pd.notna(export_row_numeric) else "unknown"
+        if not _coerce_train_timeline_import_bool(
+            metadata_row.get(TRAIN_TIMELINE_IMPORT_HAS_SCENARIO_ROW_COLUMN)
+        ):
+            errors.append(
+                f"Deleted row {export_row_number} is provider-only and cannot be removed via upload."
+            )
+            continue
+        deleted_existing_keys.append(row_key)
+
+    if errors:
+        raise ValueError(_compose_train_timeline_upload_error(errors))
+
+    base_rows_df = current_rows_df[
+        ~current_rows_df["scenario_row_key"].fillna("").astype(str).str.strip().isin(deleted_existing_keys)
+    ].copy()
+    updated_rows_df = _update_working_scenario_rows_from_grid(base_rows_df, upload_grid_rows)
+    summary = {
+        "updated": update_count,
+        "added": addition_count,
+        "deleted": len(deleted_existing_keys),
+    }
+    return updated_rows_df, summary
 
 
 layout = html.Div(
@@ -4813,18 +9065,35 @@ layout = html.Div(
         dcc.Store(id="capacity-page-woodmac-data-store", storage_type="memory"),
         dcc.Store(id="capacity-page-train-capacity-data-store", storage_type="memory"),
         dcc.Store(id="capacity-page-ea-capacity-data-store", storage_type="memory"),
-        dcc.Store(id="capacity-page-train-change-expanded-country-store", storage_type="memory", data=[]),
-        dcc.Store(id="capacity-page-train-change-expanded-plant-store", storage_type="memory", data=[]),
         dcc.Store(id="capacity-page-country-options-store", storage_type="memory"),
         dcc.Store(id="capacity-page-refresh-timestamp-store", storage_type="memory"),
         dcc.Store(id="capacity-page-load-error-store", storage_type="memory"),
         dcc.Store(id="capacity-page-metadata-store", storage_type="memory"),
         dcc.Store(id="capacity-page-plant-mapping-save-trigger", storage_type="memory"),
         dcc.Store(id="capacity-page-train-mapping-save-trigger", storage_type="memory"),
+        dcc.Store(id="capacity-page-capacity-scenario-options-store", storage_type="memory"),
+        dcc.Store(id="capacity-page-capacity-scenario-selected-store", storage_type="memory"),
+        dcc.Store(id="capacity-page-capacity-scenario-working-store", storage_type="memory"),
+        dcc.Store(id="capacity-page-capacity-scenario-dirty-store", storage_type="memory"),
+        dcc.Store(id="capacity-page-capacity-scenario-pending-selection-store", storage_type="memory"),
+        dcc.Store(id="capacity-page-capacity-scenario-dropdown-target-store", storage_type="memory"),
+        dcc.Store(id="capacity-page-capacity-scenario-refresh-store", storage_type="memory"),
         dcc.Download(id="capacity-page-download-woodmac-excel"),
         dcc.Download(id="capacity-page-download-ea-excel"),
+        dcc.Download(id="capacity-page-download-internal-scenario-excel"),
         dcc.Download(id="capacity-page-download-train-change-excel"),
         dcc.Download(id="capacity-page-download-train-timeline-excel"),
+        dcc.ConfirmDialog(
+            id="capacity-page-capacity-scenario-switch-confirm",
+            message="You have unsaved scenario edits. Switch scenarios and discard the current working copy?",
+        ),
+        dcc.ConfirmDialog(
+            id="capacity-page-capacity-scenario-delete-confirm",
+            message=(
+                "This will delete the selected internal scenario. "
+                "Please confirm to proceed. This change cannot be reverted."
+            ),
+        ),
         html.Div(
             [
                 html.Div(
@@ -4856,7 +9125,12 @@ layout = html.Div(
                         ),
                         html.Div(
                             [
-                                html.Div("Time View", className="filter-group-header"),
+                                html.Div(
+                                    "Time View",
+                                    className="filter-group-header",
+                                    title=SEASONAL_TIME_VIEW_TOOLTIP,
+                                    style={"cursor": "help"},
+                                ),
                                 html.Div(
                                     [
                                         dcc.RadioItems(
@@ -4864,6 +9138,7 @@ layout = html.Div(
                                             options=[
                                                 {"label": "Monthly", "value": "monthly"},
                                                 {"label": "Quarterly", "value": "quarterly"},
+                                                {"label": "Seasonally", "value": "seasonally"},
                                                 {"label": "Yearly", "value": "yearly"},
                                             ],
                                             value="monthly",
@@ -4887,50 +9162,28 @@ layout = html.Div(
                         ),
                         html.Div(
                             [
-                                html.Div("Country Columns", className="filter-group-header"),
-                                dcc.Dropdown(
-                                    id="capacity-page-country-dropdown",
-                                    options=[],
-                                    value=None,
-                                    multi=True,
-                                    placeholder="Select countries to keep as separate columns",
-                                    className="filter-dropdown",
-                                    style={"minWidth": "380px"},
-                                ),
-                            ],
-                            className="filter-section filter-section-origin-exp",
-                        ),
-                        html.Div(
-                            [
-                                html.Div("Other Countries", className="filter-group-header"),
-                                dcc.RadioItems(
-                                    id="capacity-page-other-country-mode",
-                                    options=[
-                                        {
-                                            "label": "Include",
-                                            "value": "rest_of_world",
-                                        },
-                                        {
-                                            "label": "Exclude",
-                                            "value": "exclude",
-                                        },
+                                html.Div("Internal Scenario", className="filter-group-header"),
+                                html.Div(
+                                    [
+                                        dcc.Dropdown(
+                                            id="capacity-page-internal-scenario-dropdown",
+                                            options=[],
+                                            value=None,
+                                            placeholder="Select internal scenario",
+                                            clearable=True,
+                                            className="capacity-scenario-sticky-dropdown",
+                                            style={"minWidth": "260px", "width": "100%"},
+                                        )
                                     ],
-                                    value="rest_of_world",
-                                    className="balance-radio-group",
-                                    labelStyle={"display": "inline-flex", "alignItems": "center"},
-                                    inputStyle={"marginRight": "6px"},
+                                    className="capacity-scenario-sticky-shell",
+                                    style={"width": "100%"},
                                 ),
                             ],
-                            className="filter-section filter-section-volume",
+                            className="filter-section filter-section-scenario",
                         ),
                         html.Div(
                             [
                                 html.Div("Status", className="filter-group-header"),
-                                html.Div(
-                                    id="capacity-page-refresh-indicator",
-                                    className="text-tertiary",
-                                    style={"fontSize": "12px", "whiteSpace": "nowrap"},
-                                ),
                                 html.Div(
                                     id="capacity-page-meta-indicator",
                                     className="text-tertiary",
@@ -4952,6 +9205,7 @@ layout = html.Div(
                     children=[
                         html.Div(
                             [
+                                _create_top_capacity_selector_region(),
                                 html.Div(
                                     [
                                         _create_source_section(
@@ -4979,6 +9233,13 @@ layout = html.Div(
                                             "capacity-page-ea-table-container",
                                             "capacity-page-export-ea-button",
                                         ),
+                                        _create_internal_scenario_section(
+                                            "Internal Scenario Capacity",
+                                            "capacity-page-internal-scenario-summary",
+                                            "capacity-page-internal-scenario-chart",
+                                            "capacity-page-internal-scenario-table-container",
+                                            "capacity-page-export-internal-scenario-button",
+                                        ),
                                     ],
                                     style={
                                         "display": "grid",
@@ -4999,7 +9260,6 @@ layout = html.Div(
                                         _create_train_timeline_section(
                                             "Train Timeline - Monthly",
                                             None,
-                                            "capacity-page-train-timeline-summary",
                                             "capacity-page-train-timeline-table-container",
                                             "capacity-page-export-train-timeline-button",
                                         ),
@@ -5033,6 +9293,17 @@ layout = html.Div(
                                     style={
                                         "display": "grid",
                                         "gridTemplateColumns": "repeat(auto-fit, minmax(520px, 1fr))",
+                                        "gap": "24px",
+                                        "alignItems": "start",
+                                    },
+                                ),
+                                html.Div(
+                                    [
+                                        _create_train_timeline_comparison_chart_section(),
+                                    ],
+                                    style={
+                                        "display": "grid",
+                                        "gridTemplateColumns": "minmax(0, 1fr)",
                                         "gap": "24px",
                                         "alignItems": "start",
                                     },
@@ -5211,12 +9482,11 @@ def update_capacity_date_range(woodmac_data, ea_capacity_data, current_start_dat
 
 
 @callback(
-    Output("capacity-page-refresh-indicator", "children"),
     Output("capacity-page-meta-indicator", "children"),
     Input("capacity-page-metadata-store", "data"),
 )
 def update_capacity_status(metadata):
-    return "", _build_capacity_status_children(metadata)
+    return _build_capacity_status_children(metadata)
 
 
 @callback(
@@ -5231,6 +9501,825 @@ def update_capacity_error_banner(error_message):
 
 
 @callback(
+    Output("capacity-page-capacity-scenario-options-store", "data"),
+    Input("capacity-page-refresh-timestamp-store", "data"),
+    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+)
+def load_capacity_scenario_options(_page_refresh_timestamp, _scenario_refresh_timestamp):
+    try:
+        return _serialize_capacity_scenario_options(
+            get_available_capacity_scenarios(engine)
+        )
+    except Exception:
+        return []
+
+
+@callback(
+    Output("capacity-page-internal-scenario-dropdown", "options"),
+    Output("capacity-page-capacity-scenario-create-source-dropdown", "options"),
+    Output("capacity-page-train-timeline-current-scenario-label", "children"),
+    Output("capacity-page-capacity-scenario-dirty-indicator", "children"),
+    Output("capacity-page-capacity-scenario-save-button", "disabled"),
+    Output("capacity-page-capacity-scenario-revert-button", "disabled"),
+    Output("capacity-page-capacity-scenario-delete-button", "disabled"),
+    Output("capacity-page-scenario-add-row-button", "disabled"),
+    Output("capacity-page-capacity-scenario-upload", "disabled"),
+    Output("capacity-page-capacity-scenario-upload-button", "disabled"),
+    Output("capacity-page-capacity-scenario-upload-button", "style"),
+    Input("capacity-page-capacity-scenario-options-store", "data"),
+    Input("capacity-page-capacity-scenario-selected-store", "data"),
+    Input("capacity-page-capacity-scenario-dirty-store", "data"),
+    Input("capacity-page-capacity-scenario-pending-selection-store", "data"),
+)
+def sync_capacity_scenario_controls(options_data, selected_scenario_id, dirty_data, _pending_selection):
+    options = [
+        {
+            "label": option.get("scenario_name"),
+            "value": int(option["scenario_id"]),
+        }
+        for option in (options_data or [])
+        if pd.notna(pd.to_numeric(option.get("scenario_id"), errors="coerce"))
+    ]
+    valid_ids = [option["value"] for option in options]
+    normalized_selected = pd.to_numeric(selected_scenario_id, errors="coerce")
+    selected_value = int(normalized_selected) if pd.notna(normalized_selected) else None
+
+    scenario_disabled = selected_value is None
+    upload_button_style = {
+        "padding": "7px 12px",
+        "borderRadius": "999px",
+        "border": "1px solid #fdba74",
+        "backgroundColor": "#fff7ed",
+        "color": "#9a3412",
+        "fontSize": "12px",
+        "fontWeight": "700",
+        "cursor": "pointer" if not scenario_disabled else "not-allowed",
+        "opacity": "1" if not scenario_disabled else "0.55",
+    }
+    return (
+        options,
+        options,
+        _build_capacity_scenario_badge_text(selected_value, options_data),
+        _build_capacity_scenario_dirty_label(dirty_data),
+        scenario_disabled,
+        scenario_disabled,
+        scenario_disabled,
+        scenario_disabled,
+        scenario_disabled,
+        scenario_disabled,
+        upload_button_style,
+    )
+
+
+@callback(
+    Output("capacity-page-internal-scenario-dropdown", "value"),
+    Input("capacity-page-capacity-scenario-options-store", "data"),
+    Input("capacity-page-capacity-scenario-dropdown-target-store", "data"),
+    State("capacity-page-internal-scenario-dropdown", "value"),
+)
+def sync_capacity_scenario_dropdown_value(options_data, target_value, current_value):
+    valid_ids = []
+    base_case_id = None
+    for option in options_data or []:
+        scenario_id = pd.to_numeric(option.get("scenario_id"), errors="coerce")
+        if pd.notna(scenario_id):
+            normalized_id = int(scenario_id)
+            valid_ids.append(normalized_id)
+            scenario_name = " ".join(str(option.get("scenario_name") or "").strip().split())
+            if scenario_name.casefold() == "base case":
+                base_case_id = normalized_id
+
+    normalized_target = pd.to_numeric(target_value, errors="coerce")
+    normalized_current = pd.to_numeric(current_value, errors="coerce")
+    target_id = int(normalized_target) if pd.notna(normalized_target) else None
+    current_id = int(normalized_current) if pd.notna(normalized_current) else None
+
+    if target_id in valid_ids:
+        return target_id
+    if current_id in valid_ids:
+        return no_update
+    if base_case_id in valid_ids:
+        return base_case_id
+    return None
+
+
+@callback(
+    Output("capacity-page-capacity-scenario-create-source-dropdown", "disabled"),
+    Output("capacity-page-capacity-scenario-create-source-dropdown", "value"),
+    Output("capacity-page-capacity-scenario-create-source-dropdown", "style"),
+    Output("capacity-page-capacity-scenario-create-source-dropdown", "placeholder"),
+    Input("capacity-page-capacity-scenario-create-base-type", "value"),
+    State("capacity-page-capacity-scenario-create-source-dropdown", "value"),
+)
+def toggle_capacity_scenario_source_dropdown(base_type, current_source_value):
+    base_style = {"width": "220px"}
+    if base_type == "internal_scenario":
+        return False, current_source_value, {**base_style, "opacity": "1"}, "Source internal scenario"
+    return True, None, {**base_style, "opacity": "0.55"}, "Source internal scenario"
+
+
+@callback(
+    Output("capacity-page-capacity-scenario-selected-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-working-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-dirty-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-pending-selection-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-dropdown-target-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-message", "children", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-switch-confirm", "displayed", allow_duplicate=True),
+    Input("capacity-page-internal-scenario-dropdown", "value"),
+    Input("capacity-page-capacity-scenario-switch-confirm", "submit_n_clicks"),
+    Input("capacity-page-capacity-scenario-switch-confirm", "cancel_n_clicks"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-capacity-scenario-pending-selection-store", "data"),
+    State("capacity-page-capacity-scenario-options-store", "data"),
+    State("capacity-page-train-capacity-data-store", "data"),
+    State("capacity-page-ea-capacity-data-store", "data"),
+    prevent_initial_call=True,
+)
+def handle_capacity_scenario_selection(
+    dropdown_value,
+    switch_submit_clicks,
+    switch_cancel_clicks,
+    current_selected_scenario_id,
+    current_working_store,
+    current_dirty_store,
+    pending_selection_store,
+    scenario_options_data,
+    train_capacity_data,
+    ea_capacity_data,
+):
+    trigger_prop = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+    current_selected_value = pd.to_numeric(current_selected_scenario_id, errors="coerce")
+    current_selected = int(current_selected_value) if pd.notna(current_selected_value) else None
+    pending_selection_value = pd.to_numeric(pending_selection_store, errors="coerce")
+    pending_selection = int(pending_selection_value) if pd.notna(pending_selection_value) else None
+    dirty_payload = (
+        current_dirty_store
+        if isinstance(current_dirty_store, dict)
+        else {"dirty": False}
+    )
+
+    def _serialize_rows(rows_df: pd.DataFrame) -> str | None:
+        return _serialize_dataframe(_prepare_capacity_scenario_rows_df(rows_df))
+
+    train_raw_df = _deserialize_dataframe(train_capacity_data)
+    ea_raw_df = _deserialize_dataframe(ea_capacity_data)
+
+    if trigger_prop == "capacity-page-internal-scenario-dropdown.value":
+        next_selected_value = pd.to_numeric(dropdown_value, errors="coerce")
+        next_selected = int(next_selected_value) if pd.notna(next_selected_value) else None
+        if next_selected == current_selected:
+            raise PreventUpdate
+
+        if dirty_payload.get("dirty") and current_selected is not None:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                next_selected,
+                no_update,
+                _build_capacity_scenario_message(
+                    "Unsaved edits detected. Confirm the scenario switch to discard the working copy.",
+                    "warning",
+                ),
+                True,
+            )
+
+        if next_selected is None:
+            return (
+                None,
+                None,
+                {"dirty": False},
+                None,
+                None,
+                html.Div(),
+                False,
+            )
+
+        selected_rows_df = fetch_capacity_scenario_rows(next_selected, engine)
+        rebuilt_rows_df, was_rebuilt = _maybe_rebuild_legacy_capacity_scenario_rows(
+            next_selected,
+            selected_rows_df,
+            scenario_options_data,
+            train_raw_df,
+            ea_raw_df,
+        )
+        return (
+            next_selected,
+            _serialize_rows(rebuilt_rows_df),
+            {"dirty": False, "source": "rebuild" if was_rebuilt else None},
+            None,
+            no_update,
+            (
+                _build_capacity_scenario_message(
+                    "Loaded a corrected source-matched working copy for this legacy scenario so the internal view matches the baseline source. Click Save if you want to persist the repaired rows.",
+                    "warning",
+                )
+                if was_rebuilt
+                else html.Div()
+            ),
+            False,
+        )
+
+    if trigger_prop == "capacity-page-capacity-scenario-switch-confirm.submit_n_clicks":
+        if pending_selection is None:
+            raise PreventUpdate
+        selected_rows_df = fetch_capacity_scenario_rows(pending_selection, engine)
+        rebuilt_rows_df, was_rebuilt = _maybe_rebuild_legacy_capacity_scenario_rows(
+            pending_selection,
+            selected_rows_df,
+            scenario_options_data,
+            train_raw_df,
+            ea_raw_df,
+        )
+        return (
+            pending_selection,
+            _serialize_rows(rebuilt_rows_df),
+            {"dirty": False, "source": "rebuild" if was_rebuilt else None},
+            None,
+            pending_selection,
+            _build_capacity_scenario_message(
+                (
+                    "Scenario switched. Unsaved edits from the previous working copy were discarded. "
+                    "This selected scenario was also refreshed into a corrected working copy from the current source baseline; click Save if you want to persist that repair."
+                )
+                if was_rebuilt
+                else "Scenario switched. Unsaved edits from the previous working copy were discarded.",
+                "warning",
+            ),
+            False,
+        )
+
+    if trigger_prop == "capacity-page-capacity-scenario-switch-confirm.cancel_n_clicks":
+        return (
+            no_update,
+            no_update,
+            no_update,
+            None,
+            current_selected,
+            _build_capacity_scenario_message("Scenario switch cancelled.", "neutral"),
+            False,
+        )
+
+    raise PreventUpdate
+
+
+@callback(
+    Output("capacity-page-capacity-scenario-working-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-dirty-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-message", "children", allow_duplicate=True),
+    Input("capacity-page-refresh-timestamp-store", "data"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-capacity-scenario-options-store", "data"),
+    State("capacity-page-train-capacity-data-store", "data"),
+    State("capacity-page-ea-capacity-data-store", "data"),
+    prevent_initial_call=True,
+)
+def refresh_selected_capacity_scenario_working_copy(
+    _refresh_timestamp,
+    selected_scenario_id,
+    dirty_store,
+    scenario_options_data,
+    train_capacity_data,
+    ea_capacity_data,
+):
+    selected_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    if pd.isna(selected_value):
+        raise PreventUpdate
+
+    dirty_payload = dirty_store if isinstance(dirty_store, dict) else {"dirty": False}
+    if dirty_payload.get("dirty"):
+        raise PreventUpdate
+
+    selected_rows_df = fetch_capacity_scenario_rows(int(selected_value), engine)
+    rebuilt_rows_df, was_rebuilt = _maybe_rebuild_legacy_capacity_scenario_rows(
+        int(selected_value),
+        selected_rows_df,
+        scenario_options_data,
+        _deserialize_dataframe(train_capacity_data),
+        _deserialize_dataframe(ea_capacity_data),
+    )
+    return (
+        _serialize_dataframe(_prepare_capacity_scenario_rows_df(rebuilt_rows_df)),
+        {"dirty": False},
+        (
+            _build_capacity_scenario_message(
+                "Internal scenario working copy refreshed from the latest saved scenario state.",
+                "neutral",
+            )
+            if was_rebuilt
+            else no_update
+        ),
+    )
+
+
+@callback(
+    Output("capacity-page-capacity-scenario-selected-store", "data"),
+    Output("capacity-page-capacity-scenario-working-store", "data"),
+    Output("capacity-page-capacity-scenario-dirty-store", "data"),
+    Output("capacity-page-capacity-scenario-refresh-store", "data"),
+    Output("capacity-page-capacity-scenario-pending-selection-store", "data"),
+    Output("capacity-page-capacity-scenario-dropdown-target-store", "data"),
+    Output("capacity-page-capacity-scenario-message", "children"),
+    Output("capacity-page-capacity-scenario-switch-confirm", "displayed"),
+    Output("capacity-page-capacity-scenario-delete-confirm", "displayed"),
+    Input("capacity-page-capacity-scenario-create-button", "n_clicks"),
+    Input("capacity-page-capacity-scenario-save-button", "n_clicks"),
+    Input("capacity-page-capacity-scenario-revert-button", "n_clicks"),
+    Input("capacity-page-capacity-scenario-delete-button", "n_clicks"),
+    Input("capacity-page-capacity-scenario-delete-confirm", "submit_n_clicks"),
+    Input("capacity-page-capacity-scenario-delete-confirm", "cancel_n_clicks"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-train-capacity-data-store", "data"),
+    State("capacity-page-ea-capacity-data-store", "data"),
+    State("capacity-page-capacity-scenario-create-name", "value"),
+    State("capacity-page-capacity-scenario-create-base-type", "value"),
+    State("capacity-page-capacity-scenario-create-source-dropdown", "value"),
+    State("capacity-page-date-range", "start_date"),
+    State("capacity-page-train-timeline-table", "rowData"),
+    prevent_initial_call=True,
+)
+def manage_capacity_scenario_state(
+    create_clicks,
+    save_clicks,
+    revert_clicks,
+    delete_clicks,
+    delete_submit_clicks,
+    delete_cancel_clicks,
+    current_selected_scenario_id,
+    current_working_store,
+    current_dirty_store,
+    train_capacity_data,
+    ea_capacity_data,
+    create_name,
+    create_base_type,
+    create_source_scenario_id,
+    selected_start_date,
+    timeline_row_data,
+):
+    trigger_prop = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+    current_selected_value = pd.to_numeric(current_selected_scenario_id, errors="coerce")
+    current_selected = int(current_selected_value) if pd.notna(current_selected_value) else None
+    working_rows_df = _resolve_active_capacity_scenario_rows(
+        current_working_store,
+        current_dirty_store,
+        timeline_row_data,
+    )
+
+    def _serialize_rows(rows_df: pd.DataFrame) -> str | None:
+        return _serialize_dataframe(_prepare_capacity_scenario_rows_df(rows_df))
+
+    if trigger_prop == "capacity-page-capacity-scenario-create-button.n_clicks":
+        try:
+            normalized_base_type = (create_base_type or "").strip().casefold()
+            normalized_source_value = pd.to_numeric(create_source_scenario_id, errors="coerce")
+            source_scenario_id = int(normalized_source_value) if pd.notna(normalized_source_value) else None
+
+            if normalized_base_type == "current_scenario":
+                if current_selected is None:
+                    raise ValueError("Select a current scenario before creating from Current Scenario.")
+                source_rows_df = working_rows_df
+                create_base_type_value = "internal_scenario"
+                create_source_scenario_id_value = current_selected
+            else:
+                source_rows_df = _build_new_capacity_scenario_rows(
+                    normalized_base_type,
+                    _deserialize_dataframe(train_capacity_data),
+                    _deserialize_dataframe(ea_capacity_data),
+                    source_scenario_id,
+                    aggregate_from_date=selected_start_date,
+                )
+                create_base_type_value = normalized_base_type
+                create_source_scenario_id_value = source_scenario_id
+
+            create_result = create_capacity_scenario_from_source(
+                base_type=create_base_type_value,
+                source_scenario_id=create_source_scenario_id_value,
+                scenario_name=create_name,
+                engine=engine,
+                source_rows_df=source_rows_df,
+            )
+            created_rows_df = fetch_capacity_scenario_rows(create_result["scenario_id"], engine)
+            refresh_value = dt.datetime.utcnow().isoformat()
+            return (
+                create_result["scenario_id"],
+                _serialize_rows(created_rows_df),
+                {"dirty": False},
+                refresh_value,
+                None,
+                create_result["scenario_id"],
+                _build_capacity_scenario_message(
+                    f"Created internal scenario '{create_result['scenario_name']}' with {create_result['row_count']:,} rows.",
+                    "success",
+                ),
+                False,
+                False,
+            )
+        except Exception as exc:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                _build_capacity_scenario_message(f"Scenario creation failed: {exc}", "error"),
+                False,
+                False,
+            )
+
+    if trigger_prop == "capacity-page-capacity-scenario-save-button.n_clicks":
+        if current_selected is None:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                _build_capacity_scenario_message(
+                    "Select an internal scenario before saving.",
+                    "warning",
+                ),
+                False,
+                False,
+            )
+        try:
+            updated_rows_df = _update_working_scenario_rows_from_grid(
+                working_rows_df,
+                timeline_row_data,
+            )
+            save_capacity_scenario_rows(current_selected, updated_rows_df, engine)
+            refresh_value = dt.datetime.utcnow().isoformat()
+            return (
+                current_selected,
+                _serialize_rows(updated_rows_df),
+                {"dirty": False},
+                refresh_value,
+                None,
+                no_update,
+                _build_capacity_scenario_message("Scenario saved successfully.", "success"),
+                False,
+                False,
+            )
+        except Exception as exc:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                _build_capacity_scenario_message(f"Scenario save failed: {exc}", "error"),
+                False,
+                False,
+            )
+
+    if trigger_prop == "capacity-page-capacity-scenario-revert-button.n_clicks":
+        if current_selected is None:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                _build_capacity_scenario_message(
+                    "Select an internal scenario before reverting.",
+                    "warning",
+                ),
+                False,
+                False,
+            )
+        reverted_rows_df = fetch_capacity_scenario_rows(current_selected, engine)
+        return (
+            current_selected,
+            _serialize_rows(reverted_rows_df),
+            {"dirty": False},
+            dt.datetime.utcnow().isoformat(),
+            None,
+            no_update,
+            _build_capacity_scenario_message(
+                "Working copy reverted to the last saved scenario state.",
+                "success",
+            ),
+            False,
+            False,
+        )
+
+    if trigger_prop == "capacity-page-capacity-scenario-delete-button.n_clicks":
+        if current_selected is None:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                _build_capacity_scenario_message(
+                    "Select an internal scenario before deleting it.",
+                    "warning",
+                ),
+                False,
+                False,
+            )
+        return (
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            False,
+            True,
+        )
+
+    if trigger_prop == "capacity-page-capacity-scenario-delete-confirm.submit_n_clicks":
+        if current_selected is None:
+            raise PreventUpdate
+        try:
+            delete_result = delete_capacity_scenario(current_selected, engine)
+            refresh_value = dt.datetime.utcnow().isoformat()
+            return (
+                None,
+                None,
+                {"dirty": False},
+                refresh_value,
+                None,
+                None,
+                _build_capacity_scenario_message(
+                    f"Deleted internal scenario '{delete_result['scenario_name']}'.",
+                    "success",
+                ),
+                False,
+                False,
+            )
+        except Exception as exc:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                _build_capacity_scenario_message(f"Scenario deletion failed: {exc}", "error"),
+                False,
+                False,
+            )
+
+    if trigger_prop == "capacity-page-capacity-scenario-delete-confirm.cancel_n_clicks":
+        return (
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            False,
+            False,
+        )
+
+    raise PreventUpdate
+
+
+@callback(
+    Output("capacity-page-capacity-scenario-dirty-store", "data", allow_duplicate=True),
+    Input("capacity-page-train-timeline-table", "cellValueChanged"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    prevent_initial_call=True,
+)
+def mark_capacity_scenario_dirty(_cell_value_changed, selected_scenario_id):
+    selected_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    if pd.isna(selected_value):
+        raise PreventUpdate
+
+    events = _cell_value_changed if isinstance(_cell_value_changed, list) else [_cell_value_changed]
+    if not any(_is_user_scenario_cell_edit(event) for event in events):
+        raise PreventUpdate
+
+    return {"dirty": True, "source": "grid", "updated_at": dt.datetime.utcnow().isoformat()}
+
+
+@callback(
+    Output("capacity-page-capacity-scenario-working-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-dirty-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-refresh-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-message", "children", allow_duplicate=True),
+    Output("capacity-page-scenario-add-country", "value"),
+    Output("capacity-page-scenario-add-plant", "value"),
+    Output("capacity-page-scenario-add-train", "value"),
+    Output("capacity-page-scenario-add-first-date", "value"),
+    Output("capacity-page-scenario-add-capacity", "value"),
+    Input("capacity-page-scenario-add-row-button", "n_clicks"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-train-timeline-table", "rowData"),
+    State("capacity-page-scenario-add-country", "value"),
+    State("capacity-page-scenario-add-plant", "value"),
+    State("capacity-page-scenario-add-train", "value"),
+    State("capacity-page-scenario-add-first-date", "value"),
+    State("capacity-page-scenario-add-capacity", "value"),
+    prevent_initial_call=True,
+)
+def add_capacity_scenario_row(
+    n_clicks,
+    selected_scenario_id,
+    current_working_store,
+    current_dirty_store,
+    timeline_row_data,
+    country_name,
+    plant_name,
+    train_label,
+    first_date,
+    capacity_value,
+):
+    if not n_clicks:
+        raise PreventUpdate
+
+    selected_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    if pd.isna(selected_value):
+        return (
+            no_update,
+            no_update,
+            no_update,
+            _build_capacity_scenario_message(
+                "Select an internal scenario before adding a row.",
+                "warning",
+            ),
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+        )
+
+    active_rows_df = _resolve_active_capacity_scenario_rows(
+        current_working_store,
+        current_dirty_store,
+        timeline_row_data,
+    )
+
+    try:
+        updated_rows_df, _row_key = _append_manual_capacity_scenario_row(
+            active_rows_df,
+            country_name,
+            plant_name,
+            train_label,
+            first_date,
+            capacity_value,
+        )
+    except Exception as exc:
+        return (
+            no_update,
+            no_update,
+            no_update,
+            _build_capacity_scenario_message(f"Unable to add row: {exc}", "error"),
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+        )
+
+    return (
+        _serialize_dataframe(updated_rows_df),
+        {"dirty": True, "source": "working", "updated_at": dt.datetime.utcnow().isoformat()},
+        dt.datetime.utcnow().isoformat(),
+        _build_capacity_scenario_message("Added a new internal scenario row to the working copy.", "success"),
+        "",
+        "",
+        None,
+        "",
+        None,
+    )
+
+
+@callback(
+    Output("capacity-page-capacity-scenario-working-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-dirty-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-refresh-store", "data", allow_duplicate=True),
+    Output("capacity-page-capacity-scenario-message", "children", allow_duplicate=True),
+    Input("capacity-page-capacity-scenario-upload", "contents"),
+    State("capacity-page-capacity-scenario-upload", "filename"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-dirty-store", "data"),
+    prevent_initial_call=True,
+)
+def upload_train_timeline_scenario_workbook(
+    upload_contents,
+    filename,
+    selected_scenario_id,
+    current_working_store,
+    current_dirty_store,
+):
+    if not upload_contents:
+        raise PreventUpdate
+
+    selected_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    if pd.isna(selected_value):
+        return (
+            no_update,
+            no_update,
+            no_update,
+            _build_capacity_scenario_message(
+                "Select an internal scenario before uploading a Train Timeline workbook.",
+                "warning",
+            ),
+        )
+
+    dirty_payload = current_dirty_store if isinstance(current_dirty_store, dict) else {"dirty": False}
+    if dirty_payload.get("dirty"):
+        return (
+            no_update,
+            no_update,
+            no_update,
+            _build_capacity_scenario_message(
+                "Save or Revert the current unsaved edits before uploading a Train Timeline workbook.",
+                "warning",
+            ),
+        )
+
+    if not filename or not str(filename).lower().endswith(".xlsx"):
+        return (
+            no_update,
+            no_update,
+            no_update,
+            _build_capacity_scenario_message(
+                "Upload a .xlsx workbook exported from Train Timeline - Monthly.",
+                "error",
+            ),
+        )
+
+    try:
+        _content_type, content_string = upload_contents.split(",", 1)
+        workbook_bytes = base64.b64decode(content_string)
+        excel_file = pd.ExcelFile(BytesIO(workbook_bytes))
+        if TRAIN_TIMELINE_SHEET_NAME not in excel_file.sheet_names:
+            raise ValueError(
+                f"Missing worksheet '{TRAIN_TIMELINE_SHEET_NAME}'. Export a fresh Train Timeline workbook and try again."
+            )
+        if TRAIN_TIMELINE_IMPORT_META_SHEET_NAME not in excel_file.sheet_names:
+            raise ValueError(
+                f"Missing hidden metadata sheet '{TRAIN_TIMELINE_IMPORT_META_SHEET_NAME}'. Export a fresh Train Timeline workbook and try again."
+            )
+
+        main_df = pd.read_excel(
+            excel_file,
+            sheet_name=TRAIN_TIMELINE_SHEET_NAME,
+            dtype=object,
+        )
+        metadata_df = pd.read_excel(
+            excel_file,
+            sheet_name=TRAIN_TIMELINE_IMPORT_META_SHEET_NAME,
+            dtype=object,
+        )
+        updated_rows_df, summary = _build_train_timeline_upload_rows_df(
+            main_df,
+            metadata_df,
+            int(selected_value),
+            _deserialize_dataframe(current_working_store),
+        )
+    except Exception as exc:
+        return (
+            no_update,
+            no_update,
+            no_update,
+            _build_capacity_scenario_message(str(exc), "error"),
+        )
+
+    if summary["updated"] == 0 and summary["added"] == 0 and summary["deleted"] == 0:
+        return (
+            no_update,
+            no_update,
+            no_update,
+            _build_capacity_scenario_message(
+                "The uploaded workbook matches the current working copy. No changes were staged.",
+                "neutral",
+            ),
+        )
+
+    refresh_value = dt.datetime.utcnow().isoformat()
+    return (
+        _serialize_dataframe(updated_rows_df),
+        {"dirty": True, "source": "working", "updated_at": refresh_value},
+        refresh_value,
+        _build_capacity_scenario_message(
+            f"Imported {summary['updated']:,} update(s), {summary['added']:,} addition(s), and {summary['deleted']:,} deletion(s) into the working copy. Review the grid and click Save to persist.",
+            "success",
+        ),
+    )
+
+
+@callback(
     Output("capacity-page-woodmac-summary", "children"),
     Output("capacity-page-woodmac-chart", "figure"),
     Output("capacity-page-woodmac-table-container", "children"),
@@ -5240,6 +10329,8 @@ def update_capacity_error_banner(error_message):
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
+    Input("capacity-page-train-change-time-view", "value"),
+    Input("capacity-page-top-table-view", "value"),
 )
 def render_capacity_table(
     woodmac_data,
@@ -5248,6 +10339,8 @@ def render_capacity_table(
     other_countries_mode,
     start_date,
     end_date,
+    time_view,
+    table_view,
 ):
     woodmac_raw_df = _filter_by_date_range(
         _deserialize_dataframe(woodmac_data),
@@ -5261,18 +10354,19 @@ def render_capacity_table(
         selected_countries,
     )
 
-    woodmac_matrix = _rename_total_column(
-        build_export_flow_matrix(
-            woodmac_raw_df,
-            resolved_countries,
-            other_countries_mode,
-        )
+    woodmac_matrix = _apply_capacity_time_view(
+        _rename_total_column(
+            build_export_flow_matrix(
+                woodmac_raw_df,
+                resolved_countries,
+                other_countries_mode,
+            )
+        ),
+        time_view,
     )
 
     woodmac_summary = _build_section_summary(
         woodmac_raw_df,
-        woodmac_matrix,
-        other_countries_mode,
         _build_capacity_metadata_lines(metadata),
     )
 
@@ -5286,8 +10380,15 @@ def render_capacity_table(
             empty_message,
         )
 
-    woodmac_chart = _create_capacity_country_area_chart(woodmac_matrix)
-    woodmac_table = _create_capacity_table("capacity-page-woodmac-table", woodmac_matrix)
+    woodmac_chart = _create_capacity_country_area_chart(
+        woodmac_matrix,
+        time_view=time_view,
+    )
+    woodmac_table = _create_capacity_table(
+        "capacity-page-woodmac-table",
+        _apply_capacity_table_view(woodmac_matrix, table_view),
+        table_view=table_view,
+    )
     return woodmac_summary, woodmac_chart, woodmac_table
 
 
@@ -5301,6 +10402,8 @@ def render_capacity_table(
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
+    Input("capacity-page-train-change-time-view", "value"),
+    Input("capacity-page-top-table-view", "value"),
 )
 def render_ea_capacity_table(
     ea_capacity_data,
@@ -5309,6 +10412,8 @@ def render_ea_capacity_table(
     other_countries_mode,
     start_date,
     end_date,
+    time_view,
+    table_view,
 ):
     ea_schedule_df = _build_ea_capacity_schedule(
         _deserialize_dataframe(ea_capacity_data),
@@ -5322,19 +10427,20 @@ def render_ea_capacity_table(
         selected_countries,
     )
 
-    ea_matrix = _rename_total_column(
-        build_export_flow_matrix(
-            ea_schedule_df,
-            resolved_countries,
-            other_countries_mode,
-        )
+    ea_matrix = _apply_capacity_time_view(
+        _rename_total_column(
+            build_export_flow_matrix(
+                ea_schedule_df,
+                resolved_countries,
+                other_countries_mode,
+            )
+        ),
+        time_view,
     )
 
     ea_summary = _build_section_summary(
         ea_schedule_df,
-        ea_matrix,
-        other_countries_mode,
-        _build_ea_capacity_metadata_lines(metadata, ea_schedule_df),
+        _build_ea_capacity_metadata_lines(metadata),
     )
 
     if resolved_countries == [] and other_countries_mode == "exclude":
@@ -5350,9 +10456,117 @@ def render_ea_capacity_table(
     ea_chart = _create_capacity_country_area_chart(
         ea_matrix,
         y_axis_title="MTPA",
+        time_view=time_view,
     )
-    ea_table = _create_capacity_table("capacity-page-ea-table", ea_matrix)
+    ea_table = _create_capacity_table(
+        "capacity-page-ea-table",
+        _apply_capacity_table_view(ea_matrix, table_view),
+        table_view=table_view,
+    )
     return ea_summary, ea_chart, ea_table
+
+
+@callback(
+    Output("capacity-page-internal-scenario-summary", "children"),
+    Output("capacity-page-internal-scenario-chart", "figure"),
+    Output("capacity-page-internal-scenario-table-container", "children"),
+    Input("capacity-page-capacity-scenario-selected-store", "data"),
+    Input("capacity-page-capacity-scenario-options-store", "data"),
+    Input("capacity-page-country-dropdown", "value"),
+    Input("capacity-page-other-country-mode", "value"),
+    Input("capacity-page-date-range", "start_date"),
+    Input("capacity-page-date-range", "end_date"),
+    Input("capacity-page-train-change-time-view", "value"),
+    Input("capacity-page-top-table-view", "value"),
+    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-train-timeline-table", "rowData"),
+)
+def render_internal_capacity_table(
+    selected_scenario_id,
+    scenario_options_data,
+    selected_countries,
+    other_countries_mode,
+    start_date,
+    end_date,
+    time_view,
+    table_view,
+    _scenario_refresh_timestamp,
+    working_store_data,
+    dirty_store,
+    timeline_row_data,
+):
+    selected_scenario_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    if pd.isna(selected_scenario_value):
+        empty_message = _create_empty_state(INTERNAL_SCENARIO_EMPTY_MESSAGE)
+        return (
+            _build_section_summary(pd.DataFrame(), [INTERNAL_SCENARIO_EMPTY_MESSAGE]),
+            _create_empty_capacity_figure(INTERNAL_SCENARIO_EMPTY_MESSAGE),
+            empty_message,
+        )
+
+    working_rows_df = _resolve_active_capacity_scenario_rows(
+        working_store_data,
+        dirty_store,
+        timeline_row_data,
+    )
+    internal_schedule_df = _build_internal_scenario_monthly_schedule(
+        working_rows_df,
+        start_date,
+        end_date,
+    )
+    option_map = _get_capacity_scenario_option_map(scenario_options_data)
+    selected_option = option_map.get(int(selected_scenario_value), {})
+    metadata_lines = [
+        f"Scenario: {selected_option.get('scenario_name', 'Internal Scenario')}. Monthly schedule is derived from scenario first dates and scenario capacities."
+    ]
+    internal_summary = _build_section_summary(internal_schedule_df, metadata_lines)
+
+    if internal_schedule_df.empty:
+        empty_message = _create_empty_state("No internal scenario capacity falls within the current selection.")
+        return (
+            internal_summary,
+            _create_empty_capacity_figure("No internal scenario capacity falls within the current selection."),
+            empty_message,
+        )
+
+    available_countries = get_available_countries([internal_schedule_df])
+    resolved_countries = _resolve_selected_countries(
+        available_countries,
+        selected_countries,
+    )
+    if resolved_countries == [] and other_countries_mode == "exclude":
+        empty_message = _create_empty_state(
+            "Select at least one country or switch to Rest of the World mode."
+        )
+        return (
+            internal_summary,
+            _create_empty_capacity_figure(empty_message.children),
+            empty_message,
+        )
+
+    internal_matrix = _apply_capacity_time_view(
+        _rename_total_column(
+            build_export_flow_matrix(
+                internal_schedule_df,
+                resolved_countries,
+                other_countries_mode,
+            )
+        ),
+        time_view,
+    )
+    internal_chart = _create_capacity_country_area_chart(
+        internal_matrix,
+        y_axis_title="MTPA",
+        time_view=time_view,
+    )
+    internal_table = _create_capacity_table(
+        "capacity-page-internal-scenario-table",
+        _apply_capacity_table_view(internal_matrix, table_view),
+        table_view=table_view,
+    )
+    return internal_summary, internal_chart, internal_table
 
 
 @callback(
@@ -5360,31 +10574,44 @@ def render_ea_capacity_table(
     Output("capacity-page-train-change-table-container", "children"),
     Input("capacity-page-train-capacity-data-store", "data"),
     Input("capacity-page-ea-capacity-data-store", "data"),
+    Input("capacity-page-capacity-scenario-selected-store", "data"),
+    Input("capacity-page-capacity-scenario-options-store", "data"),
     Input("capacity-page-country-dropdown", "value"),
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
     Input("capacity-page-train-change-time-view", "value"),
     Input("capacity-page-train-change-view-mode", "value"),
-    Input("capacity-page-train-change-expanded-country-store", "data"),
-    Input("capacity-page-train-change-expanded-plant-store", "data"),
+    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-train-timeline-table", "rowData"),
 )
 def render_train_capacity_change_table(
     train_capacity_data,
     ea_capacity_data,
+    selected_scenario_id,
+    scenario_options_data,
     selected_countries,
     other_countries_mode,
     start_date,
     end_date,
     time_view,
     detail_view,
-    expanded_country_groups,
-    expanded_plant_groups,
+    _scenario_refresh_timestamp,
+    working_scenario_data,
+    dirty_store,
+    timeline_row_data,
 ):
     train_raw_df = _deserialize_dataframe(train_capacity_data)
     ea_raw_df = _deserialize_dataframe(ea_capacity_data)
+    working_rows_df = _resolve_active_capacity_scenario_rows(
+        working_scenario_data,
+        dirty_store,
+        timeline_row_data,
+    )
 
-    if train_raw_df.empty and ea_raw_df.empty:
+    if train_raw_df.empty and ea_raw_df.empty and working_rows_df.empty:
         empty_df = pd.DataFrame()
         return (
             _build_train_change_summary(
@@ -5393,7 +10620,7 @@ def render_train_capacity_change_table(
                 time_view=time_view,
                 detail_view=detail_view,
             ),
-            _create_train_change_table("capacity-page-train-change-table", empty_df),
+            _create_train_change_table(empty_df),
         )
 
     country_scope_frames = []
@@ -5409,6 +10636,13 @@ def render_train_capacity_change_table(
                 ["month", "country_name", "total_mmtpa"]
             ]
         )
+    internal_scope_df = _build_internal_scenario_monthly_schedule(
+        working_rows_df,
+        start_date,
+        end_date,
+    )
+    if not internal_scope_df.empty:
+        country_scope_frames.append(internal_scope_df)
     available_countries = get_available_countries(country_scope_frames)
     resolved_countries = _resolve_selected_countries(
         available_countries,
@@ -5424,6 +10658,13 @@ def render_train_capacity_change_table(
     )
     ea_change_df = _build_ea_change_log(
         ea_raw_df,
+        resolved_countries,
+        other_countries_mode,
+        start_date,
+        end_date,
+    )
+    internal_change_df = _build_internal_scenario_change_log(
+        working_rows_df,
         resolved_countries,
         other_countries_mode,
         start_date,
@@ -5432,11 +10673,14 @@ def render_train_capacity_change_table(
     hierarchical_df = _build_train_change_hierarchical_rows(
         woodmac_change_df,
         ea_change_df,
-        expanded_country_groups,
-        expanded_plant_groups,
+        internal_change_df=internal_change_df,
         time_view=time_view,
         detail_view=detail_view,
     )
+    selected_option = _get_capacity_scenario_option_map(scenario_options_data).get(
+        int(selected_scenario_id)
+    ) if pd.notna(pd.to_numeric(selected_scenario_id, errors="coerce")) else None
+    internal_label = selected_option.get("scenario_name") if selected_option else None
 
     return (
         _build_train_change_summary(
@@ -5445,44 +10689,52 @@ def render_train_capacity_change_table(
             time_view=time_view,
             detail_view=detail_view,
         ),
-        _create_train_change_table("capacity-page-train-change-table", hierarchical_df),
+        _create_train_change_table(
+            hierarchical_df,
+            internal_scenario_label=internal_label,
+        ),
     )
 
 
 @callback(
-    Output("capacity-page-train-timeline-summary", "children"),
     Output("capacity-page-train-timeline-table-container", "children"),
     Input("capacity-page-train-capacity-data-store", "data"),
     Input("capacity-page-ea-capacity-data-store", "data"),
+    Input("capacity-page-capacity-scenario-selected-store", "data"),
     Input("capacity-page-country-dropdown", "value"),
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
     Input("capacity-page-train-timeline-original-name-visibility", "value"),
+    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-train-timeline-table", "rowData"),
 )
 def render_train_timeline_table(
     train_capacity_data,
     ea_capacity_data,
+    selected_scenario_id,
     selected_countries,
     other_countries_mode,
     start_date,
     end_date,
     original_name_visibility,
+    _scenario_refresh_timestamp,
+    working_scenario_data,
+    dirty_store,
+    current_timeline_row_data,
 ):
     train_raw_df = _deserialize_dataframe(train_capacity_data)
     ea_raw_df = _deserialize_dataframe(ea_capacity_data)
     show_original_names = original_name_visibility == "show"
-
-    if train_raw_df.empty and ea_raw_df.empty:
-        empty_df = pd.DataFrame()
-        return (
-            _build_train_timeline_summary(empty_df),
-            _create_train_timeline_table(
-                "capacity-page-train-timeline-table",
-                empty_df,
-                show_original_names=show_original_names,
-            ),
-        )
+    selected_scenario_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    selected_scenario = int(selected_scenario_value) if pd.notna(selected_scenario_value) else None
+    scenario_rows_df = _resolve_active_capacity_scenario_rows(
+        working_scenario_data,
+        dirty_store,
+        current_timeline_row_data,
+    )
 
     country_scope_frames = []
     if not train_raw_df.empty:
@@ -5497,6 +10749,13 @@ def render_train_timeline_table(
                 ["month", "country_name", "total_mmtpa"]
             ]
         )
+    internal_scope_df = _build_internal_scenario_monthly_schedule(
+        scenario_rows_df,
+        start_date,
+        end_date,
+    )
+    if not internal_scope_df.empty:
+        country_scope_frames.append(internal_scope_df)
     available_countries = get_available_countries(country_scope_frames)
     resolved_countries = _resolve_selected_countries(
         available_countries,
@@ -5517,15 +10776,146 @@ def render_train_timeline_table(
         start_date,
         end_date,
     )
-    timeline_df = _build_train_timeline_df(woodmac_change_df, ea_change_df)
-
-    return (
-        _build_train_timeline_summary(timeline_df),
-        _create_train_timeline_table(
-            "capacity-page-train-timeline-table",
-            timeline_df,
-            show_original_names=show_original_names,
+    timeline_df = _build_train_timeline_df(
+        woodmac_change_df,
+        ea_change_df,
+        aggregate_from_date=start_date,
+    )
+    visible_scenario_rows_df = _filter_visible_capacity_scenario_rows(
+        scenario_rows_df,
+        resolved_countries,
+        other_countries_mode,
+        start_date,
+        end_date,
+    ) if selected_scenario is not None else pd.DataFrame()
+    woodmac_lookup_df = _build_provider_timeline_lookup_snapshot(
+        _build_train_change_log(
+            train_raw_df,
+            resolved_countries,
+            other_countries_mode,
+            None,
+            None,
         ),
+        "woodmac",
+        start_date,
+        end_date,
+    )
+    ea_lookup_df = _build_provider_timeline_lookup_snapshot(
+        _build_ea_change_log(
+            ea_raw_df,
+            resolved_countries,
+            other_countries_mode,
+            None,
+            None,
+        ),
+        "energy_aspects",
+        start_date,
+        end_date,
+    )
+    scenario_lookup_df = (
+        _build_internal_scenario_lookup_snapshot(
+            scenario_rows_df,
+            resolved_countries,
+            other_countries_mode,
+            start_date,
+            end_date,
+        )
+        if selected_scenario is not None
+        else pd.DataFrame()
+    )
+
+    return _create_train_timeline_table(
+        "capacity-page-train-timeline-table",
+        timeline_df,
+        scenario_rows_df=visible_scenario_rows_df,
+        show_original_names=show_original_names,
+        enable_editing=selected_scenario is not None,
+        aggregate_from_date=start_date,
+        woodmac_lookup_df=woodmac_lookup_df,
+        ea_lookup_df=ea_lookup_df,
+        scenario_lookup_df=scenario_lookup_df,
+    )
+
+
+@callback(
+    Output("capacity-page-train-timeline-chart-source", "options"),
+    Output("capacity-page-train-timeline-chart-source", "value"),
+    Output("capacity-page-train-timeline-chart-compare", "options"),
+    Output("capacity-page-train-timeline-chart-compare", "value"),
+    Input("capacity-page-capacity-scenario-selected-store", "data"),
+    Input("capacity-page-capacity-scenario-options-store", "data"),
+    State("capacity-page-train-timeline-chart-source", "value"),
+    State("capacity-page-train-timeline-chart-compare", "value"),
+)
+def sync_train_timeline_chart_controls(
+    selected_scenario_id,
+    scenario_options_data,
+    current_source_value,
+    current_compare_value,
+):
+    options = _get_train_timeline_chart_options(
+        selected_scenario_id,
+        scenario_options_data,
+    )
+    valid_values = {str(option.get("value") or "").strip().casefold() for option in options}
+    source_value = _coerce_train_timeline_chart_value(
+        current_source_value,
+        valid_values,
+        "woodmac",
+    )
+    compare_fallback = "internal_scenario" if "internal_scenario" in valid_values else "energy_aspects"
+    compare_value = _coerce_train_timeline_chart_value(
+        current_compare_value,
+        valid_values,
+        compare_fallback,
+    )
+    return options, source_value, options, compare_value
+
+
+@callback(
+    Output("capacity-page-train-timeline-comparison-graph", "figure"),
+    Input("capacity-page-train-timeline-chart-source", "value"),
+    Input("capacity-page-train-timeline-chart-compare", "value"),
+    Input("capacity-page-date-range", "start_date"),
+    Input("capacity-page-date-range", "end_date"),
+    Input("capacity-page-train-timeline-table", "rowData"),
+    State("capacity-page-train-timeline-chart-source", "options"),
+)
+def render_train_timeline_comparison_chart(
+    source_value,
+    compare_value,
+    start_date,
+    end_date,
+    timeline_row_data,
+    source_options,
+):
+    options = source_options or [
+        {"label": "Woodmac", "value": "woodmac"},
+        {"label": "Energy Aspects", "value": "energy_aspects"},
+    ]
+    valid_values = {str(option.get("value") or "").strip().casefold() for option in options}
+    normalized_source = _coerce_train_timeline_chart_value(
+        source_value,
+        valid_values,
+        "woodmac",
+    )
+    compare_fallback = "internal_scenario" if "internal_scenario" in valid_values else "energy_aspects"
+    normalized_compare = _coerce_train_timeline_chart_value(
+        compare_value,
+        valid_values,
+        compare_fallback,
+    )
+    source_label = _get_train_timeline_chart_option_label(options, normalized_source)
+    compare_label = _get_train_timeline_chart_option_label(options, normalized_compare)
+
+    return _create_train_timeline_comparison_figure(
+        timeline_row_data,
+        source_key=normalized_source,
+        compare_key=normalized_compare,
+        start_date=start_date,
+        end_date=end_date,
+        source_label=source_label,
+        compare_label=compare_label,
     )
 
 
@@ -5958,111 +11348,28 @@ def save_unmapped_train_mappings(n_clicks, table_data):
         )
 
 
-@callback(
-    Output("capacity-page-train-change-expanded-country-store", "data"),
-    Output("capacity-page-train-change-expanded-plant-store", "data"),
-    Input({"type": "capacity-train-change-expandable-table", "index": ALL}, "active_cell"),
-    State({"type": "capacity-train-change-expandable-table", "index": ALL}, "data"),
-    State("capacity-page-train-change-expanded-country-store", "data"),
-    State("capacity-page-train-change-expanded-plant-store", "data"),
-    prevent_initial_call=True,
-)
-def toggle_train_change_expansion(
-    active_cells,
-    table_data_list,
-    expanded_country_groups,
-    expanded_plant_groups,
-):
-    if not active_cells or not any(active_cells):
-        raise PreventUpdate
-
-    active_cell = next((cell for cell in active_cells if cell), None)
-    table_data = next((data for data in table_data_list if data), None)
-    if not active_cell or not table_data:
-        raise PreventUpdate
-
-    clicked_row = table_data[active_cell["row"]]
-    row_type = clicked_row.get("Type")
-    column_id = active_cell.get("column_id")
-    expanded_country_groups = list(expanded_country_groups or [])
-    expanded_plant_groups = list(expanded_plant_groups or [])
-
-    if row_type == "country" and column_id in {"Effective Date", "Country"}:
-        country_key = clicked_row.get("country_group_key")
-        if not country_key:
-            raise PreventUpdate
-
-        if country_key in expanded_country_groups:
-            expanded_country_groups.remove(country_key)
-            expanded_plant_groups = [
-                plant_key
-                for plant_key in expanded_plant_groups
-                if not plant_key.startswith(f"{country_key}|")
-            ]
-        else:
-            expanded_country_groups.append(country_key)
-
-        return expanded_country_groups, expanded_plant_groups
-
-    if row_type == "plant" and column_id == "Plant":
-        plant_key = clicked_row.get("plant_group_key")
-        if not plant_key:
-            raise PreventUpdate
-
-        if plant_key in expanded_plant_groups:
-            expanded_plant_groups.remove(plant_key)
-        else:
-            expanded_plant_groups.append(plant_key)
-
-        return expanded_country_groups, expanded_plant_groups
-
-    raise PreventUpdate
-
-
-@callback(
-    Output("capacity-page-train-change-expanded-country-store", "data", allow_duplicate=True),
-    Output("capacity-page-train-change-expanded-plant-store", "data", allow_duplicate=True),
-    Input("capacity-page-train-change-time-view", "value"),
-    Input("capacity-page-train-change-view-mode", "value"),
-    Input("capacity-page-train-capacity-data-store", "data"),
-    Input("capacity-page-ea-capacity-data-store", "data"),
-    Input("capacity-page-country-dropdown", "value"),
-    Input("capacity-page-other-country-mode", "value"),
-    Input("capacity-page-date-range", "start_date"),
-    Input("capacity-page-date-range", "end_date"),
-    prevent_initial_call=True,
-)
-def set_train_change_view_mode(
-    time_view,
-    view_mode,
-    train_capacity_data,
-    ea_capacity_data,
-    selected_countries,
-    other_countries_mode,
-    start_date,
-    end_date,
-):
-    return [], []
-
-
 def _build_filtered_matrix_for_export(
     source_data,
     selected_countries,
     other_countries_mode,
     start_date,
     end_date,
+    time_view: str,
 ) -> pd.DataFrame:
     raw_df = _filter_by_date_range(
         _deserialize_dataframe(source_data),
         start_date,
         end_date,
     )
-    return _rename_total_column(
-        build_export_flow_matrix(
-            raw_df,
-            selected_countries,
-            other_countries_mode,
-        )
+    return _apply_capacity_time_view(
+        _rename_total_column(
+            build_export_flow_matrix(
+                raw_df,
+                selected_countries,
+                other_countries_mode,
+            )
+        ),
+        time_view,
     )
 
 
@@ -6072,18 +11379,47 @@ def _build_filtered_ea_matrix_for_export(
     other_countries_mode,
     start_date,
     end_date,
+    time_view: str,
 ) -> pd.DataFrame:
     schedule_df = _build_ea_capacity_schedule(
         _deserialize_dataframe(source_data),
         start_date,
         end_date,
     )
-    return _rename_total_column(
-        build_export_flow_matrix(
-            schedule_df,
-            selected_countries,
-            other_countries_mode,
-        )
+    return _apply_capacity_time_view(
+        _rename_total_column(
+            build_export_flow_matrix(
+                schedule_df,
+                selected_countries,
+                other_countries_mode,
+            )
+        ),
+        time_view,
+    )
+
+
+def _build_filtered_internal_scenario_matrix_for_export(
+    working_store_data,
+    selected_countries,
+    other_countries_mode,
+    start_date,
+    end_date,
+    time_view: str,
+) -> pd.DataFrame:
+    schedule_df = _build_internal_scenario_monthly_schedule(
+        _deserialize_dataframe(working_store_data),
+        start_date,
+        end_date,
+    )
+    return _apply_capacity_time_view(
+        _rename_total_column(
+            build_export_flow_matrix(
+                schedule_df,
+                selected_countries,
+                other_countries_mode,
+            )
+        ),
+        time_view,
     )
 
 
@@ -6095,6 +11431,8 @@ def _build_filtered_ea_matrix_for_export(
     State("capacity-page-other-country-mode", "value"),
     State("capacity-page-date-range", "start_date"),
     State("capacity-page-date-range", "end_date"),
+    State("capacity-page-train-change-time-view", "value"),
+    State("capacity-page-top-table-view", "value"),
     prevent_initial_call=True,
 )
 def export_woodmac_capacity_excel(
@@ -6104,17 +11442,23 @@ def export_woodmac_capacity_excel(
     other_countries_mode,
     start_date,
     end_date,
+    time_view,
+    table_view,
 ):
     if not n_clicks:
         raise PreventUpdate
 
-    export_df = _build_filtered_matrix_for_export(
-        woodmac_data,
-        selected_countries,
-        other_countries_mode,
-        start_date,
-        end_date,
-    )
+    export_df = _apply_capacity_table_view(
+        _build_filtered_matrix_for_export(
+            woodmac_data,
+            selected_countries,
+            other_countries_mode,
+            start_date,
+            end_date,
+            time_view,
+        ),
+        table_view,
+    ).drop(columns=["__axis_date"], errors="ignore")
     if export_df.empty:
         raise PreventUpdate
 
@@ -6134,6 +11478,8 @@ def export_woodmac_capacity_excel(
     State("capacity-page-other-country-mode", "value"),
     State("capacity-page-date-range", "start_date"),
     State("capacity-page-date-range", "end_date"),
+    State("capacity-page-train-change-time-view", "value"),
+    State("capacity-page-top-table-view", "value"),
     prevent_initial_call=True,
 )
 def export_ea_capacity_excel(
@@ -6143,17 +11489,23 @@ def export_ea_capacity_excel(
     other_countries_mode,
     start_date,
     end_date,
+    time_view,
+    table_view,
 ):
     if not n_clicks:
         raise PreventUpdate
 
-    export_df = _build_filtered_ea_matrix_for_export(
-        ea_data,
-        selected_countries,
-        other_countries_mode,
-        start_date,
-        end_date,
-    )
+    export_df = _apply_capacity_table_view(
+        _build_filtered_ea_matrix_for_export(
+            ea_data,
+            selected_countries,
+            other_countries_mode,
+            start_date,
+            end_date,
+            time_view,
+        ),
+        table_view,
+    ).drop(columns=["__axis_date"], errors="ignore")
     if export_df.empty:
         raise PreventUpdate
 
@@ -6166,32 +11518,94 @@ def export_ea_capacity_excel(
 
 
 @callback(
+    Output("capacity-page-download-internal-scenario-excel", "data"),
+    Input("capacity-page-export-internal-scenario-button", "n_clicks"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-options-store", "data"),
+    State("capacity-page-country-dropdown", "value"),
+    State("capacity-page-other-country-mode", "value"),
+    State("capacity-page-date-range", "start_date"),
+    State("capacity-page-date-range", "end_date"),
+    State("capacity-page-train-change-time-view", "value"),
+    State("capacity-page-top-table-view", "value"),
+    prevent_initial_call=True,
+)
+def export_internal_scenario_capacity_excel(
+    n_clicks,
+    selected_scenario_id,
+    working_scenario_data,
+    scenario_options_data,
+    selected_countries,
+    other_countries_mode,
+    start_date,
+    end_date,
+    time_view,
+    table_view,
+):
+    if not n_clicks:
+        raise PreventUpdate
+
+    selected_scenario_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    if pd.isna(selected_scenario_value):
+        raise PreventUpdate
+
+    export_df = _apply_capacity_table_view(
+        _build_filtered_internal_scenario_matrix_for_export(
+            working_scenario_data,
+            selected_countries,
+            other_countries_mode,
+            start_date,
+            end_date,
+            time_view,
+        ),
+        table_view,
+    ).drop(columns=["__axis_date"], errors="ignore")
+    if export_df.empty:
+        raise PreventUpdate
+
+    selected_option = _get_capacity_scenario_option_map(scenario_options_data).get(
+        int(selected_scenario_value)
+    )
+    scenario_name = (selected_option or {}).get("scenario_name", "Internal_Scenario")
+    safe_scenario_name = re.sub(r"[^A-Za-z0-9_]+", "_", scenario_name).strip("_") or "Internal_Scenario"
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{safe_scenario_name}_Capacity_{timestamp}.xlsx"
+    return dcc.send_bytes(
+        _export_matrix_to_excel_bytes(export_df, "Internal Scenario"),
+        filename,
+    )
+
+
+@callback(
     Output("capacity-page-download-train-change-excel", "data"),
     Input("capacity-page-export-train-change-button", "n_clicks"),
     State("capacity-page-train-capacity-data-store", "data"),
     State("capacity-page-ea-capacity-data-store", "data"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-options-store", "data"),
     State("capacity-page-country-dropdown", "value"),
     State("capacity-page-other-country-mode", "value"),
     State("capacity-page-date-range", "start_date"),
     State("capacity-page-date-range", "end_date"),
     State("capacity-page-train-change-time-view", "value"),
     State("capacity-page-train-change-view-mode", "value"),
-    State("capacity-page-train-change-expanded-country-store", "data"),
-    State("capacity-page-train-change-expanded-plant-store", "data"),
     prevent_initial_call=True,
 )
 def export_train_change_excel(
     n_clicks,
     train_capacity_data,
     ea_capacity_data,
+    selected_scenario_id,
+    working_scenario_data,
+    scenario_options_data,
     selected_countries,
     other_countries_mode,
     start_date,
     end_date,
     time_view,
     detail_view,
-    expanded_country_groups,
-    expanded_plant_groups,
 ):
     if not n_clicks:
         raise PreventUpdate
@@ -6212,6 +11626,13 @@ def export_train_change_excel(
                 ["month", "country_name", "total_mmtpa"]
             ]
         )
+    internal_scope_df = _build_internal_scenario_monthly_schedule(
+        _deserialize_dataframe(working_scenario_data),
+        start_date,
+        end_date,
+    )
+    if not internal_scope_df.empty:
+        country_scope_frames.append(internal_scope_df)
     available_countries = get_available_countries(country_scope_frames)
     resolved_countries = _resolve_selected_countries(available_countries, selected_countries)
 
@@ -6221,11 +11642,17 @@ def export_train_change_excel(
     ea_change_df = _build_ea_change_log(
         ea_raw_df, resolved_countries, other_countries_mode, start_date, end_date
     )
+    internal_change_df = _build_internal_scenario_change_log(
+        _deserialize_dataframe(working_scenario_data),
+        resolved_countries,
+        other_countries_mode,
+        start_date,
+        end_date,
+    )
     hierarchical_df = _build_train_change_hierarchical_rows(
         woodmac_change_df,
         ea_change_df,
-        expanded_country_groups,
-        expanded_plant_groups,
+        internal_change_df=internal_change_df,
         time_view=time_view,
         detail_view=detail_view,
     )
@@ -6235,6 +11662,34 @@ def export_train_change_excel(
 
     internal_cols = {"Type", "country_group_key", "plant_group_key", "month_group_key", "month_group_end"}
     export_df = hierarchical_df.drop(columns=[c for c in internal_cols if c in hierarchical_df.columns])
+    export_df = export_df.drop(
+        columns=[
+            "Woodmac Adds (MTPA)",
+            "Woodmac Reductions (MTPA)",
+            "EA Adds (MTPA)",
+            "EA Reductions (MTPA)",
+            INTERNAL_SCENARIO_ADDS_COLUMN,
+            INTERNAL_SCENARIO_REDUCTIONS_COLUMN,
+        ],
+        errors="ignore",
+    )
+    selected_option = _get_capacity_scenario_option_map(scenario_options_data).get(
+        int(selected_scenario_id)
+    ) if pd.notna(pd.to_numeric(selected_scenario_id, errors="coerce")) else None
+    if not selected_option:
+        export_df = export_df.drop(
+            columns=[
+                INTERNAL_SCENARIO_NET_COLUMN,
+            ],
+            errors="ignore",
+        )
+    else:
+        scenario_name = selected_option.get("scenario_name", "Internal Scenario")
+        export_df = export_df.rename(
+            columns={
+                INTERNAL_SCENARIO_NET_COLUMN: f"{scenario_name} Net Delta (MTPA)",
+            }
+        )
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"Capacity_Change_Comparison_{timestamp}.xlsx"
@@ -6249,28 +11704,43 @@ def export_train_change_excel(
     Input("capacity-page-export-train-timeline-button", "n_clicks"),
     State("capacity-page-train-capacity-data-store", "data"),
     State("capacity-page-ea-capacity-data-store", "data"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-options-store", "data"),
+    State("capacity-page-capacity-scenario-dirty-store", "data"),
     State("capacity-page-country-dropdown", "value"),
     State("capacity-page-other-country-mode", "value"),
     State("capacity-page-date-range", "start_date"),
     State("capacity-page-date-range", "end_date"),
     State("capacity-page-train-timeline-original-name-visibility", "value"),
+    State("capacity-page-train-timeline-table", "rowData"),
     prevent_initial_call=True,
 )
 def export_train_timeline_excel(
     n_clicks,
     train_capacity_data,
     ea_capacity_data,
+    selected_scenario_id,
+    working_scenario_data,
+    scenario_options_data,
+    dirty_store,
     selected_countries,
     other_countries_mode,
     start_date,
     end_date,
     original_name_visibility,
+    timeline_row_data,
 ):
     if not n_clicks:
         raise PreventUpdate
 
     train_raw_df = _deserialize_dataframe(train_capacity_data)
     ea_raw_df = _deserialize_dataframe(ea_capacity_data)
+    active_rows_df = _resolve_active_capacity_scenario_rows(
+        working_scenario_data,
+        dirty_store,
+        timeline_row_data,
+    )
 
     country_scope_frames = []
     if not train_raw_df.empty:
@@ -6285,6 +11755,13 @@ def export_train_timeline_excel(
                 ["month", "country_name", "total_mmtpa"]
             ]
         )
+    internal_scope_df = _build_internal_scenario_monthly_schedule(
+        active_rows_df,
+        start_date,
+        end_date,
+    )
+    if not internal_scope_df.empty:
+        country_scope_frames.append(internal_scope_df)
     available_countries = get_available_countries(country_scope_frames)
     resolved_countries = _resolve_selected_countries(available_countries, selected_countries)
 
@@ -6302,18 +11779,134 @@ def export_train_timeline_excel(
         start_date,
         end_date,
     )
-    export_df = _build_train_timeline_df(woodmac_change_df, ea_change_df)
-    if original_name_visibility != "show":
-        export_df = export_df[
-            [column["id"] for column in _get_train_timeline_columns(show_original_names=False)]
+    export_df = _build_train_timeline_df(
+        woodmac_change_df,
+        ea_change_df,
+        aggregate_from_date=start_date,
+    )
+    woodmac_lookup_df = _build_provider_timeline_lookup_snapshot(
+        _build_train_change_log(
+            train_raw_df,
+            resolved_countries,
+            other_countries_mode,
+            None,
+            None,
+        ),
+        "woodmac",
+        start_date,
+        end_date,
+    )
+    ea_lookup_df = _build_provider_timeline_lookup_snapshot(
+        _build_ea_change_log(
+            ea_raw_df,
+            resolved_countries,
+            other_countries_mode,
+            None,
+            None,
+        ),
+        "energy_aspects",
+        start_date,
+        end_date,
+    )
+    selected_scenario_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    export_row_keys = pd.Series(dtype="object")
+    if pd.notna(selected_scenario_value):
+        visible_scenario_rows_df = _filter_visible_capacity_scenario_rows(
+            active_rows_df,
+            resolved_countries,
+            other_countries_mode,
+            start_date,
+            end_date,
+        )
+        scenario_lookup_df = _build_internal_scenario_lookup_snapshot(
+            active_rows_df,
+            resolved_countries,
+            other_countries_mode,
+            start_date,
+            end_date,
+        )
+        export_df = _build_train_timeline_grid_rows(
+            export_df,
+            visible_scenario_rows_df,
+            aggregate_from_date=start_date,
+            woodmac_lookup_df=woodmac_lookup_df,
+            ea_lookup_df=ea_lookup_df,
+            scenario_lookup_df=scenario_lookup_df,
+        )
+        export_row_keys = export_df["scenario_row_key"].copy()
+        export_df = export_df.drop(
+            columns=[
+                "__scenario_overridden",
+                "__woodmac_out_of_range",
+                "__ea_out_of_range",
+                "__scenario_out_of_range",
+                "timeline_direction",
+                "timeline_reference_key",
+            ],
+            errors="ignore",
+        )
+        export_columns = [
+            column["id"]
+            for column in _get_train_timeline_columns(
+                show_original_names=(original_name_visibility == "show"),
+                include_scenario=True,
+            )
         ]
+    else:
+        export_df = _build_train_timeline_grid_rows(
+            export_df,
+            pd.DataFrame(),
+            aggregate_from_date=start_date,
+            woodmac_lookup_df=woodmac_lookup_df,
+            ea_lookup_df=ea_lookup_df,
+        )
+        export_row_keys = export_df["scenario_row_key"].copy()
+        export_df = export_df.drop(
+            columns=[
+                "__woodmac_out_of_range",
+                "__ea_out_of_range",
+                "__scenario_out_of_range",
+                "timeline_direction",
+                "timeline_reference_key",
+                "__scenario_overridden",
+            ],
+            errors="ignore",
+        )
+        export_columns = [
+            column["id"]
+            for column in _get_train_timeline_columns(
+                show_original_names=(original_name_visibility == "show"),
+                include_scenario=False,
+            )
+        ]
+
+    export_df = export_df[[column_name for column_name in export_columns if column_name in export_df.columns]]
 
     if export_df.empty:
         raise PreventUpdate
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"Train_Timeline_{timestamp}.xlsx"
+    if pd.notna(selected_scenario_value):
+        selected_option = _get_capacity_scenario_option_map(scenario_options_data).get(
+            int(selected_scenario_value)
+        )
+        scenario_name = (selected_option or {}).get("scenario_name", "Internal Scenario")
+        export_workbook_df = export_df.copy()
+        export_workbook_df.insert(0, TRAIN_TIMELINE_IMPORT_KEY_COLUMN, export_row_keys.tolist())
+        metadata_df = _build_train_timeline_upload_metadata_df(
+            export_workbook_df,
+            int(selected_scenario_value),
+            scenario_name,
+            original_name_visibility,
+            active_rows_df,
+        )
+        return dcc.send_bytes(
+            _export_train_timeline_workbook_bytes(export_workbook_df, metadata_df),
+            filename,
+        )
+
     return dcc.send_bytes(
-        _export_matrix_to_excel_bytes(export_df, "Train Timeline"),
+        _export_matrix_to_excel_bytes(export_df, TRAIN_TIMELINE_SHEET_NAME),
         filename,
     )

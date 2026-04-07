@@ -1,9 +1,11 @@
 (function () {
-  const TABLE_PAIRS = [
-    {
-      leftId: "balance-woodmac-table",
-      rightId: "balance-comparison-delta-table",
-    },
+  const TABLE_GROUPS = [
+    ["balance-woodmac-table", "balance-comparison-delta-table"],
+    [
+      "capacity-page-woodmac-table",
+      "capacity-page-ea-table",
+      "capacity-page-internal-scenario-table",
+    ],
   ];
 
   const state = (window.__balanceTableSyncState =
@@ -60,36 +62,51 @@
       return;
     }
 
-    existingBinding.leftListeners.forEach(function (listener) {
-      listener.element.removeEventListener("scroll", listener.handler);
-    });
-    existingBinding.rightListeners.forEach(function (listener) {
+    existingBinding.listeners.forEach(function (listener) {
       listener.element.removeEventListener("scroll", listener.handler);
     });
     delete state.bindings[bindingKey];
   }
 
-  function bindScrollSync(leftId, rightId) {
-    const leftScrollables = getScrollableElements(leftId);
-    const rightScrollables = getScrollableElements(rightId);
-    const bindingKey = `${leftId}::${rightId}`;
+  function areScrollableMapsEqual(currentMap, nextMap, tableIds) {
+    return tableIds.every(function (tableId) {
+      const currentElements = currentMap[tableId] || [];
+      const nextElements = nextMap[tableId] || [];
+
+      return (
+        currentElements.length === nextElements.length &&
+        currentElements.every(function (element, index) {
+          return element === nextElements[index];
+        })
+      );
+    });
+  }
+
+  function bindScrollSyncGroup(tableIds) {
+    const scrollablesById = {};
+    const bindingKey = tableIds.join("::");
     const currentBinding = state.bindings[bindingKey];
 
-    if (!leftScrollables.length || !rightScrollables.length) {
+    tableIds.forEach(function (tableId) {
+      scrollablesById[tableId] = getScrollableElements(tableId);
+    });
+
+    if (
+      tableIds.some(function (tableId) {
+        return !scrollablesById[tableId].length;
+      })
+    ) {
       cleanupBinding(bindingKey);
       return;
     }
 
     if (
       currentBinding &&
-      currentBinding.leftScrollables.length === leftScrollables.length &&
-      currentBinding.rightScrollables.length === rightScrollables.length &&
-      currentBinding.leftScrollables.every(function (element, index) {
-        return element === leftScrollables[index];
-      }) &&
-      currentBinding.rightScrollables.every(function (element, index) {
-        return element === rightScrollables[index];
-      })
+      areScrollableMapsEqual(
+        currentBinding.scrollablesById,
+        scrollablesById,
+        tableIds
+      )
     ) {
       return;
     }
@@ -98,19 +115,25 @@
 
     let isSyncing = false;
 
-    const syncScrollPosition = function (sourceElement, targetElements) {
+    const syncScrollPosition = function (sourceElement, sourceTableId) {
       if (isSyncing) {
         return;
       }
 
       isSyncing = true;
-      targetElements.forEach(function (targetElement) {
-        if (targetElement === sourceElement) {
+      tableIds.forEach(function (tableId) {
+        if (tableId === sourceTableId) {
           return;
         }
 
-        targetElement.scrollTop = sourceElement.scrollTop;
-        targetElement.scrollLeft = sourceElement.scrollLeft;
+        (scrollablesById[tableId] || []).forEach(function (targetElement) {
+          if (targetElement === sourceElement) {
+            return;
+          }
+
+          targetElement.scrollTop = sourceElement.scrollTop;
+          targetElement.scrollLeft = sourceElement.scrollLeft;
+        });
       });
 
       window.requestAnimationFrame(function () {
@@ -118,38 +141,39 @@
       });
     };
 
-    rightScrollables.forEach(function (targetElement) {
-      targetElement.scrollTop = leftScrollables[0].scrollTop;
-      targetElement.scrollLeft = leftScrollables[0].scrollLeft;
-    });
+    const primaryTableId = tableIds[0];
+    const primaryScrollables = scrollablesById[primaryTableId] || [];
+    const primaryElement = primaryScrollables[0];
 
-    const leftListeners = leftScrollables.map(function (element) {
-      const handler = function () {
-        syncScrollPosition(element, rightScrollables);
-      };
-      element.addEventListener("scroll", handler, { passive: true });
-      return { element, handler };
-    });
+    if (primaryElement) {
+      tableIds.slice(1).forEach(function (tableId) {
+        (scrollablesById[tableId] || []).forEach(function (targetElement) {
+          targetElement.scrollTop = primaryElement.scrollTop;
+          targetElement.scrollLeft = primaryElement.scrollLeft;
+        });
+      });
+    }
 
-    const rightListeners = rightScrollables.map(function (element) {
-      const handler = function () {
-        syncScrollPosition(element, leftScrollables);
-      };
-      element.addEventListener("scroll", handler, { passive: true });
-      return { element, handler };
+    const listeners = [];
+    tableIds.forEach(function (tableId) {
+      (scrollablesById[tableId] || []).forEach(function (element) {
+        const handler = function () {
+          syncScrollPosition(element, tableId);
+        };
+        element.addEventListener("scroll", handler, { passive: true });
+        listeners.push({ element, handler });
+      });
     });
 
     state.bindings[bindingKey] = {
-      leftScrollables,
-      rightScrollables,
-      leftListeners,
-      rightListeners,
+      scrollablesById,
+      listeners,
     };
   }
 
   function refreshBalanceTableEnhancements() {
-    TABLE_PAIRS.forEach(function (pair) {
-      bindScrollSync(pair.leftId, pair.rightId);
+    TABLE_GROUPS.forEach(function (tableIds) {
+      bindScrollSyncGroup(tableIds);
     });
   }
 

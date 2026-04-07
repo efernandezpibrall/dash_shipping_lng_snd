@@ -11,7 +11,6 @@ import pages.country_mappings
 import pages.plant_names_mapping
 import pages.train_names_mapping
 import pages.contracts
-import pages.terminals
 import pages.capacity
 import pages.production
 import pages.terminal_adjustments
@@ -63,7 +62,6 @@ nav_links = html.Header([
                 dcc.Link('Exporter Detail', href='/exporter_detail', id='nav-exporter-detail', className='nav-link-secondary'),
                 dcc.Link('Importer Detail', href='/importer_detail', id='nav-importer-detail', className='nav-link-secondary'),
                 dcc.Link('Contracts', href='/contracts', id='nav-contracts', className='nav-link-secondary'),
-                dcc.Link('Terminals', href='/terminals', id='nav-terminals', className='nav-link-secondary'),
                 dcc.Link('Production', href='/production', id='nav-production', className='nav-link-secondary'),
                 dcc.Link('Capacity', href='/capacity', id='nav-capacity', className='nav-link-secondary'),
                 dcc.Link('Mappings', href='/mappings', id='nav-mappings', className='nav-link-secondary'),
@@ -107,7 +105,7 @@ def display_page(pathname):
     elif pathname == '/contracts':
         return pages.contracts.layout
     elif pathname == '/terminals':
-        return pages.terminals.layout
+        return dcc.Location(pathname='/capacity', id='redirect-capacity-from-terminals')
     elif pathname == '/production':
         return pages.production.layout
     elif pathname == '/capacity':
@@ -143,7 +141,7 @@ app.clientside_callback(
         } else if (pathname === '/contracts') {
             document.title = 'LNG Shipping - Contracts';
         } else if (pathname === '/terminals') {
-            document.title = 'LNG Shipping - Terminals';
+            document.title = 'LNG Shipping - Capacity';
         } else if (pathname === '/production') {
             document.title = 'LNG Shipping - Production';
         } else if (pathname === '/capacity') {
@@ -183,7 +181,7 @@ app.clientside_callback(
         } else if (pathname === '/contracts') {
             activeNavId = 'nav-contracts';
         } else if (pathname === '/terminals') {
-            activeNavId = 'nav-terminals';
+            activeNavId = 'nav-capacity';
         } else if (pathname === '/production') {
             activeNavId = 'nav-production';
         } else if (pathname === '/capacity') {
