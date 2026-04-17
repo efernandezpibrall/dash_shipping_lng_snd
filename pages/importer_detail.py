@@ -626,6 +626,425 @@ def format_rolling_window_title(window_days):
     return f"{normalized_window_days}-Day Rolling Average"
 
 
+IMPORTER_SELECTION_TO_ORIGIN_SCOPE = {
+    'country': 'origin_country',
+    'continent': 'origin_continent',
+    'shipping_region': 'origin_shipping_region',
+    'basin': 'origin_basin',
+    'subcontinent': 'origin_subcontinent',
+    'country_classification_level1': 'origin_classification_level1',
+    'country_classification': 'origin_classification',
+}
+
+IMPORTER_ORIGIN_LEVEL_TO_SCOPE = {
+    'origin_country_name': 'origin_country',
+    'continent_origin_name': 'origin_continent',
+    'origin_shipping_region': 'origin_shipping_region',
+    'origin_basin': 'origin_basin',
+    'origin_subcontinent': 'origin_subcontinent',
+    'origin_classification_level1': 'origin_classification_level1',
+    'origin_classification': 'origin_classification',
+}
+
+IMPORTER_MAPPING_RENAME = {
+    'continent': 'origin_continent',
+    'shipping_region': 'origin_shipping_region',
+    'basin': 'origin_basin',
+    'subcontinent': 'origin_subcontinent',
+    'country_classification_level1': 'origin_classification_level1',
+    'country_classification': 'origin_classification',
+}
+
+
+def _normalize_scope_value(value, default='Unknown'):
+    normalized_value = _normalize_mapping_value(value)
+    return normalized_value if normalized_value is not None else default
+
+
+def _normalize_scope_series(series, default=None):
+    normalized_series = series.apply(_normalize_mapping_value)
+    if default is not None:
+        normalized_series = normalized_series.fillna(default)
+    return normalized_series
+
+
+def _load_importer_country_mapping_lookup(engine):
+    lookup_columns = ['mapping_key'] + list(IMPORTER_MAPPING_RENAME.values())
+    mapping_df = pd.read_sql(
+        text(f"""
+            SELECT
+                country_name,
+                country,
+                continent,
+                shipping_region,
+                basin,
+                subcontinent,
+                country_classification_level1,
+                country_classification
+            FROM {DB_SCHEMA}.mappings_country
+            WHERE country_name IS NOT NULL OR country IS NOT NULL
+        """),
+        engine
+    )
+    if mapping_df.empty:
+        return pd.DataFrame(columns=lookup_columns)
+
+    expected_columns = ['country_name', 'country'] + list(IMPORTER_MAPPING_RENAME.keys())
+    for column in expected_columns:
+        if column not in mapping_df.columns:
+            mapping_df[column] = None
+        mapping_df[column] = _normalize_scope_series(mapping_df[column], default=None)
+
+    mapping_df['country_name'] = mapping_df['country_name'].fillna(mapping_df['country'])
+    mapping_df = mapping_df[mapping_df['country_name'].notna()].copy()
+    if mapping_df.empty:
+        return pd.DataFrame(columns=lookup_columns)
+
+    aggregation_spec = {
+        'country': lambda series: _first_non_empty_value(series, fallback=''),
+    }
+    for column in IMPORTER_MAPPING_RENAME:
+        aggregation_spec[column] = _collapse_mapping_values
+
+    deduped_mapping_df = mapping_df.groupby('country_name', as_index=False).agg(aggregation_spec)
+    deduped_mapping_df['country'] = deduped_mapping_df['country'].replace('', np.nan)
+    deduped_mapping_df['country'] = deduped_mapping_df['country'].fillna(deduped_mapping_df['country_name'])
+
+    alias_frames = []
+    for alias_col in ['country_name', 'country']:
+        alias_df = deduped_mapping_df[[alias_col] + list(IMPORTER_MAPPING_RENAME.keys())].copy()
+        alias_df = alias_df.rename(columns={alias_col: 'mapping_key'})
+        alias_df['mapping_key'] = _normalize_scope_series(alias_df['mapping_key'], default=None)
+        alias_df = alias_df[alias_df['mapping_key'].notna()].copy()
+        alias_frames.append(alias_df)
+
+    if not alias_frames:
+        return pd.DataFrame(columns=lookup_columns)
+
+    lookup_df = pd.concat(alias_frames, ignore_index=True)
+    lookup_df = lookup_df.drop_duplicates(subset=['mapping_key'], keep='first')
+    lookup_df = lookup_df.rename(columns=IMPORTER_MAPPING_RENAME)
+    for column in IMPORTER_MAPPING_RENAME.values():
+        lookup_df[column] = _normalize_scope_series(lookup_df[column], default='Unknown')
+
+    return lookup_df[lookup_columns]
+
+
+def _fetch_importer_scoped_trades(engine, destination_countries, min_end_date=None, vessel_type=None,
+                                  delivered_only=False):
+    normalized_destination_countries = normalize_destination_countries(destination_countries)
+    expected_columns = [
+        'end_date',
+        'cargo_mcm',
+        'origin_country',
+        'origin_continent_chart',
+        'origin_continent',
+        'origin_shipping_region',
+        'origin_basin',
+        'origin_subcontinent',
+        'origin_classification_level1',
+        'origin_classification',
+    ]
+    if not normalized_destination_countries:
+        return pd.DataFrame(columns=expected_columns)
+
+    min_end_date = pd.Timestamp(min_end_date or SUMMARY_LOOKBACK_START).normalize().date()
+    where_clauses = [
+        "kt.upload_timestamp_utc = (SELECT MAX(upload_timestamp_utc) FROM {schema}.kpler_trades)".format(
+            schema=DB_SCHEMA
+        ),
+        "kt.destination_country_name IN :destination_countries",
+        'kt."end" IS NOT NULL',
+        "kt.cargo_destination_cubic_meters IS NOT NULL",
+        'kt."end"::date >= :min_end_date',
+    ]
+    params = {
+        'destination_countries': normalized_destination_countries,
+        'min_end_date': min_end_date,
+    }
+    if delivered_only:
+        where_clauses.append("kt.status = 'Delivered'")
+    if vessel_type and vessel_type != 'All':
+        where_clauses.append("mv.vessel_type = :vessel_type")
+        params['vessel_type'] = vessel_type
+
+    query = text(f"""
+        SELECT
+            kt."end"::date AS end_date,
+            COALESCE(kt.cargo_destination_cubic_meters, 0) * {MCM_PER_CUBIC_METER} AS cargo_mcm,
+            COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown') AS origin_country,
+            COALESCE(NULLIF(BTRIM(kt.continent_origin_name), ''), 'Unknown') AS origin_continent_chart
+        FROM {DB_SCHEMA}.kpler_trades kt
+        LEFT JOIN {DB_SCHEMA}.mapping_vessel_type_capacity mv
+            ON kt.vessel_capacity_cubic_meters >= mv.capacity_cubic_meters_min
+            AND kt.vessel_capacity_cubic_meters < mv.capacity_cubic_meters_max
+        WHERE {' AND '.join(where_clauses)}
+    """).bindparams(bindparam('destination_countries', expanding=True))
+
+    scoped_trades_df = pd.read_sql(query, engine, params=params)
+    if scoped_trades_df.empty:
+        return pd.DataFrame(columns=expected_columns)
+
+    scoped_trades_df['end_date'] = pd.to_datetime(scoped_trades_df['end_date'], errors='coerce').dt.normalize()
+    scoped_trades_df = scoped_trades_df[scoped_trades_df['end_date'].notna()].copy()
+    scoped_trades_df['cargo_mcm'] = pd.to_numeric(scoped_trades_df['cargo_mcm'], errors='coerce').fillna(0.0)
+    scoped_trades_df['origin_country'] = _normalize_scope_series(scoped_trades_df['origin_country'], default='Unknown')
+    scoped_trades_df['origin_continent_chart'] = _normalize_scope_series(
+        scoped_trades_df['origin_continent_chart'],
+        default='Unknown'
+    )
+
+    mapping_lookup_df = _load_importer_country_mapping_lookup(engine)
+    if mapping_lookup_df.empty:
+        for column in IMPORTER_MAPPING_RENAME.values():
+            scoped_trades_df[column] = 'Unknown'
+        return scoped_trades_df[expected_columns]
+
+    scoped_trades_df = pd.merge(
+        scoped_trades_df,
+        mapping_lookup_df,
+        how='left',
+        left_on='origin_country',
+        right_on='mapping_key'
+    ).drop(columns=['mapping_key'])
+
+    for column in IMPORTER_MAPPING_RENAME.values():
+        scoped_trades_df[column] = _normalize_scope_series(scoped_trades_df[column], default='Unknown')
+
+    return scoped_trades_df[expected_columns]
+
+
+def _apply_importer_self_flow_exclusion(scoped_trades_df, selected_destination_aggregation, selected_destination_value):
+    if scoped_trades_df is None or scoped_trades_df.empty:
+        return pd.DataFrame(columns=scoped_trades_df.columns if scoped_trades_df is not None else [])
+
+    if _normalize_mapping_value(selected_destination_value) is None:
+        return scoped_trades_df.copy()
+
+    selection_aggregation = (
+        selected_destination_aggregation
+        if selected_destination_aggregation in IMPORTER_SELECTION_TO_ORIGIN_SCOPE
+        else 'country'
+    )
+    scope_column = IMPORTER_SELECTION_TO_ORIGIN_SCOPE[selection_aggregation]
+    normalized_selected_value = _normalize_scope_value(selected_destination_value)
+    return scoped_trades_df[scoped_trades_df[scope_column] != normalized_selected_value].copy()
+
+
+def _prepare_importer_summary_scope_df(scoped_trades_df, origin_level):
+    if scoped_trades_df is None or scoped_trades_df.empty:
+        return pd.DataFrame(columns=['end_date', 'cargo_mcm', 'continent', 'country'])
+
+    scope_column = IMPORTER_ORIGIN_LEVEL_TO_SCOPE.get(origin_level, 'origin_shipping_region')
+    if scope_column == 'origin_country':
+        summary_df = scoped_trades_df[['end_date', 'cargo_mcm', 'origin_country']].copy()
+        summary_df['continent'] = summary_df['origin_country']
+        summary_df['country'] = summary_df['origin_country']
+        summary_df = summary_df[['end_date', 'cargo_mcm', 'continent', 'country']]
+    else:
+        summary_df = scoped_trades_df[['end_date', 'cargo_mcm', scope_column, 'origin_country']].copy()
+        summary_df = summary_df.rename(columns={
+            scope_column: 'continent',
+            'origin_country': 'country',
+        })
+    summary_df['continent'] = _normalize_scope_series(summary_df['continent'], default='Unknown')
+    summary_df['country'] = _normalize_scope_series(summary_df['country'], default='Unknown')
+    return summary_df
+
+
+def _build_importer_periods_pivot(summary_scope_df, period_type, current_date=None):
+    expected_columns = ['continent', 'country']
+    if summary_scope_df is None or summary_scope_df.empty:
+        return pd.DataFrame(columns=expected_columns)
+
+    reference_date = pd.Timestamp(current_date or dt.date.today()).normalize()
+    historical_start = reference_date - pd.DateOffset(years=2)
+    historical_df = summary_scope_df[
+        (summary_scope_df['end_date'] >= historical_start) &
+        (summary_scope_df['end_date'] < reference_date)
+    ].copy()
+    if historical_df.empty:
+        return pd.DataFrame(columns=expected_columns)
+
+    if period_type == 'quarter':
+        historical_df['period'] = (
+            'Q' + historical_df['end_date'].dt.quarter.astype(str) +
+            "'" + historical_df['end_date'].dt.strftime('%y')
+        )
+        grouped_df = historical_df.groupby(
+            ['continent', 'country', 'period'],
+            dropna=False,
+            as_index=False
+        )['cargo_mcm'].sum()
+        grouped_df['mcm_d'] = grouped_df['cargo_mcm'] / 91.25
+    elif period_type == 'month':
+        historical_df['period'] = historical_df['end_date'].dt.strftime("%b'%y")
+        historical_df['days_in_period'] = historical_df['end_date'].dt.days_in_month.astype(float)
+        grouped_df = historical_df.groupby(
+            ['continent', 'country', 'period', 'days_in_period'],
+            dropna=False,
+            as_index=False
+        )['cargo_mcm'].sum()
+        grouped_df['mcm_d'] = grouped_df['cargo_mcm'] / grouped_df['days_in_period']
+    else:
+        historical_df['period'] = (
+            'W' + historical_df['end_date'].dt.isocalendar().week.astype(int).astype(str) +
+            "'" + historical_df['end_date'].dt.strftime('%y')
+        )
+        grouped_df = historical_df.groupby(
+            ['continent', 'country', 'period'],
+            dropna=False,
+            as_index=False
+        )['cargo_mcm'].sum()
+        grouped_df['mcm_d'] = grouped_df['cargo_mcm'] / 7.0
+
+    return grouped_df.pivot_table(
+        index=['continent', 'country'],
+        columns='period',
+        values='mcm_d',
+        aggfunc='sum',
+        fill_value=0
+    ).reset_index()
+
+
+def _build_importer_rolling_windows_pivot(summary_scope_df, rolling_window_days=30, current_date=None):
+    expected_columns = ['continent', 'country', '7D', format_rolling_window_label(rolling_window_days)]
+    if summary_scope_df is None or summary_scope_df.empty:
+        return pd.DataFrame(columns=expected_columns)
+
+    normalized_window_days = normalize_rolling_window_days(rolling_window_days)
+    rolling_window_label = format_rolling_window_label(normalized_window_days)
+    reference_date = pd.Timestamp(current_date or dt.date.today()).normalize()
+    date_7d_ago = reference_date - pd.Timedelta(days=7)
+    date_window_ago = reference_date - pd.Timedelta(days=normalized_window_days)
+    date_window_y1_start = reference_date - pd.Timedelta(days=365 + normalized_window_days)
+    date_window_y1_end = reference_date - pd.Timedelta(days=365)
+
+    relevant_df = summary_scope_df[
+        (summary_scope_df['end_date'] >= date_window_y1_start) &
+        (summary_scope_df['end_date'] <= reference_date)
+    ].copy()
+    if relevant_df.empty:
+        return pd.DataFrame(columns=expected_columns)
+
+    all_combinations_df = relevant_df[['continent', 'country']].drop_duplicates().reset_index(drop=True)
+    if all_combinations_df.empty:
+        return pd.DataFrame(columns=expected_columns)
+
+    all_combinations = pd.MultiIndex.from_frame(all_combinations_df)
+    full_date_index = pd.date_range(date_window_y1_start + pd.Timedelta(days=1), reference_date, freq='D')
+
+    daily_pivot = relevant_df.groupby(
+        ['end_date', 'continent', 'country'],
+        dropna=False,
+        as_index=False
+    )['cargo_mcm'].sum().pivot(
+        index='end_date',
+        columns=['continent', 'country'],
+        values='cargo_mcm'
+    )
+    daily_pivot = daily_pivot.reindex(full_date_index, fill_value=0)
+    daily_pivot = daily_pivot.reindex(columns=all_combinations, fill_value=0).fillna(0)
+
+    avg_7d = daily_pivot.loc[date_7d_ago + pd.Timedelta(days=1):reference_date].mean()
+    avg_window = daily_pivot.loc[date_window_ago + pd.Timedelta(days=1):reference_date].mean()
+    avg_window_y1 = daily_pivot.loc[
+        date_window_y1_start + pd.Timedelta(days=1):date_window_y1_end
+    ].mean()
+
+    rolling_df = pd.concat([
+        avg_7d.rename('7D'),
+        avg_window.rename(rolling_window_label),
+        avg_window_y1.rename(f'{rolling_window_label}_Y1'),
+    ], axis=1).reset_index()
+    rolling_df.columns = ['continent', 'country', '7D', rolling_window_label, f'{rolling_window_label}_Y1']
+    rolling_df[f'Δ 7D-{rolling_window_label}'] = rolling_df['7D'] - rolling_df[rolling_window_label]
+    rolling_df[f'Δ {rolling_window_label} Y/Y'] = (
+        rolling_df[rolling_window_label] - rolling_df[f'{rolling_window_label}_Y1']
+    )
+    return rolling_df
+
+
+def _build_importer_chart_date_index(start_date=None, forecast_days=14, current_date=None):
+    reference_date = pd.Timestamp(current_date or dt.date.today()).normalize()
+    chart_start_date = pd.Timestamp(start_date or SUMMARY_LOOKBACK_START).normalize()
+    chart_end_date = reference_date + pd.Timedelta(days=forecast_days)
+    return pd.date_range(chart_start_date, chart_end_date, freq='D'), reference_date
+
+
+def _build_importer_total_import_df(scoped_trades_df, rolling_window_days=30, current_date=None):
+    if scoped_trades_df is None or scoped_trades_df.empty:
+        return pd.DataFrame(columns=['date', 'year', 'day_of_year', 'month_day', 'rolling_avg', 'is_forecast'])
+
+    date_index, reference_date = _build_importer_chart_date_index(current_date=current_date)
+    daily_series = scoped_trades_df.groupby('end_date')['cargo_mcm'].sum()
+    daily_series = daily_series.reindex(date_index, fill_value=0)
+    rolling_avg = daily_series.rolling(
+        window=normalize_rolling_window_days(rolling_window_days),
+        min_periods=1
+    ).mean()
+
+    result_df = pd.DataFrame({
+        'date': date_index,
+        'year': date_index.year.astype(int),
+        'day_of_year': date_index.dayofyear.astype(int),
+        'month_day': date_index.strftime('%b %d'),
+        'rolling_avg': rolling_avg.to_numpy(),
+        'is_forecast': date_index > reference_date,
+    })
+    return result_df[result_df['date'] >= pd.Timestamp('2024-01-01')].reset_index(drop=True)
+
+
+def _build_importer_continent_chart_df(scoped_trades_df, rolling_window_days=30, current_date=None,
+                                       include_percentage=False):
+    expected_columns = [
+        'date', 'continent_origin', 'year', 'day_of_year', 'month_day', 'rolling_avg', 'is_forecast'
+    ]
+    if include_percentage:
+        expected_columns.insert(6, 'percentage')
+
+    if scoped_trades_df is None or scoped_trades_df.empty:
+        return pd.DataFrame(columns=expected_columns)
+
+    continents = sorted(scoped_trades_df['origin_continent'].dropna().unique().tolist())
+    if not continents:
+        return pd.DataFrame(columns=expected_columns)
+
+    date_index, reference_date = _build_importer_chart_date_index(current_date=current_date)
+    daily_matrix = scoped_trades_df.groupby(
+        ['end_date', 'origin_continent'],
+        dropna=False,
+        as_index=False
+    )['cargo_mcm'].sum().pivot(
+        index='end_date',
+        columns='origin_continent',
+        values='cargo_mcm'
+    )
+    daily_matrix = daily_matrix.reindex(date_index, fill_value=0)
+    daily_matrix = daily_matrix.reindex(columns=continents, fill_value=0).fillna(0)
+    rolling_matrix = daily_matrix.rolling(
+        window=normalize_rolling_window_days(rolling_window_days),
+        min_periods=1
+    ).mean()
+
+    melted_df = rolling_matrix.stack().reset_index()
+    melted_df.columns = ['date', 'continent_origin', 'rolling_avg']
+    melted_df['year'] = melted_df['date'].dt.year.astype(int)
+    melted_df['day_of_year'] = melted_df['date'].dt.dayofyear.astype(int)
+    melted_df['month_day'] = melted_df['date'].dt.strftime('%b %d')
+    melted_df['is_forecast'] = melted_df['date'] > reference_date
+    if include_percentage:
+        total_rolling_avg = melted_df.groupby('date')['rolling_avg'].transform('sum')
+        melted_df['percentage'] = np.where(
+            total_rolling_avg > 0,
+            (melted_df['rolling_avg'] / total_rolling_avg) * 100,
+            0
+        )
+
+    melted_df = melted_df[melted_df['date'] >= pd.Timestamp('2024-01-01')].reset_index(drop=True)
+    return melted_df[expected_columns]
+
+
 def process_trade_and_distance_data(engine, destination_countries):
     """
     Loads trade and distance data from a database for the selected importer destinations,
@@ -2424,59 +2843,51 @@ def prepare_origin_table_for_display(df, expanded_continents=None):
     return pd.concat(filtered_rows, ignore_index=True) if filtered_rows else pd.DataFrame()
 
 
-def fetch_origin_summary_data(engine, destination_countries, status, vessel_type, rolling_window_days=30, origin_level='origin_shipping_region'):
+def fetch_origin_summary_data(engine, destination_countries, status, vessel_type, rolling_window_days=30,
+                              origin_level='origin_shipping_region',
+                              selected_destination_aggregation='country',
+                              selected_destination_value=None,
+                              scoped_trades_df=None):
     """Fetch importer-side origin summary data with supplier continent/country hierarchy."""
     normalized_destination_countries = normalize_destination_countries(destination_countries)
     if not normalized_destination_countries or status == 'non_laden':
         return pd.DataFrame()
 
     try:
-        continent_col, country_col, where_clause, params = _build_importer_summary_context(
-            normalized_destination_countries,
-            vessel_type,
-            origin_level=origin_level
+        if scoped_trades_df is None:
+            scoped_trades_df = _fetch_importer_scoped_trades(
+                engine,
+                normalized_destination_countries,
+                vessel_type=vessel_type,
+                delivered_only=True
+            )
+
+        filtered_df = _apply_importer_self_flow_exclusion(
+            scoped_trades_df,
+            selected_destination_aggregation,
+            selected_destination_value
         )
-        with engine.connect() as conn:
-            quarters_df = fetch_origin_periods_data_hierarchical(
-                conn, continent_col, country_col, where_clause, params, 'quarter'
-            )
-            months_df = fetch_origin_periods_data_hierarchical(
-                conn, continent_col, country_col, where_clause, params, 'month'
-            )
-            weeks_df = fetch_origin_periods_data_hierarchical(
-                conn, continent_col, country_col, where_clause, params, 'week'
-            )
-            rolling_df = fetch_origin_rolling_windows_hierarchical(
-                conn, continent_col, country_col, where_clause, params, rolling_window_days
-            )
-        result = combine_origin_summary_data_hierarchical(
+        summary_scope_df = _prepare_importer_summary_scope_df(
+            filtered_df,
+            origin_level or 'origin_shipping_region'
+        )
+        if summary_scope_df.empty:
+            return pd.DataFrame()
+
+        quarters_df = _build_importer_periods_pivot(summary_scope_df, 'quarter')
+        months_df = _build_importer_periods_pivot(summary_scope_df, 'month')
+        weeks_df = _build_importer_periods_pivot(summary_scope_df, 'week')
+        rolling_df = _build_importer_rolling_windows_pivot(
+            summary_scope_df,
+            rolling_window_days=rolling_window_days
+        )
+        return combine_origin_summary_data_hierarchical(
             quarters_df,
             months_df,
             weeks_df,
             rolling_df,
             rolling_window_days
         )
-        # Python-side grouping: replace continent with selected level
-        level_col_map = {
-            'continent_origin_name':        'continent',
-            'origin_shipping_region':       'shipping_region',
-            'origin_basin':                 'basin',
-            'origin_subcontinent':          'subcontinent',
-            'origin_classification_level1': 'country_classification_level1',
-            'origin_classification':        'country_classification',
-        }
-        mapping_col = level_col_map.get(origin_level)
-        if mapping_col and not result.empty:
-            mapping_df = pd.read_sql(
-                f"SELECT DISTINCT country_name AS country, {mapping_col} FROM {DB_SCHEMA}.mappings_country WHERE country_name IS NOT NULL",
-                engine
-            )
-            result = pd.merge(result, mapping_df, on='country', how='left')
-            result[mapping_col] = result[mapping_col].fillna('Unknown')
-            result['continent'] = result[mapping_col]
-            result = result.drop(columns=[mapping_col])
-        # origin_country_name: continent already == country from SQL fetch, no change needed
-        return result
     except Exception as e:
         return pd.DataFrame()
 
@@ -2915,100 +3326,24 @@ def fetch_origin_forecast_summary_data(engine, destination_countries, current_da
     return summary_df, footer_rows, run_metadata
 
 
-def fetch_country_import_chart_data(destination_countries, rolling_window_days=30):
+def fetch_country_import_chart_data(destination_countries, rolling_window_days=30,
+                                    selected_destination_aggregation='country',
+                                    selected_destination_value=None,
+                                    scoped_trades_df=None):
     """Fetch seasonal comparison data for total LNG imports into the selected destinations."""
     normalized_destination_countries = normalize_destination_countries(destination_countries)
     if not normalized_destination_countries:
         return pd.DataFrame()
 
-    normalized_window_days = normalize_rolling_window_days(rolling_window_days)
-    preceding_days = normalized_window_days - 1
+    if scoped_trades_df is None:
+        scoped_trades_df = _fetch_importer_scoped_trades(engine, normalized_destination_countries)
 
-    query = text(f"""
-        WITH latest_data AS (
-            SELECT MAX(upload_timestamp_utc) AS max_timestamp
-            FROM {DB_SCHEMA}.kpler_trades
-        ),
-        all_continents AS (
-            SELECT DISTINCT
-                COALESCE(NULLIF(continent_origin_name, ''), 'Unknown') AS continent_origin
-            FROM {DB_SCHEMA}.kpler_trades kt, latest_data ld
-            WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                AND kt.destination_country_name IN :destination_countries
-                AND kt."end"::date >= :start_date
-        ),
-        all_dates AS (
-            SELECT generate_series(
-                CAST(:start_date AS date),
-                (CURRENT_DATE + INTERVAL '14 days')::date,
-                '1 day'::interval
-            )::date AS date
-        ),
-        date_continent_matrix AS (
-            SELECT d.date, c.continent_origin
-            FROM all_dates d
-            CROSS JOIN all_continents c
-        ),
-        daily_imports_raw AS (
-            SELECT
-                kt."end"::date AS date,
-                COALESCE(NULLIF(kt.continent_origin_name, ''), 'Unknown') AS continent_origin,
-                SUM(kt.cargo_destination_cubic_meters * {MCM_PER_CUBIC_METER}) AS daily_import_mcmd
-            FROM {DB_SCHEMA}.kpler_trades kt, latest_data ld
-            WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                AND kt.destination_country_name IN :destination_countries
-                AND kt."end"::date >= :start_date
-                AND kt."end"::date <= CURRENT_DATE + INTERVAL '14 days'
-            GROUP BY
-                kt."end"::date,
-                COALESCE(NULLIF(kt.continent_origin_name, ''), 'Unknown')
-        ),
-        daily_imports_complete AS (
-            SELECT
-                dcm.date,
-                dcm.continent_origin,
-                COALESCE(dir.daily_import_mcmd, 0) AS daily_import_mcmd
-            FROM date_continent_matrix dcm
-            LEFT JOIN daily_imports_raw dir
-                ON dcm.date = dir.date
-                AND dcm.continent_origin = dir.continent_origin
-        ),
-        daily_total_imports AS (
-            SELECT
-                date,
-                SUM(daily_import_mcmd) AS mcmd
-            FROM daily_imports_complete
-            GROUP BY date
-        ),
-        rolling_imports AS (
-            SELECT
-                date,
-                AVG(mcmd) OVER (
-                    ORDER BY date
-                    ROWS BETWEEN {preceding_days} PRECEDING AND CURRENT ROW
-                ) AS rolling_avg,
-                CASE WHEN date > CURRENT_DATE THEN true ELSE false END AS is_forecast
-            FROM daily_total_imports
-        )
-        SELECT
-            date,
-            EXTRACT(YEAR FROM date) AS year,
-            EXTRACT(DOY FROM date) AS day_of_year,
-            TO_CHAR(date, 'Mon DD') AS month_day,
-            rolling_avg,
-            is_forecast
-        FROM rolling_imports
-        WHERE date >= '2024-01-01'
-        ORDER BY date
-    """)
-    return pd.read_sql(
-        query,
-        engine,
-        params={
-            'destination_countries': normalized_destination_countries,
-            'start_date': SUMMARY_LOOKBACK_START
-        }
+    filtered_df = _apply_importer_self_flow_exclusion(
+        scoped_trades_df,
+        selected_destination_aggregation,
+        selected_destination_value
     )
+    return _build_importer_total_import_df(filtered_df, rolling_window_days=rolling_window_days)
 
 
 def deduplicate_woodmac_monthly_forecast_data(monthly_df):
@@ -3197,120 +3532,27 @@ def fetch_woodmac_country_import_forecast_data(destination_countries):
     return filter_woodmac_forecast_horizon(forecast_df)
 
 
-def fetch_continent_origin_chart_data(destination_countries, rolling_window_days=30, include_percentage=False):
+def fetch_continent_origin_chart_data(destination_countries, rolling_window_days=30, include_percentage=False,
+                                      selected_destination_aggregation='country',
+                                      selected_destination_value=None,
+                                      scoped_trades_df=None):
     """Fetch seasonal comparison data by supplier continent for the selected importer destinations."""
     normalized_destination_countries = normalize_destination_countries(destination_countries)
     if not normalized_destination_countries:
         return pd.DataFrame()
 
-    normalized_window_days = normalize_rolling_window_days(rolling_window_days)
-    preceding_days = normalized_window_days - 1
+    if scoped_trades_df is None:
+        scoped_trades_df = _fetch_importer_scoped_trades(engine, normalized_destination_countries)
 
-    percentage_select = ""
-    percentage_cte = ""
-    if include_percentage:
-        percentage_cte = """
-        ,
-        rolling_totals AS (
-            SELECT
-                date,
-                SUM(rolling_avg) AS total_rolling_avg
-            FROM rolling_imports
-            GROUP BY date
-        )
-        """
-        percentage_select = """
-            ,
-            CASE
-                WHEN rt.total_rolling_avg > 0
-                THEN (ri.rolling_avg / rt.total_rolling_avg) * 100
-                ELSE 0
-            END AS percentage
-        """
-
-    query = text(f"""
-        WITH latest_data AS (
-            SELECT MAX(upload_timestamp_utc) AS max_timestamp
-            FROM {DB_SCHEMA}.kpler_trades
-        ),
-        all_continents AS (
-            SELECT DISTINCT
-                COALESCE(NULLIF(continent_origin_name, ''), 'Unknown') AS continent_origin
-            FROM {DB_SCHEMA}.kpler_trades kt, latest_data ld
-            WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                AND kt.destination_country_name IN :destination_countries
-                AND kt."end"::date >= :start_date
-        ),
-        all_dates AS (
-            SELECT generate_series(
-                CAST(:start_date AS date),
-                (CURRENT_DATE + INTERVAL '14 days')::date,
-                '1 day'::interval
-            )::date AS date
-        ),
-        date_continent_matrix AS (
-            SELECT d.date, c.continent_origin
-            FROM all_dates d
-            CROSS JOIN all_continents c
-        ),
-        daily_imports_raw AS (
-            SELECT
-                kt."end"::date AS date,
-                COALESCE(NULLIF(kt.continent_origin_name, ''), 'Unknown') AS continent_origin,
-                SUM(kt.cargo_destination_cubic_meters * {MCM_PER_CUBIC_METER}) AS daily_import_mcmd
-            FROM {DB_SCHEMA}.kpler_trades kt, latest_data ld
-            WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                AND kt.destination_country_name IN :destination_countries
-                AND kt."end"::date >= :start_date
-                AND kt."end"::date <= CURRENT_DATE + INTERVAL '14 days'
-            GROUP BY
-                kt."end"::date,
-                COALESCE(NULLIF(kt.continent_origin_name, ''), 'Unknown')
-        ),
-        daily_imports_complete AS (
-            SELECT
-                dcm.date,
-                dcm.continent_origin,
-                COALESCE(dir.daily_import_mcmd, 0) AS daily_import_mcmd
-            FROM date_continent_matrix dcm
-            LEFT JOIN daily_imports_raw dir
-                ON dcm.date = dir.date
-                AND dcm.continent_origin = dir.continent_origin
-        ),
-        rolling_imports AS (
-            SELECT
-                date,
-                continent_origin,
-                AVG(daily_import_mcmd) OVER (
-                    PARTITION BY continent_origin
-                    ORDER BY date
-                    ROWS BETWEEN {preceding_days} PRECEDING AND CURRENT ROW
-                ) AS rolling_avg,
-                CASE WHEN date > CURRENT_DATE THEN true ELSE false END AS is_forecast
-            FROM daily_imports_complete
-        )
-        {percentage_cte}
-        SELECT
-            ri.date,
-            ri.continent_origin,
-            EXTRACT(YEAR FROM ri.date) AS year,
-            EXTRACT(DOY FROM ri.date) AS day_of_year,
-            TO_CHAR(ri.date, 'Mon DD') AS month_day,
-            ri.rolling_avg
-            {percentage_select},
-            ri.is_forecast
-        FROM rolling_imports ri
-        {"JOIN rolling_totals rt ON ri.date = rt.date" if include_percentage else ""}
-        WHERE ri.date >= '2024-01-01'
-        ORDER BY ri.continent_origin, ri.date
-    """)
-    return pd.read_sql(
-        query,
-        engine,
-        params={
-            'destination_countries': normalized_destination_countries,
-            'start_date': SUMMARY_LOOKBACK_START
-        }
+    filtered_df = _apply_importer_self_flow_exclusion(
+        scoped_trades_df,
+        selected_destination_aggregation,
+        selected_destination_value
+    )
+    return _build_importer_continent_chart_df(
+        filtered_df,
+        rolling_window_days=rolling_window_days,
+        include_percentage=include_percentage
     )
 
 
@@ -3601,8 +3843,14 @@ def _create_total_import_chart_with_woodmac_forecast(historical_df, forecast_df)
     return _apply_time_series_chart_layout(fig, 'mcm/d')
 
 
-def create_country_import_chart(destination_label, destination_countries, rolling_window_days=30):
-    historical_df = fetch_country_import_chart_data(destination_countries, rolling_window_days)
+def create_country_import_chart(destination_label, destination_countries, rolling_window_days=30,
+                                selected_destination_aggregation='country', selected_destination_value=None):
+    historical_df = fetch_country_import_chart_data(
+        destination_countries,
+        rolling_window_days,
+        selected_destination_aggregation=selected_destination_aggregation,
+        selected_destination_value=selected_destination_value
+    )
 
     forecast_df = fetch_woodmac_country_import_forecast_data(destination_countries)
     if historical_df.empty and forecast_df.empty:
@@ -3610,15 +3858,29 @@ def create_country_import_chart(destination_label, destination_countries, rollin
     return _create_total_import_chart_with_woodmac_forecast(historical_df, forecast_df)
 
 
-def create_continent_origin_chart(destination_label, destination_countries, rolling_window_days=30):
-    df = fetch_continent_origin_chart_data(destination_countries, rolling_window_days)
+def create_continent_origin_chart(destination_label, destination_countries, rolling_window_days=30,
+                                  selected_destination_aggregation='country', selected_destination_value=None):
+    df = fetch_continent_origin_chart_data(
+        destination_countries,
+        rolling_window_days,
+        selected_destination_aggregation=selected_destination_aggregation,
+        selected_destination_value=selected_destination_value
+    )
     if df.empty:
         return _empty_timeseries_chart(f"No origin-continent import data available for {destination_label}")
     return _create_seasonal_line_chart(df, 'continent_origin', 'rolling_avg', 'mcm/d', 'Imports')
 
 
-def create_continent_origin_percentage_chart(destination_label, destination_countries, rolling_window_days=30):
-    df = fetch_continent_origin_chart_data(destination_countries, rolling_window_days, include_percentage=True)
+def create_continent_origin_percentage_chart(destination_label, destination_countries, rolling_window_days=30,
+                                             selected_destination_aggregation='country',
+                                             selected_destination_value=None):
+    df = fetch_continent_origin_chart_data(
+        destination_countries,
+        rolling_window_days,
+        include_percentage=True,
+        selected_destination_aggregation=selected_destination_aggregation,
+        selected_destination_value=selected_destination_value
+    )
     if df.empty:
         return _empty_timeseries_chart(f"No origin share data available for {destination_label}")
     return _create_seasonal_line_chart(df, 'continent_origin', 'percentage', '%', 'Share')
@@ -3656,7 +3918,9 @@ def update_country_import_chart(selected_destination_aggregation, selected_desti
         create_country_import_chart(
             destination_context['display_label'],
             destination_context['destination_countries'],
-            rolling_window_days
+            rolling_window_days,
+            selected_destination_aggregation=selected_destination_aggregation,
+            selected_destination_value=selected_destination
         ),
         f"{destination_context['display_label']} - Total Imports + WoodMac Forecast"
     )
@@ -3685,7 +3949,9 @@ def update_continent_origin_chart(selected_destination_aggregation, selected_des
     return create_continent_origin_chart(
         destination_context['display_label'],
         destination_context['destination_countries'],
-        rolling_window_days
+        rolling_window_days,
+        selected_destination_aggregation=selected_destination_aggregation,
+        selected_destination_value=selected_destination
     ), (
         f"{destination_context['display_label']} - By Origin Continent"
     )
@@ -3714,7 +3980,9 @@ def update_continent_origin_percentage_chart(selected_destination_aggregation, s
     return create_continent_origin_percentage_chart(
         destination_context['display_label'],
         destination_context['destination_countries'],
-        rolling_window_days
+        rolling_window_days,
+        selected_destination_aggregation=selected_destination_aggregation,
+        selected_destination_value=selected_destination
     ), (
         f"{destination_context['display_label']} - Origin Share (%)"
     )
@@ -3729,10 +3997,11 @@ def update_continent_origin_percentage_chart(selected_destination_aggregation, s
     State('imp-supply-rolling-window-input', 'value'),
     State('imp-region-status-dropdown', 'value'),
     State('imp-vessel-type-dropdown', 'value'),
+    State('imp-origin-level-dropdown', 'value'),
     prevent_initial_call=True
 )
 def export_import_analysis_to_excel(n_clicks, selected_destination_aggregation, selected_destination,
-                                    destination_catalog, rolling_window_days, status, vessel_type):
+                                    destination_catalog, rolling_window_days, status, vessel_type, origin_level):
     if not n_clicks or not selected_destination:
         raise PreventUpdate
 
@@ -3746,19 +4015,49 @@ def export_import_analysis_to_excel(n_clicks, selected_destination_aggregation, 
     if not destination_context['destination_countries']:
         raise PreventUpdate
 
-    supply_df = fetch_country_import_chart_data(destination_context['destination_countries'], normalized_window_days)
-    continent_df = fetch_continent_origin_chart_data(destination_context['destination_countries'], normalized_window_days)
+    chart_scoped_trades_df = _fetch_importer_scoped_trades(
+        engine,
+        destination_context['destination_countries']
+    )
+    summary_scoped_trades_df = _fetch_importer_scoped_trades(
+        engine,
+        destination_context['destination_countries'],
+        vessel_type=vessel_type,
+        delivered_only=True
+    )
+
+    supply_df = fetch_country_import_chart_data(
+        destination_context['destination_countries'],
+        normalized_window_days,
+        selected_destination_aggregation=selected_destination_aggregation,
+        selected_destination_value=selected_destination,
+        scoped_trades_df=chart_scoped_trades_df
+    )
+    continent_df = fetch_continent_origin_chart_data(
+        destination_context['destination_countries'],
+        normalized_window_days,
+        selected_destination_aggregation=selected_destination_aggregation,
+        selected_destination_value=selected_destination,
+        scoped_trades_df=chart_scoped_trades_df
+    )
     percentage_df = fetch_continent_origin_chart_data(
         destination_context['destination_countries'],
         normalized_window_days,
-        include_percentage=True
+        include_percentage=True,
+        selected_destination_aggregation=selected_destination_aggregation,
+        selected_destination_value=selected_destination,
+        scoped_trades_df=chart_scoped_trades_df
     )
     summary_df = fetch_origin_summary_data(
         engine,
         destination_context['destination_countries'],
         status,
         vessel_type,
-        normalized_window_days
+        normalized_window_days,
+        origin_level=origin_level or 'origin_shipping_region',
+        selected_destination_aggregation=selected_destination_aggregation,
+        selected_destination_value=selected_destination,
+        scoped_trades_df=summary_scoped_trades_df
     )
 
     if supply_df.empty and continent_df.empty and percentage_df.empty and summary_df.empty:
@@ -5115,7 +5414,9 @@ def update_origin_summary_table(selected_destination_aggregation, selected_desti
             status,
             vessel_type,
             rolling_window_days,
-            origin_level=origin_level or 'origin_shipping_region'
+            origin_level=origin_level or 'origin_shipping_region',
+            selected_destination_aggregation=selected_destination_aggregation,
+            selected_destination_value=selected_destination
         )
         if df.empty:
             return html.Div("No data available for the selected filters.", style={'textAlign': 'center', 'padding': '20px'})

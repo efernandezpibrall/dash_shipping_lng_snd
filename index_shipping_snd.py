@@ -3,10 +3,13 @@ from dash import html, dcc, clientside_callback, ClientsideFunction, callback, c
 from dash.dependencies import Input, Output, State
 from app import app
 import pages.shipping_balance
-import pages.balance
+import pages.supply
+import pages.demand
+import pages.market_balance
 import pages.exporter_detail
 import pages.importer_detail
 import pages.exporters
+import pages.importers
 import pages.country_mappings
 import pages.plant_names_mapping
 import pages.train_names_mapping
@@ -57,8 +60,11 @@ nav_links = html.Header([
             # Navigation group
             html.Div([
                 dcc.Link('Shipping Balance', href='/shipping_balance', id='nav-shipping-balance', className='nav-link-secondary'),
-                dcc.Link('Balance', href='/balance', id='nav-balance', className='nav-link-secondary'),
+                dcc.Link('Supply', href='/supply', id='nav-supply', className='nav-link-secondary'),
+                dcc.Link('Demand', href='/demand', id='nav-demand', className='nav-link-secondary'),
+                dcc.Link('Market Balance', href='/market_balance', id='nav-market-balance', className='nav-link-secondary'),
                 dcc.Link('Exporters', href='/exporters', id='nav-exporters', className='nav-link-secondary'),
+                dcc.Link('Importers', href='/importers', id='nav-importers', className='nav-link-secondary'),
                 dcc.Link('Exporter Detail', href='/exporter_detail', id='nav-exporter-detail', className='nav-link-secondary'),
                 dcc.Link('Importer Detail', href='/importer_detail', id='nav-importer-detail', className='nav-link-secondary'),
                 dcc.Link('Contracts', href='/contracts', id='nav-contracts', className='nav-link-secondary'),
@@ -95,9 +101,17 @@ def display_page(pathname):
     if pathname == '/' or pathname == '/shipping_balance':
         return pages.shipping_balance.layout
     elif pathname == '/balance':
-        return pages.balance.layout
+        return dcc.Location(pathname='/supply', id='redirect-supply-from-balance')
+    elif pathname == '/supply':
+        return pages.supply.layout
+    elif pathname == '/demand':
+        return pages.demand.layout
+    elif pathname == '/market_balance':
+        return pages.market_balance.layout
     elif pathname == '/exporters':
         return pages.exporters.layout
+    elif pathname == '/importers':
+        return pages.importers.layout
     elif pathname == '/exporter_detail':
         return pages.exporter_detail.layout
     elif pathname == '/importer_detail':
@@ -130,10 +144,16 @@ app.clientside_callback(
         // Update page title
         if (pathname === '/' || pathname === '/shipping_balance') {
             document.title = 'LNG Shipping - Shipping Balance';
-        } else if (pathname === '/balance') {
-            document.title = 'LNG Shipping - Balance';
+        } else if (pathname === '/balance' || pathname === '/supply') {
+            document.title = 'LNG Shipping - Supply';
+        } else if (pathname === '/demand') {
+            document.title = 'LNG Shipping - Demand';
+        } else if (pathname === '/market_balance') {
+            document.title = 'LNG Shipping - Market Balance';
         } else if (pathname === '/exporters') {
             document.title = 'LNG Shipping - Exporters';
+        } else if (pathname === '/importers') {
+            document.title = 'LNG Shipping - Importers';
         } else if (pathname === '/exporter_detail') {
             document.title = 'LNG Shipping - Exporter Detail';
         } else if (pathname === '/importer_detail') {
@@ -170,10 +190,16 @@ app.clientside_callback(
         let activeNavId = '';
         if (pathname === '/' || pathname === '/shipping_balance') {
             activeNavId = 'nav-shipping-balance';
-        } else if (pathname === '/balance') {
-            activeNavId = 'nav-balance';
+        } else if (pathname === '/balance' || pathname === '/supply') {
+            activeNavId = 'nav-supply';
+        } else if (pathname === '/demand') {
+            activeNavId = 'nav-demand';
+        } else if (pathname === '/market_balance') {
+            activeNavId = 'nav-market-balance';
         } else if (pathname === '/exporters') {
             activeNavId = 'nav-exporters';
+        } else if (pathname === '/importers') {
+            activeNavId = 'nav-importers';
         } else if (pathname === '/exporter_detail') {
             activeNavId = 'nav-exporter-detail';
         } else if (pathname === '/importer_detail') {

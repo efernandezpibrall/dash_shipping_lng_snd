@@ -29,13 +29,13 @@ engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
 
 DEFAULT_SELECTED_COUNTRIES = [
-    "United States",
-    "Qatar",
-    "United Arab Emirates",
-    "Australia",
-    "Russia",
-    "Canada",
-    "Mozambique",
+    "China",
+    "Japan",
+    "South Korea",
+    "India",
+    "Spain",
+    "France",
+    "Turkey",
 ]
 
 MONTH_YEAR_REGEX = (
@@ -68,7 +68,7 @@ country_mapping AS (
 )
 """
 
-WOODMAC_EXPORT_FLOW_QUERY = f"""
+WOODMAC_IMPORT_FLOW_QUERY = f"""
 WITH
 {COUNTRY_MAPPING_CTE},
 latest_short_term_market AS (
@@ -77,8 +77,8 @@ latest_short_term_market AS (
         MAX(publication_date::timestamp) AS publication_timestamp
     FROM {DB_SCHEMA}.woodmac_gas_imports_exports_monthly__mmtpa
     WHERE release_type = 'Short Term Outlook'
-      AND direction = 'Export'
-      AND measured_at = 'Exit'
+      AND direction = 'Import'
+      AND measured_at = 'Entry'
       AND metric_name = 'Flow'
     GROUP BY market_outlook
     ORDER BY TO_DATE(
@@ -96,8 +96,8 @@ latest_long_term_market AS (
         MAX(publication_date::timestamp) AS publication_timestamp
     FROM {DB_SCHEMA}.woodmac_gas_imports_exports_monthly__mmtpa
     WHERE release_type = 'Long Term Outlook'
-      AND direction = 'Export'
-      AND measured_at = 'Exit'
+      AND direction = 'Import'
+      AND measured_at = 'Entry'
       AND metric_name = 'Flow'
     GROUP BY market_outlook
     ORDER BY TO_DATE(
@@ -120,8 +120,8 @@ short_term_raw AS (
           SELECT publication_timestamp FROM latest_short_term_market
       )
       AND release_type = 'Short Term Outlook'
-      AND direction = 'Export'
-      AND measured_at = 'Exit'
+      AND direction = 'Import'
+      AND measured_at = 'Entry'
       AND metric_name = 'Flow'
     GROUP BY start_date::date, country_name
     HAVING SUM(metric_value) > 0
@@ -151,8 +151,8 @@ long_term_raw AS (
           SELECT publication_timestamp FROM latest_long_term_market
       )
       AND release_type = 'Long Term Outlook'
-      AND direction = 'Export'
-      AND measured_at = 'Exit'
+      AND direction = 'Import'
+      AND measured_at = 'Entry'
       AND metric_name = 'Flow'
     GROUP BY start_date::date, country_name
     HAVING SUM(metric_value) > 0
@@ -179,7 +179,7 @@ FROM long_term
 ORDER BY month, country_name
 """
 
-def _build_ea_export_flow_query() -> str:
+def _build_ea_import_flow_query() -> str:
     balance_ctes, resolved_reference = build_resolved_ea_lng_balance_ctes(
         engine, DB_SCHEMA
     )
@@ -187,23 +187,24 @@ def _build_ea_export_flow_query() -> str:
 WITH
 {COUNTRY_MAPPING_CTE},
 {balance_ctes},
-latest_snapshot AS (
-    SELECT MAX(upload_timestamp_utc) AS upload_timestamp_utc
-    FROM {DB_SCHEMA}.ea_values
-),
-export_mappings AS (
+import_mappings AS (
     SELECT
         dataset_id,
         country,
         unit,
         frequency
     FROM {resolved_reference}
-    WHERE aspect = 'exports'
+    WHERE aspect = 'imports'
       AND category_subtype = 'LNG'
       AND frequency = 'monthly'
       AND unit = 'Mt'
       AND country IS NOT NULL
       AND country <> ''
+),
+latest_snapshot AS (
+    SELECT MAX(upload_timestamp_utc) AS upload_timestamp_utc
+    FROM {DB_SCHEMA}.ea_values
+    WHERE dataset_id IN (SELECT dataset_id FROM import_mappings)
 ),
 latest_values AS (
     SELECT
@@ -213,7 +214,7 @@ latest_values AS (
     FROM {DB_SCHEMA}.ea_values values_table
     JOIN latest_snapshot snapshot
         ON values_table.upload_timestamp_utc = snapshot.upload_timestamp_utc
-    WHERE values_table.dataset_id IN (SELECT dataset_id FROM export_mappings)
+    WHERE values_table.dataset_id IN (SELECT dataset_id FROM import_mappings)
 ),
 country_monthly AS (
     SELECT
@@ -221,7 +222,7 @@ country_monthly AS (
         COALESCE(mapping.country_name, mappings.country) AS country_name,
         SUM(values_table.value * 12.0) AS total_mmtpa
     FROM latest_values values_table
-    JOIN export_mappings mappings
+    JOIN import_mappings mappings
         ON values_table.dataset_id = mappings.dataset_id
     LEFT JOIN country_mapping mapping
         ON UPPER(TRIM(mappings.country)) = mapping.raw_country_key
@@ -232,7 +233,7 @@ FROM country_monthly
 ORDER BY month, country_name
 """
 
-WOODMAC_PARAMETERIZED_EXPORT_FLOW_QUERY = f"""
+WOODMAC_PARAMETERIZED_IMPORT_FLOW_QUERY = f"""
 WITH
 {COUNTRY_MAPPING_CTE},
 short_term_raw AS (
@@ -244,8 +245,8 @@ short_term_raw AS (
     WHERE market_outlook = :short_term_market_outlook
       AND publication_date::timestamp = CAST(:short_term_publication_timestamp AS timestamp)
       AND release_type = 'Short Term Outlook'
-      AND direction = 'Export'
-      AND measured_at = 'Exit'
+      AND direction = 'Import'
+      AND measured_at = 'Entry'
       AND metric_name = 'Flow'
     GROUP BY start_date::date, country_name
     HAVING SUM(metric_value) > 0
@@ -273,8 +274,8 @@ long_term_raw AS (
     WHERE market_outlook = :long_term_market_outlook
       AND publication_date::timestamp = CAST(:long_term_publication_timestamp AS timestamp)
       AND release_type = 'Long Term Outlook'
-      AND direction = 'Export'
-      AND measured_at = 'Exit'
+      AND direction = 'Import'
+      AND measured_at = 'Entry'
       AND metric_name = 'Flow'
     GROUP BY start_date::date, country_name
     HAVING SUM(metric_value) > 0
@@ -301,7 +302,7 @@ FROM long_term
 ORDER BY month, country_name
 """
 
-def _build_ea_parameterized_export_flow_query() -> str:
+def _build_ea_parameterized_import_flow_query() -> str:
     balance_ctes, resolved_reference = build_resolved_ea_lng_balance_ctes(
         engine, DB_SCHEMA
     )
@@ -309,14 +310,14 @@ def _build_ea_parameterized_export_flow_query() -> str:
 WITH
 {COUNTRY_MAPPING_CTE},
 {balance_ctes},
-export_mappings AS (
+import_mappings AS (
     SELECT
         dataset_id,
         country,
         unit,
         frequency
     FROM {resolved_reference}
-    WHERE aspect = 'exports'
+    WHERE aspect = 'imports'
       AND category_subtype = 'LNG'
       AND frequency = 'monthly'
       AND unit = 'Mt'
@@ -330,7 +331,7 @@ latest_values AS (
         values_table.value
     FROM {DB_SCHEMA}.ea_values values_table
     WHERE values_table.upload_timestamp_utc = CAST(:upload_timestamp_utc AS timestamp)
-      AND values_table.dataset_id IN (SELECT dataset_id FROM export_mappings)
+      AND values_table.dataset_id IN (SELECT dataset_id FROM import_mappings)
 ),
 country_monthly AS (
     SELECT
@@ -338,7 +339,7 @@ country_monthly AS (
         COALESCE(mapping.country_name, mappings.country) AS country_name,
         SUM(values_table.value * 12.0) AS total_mmtpa
     FROM latest_values values_table
-    JOIN export_mappings mappings
+    JOIN import_mappings mappings
         ON values_table.dataset_id = mappings.dataset_id
     LEFT JOIN country_mapping mapping
         ON UPPER(TRIM(mappings.country)) = mapping.raw_country_key
@@ -349,15 +350,15 @@ FROM country_monthly
 ORDER BY month, country_name
 """
 
-WOODMAC_EXPORT_FLOW_METADATA_QUERY = f"""
+WOODMAC_IMPORT_FLOW_METADATA_QUERY = f"""
 WITH latest_short_term_market AS (
     SELECT
         market_outlook,
         MAX(publication_date::timestamp) AS publication_timestamp
     FROM {DB_SCHEMA}.woodmac_gas_imports_exports_monthly__mmtpa
     WHERE release_type = 'Short Term Outlook'
-      AND direction = 'Export'
-      AND measured_at = 'Exit'
+      AND direction = 'Import'
+      AND measured_at = 'Entry'
       AND metric_name = 'Flow'
     GROUP BY market_outlook
     ORDER BY TO_DATE(
@@ -375,8 +376,8 @@ latest_long_term_market AS (
         MAX(publication_date::timestamp) AS publication_timestamp
     FROM {DB_SCHEMA}.woodmac_gas_imports_exports_monthly__mmtpa
     WHERE release_type = 'Long Term Outlook'
-      AND direction = 'Export'
-      AND measured_at = 'Exit'
+      AND direction = 'Import'
+      AND measured_at = 'Entry'
       AND metric_name = 'Flow'
     GROUP BY market_outlook
     ORDER BY TO_DATE(
@@ -397,17 +398,17 @@ FROM latest_short_term_market st
 CROSS JOIN latest_long_term_market lt
 """
 
-def _build_ea_export_flow_metadata_query() -> str:
+def _build_ea_import_flow_metadata_query() -> str:
     balance_ctes, resolved_reference = build_resolved_ea_lng_balance_ctes(
         engine, DB_SCHEMA
     )
     return f"""
 WITH
 {balance_ctes},
-export_mappings AS (
+import_mappings AS (
     SELECT dataset_id
     FROM {resolved_reference}
-    WHERE aspect = 'exports'
+    WHERE aspect = 'imports'
       AND category_subtype = 'LNG'
       AND frequency = 'monthly'
       AND unit = 'Mt'
@@ -416,7 +417,7 @@ export_mappings AS (
 )
 SELECT MAX(upload_timestamp_utc) AS upload_timestamp_utc
 FROM {DB_SCHEMA}.ea_values
-WHERE dataset_id IN (SELECT dataset_id FROM export_mappings)
+WHERE dataset_id IN (SELECT dataset_id FROM import_mappings)
 """
 
 WOODMAC_PUBLICATION_OPTIONS_QUERY = f"""
@@ -429,8 +430,8 @@ SELECT
     MAX(publication_date::timestamp) AS publication_timestamp
 FROM {DB_SCHEMA}.woodmac_gas_imports_exports_monthly__mmtpa
 WHERE release_type IN ('Short Term Outlook', 'Long Term Outlook')
-  AND direction = 'Export'
-  AND measured_at = 'Exit'
+  AND direction = 'Import'
+  AND measured_at = 'Entry'
   AND metric_name = 'Flow'
 GROUP BY release_type, market_outlook
 ORDER BY publication_kind,
@@ -450,10 +451,10 @@ def _build_ea_upload_options_query() -> str:
     return f"""
 WITH
 {balance_ctes},
-export_mappings AS (
+import_mappings AS (
     SELECT dataset_id
     FROM {resolved_reference}
-    WHERE aspect = 'exports'
+    WHERE aspect = 'imports'
       AND category_subtype = 'LNG'
       AND frequency = 'monthly'
       AND unit = 'Mt'
@@ -463,12 +464,12 @@ export_mappings AS (
 SELECT DISTINCT upload_timestamp_utc::timestamp AS upload_timestamp_utc
 FROM {DB_SCHEMA}.ea_values
 WHERE upload_timestamp_utc IS NOT NULL
-  AND dataset_id IN (SELECT dataset_id FROM export_mappings)
+  AND dataset_id IN (SELECT dataset_id FROM import_mappings)
 ORDER BY upload_timestamp_utc DESC
 """
 
 
-def _sanitize_raw_export_flow(df: pd.DataFrame) -> pd.DataFrame:
+def _sanitize_raw_import_flow(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["month", "country_name", "total_mmtpa"])
 
@@ -501,32 +502,32 @@ def _serialize_timestamp(value) -> str | None:
     return pd.Timestamp(value).isoformat()
 
 
-def fetch_all_export_flow_raw_data() -> dict[str, pd.DataFrame]:
+def fetch_all_import_flow_raw_data() -> dict[str, pd.DataFrame]:
     with engine.connect() as connection:
-        woodmac_df = pd.read_sql_query(WOODMAC_EXPORT_FLOW_QUERY, connection)
-        ea_df = pd.read_sql_query(_build_ea_export_flow_query(), connection)
+        woodmac_df = pd.read_sql_query(WOODMAC_IMPORT_FLOW_QUERY, connection)
+        ea_df = pd.read_sql_query(_build_ea_import_flow_query(), connection)
 
     return {
-        "woodmac": _sanitize_raw_export_flow(woodmac_df),
-        "ea": _sanitize_raw_export_flow(ea_df),
+        "woodmac": _sanitize_raw_import_flow(woodmac_df),
+        "ea": _sanitize_raw_import_flow(ea_df),
     }
 
 
-def fetch_woodmac_export_flow_raw_data() -> pd.DataFrame:
+def fetch_woodmac_import_flow_raw_data() -> pd.DataFrame:
     with engine.connect() as connection:
-        woodmac_df = pd.read_sql_query(WOODMAC_EXPORT_FLOW_QUERY, connection)
+        woodmac_df = pd.read_sql_query(WOODMAC_IMPORT_FLOW_QUERY, connection)
 
-    return _sanitize_raw_export_flow(woodmac_df)
+    return _sanitize_raw_import_flow(woodmac_df)
 
 
-def fetch_ea_export_flow_raw_data() -> pd.DataFrame:
+def fetch_ea_import_flow_raw_data() -> pd.DataFrame:
     with engine.connect() as connection:
-        ea_df = pd.read_sql_query(_build_ea_export_flow_query(), connection)
+        ea_df = pd.read_sql_query(_build_ea_import_flow_query(), connection)
 
-    return _sanitize_raw_export_flow(ea_df)
+    return _sanitize_raw_import_flow(ea_df)
 
 
-def fetch_woodmac_export_flow_raw_data_for_publications(
+def fetch_woodmac_import_flow_raw_data_for_publications(
     short_term_market_outlook: str,
     short_term_publication_timestamp: str,
     long_term_market_outlook: str,
@@ -541,28 +542,28 @@ def fetch_woodmac_export_flow_raw_data_for_publications(
 
     with engine.connect() as connection:
         woodmac_df = pd.read_sql_query(
-            text(WOODMAC_PARAMETERIZED_EXPORT_FLOW_QUERY),
+            text(WOODMAC_PARAMETERIZED_IMPORT_FLOW_QUERY),
             connection,
             params=params,
         )
 
-    return _sanitize_raw_export_flow(woodmac_df)
+    return _sanitize_raw_import_flow(woodmac_df)
 
 
-def fetch_ea_export_flow_raw_data_for_upload(upload_timestamp_utc: str) -> pd.DataFrame:
+def fetch_ea_import_flow_raw_data_for_upload(upload_timestamp_utc: str) -> pd.DataFrame:
     with engine.connect() as connection:
         ea_df = pd.read_sql_query(
-            text(_build_ea_parameterized_export_flow_query()),
+            text(_build_ea_parameterized_import_flow_query()),
             connection,
             params={"upload_timestamp_utc": upload_timestamp_utc},
         )
 
-    return _sanitize_raw_export_flow(ea_df)
+    return _sanitize_raw_import_flow(ea_df)
 
 
-def fetch_woodmac_export_flow_metadata() -> dict[str, str | None]:
+def fetch_woodmac_import_flow_metadata() -> dict[str, str | None]:
     with engine.connect() as connection:
-        metadata_df = pd.read_sql_query(WOODMAC_EXPORT_FLOW_METADATA_QUERY, connection)
+        metadata_df = pd.read_sql_query(WOODMAC_IMPORT_FLOW_METADATA_QUERY, connection)
 
     if metadata_df.empty:
         return {}
@@ -580,10 +581,10 @@ def fetch_woodmac_export_flow_metadata() -> dict[str, str | None]:
     }
 
 
-def fetch_ea_export_flow_metadata() -> dict[str, str | None]:
+def fetch_ea_import_flow_metadata() -> dict[str, str | None]:
     with engine.connect() as connection:
         metadata_df = pd.read_sql_query(
-            _build_ea_export_flow_metadata_query(), connection
+            _build_ea_import_flow_metadata_query(), connection
         )
 
     if metadata_df.empty:
@@ -656,12 +657,12 @@ def default_selected_countries(available_countries: list[str]) -> list[str]:
     return available_countries[: min(7, len(available_countries))]
 
 
-def build_export_flow_matrix(
+def build_import_flow_matrix(
     raw_df: pd.DataFrame,
     selected_countries: list[str] | None,
     other_countries_mode: str = "rest_of_world",
 ) -> pd.DataFrame:
-    sanitized_df = _sanitize_raw_export_flow(raw_df)
+    sanitized_df = _sanitize_raw_import_flow(raw_df)
     if sanitized_df.empty:
         return pd.DataFrame(columns=["Month", "Total MMTPA"])
 

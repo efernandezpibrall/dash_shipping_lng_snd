@@ -1,7 +1,8 @@
-from dash import html, dcc, dash_table, callback, Output, Input, State, ALL, callback_context
+from dash import html, dcc, dash_table, callback, Output, Input, State, ALL, callback_context, no_update
 from dash.dash_table.Format import Format, Scheme
 import plotly.graph_objects as go
 import pandas as pd
+from copy import deepcopy
 from datetime import datetime, timedelta
 from io import BytesIO
 import configparser
@@ -15,6 +16,238 @@ from utils.table_styles import StandardTableStyleManager, TABLE_COLORS
 MONTH_ORDER = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
                'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
 
+SUPPLY_DEST_PERIOD_VIEW_OPTIONS = [
+    {'label': 'Monthly', 'value': 'monthly'},
+    {'label': 'Quarterly', 'value': 'quarterly'},
+    {'label': 'Seasonally', 'value': 'seasonally'},
+    {'label': 'Yearly', 'value': 'yearly'}
+]
+
+SUPPLY_DEST_PERIOD_COUNT_OPTIONS = {
+    'monthly': [12, 24, 36],
+    'quarterly': [4, 8],
+    'seasonally': [4, 6],
+    'yearly': [3, 5]
+}
+
+SUPPLY_DEST_COMPARISON_BASIS_OPTIONS = [
+    {'label': 'Levels', 'value': 'levels'},
+    {'label': 'vs Previous Period', 'value': 'previous_period'},
+    {'label': 'vs Same Period Last Year', 'value': 'same_period_last_year'}
+]
+
+SUPPLY_DEST_COUNTRY_GROUPING_OPTIONS = [
+    {'label': 'Show all countries', 'value': 'show_all'},
+    {'label': 'Group small countries', 'value': 'group_small_countries'}
+]
+
+SUPPLY_DEST_TEXT_COLUMNS = [
+    'Aggregation Supply',
+    'Aggregation Demand',
+    'Country Demand',
+    'Demand Country',
+    'Supply Country'
+]
+
+
+def _empty_supply_dest_period_analysis_payload():
+    """Return the default empty payload for the supply-destination period-analysis store."""
+    return {
+        key: {
+            'records': [],
+            'current_period_label': None,
+            'current_period_previous_label': None,
+            'current_period_previous_records': [],
+            'current_period_prior_year_label': None,
+            'current_period_prior_year_records': []
+        }
+        for key in ['monthly', 'quarterly', 'seasonally', 'yearly']
+    }
+
+
+def _empty_supply_dest_summary_store_payload():
+    """Return the default store payload for grouped and ungrouped overview tables."""
+    return {
+        'show_all': [],
+        'group_small_countries': []
+    }
+
+
+def _empty_supply_dest_period_store_payload():
+    """Return the default store payload for grouped and ungrouped period-analysis views."""
+    return {
+        'show_all': _empty_supply_dest_period_analysis_payload(),
+        'group_small_countries': _empty_supply_dest_period_analysis_payload()
+    }
+
+
+def _build_lng_season_periods(dates: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Match the seasonal period definition used on the capacity page."""
+    normalized_dates = pd.to_datetime(dates, errors='coerce').dt.to_period('M').dt.to_timestamp()
+    is_summer = normalized_dates.dt.month.between(4, 9)
+    season_year = (
+        normalized_dates.dt.year - normalized_dates.dt.month.isin([1, 2, 3]).astype(int)
+    ).astype('Int64')
+
+    season_start_month = pd.Series(10, index=normalized_dates.index, dtype='int64')
+    season_start_month.loc[is_summer] = 4
+
+    season_code = pd.Series('W', index=normalized_dates.index, dtype='object')
+    season_code.loc[is_summer] = 'S'
+
+    season_start = pd.to_datetime(
+        {
+            'year': season_year,
+            'month': season_start_month,
+            'day': 1
+        },
+        errors='coerce'
+    )
+    season_label = season_year.astype(str)
+    season_label = season_label.where(normalized_dates.notna(), '')
+    season_label = season_label + '-' + season_code.where(normalized_dates.notna(), '')
+    return season_start, season_label
+
+
+def _normalize_supply_dest_period_view(period_view):
+    """Normalize the selected period view for supply-destination analysis."""
+    if period_view in {'monthly', 'quarterly', 'seasonally', 'yearly'}:
+        return period_view
+    return None
+
+
+def _normalize_supply_dest_comparison_basis(comparison_basis):
+    """Normalize comparison basis while keeping the current table as the default state."""
+    if comparison_basis in {'levels', 'previous_period', 'same_period_last_year'}:
+        return comparison_basis
+    return 'levels'
+
+
+def _normalize_supply_dest_country_grouping(grouping_mode):
+    """Normalize the small-country grouping mode for the period-analysis table."""
+    if grouping_mode == 'group_small_countries':
+        return 'group_small_countries'
+    return 'show_all'
+
+
+def _resolve_supply_dest_period_payload(period_payload, grouping_mode='show_all'):
+    """Resolve the grouped or ungrouped period payload from the store data."""
+    grouping_mode = _normalize_supply_dest_country_grouping(grouping_mode)
+    if not isinstance(period_payload, dict):
+        return _empty_supply_dest_period_analysis_payload()
+
+    period_keys = {'monthly', 'quarterly', 'seasonally', 'yearly'}
+    if period_keys.issubset(set(period_payload.keys())):
+        return period_payload
+
+    selected_payload = period_payload.get(grouping_mode)
+    if isinstance(selected_payload, dict):
+        return selected_payload
+
+    fallback_payload = period_payload.get('show_all')
+    if isinstance(fallback_payload, dict):
+        return fallback_payload
+
+    return _empty_supply_dest_period_analysis_payload()
+
+
+def _resolve_supply_dest_summary_payload(summary_payload, grouping_mode='show_all'):
+    """Resolve the grouped or ungrouped overview payload from the store data."""
+    grouping_mode = _normalize_supply_dest_country_grouping(grouping_mode)
+    if isinstance(summary_payload, list):
+        return summary_payload
+    if not isinstance(summary_payload, dict):
+        return []
+
+    selected_payload = summary_payload.get(grouping_mode)
+    if isinstance(selected_payload, list):
+        return selected_payload
+
+    fallback_payload = summary_payload.get('show_all')
+    if isinstance(fallback_payload, list):
+        return fallback_payload
+
+    return []
+
+
+def _format_supply_dest_period_label(period_start, period_view):
+    """Format the period label shown in historical supply-destination views."""
+    if pd.isna(period_start):
+        return ''
+
+    period_start = pd.Timestamp(period_start)
+    if period_view == 'monthly':
+        return f"{calendar.month_abbr[period_start.month]}'{str(period_start.year)[2:]}"
+    if period_view == 'quarterly':
+        return f"Q{period_start.quarter}'{str(period_start.year)[2:]}"
+    if period_view == 'yearly':
+        return str(period_start.year)
+    return ''
+
+
+def _get_supply_dest_period_sort_key(label, period_view):
+    """Return a sortable tuple for visible period labels."""
+    if period_view == 'monthly':
+        month_abbr, year_suffix = label.split("'")
+        return (int(f"20{year_suffix}"), MONTH_ORDER.get(month_abbr, 0))
+    if period_view == 'quarterly':
+        quarter_part, year_suffix = label.split("'")
+        return (int(f"20{year_suffix}"), int(quarter_part.replace('Q', '')))
+    if period_view == 'seasonally':
+        year_text, season_code = label.split('-')
+        return (int(year_text), 0 if season_code == 'S' else 1)
+    if period_view == 'yearly':
+        return (int(label), 0)
+    return (0, 0)
+
+
+def _get_supply_dest_previous_period_label(label, period_view):
+    """Return the immediately preceding completed period label."""
+    if period_view == 'monthly':
+        month_abbr, year_suffix = label.split("'")
+        year = int(f"20{year_suffix}")
+        month = MONTH_ORDER[month_abbr]
+        previous = pd.Timestamp(year=year, month=month, day=1) - pd.offsets.MonthBegin(1)
+        return _format_supply_dest_period_label(previous, 'monthly')
+    if period_view == 'quarterly':
+        quarter_part, year_suffix = label.split("'")
+        year = int(f"20{year_suffix}")
+        quarter = int(quarter_part.replace('Q', ''))
+        if quarter == 1:
+            return f"Q4'{str(year - 1)[2:]}"
+        return f"Q{quarter - 1}'{str(year)[2:]}"
+    if period_view == 'seasonally':
+        year_text, season_code = label.split('-')
+        year = int(year_text)
+        if season_code == 'S':
+            return f"{year - 1}-W"
+        return f"{year}-S"
+    if period_view == 'yearly':
+        return str(int(label) - 1)
+    return None
+
+
+def _get_supply_dest_prior_year_label(label, period_view):
+    """Return the same period one year earlier."""
+    if period_view == 'monthly':
+        month_abbr, year_suffix = label.split("'")
+        return f"{month_abbr}'{str(int(f'20{year_suffix}') - 1)[2:]}"
+    if period_view == 'quarterly':
+        quarter_part, year_suffix = label.split("'")
+        return f"{quarter_part}'{str(int(f'20{year_suffix}') - 1)[2:]}"
+    if period_view == 'seasonally':
+        year_text, season_code = label.split('-')
+        return f"{int(year_text) - 1}-{season_code}"
+    if period_view == 'yearly':
+        return str(int(label) - 1)
+    return None
+
+
+def _get_supply_dest_period_options(period_view):
+    """Return period count options for the selected time view."""
+    values = SUPPLY_DEST_PERIOD_COUNT_OPTIONS.get(period_view, [])
+    return [{'label': str(value), 'value': value} for value in values]
+
 
 def safe_concat(dataframes, **kwargs):
     """Concatenate DataFrames, filtering out empty ones to avoid FutureWarning."""
@@ -22,6 +255,76 @@ def safe_concat(dataframes, **kwargs):
     if not non_empty_dfs:
         return pd.DataFrame()
     return pd.concat(non_empty_dfs, **kwargs)
+
+
+def normalize_demand_aggregation_mode(demand_aggregation_mode):
+    """Normalize demand aggregation mode so the dropdown can safely default to None."""
+    if demand_aggregation_mode in (None, '', 'None'):
+        return 'None'
+    return demand_aggregation_mode
+
+
+def use_demand_classification_mode(classification_mode, demand_aggregation_mode):
+    """Demand aggregation is only applied when supply is already in Classification Level 1 mode."""
+    return (
+        classification_mode == 'Classification Level 1'
+        and normalize_demand_aggregation_mode(demand_aggregation_mode) == 'Classification Level 1'
+    )
+
+
+def use_demand_country_mode(demand_aggregation_mode):
+    """Country granularity is shown whenever demand aggregation is not None."""
+    return normalize_demand_aggregation_mode(demand_aggregation_mode) != 'None'
+
+
+def get_supply_dest_id_cols(classification_mode='Country', demand_aggregation_mode='None'):
+    """Return the identifier columns used by the supply-destination table for the active mode."""
+    if classification_mode == 'Classification Level 1':
+        if use_demand_classification_mode(classification_mode, demand_aggregation_mode):
+            return ['supply_classification', 'demand_classification', 'demand_country', 'supply_country']
+        if use_demand_country_mode(demand_aggregation_mode):
+            return ['supply_classification', 'demand_country', 'supply_country']
+        return ['supply_classification', 'supply_country']
+    if use_demand_country_mode(demand_aggregation_mode):
+        return ['supply_country', 'demand_country']
+    return ['supply_country']
+
+
+def get_supply_dest_small_country_grouping_config(classification_mode='Country', demand_aggregation_mode='None'):
+    """Return the visible country axis and its parent hierarchy for small-country grouping."""
+    if classification_mode == 'Classification Level 1':
+        if use_demand_classification_mode(classification_mode, demand_aggregation_mode):
+            return 'demand_country', ['supply_classification', 'demand_classification']
+        if use_demand_country_mode(demand_aggregation_mode):
+            return 'demand_country', ['supply_classification']
+        return 'supply_country', ['supply_classification']
+    if use_demand_country_mode(demand_aggregation_mode):
+        return 'demand_country', ['supply_country']
+    return 'supply_country', []
+
+
+def exclude_internal_destination_flows(df, classification_mode='Country',
+                                       origin_country_col='supply_country',
+                                       destination_country_col='demand_country',
+                                       origin_classification_col='supply_classification',
+                                       destination_classification_col='demand_classification'):
+    """Exclude internal destination flows for the active page mode."""
+    if df is None or df.empty:
+        return df
+
+    if classification_mode == 'Classification Level 1':
+        if origin_classification_col not in df.columns or destination_classification_col not in df.columns:
+            return df
+        origin_values = df[origin_classification_col].fillna('Unknown').astype(str).str.strip()
+        destination_values = df[destination_classification_col].fillna('Unknown').astype(str).str.strip()
+        return df[origin_values != destination_values].copy()
+
+    if origin_country_col not in df.columns or destination_country_col not in df.columns:
+        return df
+
+    origin_values = df[origin_country_col].fillna('Unknown').astype(str).str.strip()
+    destination_values = df[destination_country_col].fillna('Unknown').astype(str).str.strip()
+    return df[origin_values != destination_values].copy()
 
 
 ############################################ postgres sql connection ###################################################
@@ -99,8 +402,11 @@ def fetch_rolling_windows_data(engine, schema, classification_mode='Country'):
                     kt.cargo_origin_cubic_meters * 0.6 / 1000 as mcmd
                 FROM {schema}.kpler_trades kt
                 LEFT JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country
+                LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
                 , latest_data ld
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                    AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
+                        IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
                     AND (
                         -- Current 30-day window
                         (kt.start >= CURRENT_DATE - INTERVAL '30 days' AND kt.start <= CURRENT_DATE)
@@ -124,6 +430,8 @@ def fetch_rolling_windows_data(engine, schema, classification_mode='Country'):
                     kt.cargo_origin_cubic_meters * 0.6 / 1000 as mcmd
                 FROM {schema}.kpler_trades kt, latest_data ld
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                    AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
+                        IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
                     AND (
                         -- Current 30-day window
                         (kt.start >= CURRENT_DATE - INTERVAL '30 days' AND kt.start <= CURRENT_DATE)
@@ -261,12 +569,15 @@ def get_all_classification_groups(engine, schema):
                     SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as total_mcmd
                 FROM {schema}.kpler_trades kt
                 INNER JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country
+                LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
                 , latest_data ld
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
                     AND kt.start >= CURRENT_DATE - INTERVAL '30 days'
                     AND kt.start <= CURRENT_DATE
                     AND kt.installation_origin_name IS NOT NULL
                     AND mc.country_classification_level1 IS NOT NULL
+                    AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
+                        IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
                 GROUP BY mc.country_classification_level1
                 HAVING SUM(kt.cargo_origin_cubic_meters) > 0
             )
@@ -366,7 +677,145 @@ def get_completed_periods(current_date=None):
     }
 
 
-def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Country'):
+def _build_supply_dest_rolling_windows_from_df(df, classification_mode='Country', demand_aggregation_mode='None'):
+    """Build supply-destination rolling windows from a bilateral flow dataframe."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = exclude_internal_destination_flows(
+        df.copy(),
+        classification_mode,
+        origin_country_col='supply_country',
+        destination_country_col='demand_country',
+        origin_classification_col='supply_classification',
+        destination_classification_col='demand_classification'
+    )
+    if df.empty:
+        return pd.DataFrame()
+
+    df['flow_date'] = pd.to_datetime(df['flow_date'])
+
+    current_date = datetime.now().date()
+    date_7d_ago = current_date - timedelta(days=7)
+    date_30d_ago = current_date - timedelta(days=30)
+    date_30d_y1_start = current_date - timedelta(days=365) - timedelta(days=30)
+    date_30d_y1_end = current_date - timedelta(days=365)
+
+    group_cols = get_supply_dest_id_cols(classification_mode, demand_aggregation_mode)
+
+    df_7d = df[
+        (df['flow_date'].dt.date > date_7d_ago)
+        & (df['flow_date'].dt.date <= current_date)
+    ].copy()
+    rolling_7d = (df_7d.groupby(group_cols)['mcmd'].sum() / 7).round(1).reset_index()
+    rolling_7d.columns = group_cols + ['7D']
+
+    df_30d = df[
+        (df['flow_date'].dt.date > date_30d_ago)
+        & (df['flow_date'].dt.date <= current_date)
+    ].copy()
+    rolling_30d = (df_30d.groupby(group_cols)['mcmd'].sum() / 30).round(1).reset_index()
+    rolling_30d.columns = group_cols + ['30D']
+
+    df_30d_y1 = df[
+        (df['flow_date'].dt.date > date_30d_y1_start)
+        & (df['flow_date'].dt.date <= date_30d_y1_end)
+    ].copy()
+    rolling_30d_y1 = (df_30d_y1.groupby(group_cols)['mcmd'].sum() / 30).round(1).reset_index()
+    rolling_30d_y1.columns = group_cols + ['30D_Y1']
+
+    result = rolling_7d.merge(rolling_30d, on=group_cols, how='outer')
+    result = result.merge(rolling_30d_y1, on=group_cols, how='outer')
+
+    if classification_mode == 'Classification Level 1':
+        if use_demand_classification_mode(classification_mode, demand_aggregation_mode):
+            class_totals_7d = result.groupby(['supply_classification', 'demand_classification'])['7D'].sum().round(1)
+            class_totals_30d = result.groupby(['supply_classification', 'demand_classification'])['30D'].sum().round(1)
+            class_totals_30d_y1 = result.groupby(['supply_classification', 'demand_classification'])['30D_Y1'].sum().round(1)
+
+            class_totals = pd.DataFrame({
+                'supply_classification': class_totals_7d.index.get_level_values(0),
+                'demand_classification': class_totals_7d.index.get_level_values(1),
+                'demand_country': 'Total',
+                'supply_country': 'Total',
+                '7D': class_totals_7d.values,
+                '30D': class_totals_30d.values,
+                '30D_Y1': class_totals_30d_y1.values
+            })
+
+            country_totals_7d = result.groupby(
+                ['supply_classification', 'demand_classification', 'demand_country']
+            )['7D'].sum().round(1)
+            country_totals_30d = result.groupby(
+                ['supply_classification', 'demand_classification', 'demand_country']
+            )['30D'].sum().round(1)
+            country_totals_30d_y1 = result.groupby(
+                ['supply_classification', 'demand_classification', 'demand_country']
+            )['30D_Y1'].sum().round(1)
+
+            country_totals = pd.DataFrame({
+                'supply_classification': country_totals_7d.index.get_level_values(0),
+                'demand_classification': country_totals_7d.index.get_level_values(1),
+                'demand_country': country_totals_7d.index.get_level_values(2),
+                'supply_country': 'Total',
+                '7D': country_totals_7d.values,
+                '30D': country_totals_30d.values,
+                '30D_Y1': country_totals_30d_y1.values
+            })
+
+            final_result = safe_concat([result, country_totals, class_totals], ignore_index=True)
+        elif use_demand_country_mode(demand_aggregation_mode):
+            class_totals_7d = result.groupby(['supply_classification'])['7D'].sum().round(1)
+            class_totals_30d = result.groupby(['supply_classification'])['30D'].sum().round(1)
+            class_totals_30d_y1 = result.groupby(['supply_classification'])['30D_Y1'].sum().round(1)
+
+            class_totals = pd.DataFrame({
+                'supply_classification': class_totals_7d.index,
+                'demand_country': 'Total',
+                'supply_country': 'Total',
+                '7D': class_totals_7d.values,
+                '30D': class_totals_30d.values,
+                '30D_Y1': class_totals_30d_y1.values
+            })
+
+            country_totals_7d = result.groupby(['supply_classification', 'demand_country'])['7D'].sum().round(1)
+            country_totals_30d = result.groupby(['supply_classification', 'demand_country'])['30D'].sum().round(1)
+            country_totals_30d_y1 = result.groupby(['supply_classification', 'demand_country'])['30D_Y1'].sum().round(1)
+
+            country_totals = pd.DataFrame({
+                'supply_classification': country_totals_7d.index.get_level_values(0),
+                'demand_country': country_totals_7d.index.get_level_values(1),
+                'supply_country': 'Total',
+                '7D': country_totals_7d.values,
+                '30D': country_totals_30d.values,
+                '30D_Y1': country_totals_30d_y1.values
+            })
+
+            final_result = safe_concat([result, country_totals, class_totals], ignore_index=True)
+        else:
+            class_totals_7d = result.groupby(['supply_classification'])['7D'].sum().round(1)
+            class_totals_30d = result.groupby(['supply_classification'])['30D'].sum().round(1)
+            class_totals_30d_y1 = result.groupby(['supply_classification'])['30D_Y1'].sum().round(1)
+
+            class_totals = pd.DataFrame({
+                'supply_classification': class_totals_7d.index,
+                'demand_country': 'Total',
+                'supply_country': 'Total',
+                '7D': class_totals_7d.values,
+                '30D': class_totals_30d.values,
+                '30D_Y1': class_totals_30d_y1.values
+            })
+            final_result = safe_concat([result, class_totals], ignore_index=True)
+    else:
+        final_result = result
+
+    final_result = final_result.fillna(0)
+    final_result['Δ 7D-30D'] = (final_result['7D'] - final_result['30D']).round(1)
+    final_result['Δ 30D Y/Y'] = (final_result['30D'] - final_result['30D_Y1']).round(1)
+    return final_result
+
+
+def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Country', demand_aggregation_mode='None'):
     """
     Fetch 7-day and 30-day rolling window data for supply-destination pairs,
     including previous year data for seasonal comparison
@@ -375,6 +824,7 @@ def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Count
         engine: Database engine
         schema: Database schema
         classification_mode: 'Country' or 'Classification Level 1'
+        demand_aggregation_mode: 'None', 'Country', or 'Classification Level 1'
     """
     
     try:
@@ -433,108 +883,20 @@ def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Count
                 """)
             
             df = pd.read_sql(query, conn)
-            
-            if df.empty:
-                return pd.DataFrame()
-            
-            # Convert to datetime
-            df['flow_date'] = pd.to_datetime(df['flow_date'])
-            
-            # Get current date and calculate date ranges
-            from datetime import datetime, timedelta
-            current_date = datetime.now().date()
-            date_7d_ago = current_date - timedelta(days=7)
-            date_30d_ago = current_date - timedelta(days=30)
-            date_30d_y1_start = current_date - timedelta(days=365) - timedelta(days=30)
-            date_30d_y1_end = current_date - timedelta(days=365)
-            
-            # Determine group columns based on mode
-            if classification_mode == 'Classification Level 1':
-                group_cols = ['supply_classification', 'demand_classification', 'demand_country', 'supply_country']
-            else:
-                group_cols = ['supply_country', 'demand_country']
-            
-            # Filter for 7D window (current)
-            df_7d = df[(df['flow_date'].dt.date > date_7d_ago) & 
-                      (df['flow_date'].dt.date <= current_date)].copy()
-            # Group and calculate daily average
-            rolling_7d = df_7d.groupby(group_cols)['mcmd'].sum() / 7
-            rolling_7d = rolling_7d.round(1).reset_index()
-            rolling_7d.columns = group_cols + ['7D']
-            
-            # Filter for 30D window (current)
-            df_30d = df[(df['flow_date'].dt.date > date_30d_ago) & 
-                       (df['flow_date'].dt.date <= current_date)].copy()
-            # Group and calculate daily average
-            rolling_30d = df_30d.groupby(group_cols)['mcmd'].sum() / 30
-            rolling_30d = rolling_30d.round(1).reset_index()
-            rolling_30d.columns = group_cols + ['30D']
-            
-            # Filter for 30D window (previous year)
-            df_30d_y1 = df[(df['flow_date'].dt.date > date_30d_y1_start) & 
-                          (df['flow_date'].dt.date <= date_30d_y1_end)].copy()
-            # Group and calculate daily average for previous year
-            rolling_30d_y1 = df_30d_y1.groupby(group_cols)['mcmd'].sum() / 30
-            rolling_30d_y1 = rolling_30d_y1.round(1).reset_index()
-            rolling_30d_y1.columns = group_cols + ['30D_Y1']
-            
-            # Merge all data
-            result = rolling_7d.merge(rolling_30d, on=group_cols, how='outer')
-            result = result.merge(rolling_30d_y1, on=group_cols, how='outer')
-            
-            # Add totals based on mode
-            if classification_mode == 'Classification Level 1':
-                # Classification to Classification totals
-                class_totals_7d = result.groupby(['supply_classification', 'demand_classification'])['7D'].sum().round(1)
-                class_totals_30d = result.groupby(['supply_classification', 'demand_classification'])['30D'].sum().round(1)
-                class_totals_30d_y1 = result.groupby(['supply_classification', 'demand_classification'])['30D_Y1'].sum().round(1)
-                
-                class_totals = pd.DataFrame({
-                    'supply_classification': class_totals_7d.index.get_level_values(0),
-                    'demand_classification': class_totals_7d.index.get_level_values(1),
-                    'demand_country': 'Total',
-                    'supply_country': 'Total',
-                    '7D': class_totals_7d.values,
-                    '30D': class_totals_30d.values,
-                    '30D_Y1': class_totals_30d_y1.values
-                })
-                
-                # Country totals
-                country_totals_7d = result.groupby(['supply_classification', 'demand_classification', 'demand_country'])['7D'].sum().round(1)
-                country_totals_30d = result.groupby(['supply_classification', 'demand_classification', 'demand_country'])['30D'].sum().round(1)
-                country_totals_30d_y1 = result.groupby(['supply_classification', 'demand_classification', 'demand_country'])['30D_Y1'].sum().round(1)
-                
-                country_totals = pd.DataFrame({
-                    'supply_classification': country_totals_7d.index.get_level_values(0),
-                    'demand_classification': country_totals_7d.index.get_level_values(1),
-                    'demand_country': country_totals_7d.index.get_level_values(2),
-                    'supply_country': 'Total',
-                    '7D': country_totals_7d.values,
-                    '30D': country_totals_30d.values,
-                    '30D_Y1': country_totals_30d_y1.values
-                })
-                
-                # Combine all
-                final_result = safe_concat([result, country_totals, class_totals], ignore_index=True)
-            else:
-                final_result = result
-            
-            final_result = final_result.fillna(0)
-            
-            # Calculate deltas
-            final_result['Δ 7D-30D'] = (final_result['7D'] - final_result['30D']).round(1)
-            final_result['Δ 30D Y/Y'] = (final_result['30D'] - final_result['30D_Y1']).round(1)
-            
-            # Keep the 30D_Y1 column for percentage calculations
-            # It will be hidden in the display
-            
-            return final_result
+
+            return _build_supply_dest_rolling_windows_from_df(
+                df,
+                classification_mode,
+                demand_aggregation_mode
+            )
             
     except Exception as e:
         return pd.DataFrame()
 
 
-def fetch_supply_dest_summary_data(engine, schema, classification_mode, quarters_df, months_df, weeks_df):
+def fetch_supply_dest_summary_data(engine, schema, classification_mode, demand_aggregation_mode,
+                                   quarters_df, months_df, weeks_df,
+                                   rolling_data=None, global_rolling_data=None):
     """Combine supply-destination quarters, months, and weeks data into summary format
     
     Similar to fetch_summary_table_data but for supply-destination bilateral flows
@@ -548,17 +910,18 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, quarters
         current_quarter = (current_date.month - 1) // 3 + 1
         current_year = current_date.year
         
-        # Fetch rolling windows data for supply-destination pairs
-        rolling_data = fetch_supply_dest_rolling_windows(engine, schema, classification_mode)
+        if rolling_data is None:
+            rolling_data = fetch_supply_dest_rolling_windows(
+                engine,
+                schema,
+                classification_mode,
+                demand_aggregation_mode
+            )
 
-        # Also fetch the global rolling totals (same as LNG loadings uses) for GRAND TOTAL
-        global_rolling_data = fetch_rolling_windows_data(engine, schema, classification_mode)
+        if global_rolling_data is None:
+            global_rolling_data = fetch_rolling_windows_data(engine, schema, classification_mode)
         
-        # Identify columns based on classification mode
-        if classification_mode == 'Classification Level 1':
-            id_cols = ['supply_classification', 'demand_classification', 'demand_country', 'supply_country']
-        else:
-            id_cols = ['supply_country', 'demand_country']
+        id_cols = get_supply_dest_id_cols(classification_mode, demand_aggregation_mode)
         
         # Get period columns
         quarter_cols = [col for col in quarters_df.columns if col not in id_cols]
@@ -661,10 +1024,7 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, quarters
                 result[col] = result[col].astype(float)
         
         # Sort by classification/country pairs
-        if classification_mode == 'Classification Level 1':
-            result = result.sort_values(['supply_classification', 'demand_classification', 'demand_country', 'supply_country'])
-        else:
-            result = result.sort_values(['supply_country', 'demand_country'])
+        result = result.sort_values(id_cols)
         
         result = result.reset_index(drop=True)
         
@@ -686,27 +1046,33 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, quarters
                 
                 # Create GRAND TOTAL row
                 if classification_mode == 'Classification Level 1':
-                    grand_total_row = pd.DataFrame([{
+                    grand_total_payload = {
                         'supply_classification': 'GRAND TOTAL',
-                        'demand_classification': '',
-                        'demand_country': '',
                         'supply_country': '',
                         **other_cols,
                         '30D': global_30d,
                         '7D': global_7d,
                         'Δ 7D-30D': global_delta_7d_30d,
                         'Δ 30D Y/Y': global_delta_30d_yy
-                    }])
+                    }
+                    if use_demand_classification_mode(classification_mode, demand_aggregation_mode):
+                        grand_total_payload['demand_classification'] = ''
+                        grand_total_payload['demand_country'] = ''
+                    elif use_demand_country_mode(demand_aggregation_mode):
+                        grand_total_payload['demand_country'] = ''
+                    grand_total_row = pd.DataFrame([grand_total_payload])
                 else:
-                    grand_total_row = pd.DataFrame([{
+                    grand_total_payload = {
                         'supply_country': 'GRAND TOTAL',
-                        'demand_country': '',
                         **other_cols,
                         '30D': global_30d,
                         '7D': global_7d,
                         'Δ 7D-30D': global_delta_7d_30d,
                         'Δ 30D Y/Y': global_delta_30d_yy
-                    }])
+                    }
+                    if use_demand_country_mode(demand_aggregation_mode):
+                        grand_total_payload['demand_country'] = ''
+                    grand_total_row = pd.DataFrame([grand_total_payload])
                 
                 # Append GRAND TOTAL row
                 result = safe_concat([result, grand_total_row], ignore_index=True)
@@ -715,6 +1081,64 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, quarters
             
     except Exception as e:
         return pd.DataFrame()
+
+
+def build_supply_dest_summary_store_payload(engine, schema, base_df, classification_mode='Country',
+                                            demand_aggregation_mode='None', global_rolling_data=None):
+    """Build grouped and ungrouped overview payloads for the supply-destination summary table."""
+    if base_df is None or base_df.empty:
+        return _empty_supply_dest_summary_store_payload()
+
+    filtered_base_df = exclude_internal_destination_flows(
+        base_df.copy(),
+        classification_mode,
+        origin_country_col='supply_country',
+        destination_country_col='demand_country',
+        origin_classification_col='supply_classification',
+        destination_classification_col='demand_classification'
+    )
+    if filtered_base_df.empty:
+        return _empty_supply_dest_summary_store_payload()
+
+    if global_rolling_data is None:
+        global_rolling_data = fetch_rolling_windows_data(engine, schema, classification_mode)
+
+    def _build_payload_records(summary_base_df):
+        quarters_df, months_df, weeks_df = fetch_supply_destination_data(
+            engine,
+            schema,
+            classification_mode,
+            demand_aggregation_mode,
+            summary_base_df
+        )
+        rolling_df = _build_supply_dest_rolling_windows_from_df(
+            summary_base_df,
+            classification_mode,
+            demand_aggregation_mode
+        )
+        summary_df = fetch_supply_dest_summary_data(
+            engine,
+            schema,
+            classification_mode,
+            demand_aggregation_mode,
+            quarters_df,
+            months_df,
+            weeks_df,
+            rolling_data=rolling_df,
+            global_rolling_data=global_rolling_data
+        )
+        return summary_df.to_dict('records') if not summary_df.empty else []
+
+    grouped_base_df = group_small_supply_dest_countries(
+        filtered_base_df,
+        classification_mode,
+        demand_aggregation_mode
+    )
+
+    return {
+        'show_all': _build_payload_records(filtered_base_df),
+        'group_small_countries': _build_payload_records(grouped_base_df)
+    }
 
 
 def fetch_summary_table_data(engine, schema, classification_mode='Country'):
@@ -911,11 +1335,26 @@ def fetch_global_supply_data(engine, schema, classification_mode='Country'):
     Args:
         engine: Database engine
         schema: Database schema
-        classification_mode: 'Country' or 'Classification Level 1' (not used for global data)
+        classification_mode: 'Country' or 'Classification Level 1'
     """
     
     try:
         with engine.connect() as conn:
+            classification_join_clause = ""
+            internal_flow_filter = """
+                    AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
+                        IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
+            """
+            if classification_mode == 'Classification Level 1':
+                classification_join_clause = f"""
+                LEFT JOIN {schema}.mappings_country mc_origin ON kt.origin_country_name = mc_origin.country
+                LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
+                """
+                internal_flow_filter = """
+                    AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
+                        IS DISTINCT FROM COALESCE(mc_origin.country_classification_level1, 'Unknown')
+                """
+
             # Get daily aggregated data with rolling average calculated in SQL
             query = text(f"""
             WITH latest_data AS (
@@ -927,9 +1366,11 @@ def fetch_global_supply_data(engine, schema, classification_mode='Country'):
                 SELECT DISTINCT 
                     COALESCE(NULLIF(continent_destination_name, ''), 'Unknown') as continent_destination
                 FROM {schema}.kpler_trades kt
+                {classification_join_clause}
                 , latest_data ld
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
                     AND kt.start >= '2023-11-01'
+                    {internal_flow_filter}
             ),
             -- Get all dates in our range
             all_dates AS (
@@ -954,10 +1395,12 @@ def fetch_global_supply_data(engine, schema, classification_mode='Country'):
                     COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
                     SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
                 FROM {schema}.kpler_trades kt
+                {classification_join_clause}
                 , latest_data ld
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
                     AND kt.start >= '2023-11-01'
                     AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+                    {internal_flow_filter}
                 GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
             ),
             -- Join to get complete dataset with zeros for missing data
@@ -1040,15 +1483,18 @@ def fetch_country_supply_data(engine, schema, country_name, classification_mode=
                 ),
                 -- Get all unique continents for this classification
                 all_continents AS (
-                    SELECT DISTINCT 
-                        COALESCE(NULLIF(continent_destination_name, ''), 'Unknown') as continent_destination
-                    FROM {schema}.kpler_trades kt
-                    INNER JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country
-                    , latest_data ld
-                    WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                        AND mc.country_classification_level1 = :country
-                        AND mc.country_classification_level1 IS NOT NULL
-                        AND kt.start >= '2023-11-01'
+                SELECT DISTINCT 
+                    COALESCE(NULLIF(continent_destination_name, ''), 'Unknown') as continent_destination
+                FROM {schema}.kpler_trades kt
+                INNER JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country
+                LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
+                , latest_data ld
+                WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                    AND mc.country_classification_level1 = :country
+                    AND mc.country_classification_level1 IS NOT NULL
+                    AND kt.start >= '2023-11-01'
+                    AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
+                        IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
                 ),
                 -- Get all dates in our range
                 all_dates AS (
@@ -1068,20 +1514,23 @@ def fetch_country_supply_data(engine, schema, country_name, classification_mode=
                 ),
                 -- Get actual daily exports
                 daily_exports_raw AS (
-                    SELECT 
-                        kt.start::date as date,
-                        COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
-                        SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
-                    FROM {schema}.kpler_trades kt
-                    INNER JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country
-                    , latest_data ld
-                    WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                        AND mc.country_classification_level1 = :country
-                        AND mc.country_classification_level1 IS NOT NULL
-                        AND kt.start >= '2023-11-01'
-                        AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
-                    GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
-                ),
+                SELECT 
+                    kt.start::date as date,
+                    COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
+                    SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
+                FROM {schema}.kpler_trades kt
+                INNER JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country
+                LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
+                , latest_data ld
+                WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                    AND mc.country_classification_level1 = :country
+                    AND mc.country_classification_level1 IS NOT NULL
+                    AND kt.start >= '2023-11-01'
+                    AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+                    AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
+                        IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
+                GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
+            ),
                 -- Join to get complete dataset with zeros for missing data
                 daily_exports_complete AS (
                     SELECT 
@@ -1141,6 +1590,8 @@ def fetch_country_supply_data(engine, schema, country_name, classification_mode=
                     WHERE kt.upload_timestamp_utc = ld.max_timestamp
                         AND kt.origin_country_name = :country
                         AND kt.start >= '2023-11-01'
+                        AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
+                            IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
                 ),
                 -- Get all dates in our range
                 all_dates AS (
@@ -1170,6 +1621,8 @@ def fetch_country_supply_data(engine, schema, country_name, classification_mode=
                         AND kt.origin_country_name = :country
                         AND kt.start >= '2023-11-01'
                         AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+                        AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
+                            IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
                     GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
                 ),
                 -- Join to get complete dataset with zeros for missing data
@@ -1263,11 +1716,14 @@ def fetch_installation_data(engine, schema, classification_mode='Country'):
                     kt.cargo_origin_cubic_meters as volume
                 FROM {schema}.kpler_trades kt
                 LEFT JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country
+                LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
                 , latest_data ld
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
                     AND kt.start IS NOT NULL
                     AND kt.start >= '2022-01-01'
                     AND kt.start <= CURRENT_DATE
+                    AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
+                        IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
                 """)
             else:
                 base_query = text(f"""
@@ -1289,6 +1745,8 @@ def fetch_installation_data(engine, schema, classification_mode='Country'):
                     AND kt.start IS NOT NULL
                     AND kt.start >= '2022-01-01'
                     AND kt.start <= CURRENT_DATE
+                    AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
+                        IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
                 """)
             
             df = pd.read_sql(base_query, conn)
@@ -1324,235 +1782,544 @@ def fetch_installation_data(engine, schema, classification_mode='Country'):
     return quarters_df, months_df, weeks_df
 
 
-def fetch_supply_destination_data(engine, schema, classification_mode='Country'):
-    """Fetch bilateral trade flow data for supply-destination table
-    
-    Args:
-        engine: Database engine
-        schema: Database schema
-        classification_mode: 'Country' or 'Classification Level 1'
-    """
-    
-    current_date = datetime.now()
-    
+def fetch_supply_destination_base_data(engine, schema):
+    """Fetch and normalize bilateral trade flow data used across supply-destination views."""
     try:
         with engine.connect() as conn:
-            # Get bilateral trade flow data
-            if classification_mode == 'Classification Level 1':
-                base_query = text(f"""
-                WITH latest_data AS (
-                    SELECT MAX(upload_timestamp_utc) as max_timestamp
-                    FROM {schema}.kpler_trades
-                )
-                SELECT 
-                    COALESCE(mc_origin.country_classification_level1, 'Unknown') as supply_classification,
-                    kt.origin_country_name as supply_country,
-                    COALESCE(mc_dest.country_classification_level1, 'Unknown') as demand_classification,
-                    COALESCE(kt.destination_country_name, 'Unknown') as demand_country,
-                    kt.start::date as flow_date,
-                    EXTRACT(YEAR FROM kt.start) as year,
-                    EXTRACT(QUARTER FROM kt.start) as quarter,
-                    EXTRACT(MONTH FROM kt.start) as month,
-                    EXTRACT(WEEK FROM kt.start) as week,
-                    kt.cargo_origin_cubic_meters as volume
-                FROM {schema}.kpler_trades kt
-                LEFT JOIN {schema}.mappings_country mc_origin ON kt.origin_country_name = mc_origin.country
-                LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
-                , latest_data ld
-                WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                    AND kt.start IS NOT NULL
-                    AND kt.start >= '2022-01-01'
-                    AND kt.start <= CURRENT_DATE
-                """)
-            else:
-                base_query = text(f"""
-                WITH latest_data AS (
-                    SELECT MAX(upload_timestamp_utc) as max_timestamp
-                    FROM {schema}.kpler_trades
-                )
-                SELECT 
-                    kt.origin_country_name as supply_country,
-                    COALESCE(kt.destination_country_name, 'Unknown') as demand_country,
-                    kt.start::date as flow_date,
-                    EXTRACT(YEAR FROM kt.start) as year,
-                    EXTRACT(QUARTER FROM kt.start) as quarter,
-                    EXTRACT(MONTH FROM kt.start) as month,
-                    EXTRACT(WEEK FROM kt.start) as week,
-                    kt.cargo_origin_cubic_meters as volume
-                FROM {schema}.kpler_trades kt, latest_data ld
-                WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                    AND kt.start IS NOT NULL
-                    AND kt.start >= '2022-01-01'
-                    AND kt.start <= CURRENT_DATE
-                """)
+            base_query = text(f"""
+            WITH latest_data AS (
+                SELECT MAX(upload_timestamp_utc) as max_timestamp
+                FROM {schema}.kpler_trades
+            )
+            SELECT 
+                COALESCE(mc_origin.country_classification_level1, 'Unknown') as supply_classification,
+                kt.origin_country_name as supply_country,
+                COALESCE(mc_dest.country_classification_level1, 'Unknown') as demand_classification,
+                COALESCE(kt.destination_country_name, 'Unknown') as demand_country,
+                kt.start::date as flow_date,
+                EXTRACT(YEAR FROM kt.start) as year,
+                EXTRACT(QUARTER FROM kt.start) as quarter,
+                EXTRACT(MONTH FROM kt.start) as month,
+                EXTRACT(WEEK FROM kt.start) as week,
+                kt.cargo_origin_cubic_meters as volume
+            FROM {schema}.kpler_trades kt
+            LEFT JOIN {schema}.mappings_country mc_origin ON kt.origin_country_name = mc_origin.country
+            LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
+            , latest_data ld
+            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+                AND kt.start IS NOT NULL
+                AND kt.start >= '2022-01-01'
+                AND kt.start <= CURRENT_DATE
+            """)
             
             df = pd.read_sql(base_query, conn)
     
     except Exception as e:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame()
 
     if df.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame()
 
     # Common data preparation
-    if classification_mode == 'Classification Level 1':
-        # In classification mode, we have classification and country names for both supply and demand
-        # Handle NULL values and strip strings
-        df['supply_classification'] = df['supply_classification'].fillna('Unknown')
-        df['demand_classification'] = df['demand_classification'].fillna('Unknown')
-        df['supply_classification'] = df['supply_classification'].astype(str).str.strip()
-        df['supply_country'] = df['supply_country'].fillna('Unknown').astype(str).str.strip()
-        df['demand_classification'] = df['demand_classification'].astype(str).str.strip()
-        df['demand_country'] = df['demand_country'].fillna('Unknown').astype(str).str.strip()
-    else:
-        df['supply_country'] = df['supply_country'].fillna('Unknown').astype(str).str.strip()
-        df['demand_country'] = df['demand_country'].fillna('Unknown').astype(str).str.strip()
+    df['supply_classification'] = df['supply_classification'].fillna('Unknown').astype(str).str.strip()
+    df['supply_country'] = df['supply_country'].fillna('Unknown').astype(str).str.strip()
+    df['demand_classification'] = df['demand_classification'].fillna('Unknown').astype(str).str.strip()
+    df['demand_country'] = df['demand_country'].fillna('Unknown').astype(str).str.strip()
     
     df['mcmd'] = df['volume'] * 0.6 / 1000
     df['flow_date'] = pd.to_datetime(df['flow_date'])
+    return df
+
+
+def group_small_supply_dest_countries(df, classification_mode='Country',
+                                      demand_aggregation_mode='None',
+                                      threshold_mcmd=10, lookback_months=24):
+    """Group small countries on the visible country axis into Rest of countries."""
+    if df.empty:
+        return df
+
+    country_col, parent_cols = get_supply_dest_small_country_grouping_config(
+        classification_mode,
+        demand_aggregation_mode
+    )
+    if country_col not in df.columns:
+        return df
+
+    grouped_df = df.copy()
+    current_timestamp = pd.Timestamp(datetime.now()).normalize()
+    current_month = current_timestamp.to_period('M')
+    start_month = current_month - (lookback_months - 1)
+
+    lookback_df = grouped_df[
+        grouped_df['flow_date'].dt.to_period('M') >= start_month
+    ].copy()
+    if lookback_df.empty:
+        return grouped_df
+
+    lookback_df['__month_period'] = lookback_df['flow_date'].dt.to_period('M')
+    monthly_totals = (
+        lookback_df.groupby(parent_cols + [country_col, '__month_period'], dropna=False)['mcmd']
+        .sum()
+        .reset_index()
+    )
+    if monthly_totals.empty:
+        return grouped_df
+
+    monthly_totals['__days'] = monthly_totals['__month_period'].apply(
+        lambda month_period: (
+            current_timestamp.day if month_period == current_month else month_period.days_in_month
+        )
+    )
+    monthly_totals['__monthly_mcmd'] = (
+        monthly_totals['mcmd'] / monthly_totals['__days']
+    ).fillna(0)
+
+    pair_cols = parent_cols + [country_col]
+    max_monthly_by_pair = (
+        monthly_totals.groupby(pair_cols, dropna=False)['__monthly_mcmd']
+        .max()
+        .reset_index()
+    )
+    all_pairs = grouped_df[pair_cols].drop_duplicates()
+    pair_threshold_df = all_pairs.merge(max_monthly_by_pair, on=pair_cols, how='left')
+    pair_threshold_df['__monthly_mcmd'] = pair_threshold_df['__monthly_mcmd'].fillna(0)
+    small_pairs = pair_threshold_df[pair_threshold_df['__monthly_mcmd'] <= threshold_mcmd][pair_cols].copy()
+
+    if small_pairs.empty:
+        return grouped_df
+
+    small_pairs['__group_small_country'] = True
+    grouped_df = grouped_df.merge(small_pairs, on=pair_cols, how='left')
+    grouped_df['__group_small_country'] = grouped_df['__group_small_country'].eq(True)
+    grouped_df.loc[
+        grouped_df['__group_small_country'],
+        country_col
+    ] = 'Rest of countries'
+    grouped_df = grouped_df.drop(columns='__group_small_country')
+    return grouped_df
+
+
+def _apply_supply_dest_period_totals(result, classification_mode='Country', demand_aggregation_mode='None'):
+    """Add hierarchy subtotal rows required by the expandable supply-destination table."""
+    if result.empty:
+        return result
+
+    numeric_cols = [
+        col for col in result.columns
+        if col not in ['supply_classification', 'demand_classification', 'supply_country', 'demand_country']
+    ]
+
+    if classification_mode == 'Classification Level 1':
+        if use_demand_classification_mode(classification_mode, demand_aggregation_mode):
+            class_totals = result.groupby(
+                ['supply_classification', 'demand_classification']
+            )[numeric_cols].sum().round(1).reset_index()
+            class_totals['demand_country'] = 'Total'
+            class_totals['supply_country'] = 'Total'
+
+            country_totals = result.groupby(
+                ['supply_classification', 'demand_classification', 'demand_country']
+            )[numeric_cols].sum().round(1).reset_index()
+            country_totals['supply_country'] = 'Total'
+
+            final_df = safe_concat([result, country_totals, class_totals], ignore_index=True)
+            return final_df.sort_values(
+                ['supply_classification', 'demand_classification', 'demand_country', 'supply_country']
+            ).reset_index(drop=True)
+
+        if use_demand_country_mode(demand_aggregation_mode):
+            class_totals = result.groupby(['supply_classification'])[numeric_cols].sum().round(1).reset_index()
+            class_totals['demand_country'] = 'Total'
+            class_totals['supply_country'] = 'Total'
+
+            country_totals = result.groupby(
+                ['supply_classification', 'demand_country']
+            )[numeric_cols].sum().round(1).reset_index()
+            country_totals['supply_country'] = 'Total'
+
+            final_df = safe_concat([result, country_totals, class_totals], ignore_index=True)
+            return final_df.sort_values(
+                ['supply_classification', 'demand_country', 'supply_country']
+            ).reset_index(drop=True)
+
+        class_totals = result.groupby(['supply_classification'])[numeric_cols].sum().round(1).reset_index()
+        class_totals['supply_country'] = 'Total'
+        final_df = safe_concat([result, class_totals], ignore_index=True)
+        return final_df.sort_values(['supply_classification', 'supply_country']).reset_index(drop=True)
+
+    return result.reset_index(drop=True)
+
+
+def _get_supply_dest_period_days(period_start, period_view):
+    """Return the number of days in a completed reporting period."""
+    period_start = pd.Timestamp(period_start)
+
+    if period_view == 'monthly':
+        return period_start.days_in_month
+    if period_view == 'quarterly':
+        period_end = period_start.to_period('Q').end_time.normalize()
+        return (period_end - period_start).days + 1
+    if period_view == 'seasonally':
+        if period_start.month == 4:
+            period_end = pd.Timestamp(year=period_start.year, month=9, day=30)
+        else:
+            period_end = pd.Timestamp(year=period_start.year + 1, month=3, day=31)
+        return (period_end - period_start).days + 1
+    if period_view == 'yearly':
+        period_end = period_start.to_period('Y').end_time.normalize()
+        return (period_end - period_start).days + 1
+    return 1
+
+
+def _get_supply_dest_elapsed_period_days(period_start, current_date):
+    """Return elapsed days from the start of the current reporting period to today."""
+    period_start = pd.Timestamp(period_start).normalize()
+    current_timestamp = pd.Timestamp(current_date).normalize()
+    if current_timestamp < period_start:
+        return 0
+    return (current_timestamp - period_start).days + 1
+
+
+def _get_supply_dest_current_period_details(current_date, period_view):
+    """Return the current timestamp, period start, and display label for the active period."""
+    current_timestamp = pd.Timestamp(current_date).normalize()
+
+    if period_view == 'monthly':
+        current_period_start = current_timestamp.to_period('M').start_time
+        current_period_label = _format_supply_dest_period_label(current_period_start, period_view)
+    elif period_view == 'quarterly':
+        current_period_start = current_timestamp.to_period('Q').start_time
+        current_period_label = _format_supply_dest_period_label(current_period_start, period_view)
+    elif period_view == 'seasonally':
+        current_period_start, current_period_label = _build_lng_season_periods(pd.Series([current_timestamp]))
+        current_period_start = current_period_start.iloc[0]
+        current_period_label = current_period_label.iloc[0]
+    elif period_view == 'yearly':
+        current_period_start = current_timestamp.to_period('Y').start_time
+        current_period_label = _format_supply_dest_period_label(current_period_start, period_view)
+    else:
+        return current_timestamp, None, None
+
+    return current_timestamp, current_period_start, current_period_label
+
+
+def _get_supply_dest_previous_period_start(period_start, period_view):
+    """Return the start timestamp for the immediately previous reporting period."""
+    period_start = pd.Timestamp(period_start).normalize()
+
+    if period_view == 'monthly':
+        return (period_start.to_period('M') - 1).start_time
+    if period_view == 'quarterly':
+        return (period_start.to_period('Q') - 1).start_time
+    if period_view == 'seasonally':
+        if period_start.month == 4:
+            return pd.Timestamp(year=period_start.year - 1, month=10, day=1)
+        return pd.Timestamp(year=period_start.year, month=4, day=1)
+    if period_view == 'yearly':
+        return (period_start.to_period('Y') - 1).start_time
+    return None
+
+
+def _build_supply_dest_current_period_previous_reference(df, current_date, period_view,
+                                                         classification_mode='Country',
+                                                         demand_aggregation_mode='None'):
+    """Build the previous-period-to-date reference for the current active period."""
+    if df.empty:
+        return pd.DataFrame(), None
+
+    current_timestamp, current_period_start, current_period_label = _get_supply_dest_current_period_details(
+        current_date,
+        period_view
+    )
+    if current_period_start is None or not current_period_label:
+        return pd.DataFrame(), None
+
+    previous_period_label = _get_supply_dest_previous_period_label(current_period_label, period_view)
+    previous_period_start = _get_supply_dest_previous_period_start(current_period_start, period_view)
+    if not previous_period_label or previous_period_start is None:
+        return pd.DataFrame(), None
+
+    elapsed_days = _get_supply_dest_elapsed_period_days(current_period_start, current_timestamp)
+    if elapsed_days <= 0:
+        return pd.DataFrame(), None
+
+    previous_period_end = previous_period_start + pd.Timedelta(days=elapsed_days - 1)
+    reference_label = f"{previous_period_label} PTD"
+    id_cols = get_supply_dest_id_cols(classification_mode, demand_aggregation_mode)
+
+    reference_df = df[
+        (df['flow_date'] >= previous_period_start)
+        & (df['flow_date'] <= previous_period_end)
+    ].copy()
+
+    if reference_df.empty:
+        return pd.DataFrame(columns=id_cols + [reference_label]), reference_label
+
+    grouped_df = (
+        reference_df.groupby(id_cols, dropna=False)['mcmd']
+        .sum()
+        .reset_index()
+    )
+    grouped_df[reference_label] = (grouped_df['mcmd'] / elapsed_days).round(1)
+    grouped_df = grouped_df.drop(columns=['mcmd'])
+    grouped_df = _apply_supply_dest_period_totals(
+        grouped_df,
+        classification_mode,
+        demand_aggregation_mode
+    )
+    return grouped_df, reference_label
+
+
+def _build_supply_dest_current_period_prior_year_reference(df, current_date, period_view,
+                                                           classification_mode='Country',
+                                                           demand_aggregation_mode='None'):
+    """Build the same-period-last-year-to-date reference for the current active period."""
+    if df.empty:
+        return pd.DataFrame(), None
+
+    current_timestamp, current_period_start, current_period_label = _get_supply_dest_current_period_details(
+        current_date,
+        period_view
+    )
+    if current_period_start is None or not current_period_label:
+        return pd.DataFrame(), None
+
+    prior_year_label = _get_supply_dest_prior_year_label(current_period_label, period_view)
+    if not prior_year_label:
+        return pd.DataFrame(), None
+
+    elapsed_days = _get_supply_dest_elapsed_period_days(current_period_start, current_timestamp)
+    if elapsed_days <= 0:
+        return pd.DataFrame(), None
+
+    prior_year_start = pd.Timestamp(current_period_start) - pd.DateOffset(years=1)
+    prior_year_end = prior_year_start + pd.Timedelta(days=elapsed_days - 1)
+    reference_label = f"{prior_year_label} PTD"
+    id_cols = get_supply_dest_id_cols(classification_mode, demand_aggregation_mode)
+
+    reference_df = df[
+        (df['flow_date'] >= prior_year_start)
+        & (df['flow_date'] <= prior_year_end)
+    ].copy()
+
+    if reference_df.empty:
+        return pd.DataFrame(columns=id_cols + [reference_label]), reference_label
+
+    grouped_df = (
+        reference_df.groupby(id_cols, dropna=False)['mcmd']
+        .sum()
+        .reset_index()
+    )
+    grouped_df[reference_label] = (grouped_df['mcmd'] / elapsed_days).round(1)
+    grouped_df = grouped_df.drop(columns=['mcmd'])
+    grouped_df = _apply_supply_dest_period_totals(
+        grouped_df,
+        classification_mode,
+        demand_aggregation_mode
+    )
+    return grouped_df, reference_label
+
+
+def _build_supply_dest_period_matrix(df, current_date, period_view='monthly',
+                                     classification_mode='Country', demand_aggregation_mode='None',
+                                     include_current_period=False):
+    """Build a period matrix for monthly, quarterly, seasonal, or yearly views."""
+    if df.empty:
+        return pd.DataFrame()
+
+    period_df = df.copy()
+    current_timestamp, current_period_start, current_period_label = _get_supply_dest_current_period_details(
+        current_date,
+        period_view
+    )
+
+    if current_period_start is None:
+        return pd.DataFrame()
+
+    if period_view == 'monthly':
+        period_df['__period_start'] = period_df['flow_date'].dt.to_period('M').dt.start_time
+    elif period_view == 'quarterly':
+        period_df['__period_start'] = period_df['flow_date'].dt.to_period('Q').dt.start_time
+    elif period_view == 'seasonally':
+        period_df['__period_start'], period_df['__period_label'] = _build_lng_season_periods(period_df['flow_date'])
+    elif period_view == 'yearly':
+        period_df['__period_start'] = period_df['flow_date'].dt.to_period('Y').dt.start_time
+
+    period_df = period_df[
+        period_df['__period_start'].notna()
+        & (
+            period_df['__period_start'] <= current_period_start
+            if include_current_period
+            else period_df['__period_start'] < current_period_start
+        )
+    ].copy()
+
+    if period_df.empty:
+        return pd.DataFrame()
+
+    pivot = period_df.pivot_table(
+        index=get_supply_dest_id_cols(classification_mode, demand_aggregation_mode),
+        columns='__period_start',
+        values='mcmd',
+        aggfunc='sum',
+        fill_value=0
+    )
+
+    if include_current_period and current_period_start not in pivot.columns:
+        pivot[current_period_start] = 0
+
+    pivot = pivot.reindex(sorted(pivot.columns), axis=1)
+
+    for col in pivot.columns:
+        if include_current_period and pd.Timestamp(col) == current_period_start:
+            days = _get_supply_dest_elapsed_period_days(col, current_timestamp)
+        else:
+            days = _get_supply_dest_period_days(col, period_view)
+        pivot[col] = (pivot[col] / days).round(1) if days else 0
+
+    if period_view == 'seasonally':
+        label_map = (
+            period_df[['__period_start', '__period_label']]
+            .drop_duplicates(subset=['__period_start'])
+            .set_index('__period_start')['__period_label']
+            .to_dict()
+        )
+        if include_current_period and current_period_label:
+            label_map[pd.Timestamp(current_period_start)] = current_period_label
+        pivot.columns = [label_map.get(pd.Timestamp(col), '') for col in pivot.columns]
+    else:
+        pivot.columns = [_format_supply_dest_period_label(col, period_view) for col in pivot.columns]
+
+    result = pivot.reset_index()
+    result = _apply_supply_dest_period_totals(result, classification_mode, demand_aggregation_mode)
+    result.attrs['current_period_label'] = current_period_label if include_current_period else None
+    return result
+
+
+def build_supply_dest_period_analysis_payload(df, classification_mode='Country', demand_aggregation_mode='None'):
+    """Precompute period datasets for the historical analysis controls."""
+    if df.empty:
+        return _empty_supply_dest_period_analysis_payload()
+
+    current_date = datetime.now()
+    payload = {}
+    for period_view in ['monthly', 'quarterly', 'seasonally', 'yearly']:
+        period_df = _build_supply_dest_period_matrix(
+            df,
+            current_date,
+            period_view,
+            classification_mode,
+            demand_aggregation_mode,
+            include_current_period=True
+        )
+        current_previous_df, current_previous_label = _build_supply_dest_current_period_previous_reference(
+            df,
+            current_date,
+            period_view,
+            classification_mode,
+            demand_aggregation_mode
+        )
+        current_prior_year_df, current_prior_year_label = _build_supply_dest_current_period_prior_year_reference(
+            df,
+            current_date,
+            period_view,
+            classification_mode,
+            demand_aggregation_mode
+        )
+        payload[period_view] = {
+            'records': period_df.to_dict('records') if not period_df.empty else [],
+            'current_period_label': period_df.attrs.get('current_period_label'),
+            'current_period_previous_label': current_previous_label,
+            'current_period_previous_records': (
+                current_previous_df.to_dict('records') if not current_previous_df.empty else []
+            ),
+            'current_period_prior_year_label': current_prior_year_label,
+            'current_period_prior_year_records': (
+                current_prior_year_df.to_dict('records') if not current_prior_year_df.empty else []
+            )
+        }
+    return payload
+
+
+def build_supply_dest_period_store_payload(df, classification_mode='Country', demand_aggregation_mode='None'):
+    """Build both grouped and ungrouped payloads for the period-analysis table."""
+    df = exclude_internal_destination_flows(
+        df,
+        classification_mode,
+        origin_country_col='supply_country',
+        destination_country_col='demand_country',
+        origin_classification_col='supply_classification',
+        destination_classification_col='demand_classification'
+    )
+    if df.empty:
+        return _empty_supply_dest_period_store_payload()
+
+    grouped_df = group_small_supply_dest_countries(
+        df,
+        classification_mode,
+        demand_aggregation_mode
+    )
+    return {
+        'show_all': build_supply_dest_period_analysis_payload(
+            df,
+            classification_mode,
+            demand_aggregation_mode
+        ),
+        'group_small_countries': build_supply_dest_period_analysis_payload(
+            grouped_df,
+            classification_mode,
+            demand_aggregation_mode
+        )
+    }
+
+
+def fetch_supply_destination_data(engine, schema, classification_mode='Country',
+                                  demand_aggregation_mode='None', base_df=None):
+    """Fetch bilateral trade flow data for the default supply-destination table."""
+    current_date = datetime.now()
+    df = base_df.copy() if base_df is not None else fetch_supply_destination_base_data(engine, schema)
+    df = exclude_internal_destination_flows(
+        df,
+        classification_mode,
+        origin_country_col='supply_country',
+        destination_country_col='demand_country',
+        origin_classification_col='supply_classification',
+        destination_classification_col='demand_classification'
+    )
+
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     
-    # Process data for three separate tables
-    quarters_df = process_supply_dest_quarters(df, current_date, classification_mode)
-    months_df = process_supply_dest_months(df, current_date, classification_mode)
-    weeks_df = process_supply_dest_weeks(df, current_date, classification_mode)
+    quarters_df = process_supply_dest_quarters(df, current_date, classification_mode, demand_aggregation_mode)
+    months_df = process_supply_dest_months(df, current_date, classification_mode, demand_aggregation_mode)
+    weeks_df = process_supply_dest_weeks(df, current_date, classification_mode, demand_aggregation_mode)
     
     return quarters_df, months_df, weeks_df
 
 
-def process_supply_dest_quarters(df, current_date, classification_mode='Country'):
+def process_supply_dest_quarters(df, current_date, classification_mode='Country', demand_aggregation_mode='None'):
     """Process supply-destination data for quarters"""
-    df = df.copy()
-    
-    # Create quarter period
-    df['period'] = df['flow_date'].dt.to_period('Q')
-    
-    # Filter to last 8 quarters
-    current_quarter = pd.Period(current_date, freq='Q')
-    start_quarter = current_quarter - 7
-    df_filtered = df[(df['period'] >= start_quarter) & (df['period'] <= current_quarter)]
-    
-    # Create pivot table based on mode
-    if classification_mode == 'Classification Level 1':
-        # Group by classifications and countries
-        pivot = df_filtered.pivot_table(
-            index=['supply_classification', 'demand_classification', 'demand_country', 'supply_country'],
-            columns='period',
-            values='mcmd',
-            aggfunc='sum',
-            fill_value=0
-        )
-    else:
-        # Group by countries only
-        pivot = df_filtered.pivot_table(
-            index=['supply_country', 'demand_country'],
-            columns='period',
-            values='mcmd',
-            aggfunc='sum',
-            fill_value=0
-        )
-    
-    # Calculate daily averages
-    for col in pivot.columns:
-        if col == current_quarter:
-            days = (current_date.date() - col.start_time.date()).days + 1
-        else:
-            days = (col.end_time.date() - col.start_time.date()).days + 1
-        pivot[col] = (pivot[col] / days).round(1)
-    
-    # Rename columns
-    pivot.columns = [f"Q{p.quarter}'{str(p.year)[2:]}" for p in pivot.columns]
-    
-    # Reset index
-    result = pivot.reset_index()
-    
-    # Add aggregation totals
-    if classification_mode == 'Classification Level 1':
-        # Add multiple levels of totals
-        numeric_cols = [col for col in result.columns if col.startswith('Q')]
-        
-        # Classification to Classification totals
-        class_totals = result.groupby(['supply_classification', 'demand_classification'])[numeric_cols].sum().round(1).reset_index()
-        class_totals['demand_country'] = 'Total'
-        class_totals['supply_country'] = 'Total'
-        
-        # Classification to Country totals
-        country_totals = result.groupby(['supply_classification', 'demand_classification', 'demand_country'])[numeric_cols].sum().round(1).reset_index()
-        country_totals['supply_country'] = 'Total'
-        
-        # Combine all
-        final_df = safe_concat([result, country_totals, class_totals], ignore_index=True)
-        final_df = final_df.sort_values(['supply_classification', 'demand_classification', 'demand_country', 'supply_country']).reset_index(drop=True)
-    else:
-        # Add country pair totals
-        numeric_cols = [col for col in result.columns if col.startswith('Q')]
-        final_df = result
-    
-    return final_df
+    return _build_supply_dest_period_matrix(
+        df,
+        current_date,
+        'quarterly',
+        classification_mode,
+        demand_aggregation_mode
+    )
 
 
-def process_supply_dest_months(df, current_date, classification_mode='Country'):
+def process_supply_dest_months(df, current_date, classification_mode='Country', demand_aggregation_mode='None'):
     """Process supply-destination data for months"""
-    df = df.copy()
-    
-    # Create month period
-    df['period'] = df['flow_date'].dt.to_period('M')
-    
-    # Filter to last 12 months
-    current_month = pd.Period(current_date, freq='M')
-    start_month = current_month - 11
-    df_filtered = df[(df['period'] >= start_month) & (df['period'] <= current_month)]
-    
-    # Create pivot table based on mode
-    if classification_mode == 'Classification Level 1':
-        pivot = df_filtered.pivot_table(
-            index=['supply_classification', 'demand_classification', 'demand_country', 'supply_country'],
-            columns='period',
-            values='mcmd',
-            aggfunc='sum',
-            fill_value=0
-        )
-    else:
-        pivot = df_filtered.pivot_table(
-            index=['supply_country', 'demand_country'],
-            columns='period',
-            values='mcmd',
-            aggfunc='sum',
-            fill_value=0
-        )
-    
-    # Calculate daily averages
-    for col in pivot.columns:
-        if col == current_month:
-            days = current_date.day
-        else:
-            days = col.days_in_month
-        pivot[col] = (pivot[col] / days).round(1)
-    
-    # Rename columns
-    pivot.columns = [f"{calendar.month_abbr[p.month]}'{str(p.year)[2:]}" for p in pivot.columns]
-    
-    # Reset index and add totals (similar to quarters)
-    result = pivot.reset_index()
-    
-    if classification_mode == 'Classification Level 1':
-        numeric_cols = [col for col in result.columns if "'" in col and not col.startswith('Q')]
-        
-        class_totals = result.groupby(['supply_classification', 'demand_classification'])[numeric_cols].sum().round(1).reset_index()
-        class_totals['demand_country'] = 'Total'
-        class_totals['supply_country'] = 'Total'
-        
-        country_totals = result.groupby(['supply_classification', 'demand_classification', 'demand_country'])[numeric_cols].sum().round(1).reset_index()
-        country_totals['supply_country'] = 'Total'
-        
-        final_df = safe_concat([result, country_totals, class_totals], ignore_index=True)
-        final_df = final_df.sort_values(['supply_classification', 'demand_classification', 'demand_country', 'supply_country']).reset_index(drop=True)
-    else:
-        final_df = result
-    
-    return final_df
+    return _build_supply_dest_period_matrix(
+        df,
+        current_date,
+        'monthly',
+        classification_mode,
+        demand_aggregation_mode
+    )
 
 
-def process_supply_dest_weeks(df, current_date, classification_mode='Country'):
+def process_supply_dest_weeks(df, current_date, classification_mode='Country', demand_aggregation_mode='None'):
     """Process supply-destination data for weeks"""
     df = df.copy()
     
@@ -1564,23 +2331,13 @@ def process_supply_dest_weeks(df, current_date, classification_mode='Country'):
     start_week = current_week - 11
     df_filtered = df[(df['period'] >= start_week) & (df['period'] <= current_week)]
     
-    # Create pivot table based on mode
-    if classification_mode == 'Classification Level 1':
-        pivot = df_filtered.pivot_table(
-            index=['supply_classification', 'demand_classification', 'demand_country', 'supply_country'],
-            columns='period',
-            values='mcmd',
-            aggfunc='sum',
-            fill_value=0
-        )
-    else:
-        pivot = df_filtered.pivot_table(
-            index=['supply_country', 'demand_country'],
-            columns='period',
-            values='mcmd',
-            aggfunc='sum',
-            fill_value=0
-        )
+    pivot = df_filtered.pivot_table(
+        index=get_supply_dest_id_cols(classification_mode, demand_aggregation_mode),
+        columns='period',
+        values='mcmd',
+        aggfunc='sum',
+        fill_value=0
+    )
     
     # Calculate daily averages
     for col in pivot.columns:
@@ -1599,15 +2356,32 @@ def process_supply_dest_weeks(df, current_date, classification_mode='Country'):
     if classification_mode == 'Classification Level 1':
         numeric_cols = [col for col in result.columns if col.startswith('W')]
         
-        class_totals = result.groupby(['supply_classification', 'demand_classification'])[numeric_cols].sum().round(1).reset_index()
-        class_totals['demand_country'] = 'Total'
-        class_totals['supply_country'] = 'Total'
-        
-        country_totals = result.groupby(['supply_classification', 'demand_classification', 'demand_country'])[numeric_cols].sum().round(1).reset_index()
-        country_totals['supply_country'] = 'Total'
-        
-        final_df = safe_concat([result, country_totals, class_totals], ignore_index=True)
-        final_df = final_df.sort_values(['supply_classification', 'demand_classification', 'demand_country', 'supply_country']).reset_index(drop=True)
+        if use_demand_classification_mode(classification_mode, demand_aggregation_mode):
+            class_totals = result.groupby(['supply_classification', 'demand_classification'])[numeric_cols].sum().round(1).reset_index()
+            class_totals['demand_country'] = 'Total'
+            class_totals['supply_country'] = 'Total'
+            
+            country_totals = result.groupby(['supply_classification', 'demand_classification', 'demand_country'])[numeric_cols].sum().round(1).reset_index()
+            country_totals['supply_country'] = 'Total'
+            
+            final_df = safe_concat([result, country_totals, class_totals], ignore_index=True)
+            final_df = final_df.sort_values(['supply_classification', 'demand_classification', 'demand_country', 'supply_country']).reset_index(drop=True)
+        elif use_demand_country_mode(demand_aggregation_mode):
+            class_totals = result.groupby(['supply_classification'])[numeric_cols].sum().round(1).reset_index()
+            class_totals['demand_country'] = 'Total'
+            class_totals['supply_country'] = 'Total'
+            
+            country_totals = result.groupby(['supply_classification', 'demand_country'])[numeric_cols].sum().round(1).reset_index()
+            country_totals['supply_country'] = 'Total'
+            
+            final_df = safe_concat([result, country_totals, class_totals], ignore_index=True)
+            final_df = final_df.sort_values(['supply_classification', 'demand_country', 'supply_country']).reset_index(drop=True)
+        else:
+            class_totals = result.groupby(['supply_classification'])[numeric_cols].sum().round(1).reset_index()
+            class_totals['supply_country'] = 'Total'
+            
+            final_df = safe_concat([result, class_totals], ignore_index=True)
+            final_df = final_df.sort_values(['supply_classification', 'supply_country']).reset_index(drop=True)
     else:
         final_df = result
     
@@ -1908,8 +2682,25 @@ def create_continent_destination_chart(entity_name, engine, db_schema, classific
         # Query to get export data by continent destination
         # Add join for classification mode
         join_clause = ""
-        if classification_mode == 'Classification Level 1' and entity_name != "Global":
-            join_clause = f"INNER JOIN {db_schema}.mappings_country mc ON kt.origin_country_name = mc.country"
+        internal_flow_filter = """
+                AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
+                    IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
+        """
+        if classification_mode == 'Classification Level 1':
+            if entity_name != "Global":
+                join_clause = f"""
+                INNER JOIN {db_schema}.mappings_country mc ON kt.origin_country_name = mc.country
+                LEFT JOIN {db_schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
+                """
+            else:
+                join_clause = f"""
+                LEFT JOIN {db_schema}.mappings_country mc ON kt.origin_country_name = mc.country
+                LEFT JOIN {db_schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
+                """
+            internal_flow_filter = """
+                AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
+                    IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
+            """
         
         query = f"""
         WITH latest_data AS (
@@ -1926,6 +2717,7 @@ def create_continent_destination_chart(entity_name, engine, db_schema, classific
             WHERE kt.upload_timestamp_utc = ld.max_timestamp
                 {country_filter}
                 AND kt.start >= '2023-11-01'
+                {internal_flow_filter}
         ),
         -- Get all dates in our range
         all_dates AS (
@@ -1956,6 +2748,7 @@ def create_continent_destination_chart(entity_name, engine, db_schema, classific
                 {country_filter}
                 AND kt.start >= '2023-11-01'
                 AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+                {internal_flow_filter}
             GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
         ),
         -- Join to get complete dataset with zeros for missing data
@@ -2171,8 +2964,25 @@ def create_continent_percentage_chart(entity_name, engine, db_schema, classifica
         # Query to get export data by continent destination for percentage calculation
         # Add join for classification mode
         join_clause = ""
-        if classification_mode == 'Classification Level 1' and entity_name != "Global":
-            join_clause = f"INNER JOIN {db_schema}.mappings_country mc ON kt.origin_country_name = mc.country"
+        internal_flow_filter = """
+                AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
+                    IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
+        """
+        if classification_mode == 'Classification Level 1':
+            if entity_name != "Global":
+                join_clause = f"""
+                INNER JOIN {db_schema}.mappings_country mc ON kt.origin_country_name = mc.country
+                LEFT JOIN {db_schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
+                """
+            else:
+                join_clause = f"""
+                LEFT JOIN {db_schema}.mappings_country mc ON kt.origin_country_name = mc.country
+                LEFT JOIN {db_schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
+                """
+            internal_flow_filter = """
+                AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
+                    IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
+            """
         
         query = f"""
         WITH latest_data AS (
@@ -2189,6 +2999,7 @@ def create_continent_percentage_chart(entity_name, engine, db_schema, classifica
             WHERE kt.upload_timestamp_utc = ld.max_timestamp
                 {country_filter}
                 AND kt.start >= '2023-11-01'
+                {internal_flow_filter}
         ),
         -- Get all dates in our range
         all_dates AS (
@@ -2219,6 +3030,7 @@ def create_continent_percentage_chart(entity_name, engine, db_schema, classifica
                 {country_filter}
                 AND kt.start >= '2023-11-01'
                 AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+                {internal_flow_filter}
             GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
         ),
         -- Join to get complete dataset with zeros for missing data
@@ -2641,9 +3453,192 @@ def prepare_table_for_display(df, table_type, expanded_countries=None, classific
     return display_df, columns
 
 
+def _build_supply_dest_columns(display_df, view_type='absolute', hidden_cols=None, delta_like_cols=None):
+    """Build DataTable column definitions for supply-destination tables."""
+    hidden_cols = set(hidden_cols or ['30D_Y1'])
+    delta_cols = set(col for col in display_df.columns if str(col).startswith('Δ '))
+    delta_cols.update(delta_like_cols or [])
+
+    columns = []
+    for col in display_df.columns:
+        if col in hidden_cols:
+            continue
+        if col in SUPPLY_DEST_TEXT_COLUMNS:
+            columns.append({'name': col, 'id': col, 'type': 'text'})
+        elif col in delta_cols:
+            columns.append({
+                'name': col,
+                'id': col,
+                'type': 'numeric',
+                'format': Format(precision=0, scheme=Scheme.fixed)
+            })
+        elif view_type == 'percentage':
+            columns.append({
+                'name': col,
+                'id': col,
+                'type': 'numeric',
+                'format': Format(precision=0, scheme=Scheme.percentage)
+            })
+        else:
+            columns.append({
+                'name': col,
+                'id': col,
+                'type': 'numeric',
+                'format': Format(precision=0, scheme=Scheme.fixed)
+            })
+    return columns
+
+
+def _drop_supply_dest_grand_total_rows(display_df):
+    """Remove grand total rows when market-share mode should stay focused on components."""
+    filtered_df = display_df.copy()
+    if 'Aggregation Supply' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['Aggregation Supply'] != 'GRAND TOTAL']
+    if 'Supply Country' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['Supply Country'] != 'GRAND TOTAL']
+    return filtered_df.reset_index(drop=True)
+
+
+def _convert_supply_dest_period_display_to_percentage(display_df, classification_mode='Country',
+                                                      demand_aggregation_mode='None', value_cols=None):
+    """Convert historical period values into shares using the same hierarchy logic as the default table."""
+    value_cols = [col for col in (value_cols or []) if col in display_df.columns]
+    if not value_cols or display_df.empty:
+        return display_df
+
+    percentage_df = display_df.copy()
+    show_demand_aggregation = use_demand_classification_mode(classification_mode, demand_aggregation_mode)
+    show_demand_country = use_demand_country_mode(demand_aggregation_mode)
+
+    if classification_mode == 'Classification Level 1' and show_demand_aggregation:
+        current_supply_class = None
+        subtotal_values = {}
+
+        for _, row in percentage_df.iterrows():
+            agg_supply = str(row.get('Aggregation Supply', ''))
+            agg_demand = str(row.get('Aggregation Demand', ''))
+            if agg_demand == 'Total' and agg_supply:
+                subtotal_values[agg_supply] = {col: row[col] for col in value_cols}
+
+        for idx, row in percentage_df.iterrows():
+            agg_supply = str(row.get('Aggregation Supply', ''))
+            agg_demand = str(row.get('Aggregation Demand', ''))
+
+            if agg_supply:
+                if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                    current_supply_class = agg_supply[2:].strip()
+                elif agg_demand == 'Total':
+                    current_supply_class = agg_supply
+
+            if current_supply_class and current_supply_class in subtotal_values:
+                for col in value_cols:
+                    subtotal_val = subtotal_values[current_supply_class].get(col, 0)
+                    percentage_df.at[idx, col] = (
+                        1.0 if agg_demand == 'Total' and agg_supply == current_supply_class
+                        else (row[col] / subtotal_val if subtotal_val else 0)
+                    )
+
+    elif classification_mode == 'Classification Level 1' and show_demand_country:
+        current_supply_class = None
+        subtotal_values = {}
+
+        for _, row in percentage_df.iterrows():
+            agg_supply = str(row.get('Aggregation Supply', ''))
+            demand_country = str(row.get('Demand Country', ''))
+            if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                subtotal_values[agg_supply[2:].strip()] = {col: row[col] for col in value_cols}
+            elif demand_country == 'Total' and agg_supply:
+                subtotal_values[agg_supply] = {col: row[col] for col in value_cols}
+
+        for idx, row in percentage_df.iterrows():
+            agg_supply = str(row.get('Aggregation Supply', ''))
+            demand_country = str(row.get('Demand Country', ''))
+
+            if agg_supply:
+                if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                    current_supply_class = agg_supply[2:].strip()
+                elif demand_country == 'Total':
+                    current_supply_class = agg_supply
+
+            if current_supply_class and current_supply_class in subtotal_values:
+                for col in value_cols:
+                    subtotal_val = subtotal_values[current_supply_class].get(col, 0)
+                    if subtotal_val:
+                        if agg_supply.startswith('▶') or agg_supply.startswith('▼') or (
+                            demand_country == 'Total' and agg_supply == current_supply_class
+                        ):
+                            percentage_df.at[idx, col] = 1.0
+                        else:
+                            percentage_df.at[idx, col] = row[col] / subtotal_val
+                    else:
+                        percentage_df.at[idx, col] = 0
+
+    elif classification_mode == 'Classification Level 1':
+        current_supply_class = None
+        subtotal_values = {}
+
+        for _, row in percentage_df.iterrows():
+            agg_supply = str(row.get('Aggregation Supply', ''))
+            if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                subtotal_values[agg_supply[2:].strip()] = {col: row[col] for col in value_cols}
+
+        for idx, row in percentage_df.iterrows():
+            agg_supply = str(row.get('Aggregation Supply', ''))
+            if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                current_supply_class = agg_supply[2:].strip()
+
+            if current_supply_class and current_supply_class in subtotal_values:
+                for col in value_cols:
+                    subtotal_val = subtotal_values[current_supply_class].get(col, 0)
+                    if subtotal_val:
+                        percentage_df.at[idx, col] = (
+                            1.0 if agg_supply.startswith('▶') or agg_supply.startswith('▼')
+                            else row[col] / subtotal_val
+                        )
+                    else:
+                        percentage_df.at[idx, col] = 0
+
+    elif show_demand_country:
+        current_supply_country = None
+        supply_subtotals = {}
+
+        for _, row in percentage_df.iterrows():
+            supply_country = str(row.get('Supply Country', ''))
+            demand_country = str(row.get('Demand Country', ''))
+            if demand_country == 'Total' and supply_country:
+                supply_subtotals[supply_country] = {col: row[col] for col in value_cols}
+
+        for idx, row in percentage_df.iterrows():
+            supply_country = str(row.get('Supply Country', ''))
+            demand_country = str(row.get('Demand Country', ''))
+            if supply_country:
+                current_supply_country = supply_country
+
+            if current_supply_country and current_supply_country in supply_subtotals:
+                for col in value_cols:
+                    subtotal_val = supply_subtotals[current_supply_country].get(col, 0)
+                    if subtotal_val:
+                        percentage_df.at[idx, col] = (
+                            1.0 if demand_country == 'Total' and supply_country == current_supply_country
+                            else row[col] / subtotal_val
+                        )
+                    else:
+                        percentage_df.at[idx, col] = 0
+
+    else:
+        total_values = {col: percentage_df[col].sum() for col in value_cols}
+        for idx, row in percentage_df.iterrows():
+            for col in value_cols:
+                total_val = total_values.get(col, 0)
+                percentage_df.at[idx, col] = row[col] / total_val if total_val else 0
+
+    return percentage_df
+
+
 def prepare_supply_dest_table_for_display(df, table_type, classification_mode='Country', 
                                           expanded_classifications=None, expanded_countries=None, 
-                                          expanded_supply_countries=None, view_type='absolute'):
+                                          expanded_supply_countries=None, view_type='absolute',
+                                          demand_aggregation_mode='None'):
     """Prepare supply-destination data for display in DataTable with expandable rows
     
     Args:
@@ -2658,6 +3653,12 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
     if df.empty:
         return pd.DataFrame(), []
     
+    df = df.copy()
+    if classification_mode == 'Classification Level 1' and 'supply_classification' in df.columns:
+        df = df[df['supply_classification'] != 'GRAND TOTAL']
+    elif 'supply_country' in df.columns:
+        df = df[df['supply_country'] != 'GRAND TOTAL']
+    
     expanded_classifications = expanded_classifications or []
     expanded_countries = expanded_countries or []
     expanded_supply_countries = expanded_supply_countries or []
@@ -2671,48 +3672,54 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
             return True
         return (row_df[numeric_cols] != 0).any().any()
     
+    show_demand_aggregation = use_demand_classification_mode(classification_mode, demand_aggregation_mode)
+    show_demand_country = use_demand_country_mode(demand_aggregation_mode)
+
     # Filter data based on expanded state
     filtered_rows = []
     entity_totals_for_grand = []
-    supply_subtotals = {}  # Store subtotals by supply classification
     
-    if classification_mode == 'Classification Level 1':
+    if classification_mode == 'Classification Level 1' and show_demand_aggregation:
         # Four-level hierarchy: Supply Class → Demand Class → Demand Country → Supply Country
-        
-        # First, calculate subtotals for each supply classification
+        supply_subtotals = {}
         for supply_class in df['supply_classification'].unique():
             supply_data = df[df['supply_classification'] == supply_class]
-            supply_totals = supply_data[(supply_data['demand_country'] == 'Total') & 
-                                       (supply_data['supply_country'] == 'Total')]
+            supply_totals = supply_data[
+                (supply_data['demand_country'] == 'Total')
+                & (supply_data['supply_country'] == 'Total')
+            ]
             if not supply_totals.empty:
-                numeric_cols = [col for col in supply_totals.columns if col not in 
-                              ['supply_classification', 'demand_classification', 'supply_country', 'demand_country']]
-                supply_subtotals[supply_class] = {col: supply_totals[col].sum() for col in numeric_cols}
-        
-        # Process each supply classification group
+                numeric_cols = [
+                    col for col in supply_totals.columns
+                    if col not in ['supply_classification', 'demand_classification', 'supply_country', 'demand_country']
+                ]
+                supply_subtotals[supply_class] = {
+                    col: supply_totals[col].sum() for col in numeric_cols
+                }
+
         for supply_class in sorted(df['supply_classification'].unique()):
             supply_class_rows = []
             
-            # Get all classification pairs for this supply
-            supply_pairs = df[df['supply_classification'] == supply_class].groupby(['supply_classification', 'demand_classification']).size().reset_index()[['supply_classification', 'demand_classification']]
+            supply_pairs = df[df['supply_classification'] == supply_class].groupby(
+                ['supply_classification', 'demand_classification']
+            ).size().reset_index()[['supply_classification', 'demand_classification']]
             
             for _, pair in supply_pairs.iterrows():
                 demand_class = pair['demand_classification']
                 pair_key = f"{supply_class}→{demand_class}"
                 
-                # Get data for this classification pair
-                pair_data = df[(df['supply_classification'] == supply_class) & 
-                              (df['demand_classification'] == demand_class)]
+                pair_data = df[
+                    (df['supply_classification'] == supply_class)
+                    & (df['demand_classification'] == demand_class)
+                ]
                 
-                # Get classification pair total
-                class_total = pair_data[(pair_data['demand_country'] == 'Total') & 
-                                       (pair_data['supply_country'] == 'Total')]
+                class_total = pair_data[
+                    (pair_data['demand_country'] == 'Total')
+                    & (pair_data['supply_country'] == 'Total')
+                ]
                 
                 if not class_total.empty and has_non_zero_values(class_total):
-                    # Store for grand total
                     entity_totals_for_grand.append(class_total.copy())
-                    
-                    # Add expand/collapse indicator
                     class_total = class_total.copy()
                     if pair_key in expanded_classifications:
                         class_total.loc[:, 'supply_classification'] = f"▼ {supply_class}"
@@ -2724,16 +3731,12 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
                     class_total['supply_country'] = ''
                     supply_class_rows.append(class_total)
                 
-                # If classification pair is expanded, show demand countries
                 if pair_key in expanded_classifications:
-                    # Get unique demand countries for this pair
                     demand_countries = pair_data[pair_data['demand_country'] != 'Total']['demand_country'].unique()
                     
                     for demand_country in demand_countries:
                         country_key = f"{pair_key}→{demand_country}"
                         country_data = pair_data[pair_data['demand_country'] == demand_country]
-                        
-                        # Get country total
                         country_total = country_data[country_data['supply_country'] == 'Total']
                         
                         if not country_total.empty and has_non_zero_values(country_total):
@@ -2747,12 +3750,13 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
                             country_total['supply_country'] = 'Total'
                             supply_class_rows.append(country_total)
                         
-                        # If demand country is expanded, show supply countries
                         if country_key in expanded_countries:
                             supply_countries = country_data[country_data['supply_country'] != 'Total']
                             if not supply_countries.empty:
-                                # Filter out supply countries with all zeros
-                                non_zero_mask = supply_countries.apply(lambda row: has_non_zero_values(row.to_frame().T), axis=1)
+                                non_zero_mask = supply_countries.apply(
+                                    lambda row: has_non_zero_values(row.to_frame().T),
+                                    axis=1
+                                )
                                 supply_countries = supply_countries[non_zero_mask]
                                 
                                 if not supply_countries.empty:
@@ -2763,13 +3767,12 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
                                     supply_countries.loc[:, 'supply_country'] = "    " + supply_countries['supply_country']
                                     supply_class_rows.append(supply_countries)
             
-            # Add all rows for this supply classification
             filtered_rows.extend(supply_class_rows)
-            
-            # Add subtotal row for this supply classification
-            # Only show when no classification pairs are expanded for this supply
-            supply_pairs_expanded = any(pair_key.startswith(f"{supply_class}→") for pair_key in expanded_classifications)
-            
+
+            supply_pairs_expanded = any(
+                pair_key.startswith(f"{supply_class}→")
+                for pair_key in expanded_classifications
+            )
             if supply_class in supply_subtotals and supply_class_rows and not supply_pairs_expanded:
                 subtotal_row = pd.DataFrame([{
                     'supply_classification': supply_class,
@@ -2780,7 +3783,95 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
                 }])
                 filtered_rows.append(subtotal_row)
     
-    else:
+    elif classification_mode == 'Classification Level 1' and show_demand_country:
+        # Three-level hierarchy: Supply Class → Demand Country → Supply Country
+        for supply_class in sorted(df['supply_classification'].unique()):
+            supply_data = df[df['supply_classification'] == supply_class]
+            supply_total = supply_data[
+                (supply_data['demand_country'] == 'Total')
+                & (supply_data['supply_country'] == 'Total')
+            ]
+            
+            if not supply_total.empty and has_non_zero_values(supply_total):
+                entity_totals_for_grand.append(supply_total.copy())
+                supply_total = supply_total.copy()
+                if supply_class in expanded_classifications:
+                    supply_total.loc[:, 'supply_classification'] = f"▼ {supply_class}"
+                else:
+                    supply_total.loc[:, 'supply_classification'] = f"▶ {supply_class}"
+                supply_total['demand_country'] = ''
+                supply_total['supply_country'] = ''
+                filtered_rows.append(supply_total)
+            
+            if supply_class in expanded_classifications:
+                demand_countries = supply_data[
+                    (supply_data['demand_country'] != 'Total')
+                    & (supply_data['supply_country'] == 'Total')
+                ]['demand_country'].unique()
+                
+                for demand_country in demand_countries:
+                    country_key = f"{supply_class}→{demand_country}"
+                    country_data = supply_data[supply_data['demand_country'] == demand_country]
+                    country_total = country_data[country_data['supply_country'] == 'Total']
+                    
+                    if not country_total.empty and has_non_zero_values(country_total):
+                        country_total = country_total.copy()
+                        country_total['supply_classification'] = ''
+                        if country_key in expanded_countries:
+                            country_total.loc[:, 'demand_country'] = f"  ▼ {demand_country}"
+                        else:
+                            country_total.loc[:, 'demand_country'] = f"  ▶ {demand_country}"
+                        country_total['supply_country'] = 'Total'
+                        filtered_rows.append(country_total)
+                    
+                    if country_key in expanded_countries:
+                        supply_countries = country_data[country_data['supply_country'] != 'Total']
+                        if not supply_countries.empty:
+                            non_zero_mask = supply_countries.apply(
+                                lambda row: has_non_zero_values(row.to_frame().T),
+                                axis=1
+                            )
+                            supply_countries = supply_countries[non_zero_mask]
+                            
+                            if not supply_countries.empty:
+                                supply_countries = supply_countries.copy()
+                                supply_countries['supply_classification'] = ''
+                                supply_countries['demand_country'] = ''
+                                supply_countries.loc[:, 'supply_country'] = "    " + supply_countries['supply_country']
+                                filtered_rows.append(supply_countries)
+    
+    elif classification_mode == 'Classification Level 1':
+        # Two-level hierarchy: Supply Class → Supply Country
+        for supply_class in sorted(df['supply_classification'].unique()):
+            supply_data = df[df['supply_classification'] == supply_class]
+            supply_total = supply_data[supply_data['supply_country'] == 'Total']
+            
+            if not supply_total.empty and has_non_zero_values(supply_total):
+                entity_totals_for_grand.append(supply_total.copy())
+                supply_total = supply_total.copy()
+                if supply_class in expanded_classifications:
+                    supply_total.loc[:, 'supply_classification'] = f"▼ {supply_class}"
+                else:
+                    supply_total.loc[:, 'supply_classification'] = f"▶ {supply_class}"
+                supply_total['supply_country'] = ''
+                filtered_rows.append(supply_total)
+            
+            if supply_class in expanded_classifications:
+                supply_countries = supply_data[supply_data['supply_country'] != 'Total']
+                if not supply_countries.empty:
+                    non_zero_mask = supply_countries.apply(
+                        lambda row: has_non_zero_values(row.to_frame().T),
+                        axis=1
+                    )
+                    supply_countries = supply_countries[non_zero_mask]
+                    
+                    if not supply_countries.empty:
+                        supply_countries = supply_countries.copy()
+                        supply_countries['supply_classification'] = ''
+                        supply_countries.loc[:, 'supply_country'] = "  " + supply_countries['supply_country']
+                        filtered_rows.append(supply_countries)
+    
+    elif show_demand_country:
         # Two-level hierarchy: Supply Country → Demand Country
         # First, calculate subtotals for each supply country
         for supply_country in sorted(df['supply_country'].unique()):
@@ -2815,13 +3906,20 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
                 }])
                 filtered_rows.append(subtotal_row)
     
+    else:
+        for supply_country in sorted(df['supply_country'].unique()):
+            supply_country_data = df[df['supply_country'] == supply_country]
+            if not supply_country_data.empty and has_non_zero_values(supply_country_data):
+                entity_totals_for_grand.append(supply_country_data.copy())
+                filtered_rows.append(supply_country_data.copy())
+    
     # Add Grand Total row (only if not in percentage mode)
     if entity_totals_for_grand and view_type != 'percentage':
         grand_total_df = safe_concat(entity_totals_for_grand, ignore_index=True)
         numeric_cols = [col for col in grand_total_df.columns if col not in 
                        ['supply_classification', 'demand_classification', 'supply_country', 'demand_country']]
         
-        if classification_mode == 'Classification Level 1':
+        if classification_mode == 'Classification Level 1' and show_demand_aggregation:
             grand_total_row = pd.DataFrame([{
                 'supply_classification': 'GRAND TOTAL',
                 'demand_classification': '',
@@ -2829,10 +3927,28 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
                 'supply_country': '',
                 **{col: grand_total_df[col].sum() for col in numeric_cols}
             }])
-        else:
+        elif classification_mode == 'Classification Level 1' and show_demand_country:
+            grand_total_row = pd.DataFrame([{
+                'supply_classification': 'GRAND TOTAL',
+                'demand_country': '',
+                'supply_country': '',
+                **{col: grand_total_df[col].sum() for col in numeric_cols}
+            }])
+        elif classification_mode == 'Classification Level 1':
+            grand_total_row = pd.DataFrame([{
+                'supply_classification': 'GRAND TOTAL',
+                'supply_country': '',
+                **{col: grand_total_df[col].sum() for col in numeric_cols}
+            }])
+        elif show_demand_country:
             grand_total_row = pd.DataFrame([{
                 'supply_country': 'GRAND TOTAL',
                 'demand_country': '',
+                **{col: grand_total_df[col].sum() for col in numeric_cols}
+            }])
+        else:
+            grand_total_row = pd.DataFrame([{
+                'supply_country': 'GRAND TOTAL',
                 **{col: grand_total_df[col].sum() for col in numeric_cols}
             }])
         
@@ -2845,7 +3961,7 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
         display_df = pd.DataFrame()
     
     # Rename columns for display based on classification mode
-    if classification_mode == 'Classification Level 1':
+    if classification_mode == 'Classification Level 1' and show_demand_aggregation:
         new_columns = []
         for col in display_df.columns:
             if col == 'supply_classification':
@@ -2859,58 +3975,40 @@ def prepare_supply_dest_table_for_display(df, table_type, classification_mode='C
             else:
                 new_columns.append(col)
         display_df.columns = new_columns
+    elif classification_mode == 'Classification Level 1' and show_demand_country:
+        new_columns = []
+        for col in display_df.columns:
+            if col == 'supply_classification':
+                new_columns.append('Aggregation Supply')
+            elif col == 'demand_country':
+                new_columns.append('Demand Country')
+            elif col == 'supply_country':
+                new_columns.append('Supply Country')
+            else:
+                new_columns.append(col)
+        display_df.columns = new_columns
+    elif classification_mode == 'Classification Level 1':
+        new_columns = []
+        for col in display_df.columns:
+            if col == 'supply_classification':
+                new_columns.append('Aggregation Supply')
+            elif col == 'supply_country':
+                new_columns.append('Supply Country')
+            else:
+                new_columns.append(col)
+        display_df.columns = new_columns
     else:
         new_columns = []
         for col in display_df.columns:
             if col == 'supply_country':
                 new_columns.append('Supply Country')
-            elif col == 'demand_country':
+            elif col == 'demand_country' and show_demand_country:
                 new_columns.append('Demand Country')
             else:
                 new_columns.append(col)
         display_df.columns = new_columns
     
-    # Create column definitions for DataTable
-    columns = []
-    text_cols = ['Aggregation Supply', 'Aggregation Demand', 'Country Demand', 'Supply Country', 'Demand Country']
-    delta_cols = ['Δ 7D-30D', 'Δ 30D Y/Y']
-    hidden_cols = ['30D_Y1']  # Hide the Y-1 data column
-    
-    for col in display_df.columns:
-        if col in hidden_cols:
-            continue  # Skip hidden columns
-        elif col in text_cols:
-            columns.append({
-                'name': col,
-                'id': col,
-                'type': 'text'
-            })
-        elif col in delta_cols:
-            # Delta columns should always show as fixed numbers (percentage points when in percentage mode)
-            columns.append({
-                'name': col,
-                'id': col,
-                'type': 'numeric',
-                'format': Format(precision=2, scheme=Scheme.fixed)
-            })
-        else:
-            # Use percentage format if in percentage mode
-            if view_type == 'percentage':
-                columns.append({
-                    'name': col,
-                    'id': col,
-                    'type': 'numeric',
-                    'format': Format(precision=1, scheme=Scheme.percentage)
-                })
-            else:
-                columns.append({
-                    'name': col,
-                    'id': col,
-                    'type': 'numeric',
-                    'format': Format(precision=1, scheme=Scheme.fixed)
-                })
-    
-    return display_df, columns
+    return display_df, _build_supply_dest_columns(display_df, view_type, hidden_cols=['30D_Y1'])
 
 
 # Pre-computed conditional styles (computed once at module load)
@@ -2939,7 +4037,830 @@ TABLE_CONDITIONAL_STYLES = [
 
 def get_table_conditional_styles():
     """Get conditional styling for tables"""
-    return TABLE_CONDITIONAL_STYLES
+    return deepcopy(TABLE_CONDITIONAL_STYLES)
+
+
+def _build_supply_dest_period_view_table(period_payload, period_view, period_count, comparison_basis,
+                                         classification_mode, demand_aggregation_mode,
+                                         expanded_classifications=None, expanded_countries=None,
+                                         expanded_supply_countries=None, view_type='absolute',
+                                         country_grouping_mode='show_all'):
+    """Build the historical period-analysis table while keeping the default overview untouched."""
+    period_view = _normalize_supply_dest_period_view(period_view)
+    comparison_basis = _normalize_supply_dest_comparison_basis(comparison_basis)
+    country_grouping_mode = _normalize_supply_dest_country_grouping(country_grouping_mode)
+    expanded_classifications = expanded_classifications or []
+    expanded_countries = expanded_countries or []
+    expanded_supply_countries = expanded_supply_countries or []
+
+    if not period_view:
+        return pd.DataFrame(), [], {}
+
+    period_payload = _resolve_supply_dest_period_payload(period_payload, country_grouping_mode)
+    period_entry = period_payload.get(period_view, [])
+    if isinstance(period_entry, dict):
+        records = period_entry.get('records', [])
+        current_period_label = period_entry.get('current_period_label')
+        current_period_previous_label = period_entry.get('current_period_previous_label')
+        current_period_previous_records = period_entry.get('current_period_previous_records', [])
+        current_period_prior_year_label = period_entry.get('current_period_prior_year_label')
+        current_period_prior_year_records = period_entry.get('current_period_prior_year_records', [])
+    else:
+        records = period_entry
+        current_period_label = None
+        current_period_previous_label = None
+        current_period_previous_records = []
+        current_period_prior_year_label = None
+        current_period_prior_year_records = []
+
+    source_df = pd.DataFrame(records)
+    if source_df.empty:
+        return pd.DataFrame(), [], {}
+
+    id_cols = get_supply_dest_id_cols(classification_mode, demand_aggregation_mode)
+    if current_period_previous_label:
+        current_previous_df = pd.DataFrame(current_period_previous_records)
+        if not current_previous_df.empty:
+            source_df = source_df.merge(current_previous_df, on=id_cols, how='left')
+            source_df[current_period_previous_label] = source_df[current_period_previous_label].fillna(0)
+        else:
+            source_df[current_period_previous_label] = 0
+    if current_period_prior_year_label:
+        current_prior_year_df = pd.DataFrame(current_period_prior_year_records)
+        if not current_prior_year_df.empty:
+            source_df = source_df.merge(current_prior_year_df, on=id_cols, how='left')
+            source_df[current_period_prior_year_label] = source_df[current_period_prior_year_label].fillna(0)
+        else:
+            source_df[current_period_prior_year_label] = 0
+
+    period_cols = [
+        col for col in source_df.columns
+        if col not in id_cols
+        and col != current_period_previous_label
+        and col != current_period_prior_year_label
+    ]
+    if not period_cols:
+        return pd.DataFrame(), [], {}
+
+    period_cols = sorted(
+        period_cols,
+        key=lambda col: _get_supply_dest_period_sort_key(col, period_view)
+    )
+
+    if current_period_label not in period_cols:
+        current_period_label = None
+
+    completed_period_cols = [
+        col for col in period_cols
+        if col != current_period_label
+    ]
+
+    available_counts = SUPPLY_DEST_PERIOD_COUNT_OPTIONS.get(period_view, [])
+    default_count = available_counts[0] if available_counts else len(completed_period_cols)
+    resolved_count = period_count if period_count in available_counts else default_count
+
+    if completed_period_cols:
+        resolved_count = max(1, min(int(resolved_count), len(completed_period_cols)))
+        visible_period_cols = completed_period_cols[-resolved_count:]
+    else:
+        resolved_count = 0
+        visible_period_cols = []
+
+    if current_period_label:
+        visible_period_cols = visible_period_cols + [current_period_label]
+
+    latest_label = current_period_label or (visible_period_cols[-1] if visible_period_cols else None)
+    if not latest_label:
+        return pd.DataFrame(), [], {}
+
+    comparison_reference_map = {}
+    reference_label = None
+    comparison_label = None
+    if comparison_basis == 'previous_period':
+        for visible_col in visible_period_cols:
+            if visible_col == current_period_label and current_period_previous_label:
+                reference_col = current_period_previous_label
+            else:
+                reference_col = _get_supply_dest_previous_period_label(visible_col, period_view)
+            if reference_col:
+                comparison_reference_map[visible_col] = reference_col
+    elif comparison_basis == 'same_period_last_year':
+        for visible_col in visible_period_cols:
+            if visible_col == current_period_label and current_period_prior_year_label:
+                reference_col = current_period_prior_year_label
+            else:
+                reference_col = _get_supply_dest_prior_year_label(visible_col, period_view)
+            if reference_col:
+                comparison_reference_map[visible_col] = reference_col
+
+    required_period_cols = list(visible_period_cols)
+    if reference_label and reference_label in period_cols and reference_label not in required_period_cols:
+        required_period_cols.append(reference_label)
+    if comparison_basis in {'previous_period', 'same_period_last_year'}:
+        for reference_col in comparison_reference_map.values():
+            if reference_col in source_df.columns and reference_col not in required_period_cols:
+                required_period_cols.append(reference_col)
+
+    working_df = source_df[id_cols + required_period_cols].copy()
+    display_df, _ = prepare_supply_dest_table_for_display(
+        working_df,
+        'summary',
+        classification_mode,
+        expanded_classifications,
+        expanded_countries,
+        expanded_supply_countries,
+        'absolute',
+        demand_aggregation_mode
+    )
+
+    if display_df.empty:
+        return pd.DataFrame(), [], {}
+
+    if view_type == 'percentage':
+        display_df = _drop_supply_dest_grand_total_rows(display_df)
+        display_df = _convert_supply_dest_period_display_to_percentage(
+            display_df,
+            classification_mode,
+            demand_aggregation_mode,
+            value_cols=required_period_cols
+        )
+
+    comparison_source_df = display_df.copy()
+
+    if comparison_basis in {'previous_period', 'same_period_last_year'}:
+        for visible_col in visible_period_cols:
+            reference_col = comparison_reference_map.get(visible_col)
+            if visible_col not in comparison_source_df.columns:
+                continue
+            if reference_col in comparison_source_df.columns:
+                display_df[visible_col] = comparison_source_df[visible_col] - comparison_source_df[reference_col]
+                if view_type == 'percentage':
+                    display_df[visible_col] = display_df[visible_col] * 100
+            else:
+                display_df[visible_col] = pd.NA
+
+    if comparison_label and reference_label and reference_label in display_df.columns and latest_label in display_df.columns:
+        display_df[comparison_label] = display_df[latest_label] - display_df[reference_label]
+        if view_type == 'percentage':
+            display_df[comparison_label] = display_df[comparison_label] * 100
+    else:
+        if comparison_basis != 'same_period_last_year':
+            comparison_label = None
+            reference_label = None
+
+    hidden_cols = []
+    if reference_label and reference_label not in visible_period_cols:
+        hidden_cols.append(reference_label)
+        display_df = display_df.drop(columns=[reference_label], errors='ignore')
+    if comparison_basis in {'previous_period', 'same_period_last_year'}:
+        comparison_reference_cols = [
+            reference_col
+            for reference_col in comparison_reference_map.values()
+            if reference_col not in visible_period_cols
+        ]
+        if comparison_reference_cols:
+            hidden_cols.extend(comparison_reference_cols)
+            display_df = display_df.drop(columns=comparison_reference_cols, errors='ignore')
+
+    delta_like_cols = visible_period_cols if comparison_basis in {'previous_period', 'same_period_last_year'} else None
+    columns = _build_supply_dest_columns(
+        display_df,
+        view_type,
+        hidden_cols=hidden_cols,
+        delta_like_cols=delta_like_cols
+    )
+    return display_df, columns, {
+        'period_view': period_view,
+        'period_count': resolved_count,
+        'visible_period_cols': visible_period_cols,
+        'latest_label': latest_label,
+        'reference_label': reference_label,
+        'comparison_label': comparison_label,
+        'comparison_basis': comparison_basis,
+        'current_period_label': current_period_label,
+        'comparison_reference_map': comparison_reference_map,
+        'current_period_previous_label': current_period_previous_label,
+        'current_period_prior_year_label': current_period_prior_year_label
+    }
+
+
+def _is_supply_dest_grand_total_row(display_df):
+    """Identify GRAND TOTAL rows in supply-destination tables after display labels are applied."""
+    if display_df is None or display_df.empty:
+        return pd.Series(dtype=bool)
+
+    grand_total_mask = pd.Series(False, index=display_df.index)
+    for col in ['Aggregation Supply', 'Supply Country']:
+        if col in display_df.columns:
+            grand_total_mask = grand_total_mask | display_df[col].eq('GRAND TOTAL')
+    return grand_total_mask
+
+
+def _sort_supply_dest_period_display_df(display_df, sort_by=None):
+    """Sort the period-analysis display while keeping GRAND TOTAL pinned to the bottom."""
+    if display_df is None or display_df.empty or not sort_by:
+        return display_df
+
+    valid_sort_rules = [
+        sort_rule for sort_rule in sort_by
+        if sort_rule.get('column_id') in display_df.columns
+    ]
+    if not valid_sort_rules:
+        return display_df
+
+    grand_total_mask = _is_supply_dest_grand_total_row(display_df)
+    sortable_df = display_df.loc[~grand_total_mask].copy()
+    grand_total_df = display_df.loc[grand_total_mask].copy()
+
+    if sortable_df.empty:
+        return display_df
+
+    sort_key_cols = []
+    ascending = []
+    for idx, sort_rule in enumerate(valid_sort_rules):
+        column_id = sort_rule['column_id']
+        sort_key = f'__sort_key_{idx}'
+        column_series = sortable_df[column_id]
+
+        if pd.api.types.is_numeric_dtype(column_series):
+            sortable_df[sort_key] = pd.to_numeric(column_series, errors='coerce')
+        else:
+            sortable_df[sort_key] = (
+                column_series.fillna('')
+                .astype(str)
+                .str.replace(r'^[\s▶▼]+', '', regex=True)
+                .str.lower()
+            )
+
+        sort_key_cols.append(sort_key)
+        ascending.append(sort_rule.get('direction', 'asc') != 'desc')
+
+    sortable_df = sortable_df.sort_values(
+        by=sort_key_cols,
+        ascending=ascending,
+        na_position='last',
+        kind='mergesort'
+    ).drop(columns=sort_key_cols, errors='ignore')
+
+    return safe_concat([sortable_df, grand_total_df], ignore_index=True)
+
+def _build_supply_dest_comparison_heatmap_styles(display_df, visible_period_cols):
+    """Create diverging red/green heatmap styles using one shared scale across visible periods."""
+    if display_df is None or display_df.empty or not visible_period_cols:
+        return []
+
+    comparison_df = display_df.copy()
+    grand_total_mask = _is_supply_dest_grand_total_row(comparison_df)
+    if grand_total_mask.any():
+        comparison_df = comparison_df.loc[~grand_total_mask].copy()
+
+    positive_palette = ['#ecfdf5', '#d1fae5', '#a7f3d0', '#6ee7b7', '#34d399']
+    negative_palette = ['#fef2f2', '#fee2e2', '#fecaca', '#fca5a5', '#f87171']
+
+    available_cols = [col for col in visible_period_cols if col in comparison_df.columns]
+    if not available_cols:
+        return []
+
+    numeric_df = comparison_df[available_cols].apply(pd.to_numeric, errors='coerce')
+    flattened_values = numeric_df.stack(dropna=True)
+    if flattened_values.empty:
+        return []
+
+    global_max_abs = flattened_values.abs().max()
+    if pd.isna(global_max_abs) or global_max_abs <= 0:
+        return []
+
+    heatmap_styles = []
+    bucket_thresholds = [0.2, 0.4, 0.6, 0.8, 1.0]
+    for visible_col in available_cols:
+        numeric_series = numeric_df[visible_col].dropna()
+        if numeric_series.empty:
+            continue
+
+        heatmap_styles.append({
+            'if': {'column_id': visible_col},
+            'backgroundColor': '#f8fafc',
+            'fontWeight': '600',
+            'color': TABLE_COLORS['text_primary']
+        })
+        for row_idx, value in numeric_series.items():
+            if pd.isna(value) or value == 0:
+                continue
+
+            value_ratio = min(abs(float(value)) / float(global_max_abs), 1.0)
+            palette_index = next(
+                (
+                    idx for idx, threshold in enumerate(bucket_thresholds)
+                    if value_ratio <= threshold
+                ),
+                len(bucket_thresholds) - 1
+            )
+            is_positive = float(value) > 0
+            heatmap_styles.append({
+                'if': {'column_id': visible_col, 'row_index': int(row_idx)},
+                'backgroundColor': (
+                    positive_palette[palette_index]
+                    if is_positive else negative_palette[palette_index]
+                ),
+                'color': '#14532d' if is_positive else '#7f1d1d',
+                'fontWeight': '600'
+            })
+
+    return heatmap_styles
+
+
+def _get_supply_dest_hierarchy_instruction(classification_mode, demand_aggregation_mode):
+    """Return the hierarchy help text for supply-destination tables."""
+    show_demand_aggregation = use_demand_classification_mode(classification_mode, demand_aggregation_mode)
+    show_demand_country = use_demand_country_mode(demand_aggregation_mode)
+
+    if classification_mode == 'Classification Level 1' and show_demand_aggregation:
+        return "Click on ▶ to expand classification pairs, then demand countries, then supply countries"
+    if classification_mode == 'Classification Level 1' and show_demand_country:
+        return "Click on ▶ to expand supply classifications, then demand countries, then supply countries"
+    if classification_mode == 'Classification Level 1':
+        return "Click on ▶ to expand supply classifications and see supply countries"
+    if show_demand_country:
+        return "Click on supply-demand pairs to see details"
+    return "Showing total supply by supply country"
+
+
+def _render_supply_dest_period_analysis_table(period_payload, classification_mode, demand_aggregation_mode,
+                                              view_type, period_view, period_count, comparison_basis,
+                                              expanded_classifications=None, expanded_countries=None,
+                                              expanded_supply_countries=None, period_sort_by=None,
+                                              country_grouping_mode='show_all'):
+    """Render the separate historical period-analysis table section."""
+    selected_period_view = _normalize_supply_dest_period_view(period_view)
+    country_grouping_mode = _normalize_supply_dest_country_grouping(country_grouping_mode)
+    hierarchy_instruction_text = _get_supply_dest_hierarchy_instruction(
+        classification_mode,
+        demand_aggregation_mode
+    )
+
+    if not selected_period_view:
+        return (
+            html.Div(
+                "Select a time view to display a separate historical destination table.",
+                style={'textAlign': 'center', 'padding': '28px 20px', 'color': '#64748b'}
+            ),
+            html.Span(
+                "Choose Time View, Periods, and Comparison Basis above to populate this section.",
+                style={'fontSize': '13px', 'color': '#64748b', 'fontStyle': 'italic'}
+            )
+        )
+
+    try:
+        display_df, columns, period_meta = _build_supply_dest_period_view_table(
+            period_payload,
+            selected_period_view,
+            period_count,
+            comparison_basis,
+            classification_mode,
+            demand_aggregation_mode,
+            expanded_classifications,
+            expanded_countries,
+            expanded_supply_countries,
+            view_type,
+            country_grouping_mode
+        )
+
+        if display_df.empty:
+            return (
+                html.Div(
+                    "No data available for the selected period analysis.",
+                    style={'textAlign': 'center', 'padding': '20px'}
+                ),
+                html.Span(
+                    hierarchy_instruction_text,
+                    style={'fontSize': '13px', 'color': '#666', 'fontStyle': 'italic'}
+                )
+            )
+
+        visible_period_cols = period_meta.get('visible_period_cols', [])
+        latest_label = period_meta.get('latest_label')
+        reference_label = period_meta.get('reference_label')
+        comparison_label = period_meta.get('comparison_label')
+        comparison_basis_mode = period_meta.get('comparison_basis', 'levels')
+        period_count_label = period_meta.get('period_count', len(visible_period_cols))
+        current_period_label = period_meta.get('current_period_label')
+        current_period_previous_label = period_meta.get('current_period_previous_label')
+        current_period_prior_year_label = period_meta.get('current_period_prior_year_label')
+        current_period_visible = bool(current_period_label and current_period_label in display_df.columns)
+        per_column_previous_mode = comparison_basis_mode == 'previous_period'
+        per_column_yoy_mode = comparison_basis_mode == 'same_period_last_year'
+        per_column_comparison_mode = per_column_previous_mode or per_column_yoy_mode
+        period_view_title = {
+            'monthly': 'Monthly',
+            'quarterly': 'Quarterly',
+            'seasonally': 'Seasonally',
+            'yearly': 'Yearly'
+        }.get(selected_period_view, 'Historical')
+
+        instruction_children = []
+        if per_column_yoy_mode:
+            instruction_children.extend([
+                html.Span(
+                    "Each visible period column shows the YoY level change versus the same period last year.",
+                    style={'fontSize': '13px', 'color': '#64748b'}
+                )
+            ])
+            if current_period_visible:
+                instruction_children.extend([
+                    html.Br(),
+                    html.Span(
+                        (
+                            f"{current_period_label} uses {current_period_prior_year_label} "
+                            "for the same period-to-date comparison."
+                        ),
+                        style={'fontSize': '13px', 'color': '#64748b'}
+                    )
+                ])
+        elif per_column_previous_mode:
+            instruction_children.extend([
+                html.Span(
+                    "Each visible period column shows the change versus the immediately previous period.",
+                    style={'fontSize': '13px', 'color': '#64748b'}
+                )
+            ])
+            if current_period_visible:
+                instruction_children.extend([
+                    html.Br(),
+                    html.Span(
+                        (
+                            f"{current_period_label} uses {current_period_previous_label} "
+                            "for the previous-period-to-date comparison."
+                        ),
+                        style={'fontSize': '13px', 'color': '#64748b'}
+                    )
+                ])
+        elif comparison_label and latest_label and reference_label:
+            instruction_children.extend([
+                html.Br(),
+                html.Span(
+                    f"{comparison_label} compares {latest_label} against {reference_label}.",
+                    style={'fontSize': '13px', 'color': '#64748b'}
+                )
+            ])
+        if per_column_comparison_mode:
+            instruction_children.extend([
+                html.Br(),
+                html.Span(
+                    "Heatmap shading is applied across all visible period columns on one shared scale: green for increases, red for decreases, and darker shades for larger moves.",
+                    style={'fontSize': '13px', 'color': '#64748b'}
+                )
+            ])
+        instruction_element = html.Div(instruction_children, style={'lineHeight': '1.5'})
+
+        default_sort_by = []
+        if comparison_label and comparison_label in display_df.columns:
+            default_sort_by = [{'column_id': comparison_label, 'direction': 'desc'}]
+        elif latest_label and latest_label in display_df.columns:
+            default_sort_by = [{'column_id': latest_label, 'direction': 'desc'}]
+
+        current_sort_by = period_sort_by or default_sort_by
+        current_sort_by = [
+            sort_rule for sort_rule in current_sort_by
+            if sort_rule.get('column_id') in display_df.columns
+        ]
+        if not current_sort_by:
+            current_sort_by = default_sort_by
+        display_df = _sort_supply_dest_period_display_df(display_df, current_sort_by)
+
+        conditional_styles = get_table_conditional_styles()
+
+        if 'Aggregation Supply' in display_df.columns:
+            conditional_styles.insert(1, {
+                'if': {'filter_query': '{Aggregation Supply} = ""'},
+                'backgroundColor': '#f9f9f9',
+                'fontSize': '13px'
+            })
+
+        if 'Aggregation Demand' in display_df.columns:
+            conditional_styles.append({
+                'if': {'filter_query': '{Aggregation Demand} = "Total"'},
+                'backgroundColor': TABLE_COLORS['bg_lighter'],
+                'fontWeight': 'bold',
+                'color': TABLE_COLORS['text_primary']
+            })
+
+        if 'Demand Country' in display_df.columns:
+            conditional_styles.append({
+                'if': {'filter_query': '{Demand Country} = "Total"'},
+                'backgroundColor': TABLE_COLORS['bg_lighter'],
+                'fontWeight': 'bold',
+                'color': TABLE_COLORS['text_primary']
+            })
+
+        for col in SUPPLY_DEST_TEXT_COLUMNS:
+            if col in display_df.columns:
+                conditional_styles.append({
+                    'if': {'column_id': col},
+                    'textAlign': 'left'
+                })
+
+        delta_columns = [col for col in display_df.columns if str(col).startswith('Δ ')]
+        numeric_columns = [
+            col for col in display_df.columns
+            if col not in SUPPLY_DEST_TEXT_COLUMNS
+        ]
+
+        for col in numeric_columns:
+            conditional_styles.append({
+                'if': {'column_id': col},
+                'textAlign': 'right',
+                'paddingRight': '12px'
+            })
+
+        period_color_map = {
+            'monthly': '#f3e5f5',
+            'quarterly': '#e3f2fd',
+            'seasonally': '#e8f5e9',
+            'yearly': '#fff3e0'
+        }
+        header_color = period_color_map.get(selected_period_view, '#f8fafc')
+
+        if per_column_comparison_mode:
+            conditional_styles.extend(
+                _build_supply_dest_comparison_heatmap_styles(display_df, visible_period_cols)
+            )
+
+        if current_period_visible:
+            if per_column_comparison_mode:
+                conditional_styles.append({
+                    'if': {'column_id': current_period_label},
+                    'fontWeight': '700',
+                    'borderLeft': '2px solid #f59e0b',
+                    'borderRight': '2px solid #f59e0b'
+                })
+            else:
+                conditional_styles.append({
+                    'if': {'column_id': current_period_label},
+                    'backgroundColor': '#fffbeb',
+                    'fontWeight': '600'
+                })
+
+        if visible_period_cols:
+            conditional_styles.append({
+                'if': {'column_id': visible_period_cols[0]},
+                'borderLeft': '3px solid white'
+            })
+
+        for delta_col in delta_columns:
+            conditional_styles.append({
+                'if': {'column_id': delta_col},
+                'backgroundColor': '#f5f5f5',
+                'fontWeight': '600',
+                'borderLeft': '3px solid white'
+            })
+            conditional_styles.append({
+                'if': {'column_id': delta_col, 'filter_query': f'{{{delta_col}}} > 0'},
+                'color': '#2e7d32',
+                'fontWeight': '600'
+            })
+            conditional_styles.append({
+                'if': {'column_id': delta_col, 'filter_query': f'{{{delta_col}}} < 0'},
+                'color': '#c62828',
+                'fontWeight': '600'
+            })
+
+        conditional_styles.append({
+            'if': {'filter_query': '{Aggregation Supply} = "GRAND TOTAL" or {Supply Country} = "GRAND TOTAL"'},
+            'backgroundColor': '#2E86C1',
+            'fontWeight': 'bold',
+            'color': 'white'
+        })
+
+        table_config = StandardTableStyleManager.get_base_datatable_config()
+        table_config['style_data_conditional'] = conditional_styles
+
+        header_styles = []
+        if visible_period_cols:
+            for col in visible_period_cols:
+                if col in display_df.columns:
+                    header_styles.append({
+                        'if': {'column_id': col},
+                        'backgroundColor': header_color
+                    })
+            header_styles.append({
+                'if': {'column_id': visible_period_cols[0]},
+                'borderLeft': '3px solid white'
+            })
+        if current_period_visible:
+            header_styles.append({
+                'if': {'column_id': current_period_label},
+                'backgroundColor': '#fde68a',
+                'color': '#78350f',
+                'borderBottom': '2px solid #f59e0b'
+            })
+        if comparison_label and comparison_label in display_df.columns:
+            header_styles.append({
+                'if': {'column_id': comparison_label},
+                'borderLeft': '3px solid white',
+                'backgroundColor': '#f1f5f9'
+            })
+        if header_styles:
+            table_config['style_header_conditional'] = header_styles
+
+        table = dash_table.DataTable(
+            id={'type': 'supply-dest-period-expandable-table', 'index': 'period'},
+            data=display_df.to_dict('records'),
+            columns=columns,
+            page_size=100,
+            sort_action='custom',
+            sort_mode='multi',
+            sort_by=current_sort_by,
+            fill_width=False,
+            export_format='none',
+            **table_config
+        )
+
+        if per_column_yoy_mode:
+            value_label = (
+                'YoY change in market share, shown in percentage points'
+                if view_type == 'percentage'
+                else 'YoY change in bilateral trade flows in mcm/d'
+            )
+        elif per_column_previous_mode:
+            value_label = (
+                'change versus the previous period in market share, shown in percentage points'
+                if view_type == 'percentage'
+                else 'change versus the previous period in bilateral trade flows in mcm/d'
+            )
+        else:
+            value_label = 'market share' if view_type == 'percentage' else 'bilateral trade flows in mcm/d'
+        footnote_parts = [
+            html.Span('Note: ', style={'fontWeight': 'bold'}),
+            html.Span(
+                (
+                    f"{period_view_title} view shows {period_count_label} completed periods"
+                    + (
+                        f" plus the current in-progress period ({current_period_label}), highlighted in amber. "
+                        if current_period_visible else ". "
+                    )
+                ),
+                style={'color': '#666'}
+            ),
+            html.Span(
+                f"Values shown are {value_label}. ",
+                style={'color': '#666'}
+            )
+        ]
+        if country_grouping_mode == 'group_small_countries':
+            footnote_parts.append(
+                html.Span(
+                    "Small countries on the visible country axis are grouped into Rest of countries when their monthly average never exceeds 10 mcm/d across the last 24 months. When demand countries are shown, the threshold is evaluated within each supply-side parent. ",
+                    style={'color': '#666'}
+                )
+            )
+        if per_column_previous_mode:
+            footnote_parts.append(
+                html.Span(
+                    "Every visible period column is compared against the immediately previous period. Heatmap shading uses one shared scale across the visible periods: green for increases, red for decreases, and darker shades for larger moves. ",
+                    style={'color': '#666'}
+                )
+            )
+        if per_column_yoy_mode:
+            footnote_parts.append(
+                html.Span(
+                    "Every visible period column is compared against the same period last year. Heatmap shading uses one shared scale across the visible periods: green for increases, red for decreases, and darker shades for larger moves. ",
+                    style={'color': '#666'}
+                )
+            )
+        if current_period_visible:
+            current_period_note = (
+                f"{current_period_label} is normalized using days elapsed so far in the current period"
+            )
+            if per_column_previous_mode and current_period_previous_label:
+                current_period_note += (
+                    f", and its previous-period baseline uses {current_period_previous_label}"
+                )
+            if per_column_yoy_mode and current_period_prior_year_label:
+                current_period_note += (
+                    f", and its YoY baseline uses {current_period_prior_year_label}"
+                )
+            current_period_note += "."
+            footnote_parts.append(
+                html.Span(
+                    current_period_note,
+                    style={'color': '#666'}
+                )
+            )
+        if comparison_label and latest_label and reference_label:
+            footnote_parts.append(
+                html.Span(
+                    (
+                        f"{comparison_label} uses {latest_label} versus {reference_label}"
+                        + (" and is shown in percentage points." if view_type == 'percentage' else '.')
+                    ),
+                    style={'color': '#666'}
+                )
+            )
+
+        footnote = html.Div([
+            html.P(
+                footnote_parts,
+                style={'fontSize': '12px', 'fontStyle': 'italic', 'marginTop': '10px', 'color': '#666'}
+            )
+        ])
+
+        return html.Div([table, footnote]), instruction_element
+
+    except Exception as e:
+        return (
+            html.Div(
+                f"Error creating historical supply-destination table: {str(e)}",
+                style={'textAlign': 'center', 'padding': '20px', 'color': 'red'}
+            ),
+            html.Span(
+                hierarchy_instruction_text,
+                style={'fontSize': '13px', 'color': '#666', 'fontStyle': 'italic'}
+            )
+        )
+
+
+def _create_top_exporters_selector_region():
+    """Render the sticky exporter controls using the shared header format."""
+    radio_label_style = {
+        'display': 'inline-flex',
+        'alignItems': 'center',
+        'marginRight': '10px',
+        'fontSize': '12px',
+        'fontWeight': '600',
+        'color': '#334155'
+    }
+    control_shell_style = {
+        'display': 'inline-flex',
+        'alignItems': 'center',
+        'gap': '10px',
+        'padding': '6px 8px 6px 12px',
+        'backgroundColor': '#ffffff',
+        'border': '1px solid #dbe4ee',
+        'borderRadius': '999px',
+        'boxShadow': '0 1px 2px rgba(15, 23, 42, 0.05)'
+    }
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div('Country Classification', className='filter-group-header'),
+                            html.Div(
+                                [
+                                    dcc.RadioItems(
+                                        id='country-classification-dropdown',
+                                        options=[
+                                            {'label': 'Country', 'value': 'Country'},
+                                            {'label': 'Classification Level 1', 'value': 'Classification Level 1'}
+                                        ],
+                                        value='Country',
+                                        inline=True,
+                                        labelStyle=radio_label_style,
+                                        inputStyle={'marginRight': '6px'},
+                                        style={
+                                            'display': 'flex',
+                                            'alignItems': 'center',
+                                            'flexWrap': 'wrap'
+                                        }
+                                    )
+                                ],
+                                style=control_shell_style
+                            )
+                        ],
+                        className='filter-section filter-section-destination'
+                    ),
+                    html.Div(
+                        [
+                            html.Div('Country Grouping', className='filter-group-header'),
+                            dcc.Dropdown(
+                                id='supply-dest-country-grouping-dropdown',
+                                options=SUPPLY_DEST_COUNTRY_GROUPING_OPTIONS,
+                                value='group_small_countries',
+                                clearable=False,
+                                className='filter-dropdown',
+                                style={'minWidth': '220px', 'width': '100%'}
+                            )
+                        ],
+                        className='filter-section filter-section-analysis'
+                    ),
+                    html.Div(
+                        [
+                            html.Div('Latest Upload', className='filter-group-header'),
+                            html.Div(
+                                id='data-timestamp-display',
+                                className='text-tertiary',
+                                style={'fontSize': '11px', 'maxWidth': '420px', 'width': '100%'}
+                            )
+                        ],
+                        className='filter-section filter-section-analysis'
+                    )
+                ],
+                className='filter-bar-grouped'
+            )
+        ]
+    )
 
 
 # Dashboard layout
@@ -2952,6 +4873,9 @@ layout = html.Div([
     dcc.Store(id='continent-charts-data', storage_type='memory'),  # Store for continent charts data
     dcc.Store(id='summary-data-store', storage_type='memory'),
     dcc.Store(id='supply-dest-data-store', storage_type='memory'),  # Store for supply-destination data
+    dcc.Store(id='supply-dest-period-data-store', storage_type='memory'),
+    dcc.Store(id='supply-dest-sort-by', data=[{'column_id': '30D', 'direction': 'desc'}]),
+    dcc.Store(id='supply-dest-period-sort-by', data=[]),
     
     # Store for expanded state of countries in summary table
     dcc.Store(id='summary-expanded-countries', data=[]),
@@ -2972,28 +4896,14 @@ layout = html.Div([
     # Download components for Excel exports
     dcc.Download(id='download-supply-charts-excel'),
     dcc.Download(id='download-continent-charts-excel'),
+    dcc.Download(id='download-supply-dest-excel'),
+    dcc.Download(id='download-supply-dest-period-excel'),
 
-    # Country Classification Dropdown - Top left with timestamp
-    html.Div([
-        html.Div([
-            html.Label('Country classification:',
-                      style={'display': 'inline-block', 'marginRight': '10px',
-                             'fontWeight': 'bold', 'fontSize': '14px'}),
-            dcc.Dropdown(
-                id='country-classification-dropdown',
-                options=[
-                    {'label': 'Country', 'value': 'Country'},
-                    {'label': 'Classification Level 1', 'value': 'Classification Level 1'}
-                ],
-                value='Country',
-                style={'width': '250px', 'display': 'inline-block', 'verticalAlign': 'middle'},
-                clearable=False
-            ),
-            html.Span(id='data-timestamp-display',
-                     style={'display': 'inline-block', 'marginLeft': '20px',
-                            'fontSize': '13px', 'color': '#666', 'fontStyle': 'italic'})
-        ], style={'padding': '10px 20px', 'marginBottom': '10px'})
-    ]),
+    html.Div(
+        [_create_top_exporters_selector_region()],
+        className='professional-section-header',
+        style={'margin': '0'}
+    ),
 
     # Supply Charts Section - Dynamic container
     html.Div([
@@ -3031,7 +4941,25 @@ layout = html.Div([
     html.Div([
         # Header with dropdown
         html.Div([
-            html.H3('LNG Supply by Destination Continent - 30-Day Rolling Average', className="section-title-inline"),
+            html.Div([
+                html.H3('LNG Supply by Destination Continent - 30-Day Rolling Average', className="section-title-inline"),
+                html.Button(
+                    'Export to Excel',
+                    id='export-continent-charts-button',
+                    n_clicks=0,
+                    style={
+                        'marginLeft': '20px',
+                        'padding': '5px 15px',
+                        'backgroundColor': '#28a745',
+                        'color': 'white',
+                        'border': 'none',
+                        'borderRadius': '4px',
+                        'cursor': 'pointer',
+                        'fontWeight': 'bold',
+                        'fontSize': '12px'
+                    }
+                ),
+            ], style={'display': 'flex', 'alignItems': 'center'}),
             dcc.Dropdown(
                 id='continent-chart-type',
                 options=[
@@ -3040,25 +4968,9 @@ layout = html.Div([
                 ],
                 value='absolute',
                 clearable=False,
-                style={'width': '200px', 'display': 'inline-block', 'marginLeft': '20px', 'verticalAlign': 'middle'}
+                style={'width': '200px'}
             ),
-            html.Button(
-                'Export to Excel',
-                id='export-continent-charts-button',
-                n_clicks=0,
-                style={
-                    'marginLeft': '20px',
-                    'padding': '5px 15px',
-                    'backgroundColor': '#28a745',
-                    'color': 'white',
-                    'border': 'none',
-                    'borderRadius': '4px',
-                    'cursor': 'pointer',
-                    'fontWeight': 'bold',
-                    'fontSize': '12px'
-                }
-            ),
-        ], className="inline-section-header", style={'display': 'flex', 'alignItems': 'center'}),
+        ], className="inline-section-header", style={'display': 'flex', 'alignItems': 'center', 'justifyContent': 'space-between', 'gap': '16px', 'flexWrap': 'wrap'}),
         
         # Dynamic continent charts container - will be populated by callback
         dcc.Loading(
@@ -3074,32 +4986,144 @@ layout = html.Div([
     html.Div([
         # Header with dropdown
         html.Div([
-            html.H3('LNG Supply by Destination', className="section-title-inline"),
-            dcc.Dropdown(
-                id='supply-dest-view-type',
-                options=[
-                    {'label': 'By Destination (mcm/d)', 'value': 'absolute'},
-                    {'label': 'Market Share (%)', 'value': 'percentage'}
-                ],
-                value='absolute',
-                clearable=False,
-                style={'width': '200px', 'display': 'inline-block', 'marginLeft': '20px', 'verticalAlign': 'middle'}
-            )
-        ], className="inline-section-header", style={'display': 'flex', 'alignItems': 'center'}),
-        
-        # Supply-Destination Table
+            html.Div([
+                html.H3('LNG Supply by Destination', className="section-title-inline"),
+                html.Button(
+                    'Export to Excel',
+                    id='export-supply-dest-button',
+                    n_clicks=0,
+                    style={
+                        'marginLeft': '20px',
+                        'padding': '5px 15px',
+                        'backgroundColor': '#28a745',
+                        'color': 'white',
+                        'border': 'none',
+                        'borderRadius': '4px',
+                        'cursor': 'pointer',
+                        'fontWeight': 'bold',
+                        'fontSize': '12px'
+                    }
+                ),
+            ], style={'display': 'flex', 'alignItems': 'center'}),
+            html.Div([
+                dcc.Dropdown(
+                    id='supply-dest-view-type',
+                    options=[
+                        {'label': 'By Destination (mcm/d)', 'value': 'absolute'},
+                        {'label': 'Market Share (%)', 'value': 'percentage'}
+                    ],
+                    value='absolute',
+                    clearable=False,
+                    style={'width': '200px'}
+                ),
+                html.Label(
+                    'Aggregation Demand:',
+                    style={
+                        'marginBottom': '0',
+                        'fontWeight': 'bold',
+                        'fontSize': '14px'
+                    }
+                ),
+                dcc.Dropdown(
+                    id='aggregation-demand-dropdown',
+                    options=[
+                        {'label': 'None', 'value': 'None'},
+                        {'label': 'Country', 'value': 'Country'},
+                        {'label': 'Classification Level 1', 'value': 'Classification Level 1'}
+                    ],
+                    value='None',
+                    clearable=False,
+                    style={'width': '220px'}
+                )
+            ], style={'display': 'flex', 'alignItems': 'center', 'gap': '20px', 'flexWrap': 'wrap'})
+        ], className="inline-section-header", style={'display': 'flex', 'alignItems': 'center', 'justifyContent': 'space-between', 'gap': '16px', 'flexWrap': 'wrap'}),
+
+        html.Div(id='supply-dest-table-instructions', style={'marginTop': '20px', 'marginBottom': '15px'}),
+        dcc.Loading(
+            id="supply-dest-table-loading",
+            children=[
+                html.Div(id='supply-dest-table-container')
+            ],
+            type="default"
+        )
+    ], className="main-section-container", style={'marginBottom': '30px'}),
+
+    html.Div([
         html.Div([
-            # Instructions at the top (will be updated dynamically)
-            html.Div(id='supply-dest-table-instructions', style={'marginTop': '20px', 'marginBottom': '15px'}),
-            
-            dcc.Loading(
-                id="supply-dest-table-loading",
-                children=[
-                    html.Div(id='supply-dest-table-container')
-                ],
-                type="default"
+            html.Div([
+                html.H3('LNG Supply by Destination - Period Analysis', className="section-title-inline"),
+                html.Button(
+                    'Export to Excel',
+                    id='export-supply-dest-period-button',
+                    n_clicks=0,
+                    style={
+                        'marginLeft': '20px',
+                        'padding': '5px 15px',
+                        'backgroundColor': '#28a745',
+                        'color': 'white',
+                        'border': 'none',
+                        'borderRadius': '4px',
+                        'cursor': 'pointer',
+                        'fontWeight': 'bold',
+                        'fontSize': '12px'
+                    }
+                ),
+            ], style={'display': 'flex', 'alignItems': 'center'}),
+            html.Span(
+                'Uses the same View Type, Aggregation Demand, and Country Grouping settings as the selectors above.',
+                style={'fontSize': '13px', 'color': '#64748b'}
             )
-        ], style={'marginBottom': '30px'})
+        ], className="inline-section-header", style={'display': 'flex', 'alignItems': 'center', 'justifyContent': 'space-between', 'gap': '16px', 'flexWrap': 'wrap'}),
+
+        html.Div([
+            html.Div('Period Analysis', className='filter-group-header'),
+            html.Div([
+                html.Div([
+                    html.Label('Time View', className='inline-filter-label'),
+                    dcc.Dropdown(
+                        id='supply-dest-period-view-dropdown',
+                        options=SUPPLY_DEST_PERIOD_VIEW_OPTIONS,
+                        value='monthly',
+                        placeholder='Select period view',
+                        clearable=True,
+                        className='filter-dropdown',
+                        style={'width': '100%'}
+                    )
+                ], style={'display': 'grid', 'gap': '6px', 'minWidth': '0'}),
+                html.Div([
+                    html.Label('Periods', className='inline-filter-label'),
+                    dcc.Dropdown(
+                        id='supply-dest-period-count-dropdown',
+                        options=[],
+                        value=None,
+                        clearable=False,
+                        disabled=True,
+                        className='filter-dropdown',
+                        style={'width': '100%'}
+                    )
+                ], style={'display': 'grid', 'gap': '6px', 'minWidth': '0'}),
+                html.Div([
+                    html.Label('Comparison Basis', className='inline-filter-label'),
+                    dcc.Dropdown(
+                        id='supply-dest-comparison-basis-dropdown',
+                        options=SUPPLY_DEST_COMPARISON_BASIS_OPTIONS,
+                        value='levels',
+                        clearable=False,
+                        disabled=True,
+                        className='filter-dropdown',
+                        style={'width': '100%'}
+                    )
+                ], style={'display': 'grid', 'gap': '6px', 'minWidth': '0'})
+            ], style={'display': 'grid', 'gridTemplateColumns': 'repeat(auto-fit, minmax(180px, 1fr))', 'gap': '12px'})
+        ], className='filter-section filter-section-analysis', style={'marginTop': '20px'}),
+        html.Div(id='supply-dest-period-table-instructions', style={'marginTop': '16px', 'marginBottom': '15px'}),
+        dcc.Loading(
+            id="supply-dest-period-table-loading",
+            children=[
+                html.Div(id='supply-dest-period-table-container')
+            ],
+            type="default"
+        )
     ], className="main-section-container", style={'marginBottom': '30px'}),
 
     # LNG Loadings Section
@@ -3167,16 +5191,42 @@ def update_classification_mode(value):
     """Store the selected classification mode"""
     return value
 
+
+@callback(
+    Output('supply-dest-period-count-dropdown', 'options'),
+    Output('supply-dest-period-count-dropdown', 'value'),
+    Output('supply-dest-period-count-dropdown', 'disabled'),
+    Output('supply-dest-comparison-basis-dropdown', 'disabled'),
+    Input('supply-dest-period-view-dropdown', 'value'),
+    State('supply-dest-period-count-dropdown', 'value'),
+    prevent_initial_call=False
+)
+def update_supply_dest_period_controls(period_view, current_period_count):
+    """Enable and populate the historical period controls when a time view is selected."""
+    period_view = _normalize_supply_dest_period_view(period_view)
+    if not period_view:
+        return [], None, True, True
+
+    options = _get_supply_dest_period_options(period_view)
+    valid_values = [option['value'] for option in options]
+    next_value = current_period_count if current_period_count in valid_values else (
+        valid_values[0] if valid_values else None
+    )
+    return options, next_value, False, False
+
+
 @callback(
     [Output('supply-charts-data', 'data'),
      Output('continent-charts-data', 'data'),
      Output('summary-data-store', 'data'),
-     Output('supply-dest-data-store', 'data')],
+     Output('supply-dest-data-store', 'data'),
+     Output('supply-dest-period-data-store', 'data')],
     [Input('initial-load-trigger', 'n_intervals'),
-     Input('country-classification-mode', 'data')],
+     Input('country-classification-mode', 'data'),
+     Input('aggregation-demand-dropdown', 'value')],
     prevent_initial_call=False
 )
-def refresh_all_data(n_intervals, classification_mode):
+def refresh_all_data(n_intervals, classification_mode, demand_aggregation_mode):
     """Load all data from database"""
     try:
         # Fetch data
@@ -3185,6 +5235,7 @@ def refresh_all_data(n_intervals, classification_mode):
         # Default to 'Country' if classification_mode is None
         if classification_mode is None:
             classification_mode = 'Country'
+        demand_aggregation_mode = normalize_demand_aggregation_mode(demand_aggregation_mode)
 
         # Dictionary to store all chart data
         charts_data = {}
@@ -3215,12 +5266,23 @@ def refresh_all_data(n_intervals, classification_mode):
         # Fetch summary table data
         summary_df = fetch_summary_table_data(engine_inst, schema, classification_mode)
 
-        # Fetch supply-destination data
-        supply_dest_quarters, supply_dest_months, supply_dest_weeks = fetch_supply_destination_data(engine_inst, schema, classification_mode)
+        supply_dest_base_df = fetch_supply_destination_base_data(engine_inst, schema)
+        global_rolling_data = fetch_rolling_windows_data(engine_inst, schema, classification_mode)
 
-        # Combine supply-destination data similar to summary table
-        supply_dest_df = fetch_supply_dest_summary_data(engine_inst, schema, classification_mode,
-                                                        supply_dest_quarters, supply_dest_months, supply_dest_weeks)
+        supply_dest_summary_payload = build_supply_dest_summary_store_payload(
+            engine_inst,
+            schema,
+            supply_dest_base_df,
+            classification_mode,
+            demand_aggregation_mode,
+            global_rolling_data
+        )
+
+        supply_dest_period_payload = build_supply_dest_period_store_payload(
+            supply_dest_base_df,
+            classification_mode,
+            demand_aggregation_mode
+        )
 
         # For continent charts, pass the same entity names
         continent_charts_entities = list(charts_data.keys())
@@ -3228,10 +5290,25 @@ def refresh_all_data(n_intervals, classification_mode):
         return (charts_data,
                 continent_charts_entities,
                 summary_df.to_dict('records') if not summary_df.empty else [],
-                supply_dest_df.to_dict('records') if not supply_dest_df.empty else [])
+                supply_dest_summary_payload,
+                supply_dest_period_payload)
 
     except Exception as e:
-        return {}, [], [], []
+        return {}, [], [], _empty_supply_dest_summary_store_payload(), _empty_supply_dest_period_store_payload()
+
+
+@callback(
+    [Output('supply-dest-expanded-classifications', 'data', allow_duplicate=True),
+     Output('supply-dest-expanded-countries', 'data', allow_duplicate=True),
+     Output('supply-dest-expanded-supply-countries', 'data', allow_duplicate=True)],
+    [Input('country-classification-mode', 'data'),
+     Input('aggregation-demand-dropdown', 'value'),
+     Input('supply-dest-country-grouping-dropdown', 'value')],
+    prevent_initial_call=True
+)
+def reset_supply_dest_expansion_state(classification_mode, demand_aggregation_mode, country_grouping_mode):
+    """Reset expanded rows whenever the supply/demand aggregation controls change."""
+    return [], [], []
 
 
 def create_supply_chart(data, title_prefix="", show_legend=True):
@@ -3685,6 +5762,15 @@ def update_summary_table(summary_data, expanded_countries, expanded_classificati
             'fontWeight': 'bold',
             'color': 'white'
         })
+        for rolling_col in ['30D', '7D']:
+            if rolling_col in display_df.columns:
+                conditional_styles.append({
+                    'if': {
+                        'column_id': rolling_col,
+                        'filter_query': '{Country} = "GRAND TOTAL"'
+                    },
+                    'color': TABLE_COLORS['text_primary']
+                })
         
         # Get base table configuration
         table_config = StandardTableStyleManager.get_base_datatable_config()
@@ -3788,21 +5874,42 @@ def update_summary_table(summary_data, expanded_countries, expanded_classificati
      Input('supply-dest-expanded-countries', 'data'),
      Input('supply-dest-expanded-supply-countries', 'data'),
      Input('country-classification-mode', 'data'),
-     Input('supply-dest-view-type', 'value')],
+     Input('supply-dest-view-type', 'value'),
+     Input('aggregation-demand-dropdown', 'value'),
+     Input('supply-dest-country-grouping-dropdown', 'value')],
+    [State('supply-dest-sort-by', 'data')],
     prevent_initial_call=False
 )
-def update_supply_dest_table(supply_dest_data, expanded_classifications, expanded_countries, 
-                             expanded_supply_countries, classification_mode, view_type):
+def update_supply_dest_table(supply_dest_data, expanded_classifications, expanded_countries,
+                             expanded_supply_countries, classification_mode, view_type,
+                             demand_aggregation_mode, country_grouping_mode, supply_dest_sort_by):
     """Update the supply-destination table with expandable rows"""
-    
-    # Set instruction text based on mode
-    if classification_mode == 'Classification Level 1':
-        instruction_text = "Click on ▶ to expand classification pairs, then demand countries, then supply countries"
-    else:
-        instruction_text = "Click on supply-demand pairs to see details"
-    
-    instruction_element = html.Span(instruction_text, 
-                                   style={'fontSize': '14px', 'color': '#666', 'fontStyle': 'italic'})
+    show_demand_aggregation = use_demand_classification_mode(classification_mode, demand_aggregation_mode)
+    show_demand_country = use_demand_country_mode(demand_aggregation_mode)
+    country_grouping_mode = _normalize_supply_dest_country_grouping(country_grouping_mode)
+    expanded_classifications = expanded_classifications or []
+    expanded_countries = expanded_countries or []
+    expanded_supply_countries = expanded_supply_countries or []
+
+    hierarchy_instruction_text = _get_supply_dest_hierarchy_instruction(
+        classification_mode,
+        demand_aggregation_mode
+    )
+    instruction_children = [
+        html.Span(
+            hierarchy_instruction_text,
+            style={'fontSize': '14px', 'color': '#666', 'fontStyle': 'italic'}
+        )
+    ]
+    if country_grouping_mode == 'group_small_countries':
+        instruction_children.extend([
+            html.Br(),
+            html.Span(
+                "Small countries on the visible country axis are grouped into Rest of countries when their monthly average never exceeds 10 mcm/d across the last 24 months. When demand countries are shown, the threshold is evaluated within each supply-side parent.",
+                style={'fontSize': '13px', 'color': '#64748b'}
+            )
+        ])
+    instruction_element = html.Div(instruction_children, style={'lineHeight': '1.5'})
     
     if not supply_dest_data:
         return (html.Div("No data available. Please refresh to load data.", 
@@ -3810,23 +5917,22 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
                 instruction_element)
     
     try:
-        # Convert stored data back to DataFrame
-        df = pd.DataFrame(supply_dest_data)
+        resolved_supply_dest_data = _resolve_supply_dest_summary_payload(
+            supply_dest_data,
+            country_grouping_mode
+        )
+        df = pd.DataFrame(resolved_supply_dest_data)
         
         if df.empty:
             return (html.Div("No data available. Please refresh to load data.", 
                            style={'textAlign': 'center', 'padding': '20px'}),
                     instruction_element)
         
-        # Initialize expanded states if None
-        expanded_classifications = expanded_classifications or []
-        expanded_countries = expanded_countries or []
-        expanded_supply_countries = expanded_supply_countries or []
-        
         # Prepare data for display with expandable rows
         display_df, columns = prepare_supply_dest_table_for_display(
             df, 'summary', classification_mode,
-            expanded_classifications, expanded_countries, expanded_supply_countries, view_type
+            expanded_classifications, expanded_countries, expanded_supply_countries, view_type,
+            demand_aggregation_mode
         )
         
         if display_df.empty:
@@ -3835,7 +5941,7 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
                     instruction_element)
         
         # Convert to percentages if requested
-        if view_type == 'percentage' and classification_mode == 'Classification Level 1':
+        if view_type == 'percentage' and classification_mode == 'Classification Level 1' and show_demand_aggregation:
             # Identify numeric columns (exclude text columns and delta columns)
             text_cols = ['Aggregation Supply', 'Aggregation Demand', 'Country Demand', 'Supply Country']
             delta_cols = ['Δ 7D-30D', 'Δ 30D Y/Y']
@@ -3928,7 +6034,133 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
             if '30D_Y1' in display_df.columns:
                 display_df = display_df.drop('30D_Y1', axis=1)
         
-        elif view_type == 'percentage' and classification_mode != 'Classification Level 1':
+        elif view_type == 'percentage' and classification_mode == 'Classification Level 1' and show_demand_country:
+            text_cols = ['Aggregation Supply', 'Demand Country', 'Supply Country']
+            delta_cols = ['Δ 7D-30D', 'Δ 30D Y/Y']
+            numeric_cols = [col for col in display_df.columns if col not in text_cols and col not in delta_cols]
+            numeric_cols_with_y1 = numeric_cols + (['30D_Y1'] if '30D_Y1' in display_df.columns else [])
+            
+            current_supply_class = None
+            subtotal_values = {}
+            
+            for _, row in display_df.iterrows():
+                agg_supply = str(row.get('Aggregation Supply', ''))
+                demand_country = str(row.get('Demand Country', ''))
+                if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                    supply_name = agg_supply[2:].strip()
+                    subtotal_values[supply_name] = {col: row[col] for col in numeric_cols_with_y1 if col in row}
+                elif demand_country == 'Total' and agg_supply:
+                    subtotal_values[agg_supply] = {col: row[col] for col in numeric_cols_with_y1 if col in row}
+            
+            for idx, row in display_df.iterrows():
+                agg_supply = str(row.get('Aggregation Supply', ''))
+                demand_country = str(row.get('Demand Country', ''))
+                
+                if agg_supply:
+                    if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                        current_supply_class = agg_supply[2:].strip()
+                    elif demand_country == 'Total':
+                        current_supply_class = agg_supply
+                
+                if current_supply_class and current_supply_class in subtotal_values:
+                    for col in numeric_cols:
+                        if col in display_df.columns and col != '30D_Y1' and col in subtotal_values[current_supply_class]:
+                            subtotal_val = subtotal_values[current_supply_class][col]
+                            if subtotal_val != 0:
+                                if agg_supply.startswith('▶') or agg_supply.startswith('▼') or (
+                                    demand_country == 'Total' and agg_supply == current_supply_class
+                                ):
+                                    display_df.at[idx, col] = 1.0
+                                else:
+                                    display_df.at[idx, col] = (row[col] / subtotal_val)
+            
+            if 'Δ 7D-30D' in display_df.columns and '7D' in display_df.columns and '30D' in display_df.columns:
+                display_df['Δ 7D-30D'] = (display_df['7D'] - display_df['30D'])
+            
+            if 'Δ 30D Y/Y' in display_df.columns and '30D_Y1' in display_df.columns:
+                current_supply_class_for_y1 = None
+                for idx, row in display_df.iterrows():
+                    agg_supply = str(row.get('Aggregation Supply', ''))
+                    demand_country = str(row.get('Demand Country', ''))
+                    
+                    if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                        current_supply_class_for_y1 = agg_supply[2:].strip()
+                    elif demand_country == 'Total' and agg_supply:
+                        current_supply_class_for_y1 = agg_supply
+                    
+                    if agg_supply.startswith('▶') or agg_supply.startswith('▼') or demand_country == 'Total':
+                        display_df.at[idx, 'Δ 30D Y/Y'] = 0
+                    elif current_supply_class_for_y1 and current_supply_class_for_y1 in subtotal_values:
+                        if '30D_Y1' in subtotal_values[current_supply_class_for_y1]:
+                            subtotal_y1 = subtotal_values[current_supply_class_for_y1]['30D_Y1']
+                            if subtotal_y1 != 0:
+                                y1_pct = row['30D_Y1'] / subtotal_y1
+                                display_df.at[idx, 'Δ 30D Y/Y'] = display_df.at[idx, '30D'] - y1_pct
+                            else:
+                                display_df.at[idx, 'Δ 30D Y/Y'] = 0
+                        else:
+                            display_df.at[idx, 'Δ 30D Y/Y'] = 0
+            
+            if '30D_Y1' in display_df.columns:
+                display_df = display_df.drop('30D_Y1', axis=1)
+        
+        elif view_type == 'percentage' and classification_mode == 'Classification Level 1':
+            text_cols = ['Aggregation Supply', 'Supply Country']
+            delta_cols = ['Δ 7D-30D', 'Δ 30D Y/Y']
+            numeric_cols = [col for col in display_df.columns if col not in text_cols and col not in delta_cols]
+            numeric_cols_with_y1 = numeric_cols + (['30D_Y1'] if '30D_Y1' in display_df.columns else [])
+            
+            current_supply_class = None
+            subtotal_values = {}
+            
+            for _, row in display_df.iterrows():
+                agg_supply = str(row.get('Aggregation Supply', ''))
+                if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                    supply_name = agg_supply[2:].strip()
+                    subtotal_values[supply_name] = {col: row[col] for col in numeric_cols_with_y1 if col in row}
+            
+            for idx, row in display_df.iterrows():
+                agg_supply = str(row.get('Aggregation Supply', ''))
+                supply_country = str(row.get('Supply Country', ''))
+                
+                if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                    current_supply_class = agg_supply[2:].strip()
+                
+                if current_supply_class and current_supply_class in subtotal_values:
+                    for col in numeric_cols:
+                        if col in display_df.columns and col != '30D_Y1' and col in subtotal_values[current_supply_class]:
+                            subtotal_val = subtotal_values[current_supply_class][col]
+                            if subtotal_val != 0:
+                                if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                                    display_df.at[idx, col] = 1.0
+                                else:
+                                    display_df.at[idx, col] = (row[col] / subtotal_val)
+            
+            if 'Δ 7D-30D' in display_df.columns and '7D' in display_df.columns and '30D' in display_df.columns:
+                display_df['Δ 7D-30D'] = (display_df['7D'] - display_df['30D'])
+            
+            if 'Δ 30D Y/Y' in display_df.columns and '30D_Y1' in display_df.columns:
+                current_supply_class_for_y1 = None
+                for idx, row in display_df.iterrows():
+                    agg_supply = str(row.get('Aggregation Supply', ''))
+                    if agg_supply.startswith('▶') or agg_supply.startswith('▼'):
+                        current_supply_class_for_y1 = agg_supply[2:].strip()
+                        display_df.at[idx, 'Δ 30D Y/Y'] = 0
+                    elif current_supply_class_for_y1 and current_supply_class_for_y1 in subtotal_values:
+                        if '30D_Y1' in subtotal_values[current_supply_class_for_y1]:
+                            subtotal_y1 = subtotal_values[current_supply_class_for_y1]['30D_Y1']
+                            if subtotal_y1 != 0:
+                                y1_pct = row['30D_Y1'] / subtotal_y1
+                                display_df.at[idx, 'Δ 30D Y/Y'] = display_df.at[idx, '30D'] - y1_pct
+                            else:
+                                display_df.at[idx, 'Δ 30D Y/Y'] = 0
+                        else:
+                            display_df.at[idx, 'Δ 30D Y/Y'] = 0
+            
+            if '30D_Y1' in display_df.columns:
+                display_df = display_df.drop('30D_Y1', axis=1)
+        
+        elif view_type == 'percentage' and classification_mode != 'Classification Level 1' and show_demand_country:
             # For Country mode, calculate percentages relative to supply country subtotals
             text_cols = ['Supply Country', 'Demand Country']
             delta_cols = ['Δ 7D-30D', 'Δ 30D Y/Y']
@@ -4002,31 +6234,61 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
             if '30D_Y1' in display_df.columns:
                 display_df = display_df.drop('30D_Y1', axis=1)
         
+        elif view_type == 'percentage':
+            text_cols = ['Supply Country']
+            delta_cols = ['Δ 7D-30D', 'Δ 30D Y/Y']
+            numeric_cols = [col for col in display_df.columns if col not in text_cols and col not in delta_cols]
+            total_values = {col: display_df[col].sum() for col in numeric_cols if col in display_df.columns}
+            
+            for idx, row in display_df.iterrows():
+                for col in numeric_cols:
+                    total_val = total_values.get(col, 0)
+                    if total_val != 0:
+                        display_df.at[idx, col] = row[col] / total_val
+                    else:
+                        display_df.at[idx, col] = 0
+            
+            if 'Δ 7D-30D' in display_df.columns and '7D' in display_df.columns and '30D' in display_df.columns:
+                display_df['Δ 7D-30D'] = (display_df['7D'] - display_df['30D'])
+            
+            if 'Δ 30D Y/Y' in display_df.columns and '30D_Y1' in display_df.columns:
+                total_y1 = total_values.get('30D_Y1', 0)
+                if total_y1 != 0:
+                    display_df['Δ 30D Y/Y'] = display_df['30D'] - (display_df['30D_Y1'] / total_y1)
+                else:
+                    display_df['Δ 30D Y/Y'] = 0
+            
+            if '30D_Y1' in display_df.columns:
+                display_df = display_df.drop('30D_Y1', axis=1)
+        
         # Get conditional styles (includes alternating rows, country totals, grand total)
         conditional_styles = get_table_conditional_styles()
         
         # Add style for indented rows
-        conditional_styles.insert(1, {
-            'if': {'filter_query': '{Aggregation Supply} = ""'},
-            'backgroundColor': '#f9f9f9',
-            'fontSize': '13px'
-        })
+        if 'Aggregation Supply' in display_df.columns:
+            conditional_styles.insert(1, {
+                'if': {'filter_query': '{Aggregation Supply} = ""'},
+                'backgroundColor': '#f9f9f9',
+                'fontSize': '13px'
+            })
         
         # Add style for subtotal rows (bold format like Installation Total)
         # Works for both Classification Level 1 mode (Aggregation Demand = Total) and Country mode (Demand Country = Total)
-        conditional_styles.append({
-            'if': {'filter_query': '{Aggregation Demand} = "Total"'},
-            'backgroundColor': TABLE_COLORS['bg_lighter'],
-            'fontWeight': 'bold',
-            'color': TABLE_COLORS['text_primary']
-        })
+        if 'Aggregation Demand' in display_df.columns:
+            conditional_styles.append({
+                'if': {'filter_query': '{Aggregation Demand} = "Total"'},
+                'backgroundColor': TABLE_COLORS['bg_lighter'],
+                'fontWeight': 'bold',
+                'color': TABLE_COLORS['text_primary']
+            })
         
-        conditional_styles.append({
-            'if': {'filter_query': '{Demand Country} = "Total"'},
-            'backgroundColor': TABLE_COLORS['bg_lighter'],
-            'fontWeight': 'bold',
-            'color': TABLE_COLORS['text_primary']
-        })
+        if 'Demand Country' in display_df.columns:
+            conditional_styles.append({
+                'if': {'filter_query': '{Demand Country} = "Total"'},
+                'backgroundColor': TABLE_COLORS['bg_lighter'],
+                'fontWeight': 'bold',
+                'color': TABLE_COLORS['text_primary']
+            })
         
         # Add alignment styles for text columns
         text_columns = ['Aggregation Supply', 'Aggregation Demand', 'Country Demand', 'Supply Country', 'Demand Country']
@@ -4152,6 +6414,15 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
             'fontWeight': 'bold',
             'color': 'white'
         })
+        for rolling_col in ['30D', '7D']:
+            if rolling_col in display_df.columns:
+                conditional_styles.append({
+                    'if': {
+                        'column_id': rolling_col,
+                        'filter_query': '{Aggregation Supply} = "GRAND TOTAL" or {Supply Country} = "GRAND TOTAL"'
+                    },
+                    'color': TABLE_COLORS['text_primary']
+                })
         
         # Get base table configuration
         table_config = StandardTableStyleManager.get_base_datatable_config()
@@ -4204,6 +6475,15 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
         # Apply header styles
         if header_styles:
             table_config['style_header_conditional'] = header_styles
+
+        default_sort_by = [{'column_id': '30D', 'direction': 'desc'}] if '30D' in display_df.columns else []
+        current_sort_by = supply_dest_sort_by or default_sort_by
+        current_sort_by = [
+            sort_rule for sort_rule in current_sort_by
+            if sort_rule.get('column_id') in display_df.columns
+        ]
+        if not current_sort_by:
+            current_sort_by = default_sort_by
         
         # Create the DataTable with pattern matching ID for click handling
         table = dash_table.DataTable(
@@ -4211,10 +6491,11 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
             data=display_df.to_dict('records'),
             columns=columns,
             page_size=100,
+            sort_action='native',
             sort_mode='multi',
+            sort_by=current_sort_by,
             fill_width=False,
-            export_format='xlsx',
-            export_headers='display',
+            export_format='none',
             **table_config
         )
         
@@ -4247,6 +6528,46 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
         return (html.Div(f"Error creating supply-destination table: {str(e)}", 
                         style={'textAlign': 'center', 'padding': '20px', 'color': 'red'}),
                 instruction_element)
+
+
+@callback(
+    [Output('supply-dest-period-table-container', 'children'),
+     Output('supply-dest-period-table-instructions', 'children')],
+    [Input('supply-dest-period-data-store', 'data'),
+     Input('supply-dest-expanded-classifications', 'data'),
+     Input('supply-dest-expanded-countries', 'data'),
+     Input('supply-dest-expanded-supply-countries', 'data'),
+     Input('country-classification-mode', 'data'),
+     Input('supply-dest-view-type', 'value'),
+     Input('aggregation-demand-dropdown', 'value'),
+     Input('supply-dest-period-view-dropdown', 'value'),
+     Input('supply-dest-period-count-dropdown', 'value'),
+     Input('supply-dest-comparison-basis-dropdown', 'value'),
+     Input('supply-dest-country-grouping-dropdown', 'value'),
+     Input('supply-dest-period-sort-by', 'data')],
+    prevent_initial_call=False
+)
+def update_supply_dest_period_table(supply_dest_period_data, expanded_classifications,
+                                    expanded_countries, expanded_supply_countries,
+                                    classification_mode, view_type, demand_aggregation_mode,
+                                    period_view, period_count, comparison_basis,
+                                    country_grouping_mode,
+                                    supply_dest_period_sort_by):
+    """Render the separate historical supply-destination table section."""
+    return _render_supply_dest_period_analysis_table(
+        supply_dest_period_data,
+        classification_mode,
+        demand_aggregation_mode,
+        view_type,
+        period_view,
+        period_count,
+        comparison_basis,
+        expanded_classifications,
+        expanded_countries,
+        expanded_supply_countries,
+        supply_dest_period_sort_by,
+        country_grouping_mode
+    )
 
 
 # Callback to handle expanding/collapsing rows for summary table
@@ -4348,105 +6669,292 @@ def handle_row_expansion(active_cells, table_data_list, summary_expanded, summar
 
 # Callback to handle expanding/collapsing rows for supply-destination table
 @callback(
+    Output('supply-dest-sort-by', 'data', allow_duplicate=True),
+    Input({'type': 'supply-dest-expandable-table', 'index': ALL}, 'sort_by'),
+    prevent_initial_call=True
+)
+def store_supply_dest_sort_by(sort_by_values):
+    """Persist the supply-destination table sort so refreshes keep the current order."""
+    if not sort_by_values:
+        return no_update
+
+    for sort_by in sort_by_values:
+        if sort_by:
+            return sort_by
+
+    return no_update
+
+
+@callback(
+    Output('supply-dest-period-sort-by', 'data', allow_duplicate=True),
+    Input({'type': 'supply-dest-period-expandable-table', 'index': ALL}, 'sort_by'),
+    State('supply-dest-period-sort-by', 'data'),
+    prevent_initial_call=True
+)
+def store_supply_dest_period_sort_by(sort_by_values, current_sort_by):
+    """Persist the historical period-analysis table sort independently from the overview."""
+    if not sort_by_values:
+        return no_update
+
+    for sort_by in sort_by_values:
+        if sort_by is not None:
+            if sort_by == current_sort_by:
+                return no_update
+            return sort_by
+
+    if current_sort_by == []:
+        return no_update
+    return []
+
+
+def _toggle_supply_dest_row_expansion(display_df, active_cell, classification_mode,
+                                      demand_aggregation_mode, expanded_classifications=None,
+                                      expanded_countries=None, expanded_supply_countries=None):
+    """Toggle the hierarchical expansion state for a clicked supply-destination row."""
+    expanded_classifications = list(expanded_classifications or [])
+    expanded_countries = list(expanded_countries or [])
+    expanded_supply_countries = list(expanded_supply_countries or [])
+
+    if display_df is None or display_df.empty or not active_cell:
+        return expanded_classifications, expanded_countries, expanded_supply_countries
+
+    row_index = active_cell.get('row')
+    if row_index is None or row_index >= len(display_df):
+        return expanded_classifications, expanded_countries, expanded_supply_countries
+
+    show_demand_aggregation = use_demand_classification_mode(classification_mode, demand_aggregation_mode)
+    show_demand_country = use_demand_country_mode(demand_aggregation_mode)
+    clicked_row = display_df.iloc[row_index]
+
+    if classification_mode == 'Classification Level 1' and show_demand_aggregation:
+        supply_agg = clicked_row.get('Aggregation Supply', '')
+        demand_agg = clicked_row.get('Aggregation Demand', '')
+
+        if supply_agg and (supply_agg.startswith('▶') or supply_agg.startswith('▼')):
+            supply_class = supply_agg[2:].strip()
+            pair_key = f"{supply_class}→{demand_agg}"
+
+            if pair_key in expanded_classifications:
+                expanded_classifications.remove(pair_key)
+                expanded_countries = [c for c in expanded_countries if not c.startswith(pair_key)]
+                expanded_supply_countries = [
+                    c for c in expanded_supply_countries if not c.startswith(pair_key)
+                ]
+            else:
+                expanded_classifications.append(pair_key)
+
+        country_demand = clicked_row.get('Country Demand', '')
+        if country_demand and country_demand.strip() and (
+            country_demand.strip().startswith('▶') or country_demand.strip().startswith('▼')
+        ):
+            demand_country = country_demand.strip()[2:].strip()
+
+            for i in range(row_index - 1, -1, -1):
+                prev_row = display_df.iloc[i]
+                prev_supply = prev_row.get('Aggregation Supply', '')
+                prev_demand = prev_row.get('Aggregation Demand', '')
+                if prev_supply and (prev_supply.startswith('▶') or prev_supply.startswith('▼')):
+                    supply_class = prev_supply[2:].strip()
+                    pair_key = f"{supply_class}→{prev_demand}"
+                    country_key = f"{pair_key}→{demand_country}"
+
+                    if country_key in expanded_countries:
+                        expanded_countries.remove(country_key)
+                        expanded_supply_countries = [
+                            c for c in expanded_supply_countries if not c.startswith(country_key)
+                        ]
+                    else:
+                        expanded_countries.append(country_key)
+                    break
+
+    elif classification_mode == 'Classification Level 1' and show_demand_country:
+        supply_agg = clicked_row.get('Aggregation Supply', '')
+        demand_country = clicked_row.get('Demand Country', '')
+
+        if supply_agg and (supply_agg.startswith('▶') or supply_agg.startswith('▼')):
+            supply_class = supply_agg[2:].strip()
+            if supply_class in expanded_classifications:
+                expanded_classifications.remove(supply_class)
+                expanded_countries = [
+                    c for c in expanded_countries
+                    if not c.startswith(f"{supply_class}→")
+                ]
+            else:
+                expanded_classifications.append(supply_class)
+
+        if demand_country and demand_country.strip() and (
+            demand_country.strip().startswith('▶') or demand_country.strip().startswith('▼')
+        ):
+            demand_country_name = demand_country.strip()[2:].strip()
+
+            for i in range(row_index - 1, -1, -1):
+                prev_row = display_df.iloc[i]
+                prev_supply = prev_row.get('Aggregation Supply', '')
+                if prev_supply and (prev_supply.startswith('▶') or prev_supply.startswith('▼')):
+                    supply_class = prev_supply[2:].strip()
+                    country_key = f"{supply_class}→{demand_country_name}"
+                    if country_key in expanded_countries:
+                        expanded_countries.remove(country_key)
+                    else:
+                        expanded_countries.append(country_key)
+                    break
+
+    elif classification_mode == 'Classification Level 1':
+        supply_agg = clicked_row.get('Aggregation Supply', '')
+        if supply_agg and (supply_agg.startswith('▶') or supply_agg.startswith('▼')):
+            supply_class = supply_agg[2:].strip()
+            if supply_class in expanded_classifications:
+                expanded_classifications.remove(supply_class)
+            else:
+                expanded_classifications.append(supply_class)
+
+    return expanded_classifications, expanded_countries, expanded_supply_countries
+
+
+@callback(
     [Output('supply-dest-expanded-classifications', 'data', allow_duplicate=True),
      Output('supply-dest-expanded-countries', 'data', allow_duplicate=True),
      Output('supply-dest-expanded-supply-countries', 'data', allow_duplicate=True)],
     [Input({'type': 'supply-dest-expandable-table', 'index': ALL}, 'active_cell')],
-    [State({'type': 'supply-dest-expandable-table', 'index': ALL}, 'data'),
+    [State({'type': 'supply-dest-expandable-table', 'index': ALL}, 'derived_viewport_data'),
      State('supply-dest-expanded-classifications', 'data'),
      State('supply-dest-expanded-countries', 'data'),
      State('supply-dest-expanded-supply-countries', 'data'),
      State('supply-dest-data-store', 'data'),
-     State('country-classification-mode', 'data')],
+     State('country-classification-mode', 'data'),
+     State('aggregation-demand-dropdown', 'value'),
+     State('supply-dest-country-grouping-dropdown', 'value'),
+     State('supply-dest-view-type', 'value')],
     prevent_initial_call=True
 )
 def handle_supply_dest_row_expansion(active_cells, table_data_list, expanded_classifications,
                                      expanded_countries, expanded_supply_countries,
-                                     supply_dest_data, classification_mode):
-    """Handle clicking on rows to expand/collapse in supply-destination table"""
-    
-    # Initialize if None
-    expanded_classifications = expanded_classifications or []
-    expanded_countries = expanded_countries or []
-    expanded_supply_countries = expanded_supply_countries or []
-    
-    # Check which table was clicked
+                                     supply_dest_data, classification_mode,
+                                     demand_aggregation_mode, country_grouping_mode, view_type):
+    """Handle clicking on rows to expand/collapse in the overview supply-destination table."""
     ctx = callback_context
     if not ctx.triggered:
         return expanded_classifications, expanded_countries, expanded_supply_countries
-    
-    # Get the triggered input
+
     triggered = ctx.triggered[0]
     prop_id = triggered['prop_id']
-    
-    # Parse which table and what was clicked
+
     if 'supply-dest-expandable-table' in prop_id and '.active_cell' in prop_id:
         try:
-            import json
-            # Extract the ID part
-            id_str = prop_id.split('.active_cell')[0]
-            id_dict = json.loads(id_str)
-            
-            # Get the active cell value
             active_cell = triggered['value']
             if not active_cell:
                 return expanded_classifications, expanded_countries, expanded_supply_countries
-            
-            # Get the corresponding table data
-            if supply_dest_data:
-                df = pd.DataFrame(supply_dest_data)
+
+            current_table_data = None
+            if table_data_list:
+                for table_data in table_data_list:
+                    if table_data is not None:
+                        current_table_data = table_data
+                        break
+
+            if current_table_data:
+                display_df = pd.DataFrame(current_table_data)
+            elif supply_dest_data:
+                resolved_supply_dest_data = _resolve_supply_dest_summary_payload(
+                    supply_dest_data,
+                    country_grouping_mode
+                )
+                df = pd.DataFrame(resolved_supply_dest_data)
                 display_df, _ = prepare_supply_dest_table_for_display(
                     df, 'summary', classification_mode,
-                    expanded_classifications, expanded_countries, expanded_supply_countries, 'absolute'
+                    expanded_classifications, expanded_countries, expanded_supply_countries, view_type,
+                    demand_aggregation_mode
                 )
-                
-                if active_cell['row'] < len(display_df):
-                    clicked_row = display_df.iloc[active_cell['row']]
-                    
-                    if classification_mode == 'Classification Level 1':
-                        # Check if it's a classification pair (Aggregation Supply column)
-                        supply_agg = clicked_row.get('Aggregation Supply', '')
-                        demand_agg = clicked_row.get('Aggregation Demand', '')
-                        
-                        if supply_agg and (supply_agg.startswith('▶') or supply_agg.startswith('▼')):
-                            # Extract classification names
-                            supply_class = supply_agg[2:].strip()
-                            pair_key = f"{supply_class}→{demand_agg}"
-                            
-                            if pair_key in expanded_classifications:
-                                expanded_classifications.remove(pair_key)
-                                # Also collapse all children
-                                expanded_countries = [c for c in expanded_countries if not c.startswith(pair_key)]
-                                expanded_supply_countries = [c for c in expanded_supply_countries if not c.startswith(pair_key)]
-                            else:
-                                expanded_classifications.append(pair_key)
-                        
-                        # Check if it's a demand country (Country Demand column)
-                        country_demand = clicked_row.get('Country Demand', '')
-                        if country_demand and country_demand.strip() and (
-                            country_demand.strip().startswith('▶') or country_demand.strip().startswith('▼')):
-                            # Extract country name
-                            demand_country = country_demand.strip()[2:].strip()
-                            
-                            # Find parent classification pair
-                            for i in range(active_cell['row'] - 1, -1, -1):
-                                prev_row = display_df.iloc[i]
-                                prev_supply = prev_row.get('Aggregation Supply', '')
-                                prev_demand = prev_row.get('Aggregation Demand', '')
-                                if prev_supply and (prev_supply.startswith('▶') or prev_supply.startswith('▼')):
-                                    supply_class = prev_supply[2:].strip()
-                                    pair_key = f"{supply_class}→{prev_demand}"
-                                    country_key = f"{pair_key}→{demand_country}"
-                                    
-                                    if country_key in expanded_countries:
-                                        expanded_countries.remove(country_key)
-                                        # Also collapse supply countries under this
-                                        expanded_supply_countries = [c for c in expanded_supply_countries if not c.startswith(country_key)]
-                                    else:
-                                        expanded_countries.append(country_key)
-                                    break
-                            
-        except Exception as e:
+            else:
+                display_df = pd.DataFrame()
+
+            return _toggle_supply_dest_row_expansion(
+                display_df,
+                active_cell,
+                classification_mode,
+                demand_aggregation_mode,
+                expanded_classifications,
+                expanded_countries,
+                expanded_supply_countries
+            )
+        except Exception:
+            pass
+
+    return expanded_classifications, expanded_countries, expanded_supply_countries
+
+
+@callback(
+    [Output('supply-dest-expanded-classifications', 'data', allow_duplicate=True),
+     Output('supply-dest-expanded-countries', 'data', allow_duplicate=True),
+     Output('supply-dest-expanded-supply-countries', 'data', allow_duplicate=True)],
+    [Input({'type': 'supply-dest-period-expandable-table', 'index': ALL}, 'active_cell')],
+    [State({'type': 'supply-dest-period-expandable-table', 'index': ALL}, 'derived_viewport_data'),
+     State('supply-dest-expanded-classifications', 'data'),
+     State('supply-dest-expanded-countries', 'data'),
+     State('supply-dest-expanded-supply-countries', 'data'),
+     State('supply-dest-period-data-store', 'data'),
+     State('country-classification-mode', 'data'),
+     State('aggregation-demand-dropdown', 'value'),
+     State('supply-dest-period-view-dropdown', 'value'),
+     State('supply-dest-period-count-dropdown', 'value'),
+     State('supply-dest-comparison-basis-dropdown', 'value'),
+     State('supply-dest-country-grouping-dropdown', 'value'),
+     State('supply-dest-view-type', 'value')],
+    prevent_initial_call=True
+)
+def handle_supply_dest_period_row_expansion(active_cells, table_data_list, expanded_classifications,
+                                            expanded_countries, expanded_supply_countries,
+                                            supply_dest_period_data, classification_mode,
+                                            demand_aggregation_mode, period_view, period_count,
+                                            comparison_basis, country_grouping_mode, view_type):
+    """Handle clicking on rows to expand/collapse in the right-side period-analysis table."""
+    ctx = callback_context
+    if not ctx.triggered:
+        return expanded_classifications, expanded_countries, expanded_supply_countries
+
+    triggered = ctx.triggered[0]
+    prop_id = triggered['prop_id']
+
+    if 'supply-dest-period-expandable-table' in prop_id and '.active_cell' in prop_id:
+        try:
+            active_cell = triggered['value']
+            if not active_cell:
+                return expanded_classifications, expanded_countries, expanded_supply_countries
+
+            current_table_data = None
+            if table_data_list:
+                for table_data in table_data_list:
+                    if table_data is not None:
+                        current_table_data = table_data
+                        break
+
+            if current_table_data:
+                display_df = pd.DataFrame(current_table_data)
+            else:
+                display_df, _, _ = _build_supply_dest_period_view_table(
+                    supply_dest_period_data,
+                    period_view,
+                    period_count,
+                    comparison_basis,
+                    classification_mode,
+                    demand_aggregation_mode,
+                    expanded_classifications,
+                    expanded_countries,
+                    expanded_supply_countries,
+                    view_type,
+                    country_grouping_mode
+                )
+
+            return _toggle_supply_dest_row_expansion(
+                display_df,
+                active_cell,
+                classification_mode,
+                demand_aggregation_mode,
+                expanded_classifications,
+                expanded_countries,
+                expanded_supply_countries
+            )
+        except Exception:
             pass
 
     return expanded_classifications, expanded_countries, expanded_supply_countries
@@ -4557,6 +7065,123 @@ def update_supply_charts(charts_data, classification_mode):
     )
 
 
+def _resolve_table_export_df(derived_virtual_data_list, data_list, columns_list):
+    """Resolve the current DataTable payload into an ordered export dataframe."""
+    selected_rows = None
+    selected_columns = None
+
+    row_sources = derived_virtual_data_list or []
+    fallback_sources = data_list or []
+    column_sources = columns_list or []
+
+    for idx, column_defs in enumerate(column_sources):
+        if column_defs:
+            selected_columns = column_defs
+            if idx < len(row_sources) and row_sources[idx] is not None:
+                selected_rows = row_sources[idx]
+            elif idx < len(fallback_sources) and fallback_sources[idx] is not None:
+                selected_rows = fallback_sources[idx]
+            break
+
+    if selected_columns is None:
+        for column_defs in column_sources:
+            if column_defs:
+                selected_columns = column_defs
+                break
+
+    if selected_rows is None:
+        for rows in row_sources:
+            if rows is not None:
+                selected_rows = rows
+                break
+        if selected_rows is None:
+            for rows in fallback_sources:
+                if rows is not None:
+                    selected_rows = rows
+                    break
+
+    if not selected_rows:
+        return pd.DataFrame()
+
+    export_df = pd.DataFrame(selected_rows)
+    if selected_columns:
+        visible_column_ids = [
+            column['id'] for column in selected_columns
+            if column.get('id') in export_df.columns
+        ]
+        if visible_column_ids:
+            export_df = export_df[visible_column_ids]
+
+    return export_df
+
+
+def _send_export_dataframe(export_df, filename_prefix, sheet_name):
+    """Create a single-sheet Excel download from a dataframe."""
+    if export_df is None or export_df.empty:
+        return None
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        export_df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+
+        worksheet = writer.sheets[sheet_name[:31]]
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    max_length = max(max_length, len(str(cell.value)))
+                except Exception:
+                    pass
+            worksheet.column_dimensions[column_letter].width = min(max_length + 2, 50)
+
+    output.seek(0)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return dcc.send_bytes(output.getvalue(), f'{filename_prefix}_{timestamp}.xlsx')
+
+
+@callback(
+    Output('download-supply-dest-excel', 'data'),
+    Input('export-supply-dest-button', 'n_clicks'),
+    State({'type': 'supply-dest-expandable-table', 'index': ALL}, 'derived_virtual_data'),
+    State({'type': 'supply-dest-expandable-table', 'index': ALL}, 'data'),
+    State({'type': 'supply-dest-expandable-table', 'index': ALL}, 'columns'),
+    prevent_initial_call=True
+)
+def export_supply_dest_table_to_excel(n_clicks, derived_virtual_data_list, data_list, columns_list):
+    """Export the currently rendered LNG Supply by Destination table to Excel."""
+    if not n_clicks:
+        return None
+
+    export_df = _resolve_table_export_df(derived_virtual_data_list, data_list, columns_list)
+    return _send_export_dataframe(
+        export_df,
+        'LNG_Supply_by_Destination',
+        'Supply by Destination'
+    )
+
+
+@callback(
+    Output('download-supply-dest-period-excel', 'data'),
+    Input('export-supply-dest-period-button', 'n_clicks'),
+    State({'type': 'supply-dest-period-expandable-table', 'index': ALL}, 'derived_virtual_data'),
+    State({'type': 'supply-dest-period-expandable-table', 'index': ALL}, 'data'),
+    State({'type': 'supply-dest-period-expandable-table', 'index': ALL}, 'columns'),
+    prevent_initial_call=True
+)
+def export_supply_dest_period_table_to_excel(n_clicks, derived_virtual_data_list, data_list, columns_list):
+    """Export the currently rendered LNG Supply by Destination period-analysis table to Excel."""
+    if not n_clicks:
+        return None
+
+    export_df = _resolve_table_export_df(derived_virtual_data_list, data_list, columns_list)
+    return _send_export_dataframe(
+        export_df,
+        'LNG_Supply_by_Destination_Period_Analysis',
+        'Period Analysis'
+    )
+
+
 # Export callback for Supply Charts
 @callback(
     Output('download-supply-charts-excel', 'data'),
@@ -4654,8 +7279,25 @@ def export_continent_charts_to_excel(n_clicks, entities_list, chart_type, classi
 
             # Add join for classification mode
             join_clause = ""
-            if classification_mode == 'Classification Level 1' and entity_name != "Global":
-                join_clause = f"INNER JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country"
+            internal_flow_filter = """
+                        AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
+                            IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
+            """
+            if classification_mode == 'Classification Level 1':
+                if entity_name != "Global":
+                    join_clause = f"""
+                    INNER JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country
+                    LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
+                    """
+                else:
+                    join_clause = f"""
+                    LEFT JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country
+                    LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
+                    """
+                internal_flow_filter = """
+                        AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
+                            IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
+                """
 
             # Use different query based on chart_type
             if chart_type == 'percentage':
@@ -4674,6 +7316,7 @@ def export_continent_charts_to_excel(n_clicks, entities_list, chart_type, classi
                     WHERE kt.upload_timestamp_utc = ld.max_timestamp
                         {country_filter}
                         AND kt.start >= '2023-11-01'
+                        {internal_flow_filter}
                 ),
                 all_dates AS (
                     SELECT generate_series(
@@ -4701,6 +7344,7 @@ def export_continent_charts_to_excel(n_clicks, entities_list, chart_type, classi
                         {country_filter}
                         AND kt.start >= '2023-11-01'
                         AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+                        {internal_flow_filter}
                     GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
                 ),
                 daily_exports_complete AS (
@@ -4770,6 +7414,7 @@ def export_continent_charts_to_excel(n_clicks, entities_list, chart_type, classi
                     WHERE kt.upload_timestamp_utc = ld.max_timestamp
                         {country_filter}
                         AND kt.start >= '2023-11-01'
+                        {internal_flow_filter}
                 ),
                 all_dates AS (
                     SELECT generate_series(
@@ -4797,6 +7442,7 @@ def export_continent_charts_to_excel(n_clicks, entities_list, chart_type, classi
                         {country_filter}
                         AND kt.start >= '2023-11-01'
                         AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
+                        {internal_flow_filter}
                     GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
                 ),
                 daily_exports_complete AS (

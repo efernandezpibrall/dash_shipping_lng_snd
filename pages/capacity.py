@@ -2,6 +2,7 @@ import base64
 from io import BytesIO, StringIO
 import datetime as dt
 import hashlib
+import math
 import re
 
 import pandas as pd
@@ -209,6 +210,9 @@ INTERNAL_SCENARIO_REDUCTIONS_COLUMN = "Internal Scenario Reductions (MTPA)"
 INTERNAL_SCENARIO_NET_COLUMN = "Internal Scenario Net Delta (MTPA)"
 INTERNAL_SCENARIO_EMPTY_MESSAGE = (
     "Select or create an internal scenario from Train Timeline to populate this section."
+)
+YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE = (
+    "Select an internal scenario from the Internal Scenario dropdown at the top of the page to populate this section."
 )
 
 WOODMAC_CAPACITY_QUERY = f"""
@@ -2219,6 +2223,198 @@ def _build_responsive_column_styles(df: pd.DataFrame) -> list[dict]:
     return column_styles
 
 
+def _build_fixed_column_width_styles(
+    column_widths: dict[str, int],
+    left_align_columns: set[str] | None = None,
+) -> list[dict]:
+    left_align_columns = left_align_columns or set()
+    column_styles = []
+
+    for column_name, width_px in column_widths.items():
+        style_entry = {
+            "if": {"column_id": column_name},
+            "minWidth": f"{width_px}px",
+            "width": f"{width_px}px",
+            "maxWidth": f"{width_px}px",
+        }
+        if column_name in left_align_columns:
+            style_entry["textAlign"] = "left"
+        column_styles.append(style_entry)
+
+    return column_styles
+
+
+def _get_provider_discrepancy_config(provider: str) -> dict[str, object]:
+    provider_key = str(provider or "").strip().casefold()
+    provider_config = {
+        "woodmac": {
+            "provider_key": "woodmac",
+            "display_name": "Woodmac",
+            "entity_input_column": "Plant",
+            "entity_output_column": "Plant",
+            "provider_date_column": "Woodmac First Date",
+            "provider_capacity_change_column": "Woodmac Capacity Change",
+            "provider_capacity_display_column": "Woodmac Capacity",
+            "provider_color": "#1d4ed8",
+            "capacity_columns": [
+                "Country",
+                "Plant",
+                "Train",
+                "Woodmac First Date",
+                "Woodmac Capacity",
+                "Scenario First Date",
+                "Scenario Capacity",
+                "Abs Capacity Delta",
+            ],
+            "timeline_columns": [
+                "Country",
+                "Plant",
+                "Train",
+                "Woodmac First Date",
+                "Scenario First Date",
+                "Abs Timeline Delta (Months)",
+            ],
+            "missing_columns": [
+                "Country",
+                "Plant",
+                "Train",
+                "Woodmac First Date",
+                "Woodmac Capacity",
+            ],
+            "capacity_empty_message": (
+                "No Woodmac capacity discrepancies were found in the current selection."
+            ),
+            "timeline_empty_message": (
+                "No Woodmac timeline discrepancies were found in the current selection."
+            ),
+            "missing_empty_message": (
+                "No Woodmac plants and trains are missing in the current internal scenario."
+            ),
+        },
+        "energy_aspects": {
+            "provider_key": "energy_aspects",
+            "display_name": "Energy Aspects",
+            "entity_input_column": "Plant",
+            "entity_output_column": "Project",
+            "provider_date_column": "Energy Aspects First Date",
+            "provider_capacity_change_column": "Energy Aspects Capacity Change",
+            "provider_capacity_display_column": "Energy Aspects Capacity",
+            "provider_color": "#b45309",
+            "capacity_columns": [
+                "Country",
+                "Project",
+                "Train",
+                "Energy Aspects First Date",
+                "Energy Aspects Capacity",
+                "Scenario First Date",
+                "Scenario Capacity",
+                "Abs Capacity Delta",
+            ],
+            "timeline_columns": [
+                "Country",
+                "Project",
+                "Train",
+                "Energy Aspects First Date",
+                "Scenario First Date",
+                "Abs Timeline Delta (Months)",
+            ],
+            "missing_columns": [
+                "Country",
+                "Project",
+                "Train",
+                "Energy Aspects First Date",
+                "Energy Aspects Capacity",
+            ],
+            "capacity_empty_message": (
+                "No Energy Aspects capacity discrepancies were found in the current selection."
+            ),
+            "timeline_empty_message": (
+                "No Energy Aspects timeline discrepancies were found in the current selection."
+            ),
+            "missing_empty_message": (
+                "No Energy Aspects plants and trains are missing in the current internal scenario."
+            ),
+        },
+    }.get(provider_key)
+    if provider_config is None:
+        raise ValueError(f"Unsupported provider '{provider}'.")
+
+    return provider_config
+
+
+def _build_yearly_capacity_comparison_column_styles() -> list[dict]:
+    return _build_fixed_column_width_styles(
+        {
+            "Year": 52,
+            "Internal Scenario": 76,
+            "Woodmac": 68,
+            "Energy Aspects": 78,
+            "Delta vs Woodmac": 86,
+            "Delta vs Energy Aspects": 92,
+        }
+    )
+
+
+def _build_yearly_discrepancy_column_styles(provider: str) -> list[dict]:
+    provider_config = _get_provider_discrepancy_config(provider)
+    entity_column = str(provider_config["entity_output_column"])
+    provider_date_column = str(provider_config["provider_date_column"])
+    provider_capacity_column = str(provider_config["provider_capacity_display_column"])
+
+    return _build_fixed_column_width_styles(
+        {
+            "Country": 74,
+            entity_column: 102,
+            "Train": 46,
+            provider_date_column: 88,
+            provider_capacity_column: 78,
+            "Scenario First Date": 88,
+            "Scenario Capacity": 78,
+            "Abs Capacity Delta": 80,
+        },
+        left_align_columns={"Country", entity_column},
+    )
+
+
+def _build_yearly_timeline_discrepancy_column_styles(provider: str) -> list[dict]:
+    provider_config = _get_provider_discrepancy_config(provider)
+    entity_column = str(provider_config["entity_output_column"])
+    provider_date_column = str(provider_config["provider_date_column"])
+
+    return _build_fixed_column_width_styles(
+        {
+            "Country": 74,
+            entity_column: 108,
+            "Train": 46,
+            provider_date_column: 88,
+            "Scenario First Date": 88,
+            "Abs Timeline Delta (Months)": 94,
+        },
+        left_align_columns={"Country", entity_column},
+    )
+
+
+def _build_yearly_missing_internal_column_styles(provider: str) -> list[dict]:
+    provider_config = _get_provider_discrepancy_config(provider)
+    entity_column = str(provider_config["entity_output_column"])
+    provider_date_column = str(provider_config["provider_date_column"])
+    provider_capacity_column = str(provider_config["provider_capacity_display_column"])
+
+    return _build_fixed_column_width_styles(
+        {
+            "Country": 74,
+            entity_column: 108,
+            "Train": 46,
+            provider_date_column: 88,
+            provider_capacity_column: 78,
+        },
+        left_align_columns={"Country", entity_column},
+    )
+
+
+YEARLY_PROVIDER_DISCREPANCY_TABLE_MAX_HEIGHT = "390px"
+
+
 def _format_metadata_timestamp(value) -> str | None:
     if not value:
         return None
@@ -3206,6 +3402,797 @@ def _build_internal_scenario_monthly_schedule(
     return schedule_df
 
 
+def _extract_total_yearly_capacity_series(
+    raw_df: pd.DataFrame,
+    series_label: str,
+) -> pd.DataFrame:
+    columns = ["Year", series_label]
+    if raw_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    yearly_matrix = _apply_capacity_time_view(
+        _rename_total_column(
+            build_export_flow_matrix(
+                raw_df,
+                None,
+                "rest_of_world",
+            )
+        ),
+        "yearly",
+    )
+    if yearly_matrix.empty or "Total MTPA" not in yearly_matrix.columns:
+        return pd.DataFrame(columns=columns)
+
+    series_df = yearly_matrix[["Month", "Total MTPA"]].copy()
+    series_df["Year"] = series_df["Month"].fillna("").astype(str).str.strip()
+    series_df = (
+        series_df[series_df["Year"].ne("")]
+        .drop_duplicates(subset=["Year"], keep="last")
+        .rename(columns={"Total MTPA": series_label})
+    )
+    series_df[series_label] = pd.to_numeric(series_df[series_label], errors="coerce").round(2)
+    year_sort = pd.to_numeric(series_df["Year"], errors="coerce")
+    series_df = (
+        series_df.assign(__year_sort=year_sort)
+        .sort_values(["__year_sort", "Year"], ascending=[True, True], na_position="last")
+        .drop(columns=["Month", "__year_sort"], errors="ignore")
+        .reset_index(drop=True)
+    )
+    return series_df[columns]
+
+
+def _build_yearly_capacity_comparison_df(
+    woodmac_raw_df: pd.DataFrame,
+    ea_raw_df: pd.DataFrame,
+    scenario_rows_df: pd.DataFrame,
+    start_date: str | None,
+    end_date: str | None,
+) -> pd.DataFrame:
+    columns = [
+        "Year",
+        "Internal Scenario",
+        "Woodmac",
+        "Energy Aspects",
+        "Delta vs Woodmac",
+        "Delta vs Energy Aspects",
+    ]
+
+    woodmac_yearly_df = _extract_total_yearly_capacity_series(
+        _filter_by_date_range(woodmac_raw_df, start_date, end_date),
+        "Woodmac",
+    )
+    ea_yearly_df = _extract_total_yearly_capacity_series(
+        _build_ea_capacity_schedule(ea_raw_df, start_date, end_date),
+        "Energy Aspects",
+    )
+    internal_yearly_df = _extract_total_yearly_capacity_series(
+        _build_internal_scenario_monthly_schedule(scenario_rows_df, start_date, end_date),
+        "Internal Scenario",
+    )
+
+    if woodmac_yearly_df.empty or ea_yearly_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    woodmac_years = set(woodmac_yearly_df["Year"].tolist())
+    ea_years = set(ea_yearly_df["Year"].tolist())
+    common_years = sorted(
+        woodmac_years.intersection(ea_years),
+        key=lambda value: (pd.to_numeric([value], errors="coerce")[0], str(value)),
+    )
+    if not common_years:
+        return pd.DataFrame(columns=columns)
+
+    comparison_df = pd.DataFrame({"Year": common_years})
+    comparison_df = comparison_df.merge(woodmac_yearly_df, on="Year", how="left")
+    comparison_df = comparison_df.merge(ea_yearly_df, on="Year", how="left")
+    comparison_df = comparison_df.merge(internal_yearly_df, on="Year", how="left")
+
+    internal_values = pd.to_numeric(comparison_df["Internal Scenario"], errors="coerce")
+    woodmac_values = pd.to_numeric(comparison_df["Woodmac"], errors="coerce")
+    ea_values = pd.to_numeric(comparison_df["Energy Aspects"], errors="coerce")
+    comparison_df["Delta vs Woodmac"] = (
+        internal_values - woodmac_values
+    ).where(internal_values.notna()).round(2)
+    comparison_df["Delta vs Energy Aspects"] = (
+        internal_values - ea_values
+    ).where(internal_values.notna()).round(2)
+
+    return comparison_df[columns]
+
+
+def _aggregate_capacity_discrepancy_rows(
+    source_df: pd.DataFrame,
+    entity_column_name: str,
+    date_source_column: str,
+    capacity_source_column: str,
+    date_output_column: str,
+    capacity_output_column: str,
+) -> pd.DataFrame:
+    columns = [
+        "Country",
+        entity_column_name,
+        "Train",
+        date_output_column,
+        capacity_output_column,
+    ]
+    if source_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    aggregated_df = source_df.copy()
+    country_series = (
+        aggregated_df["Country"]
+        if "Country" in aggregated_df.columns
+        else pd.Series("", index=aggregated_df.index, dtype="object")
+    )
+    plant_series = (
+        aggregated_df["Plant"]
+        if "Plant" in aggregated_df.columns
+        else pd.Series("", index=aggregated_df.index, dtype="object")
+    )
+    train_series = (
+        aggregated_df["Train"]
+        if "Train" in aggregated_df.columns
+        else pd.Series("", index=aggregated_df.index, dtype="object")
+    )
+    date_series = (
+        aggregated_df[date_source_column]
+        if date_source_column in aggregated_df.columns
+        else pd.Series(pd.NaT, index=aggregated_df.index)
+    )
+    capacity_series = (
+        aggregated_df[capacity_source_column]
+        if capacity_source_column in aggregated_df.columns
+        else pd.Series(float("nan"), index=aggregated_df.index, dtype="float64")
+    )
+    aggregated_df["Country"] = (
+        country_series.fillna("").astype(str).str.strip()
+    )
+    aggregated_df[entity_column_name] = (
+        plant_series.fillna("").astype(str).str.strip()
+    )
+    aggregated_df["Train"] = train_series.map(_format_train_label)
+    aggregated_df[date_output_column] = pd.to_datetime(
+        date_series,
+        errors="coerce",
+    )
+    aggregated_df[capacity_output_column] = pd.to_numeric(
+        capacity_series,
+        errors="coerce",
+    ).round(6)
+
+    aggregated_df = (
+        aggregated_df.groupby(
+            ["Country", entity_column_name, "Train"],
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            {
+                date_output_column: "min",
+                capacity_output_column: "sum",
+            }
+        )
+    )
+
+    aggregated_df[date_output_column] = aggregated_df[date_output_column].dt.strftime("%Y-%m-%d")
+    aggregated_df[date_output_column] = aggregated_df[date_output_column].where(
+        aggregated_df[date_output_column].notna(),
+        None,
+    )
+    aggregated_df[capacity_output_column] = pd.to_numeric(
+        aggregated_df[capacity_output_column],
+        errors="coerce",
+    ).round(2)
+    return aggregated_df[columns]
+
+
+def _build_provider_capacity_discrepancy_df(
+    provider: str,
+    provider_change_df: pd.DataFrame,
+    scenario_change_df: pd.DataFrame,
+    top_n: int = 10,
+) -> pd.DataFrame:
+    provider_key = str(provider or "").strip().casefold()
+    provider_config = {
+        "woodmac": {
+            "entity_column": "Plant",
+            "provider_capacity_source_column": "Delta MTPA",
+            "provider_date_column": "Woodmac First Date",
+            "provider_capacity_column": "Woodmac Capacity",
+            "columns": [
+                "Country",
+                "Plant",
+                "Train",
+                "Woodmac First Date",
+                "Woodmac Capacity",
+                "Scenario First Date",
+                "Scenario Capacity",
+                "Abs Capacity Delta",
+            ],
+        },
+        "energy_aspects": {
+            "entity_column": "Project",
+            "provider_capacity_source_column": "EA Net Delta (MTPA)",
+            "provider_date_column": "Energy Aspects First Date",
+            "provider_capacity_column": "Energy Aspects Capacity",
+            "columns": [
+                "Country",
+                "Project",
+                "Train",
+                "Energy Aspects First Date",
+                "Energy Aspects Capacity",
+                "Scenario First Date",
+                "Scenario Capacity",
+                "Abs Capacity Delta",
+            ],
+        },
+    }.get(provider_key)
+    if provider_config is None:
+        raise ValueError(f"Unsupported provider '{provider}'.")
+
+    provider_aggregate_df = _aggregate_capacity_discrepancy_rows(
+        provider_change_df,
+        provider_config["entity_column"],
+        "Effective Date",
+        provider_config["provider_capacity_source_column"],
+        provider_config["provider_date_column"],
+        provider_config["provider_capacity_column"],
+    )
+    scenario_aggregate_df = _aggregate_capacity_discrepancy_rows(
+        scenario_change_df,
+        provider_config["entity_column"],
+        "Effective Date",
+        INTERNAL_SCENARIO_NET_COLUMN,
+        "Scenario First Date",
+        "Scenario Capacity",
+    )
+
+    discrepancy_df = pd.merge(
+        provider_aggregate_df,
+        scenario_aggregate_df,
+        on=["Country", provider_config["entity_column"], "Train"],
+        how="outer",
+    )
+    if discrepancy_df.empty:
+        return pd.DataFrame(columns=provider_config["columns"])
+
+    provider_capacity_values = pd.to_numeric(
+        discrepancy_df[provider_config["provider_capacity_column"]],
+        errors="coerce",
+    )
+    scenario_capacity_values = pd.to_numeric(
+        discrepancy_df["Scenario Capacity"],
+        errors="coerce",
+    )
+    discrepancy_df["Abs Capacity Delta"] = (
+        scenario_capacity_values.fillna(0.0) - provider_capacity_values.fillna(0.0)
+    ).abs().round(2)
+    discrepancy_df = discrepancy_df[
+        discrepancy_df["Abs Capacity Delta"].fillna(0.0).round(6).gt(0)
+    ].copy()
+    if discrepancy_df.empty:
+        return pd.DataFrame(columns=provider_config["columns"])
+
+    discrepancy_df["__train_sort"] = pd.to_numeric(
+        discrepancy_df["Train"],
+        errors="coerce",
+    )
+    discrepancy_df = discrepancy_df.sort_values(
+        [
+            "Abs Capacity Delta",
+            "Country",
+            provider_config["entity_column"],
+            "__train_sort",
+            "Train",
+        ],
+        ascending=[False, True, True, True, True],
+        na_position="last",
+    ).head(top_n)
+    discrepancy_df = discrepancy_df.drop(
+        columns=["__train_sort"],
+        errors="ignore",
+    ).reset_index(drop=True)
+    return discrepancy_df[provider_config["columns"]]
+
+
+def _build_train_timeline_grid_df_for_scope(
+    train_raw_df: pd.DataFrame,
+    ea_raw_df: pd.DataFrame,
+    scenario_rows_df: pd.DataFrame,
+    selected_countries: list[str] | None,
+    other_countries_mode: str,
+    start_date: str | None,
+    end_date: str | None,
+    aggregate_from_date: str | None = None,
+) -> pd.DataFrame:
+    scenario_rows_df = _prepare_capacity_scenario_rows_df(scenario_rows_df)
+
+    country_scope_frames = []
+    if not train_raw_df.empty:
+        country_scope_frames.append(
+            train_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
+                ["month", "country_name", "total_mmtpa"]
+            ]
+        )
+    if not ea_raw_df.empty:
+        country_scope_frames.append(
+            ea_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
+                ["month", "country_name", "total_mmtpa"]
+            ]
+        )
+    internal_scope_df = _build_internal_scenario_monthly_schedule(
+        scenario_rows_df,
+        start_date,
+        end_date,
+    )
+    if not internal_scope_df.empty:
+        country_scope_frames.append(internal_scope_df)
+
+    available_countries = get_available_countries(country_scope_frames)
+    resolved_countries = _resolve_selected_countries(
+        available_countries,
+        selected_countries,
+    )
+
+    woodmac_change_df = _build_train_change_log(
+        train_raw_df,
+        resolved_countries,
+        other_countries_mode,
+        start_date,
+        end_date,
+    )
+    ea_change_df = _build_ea_change_log(
+        ea_raw_df,
+        resolved_countries,
+        other_countries_mode,
+        start_date,
+        end_date,
+    )
+    timeline_df = _build_train_timeline_df(
+        woodmac_change_df,
+        ea_change_df,
+        aggregate_from_date=aggregate_from_date,
+    )
+    visible_scenario_rows_df = (
+        _filter_visible_capacity_scenario_rows(
+            scenario_rows_df,
+            resolved_countries,
+            other_countries_mode,
+            start_date,
+            end_date,
+        )
+        if not scenario_rows_df.empty
+        else pd.DataFrame()
+    )
+    woodmac_lookup_df = _build_provider_timeline_lookup_snapshot(
+        _build_train_change_log(
+            train_raw_df,
+            resolved_countries,
+            other_countries_mode,
+            None,
+            None,
+        ),
+        "woodmac",
+        start_date,
+        end_date,
+    )
+    ea_lookup_df = _build_provider_timeline_lookup_snapshot(
+        _build_ea_change_log(
+            ea_raw_df,
+            resolved_countries,
+            other_countries_mode,
+            None,
+            None,
+        ),
+        "energy_aspects",
+        start_date,
+        end_date,
+    )
+    scenario_lookup_df = (
+        _build_internal_scenario_lookup_snapshot(
+            scenario_rows_df,
+            resolved_countries,
+            other_countries_mode,
+            start_date,
+            end_date,
+        )
+        if not scenario_rows_df.empty
+        else pd.DataFrame()
+    )
+    return _build_train_timeline_grid_rows(
+        timeline_df,
+        visible_scenario_rows_df,
+        aggregate_from_date=aggregate_from_date,
+        woodmac_lookup_df=woodmac_lookup_df,
+        ea_lookup_df=ea_lookup_df,
+        scenario_lookup_df=scenario_lookup_df,
+    )
+
+
+def _build_provider_capacity_discrepancy_df_from_timeline_grid(
+    provider: str,
+    grid_df: pd.DataFrame,
+    top_n: int | None = None,
+) -> pd.DataFrame:
+    discrepancy_df, provider_config = _prepare_provider_discrepancy_grid_df(
+        provider,
+        grid_df,
+    )
+    if discrepancy_df.empty:
+        return pd.DataFrame(columns=provider_config["capacity_columns"])
+
+    provider_capacity_column = str(provider_config["provider_capacity_change_column"])
+    entity_input_column = str(provider_config["entity_input_column"])
+    entity_output_column = str(provider_config["entity_output_column"])
+    provider_date_column = str(provider_config["provider_date_column"])
+    provider_capacity_display_column = str(provider_config["provider_capacity_display_column"])
+
+    provider_capacity_values = pd.to_numeric(
+        discrepancy_df.get(provider_capacity_column),
+        errors="coerce",
+    )
+    scenario_capacity_values = pd.to_numeric(
+        discrepancy_df.get("Scenario Capacity"),
+        errors="coerce",
+    )
+    discrepancy_df = discrepancy_df[
+        provider_capacity_values.notna() & scenario_capacity_values.notna()
+    ].copy()
+    if discrepancy_df.empty:
+        return pd.DataFrame(columns=provider_config["capacity_columns"])
+
+    provider_capacity_values = pd.to_numeric(
+        discrepancy_df.get(provider_capacity_column),
+        errors="coerce",
+    )
+    scenario_capacity_values = pd.to_numeric(
+        discrepancy_df.get("Scenario Capacity"),
+        errors="coerce",
+    )
+    discrepancy_df["Abs Capacity Delta"] = (
+        scenario_capacity_values.fillna(0.0) - provider_capacity_values.fillna(0.0)
+    ).abs().round(2)
+    discrepancy_df = discrepancy_df[
+        discrepancy_df["Abs Capacity Delta"].fillna(0.0).round(6).gt(0)
+    ].copy()
+    if discrepancy_df.empty:
+        return pd.DataFrame(columns=provider_config["capacity_columns"])
+
+    discrepancy_df = discrepancy_df.sort_values(
+        [
+            "Abs Capacity Delta",
+            "Country",
+            entity_input_column,
+            "__train_sort",
+            "Train",
+            "__direction_sort",
+            "__provider_date_sort",
+            "__scenario_date_sort",
+        ],
+        ascending=[False, True, True, True, True, True, True, True],
+        na_position="last",
+    )
+    if top_n is not None:
+        discrepancy_df = discrepancy_df.head(top_n)
+    discrepancy_df = discrepancy_df.reset_index(drop=True)
+
+    discrepancy_df[provider_date_column] = discrepancy_df[provider_date_column].dt.strftime(
+        "%Y-%m-%d"
+    )
+    discrepancy_df[provider_date_column] = discrepancy_df[provider_date_column].where(
+        discrepancy_df[provider_date_column].notna(),
+        None,
+    )
+    discrepancy_df["Scenario First Date"] = discrepancy_df["Scenario First Date"].dt.strftime(
+        "%Y-%m-%d"
+    )
+    discrepancy_df["Scenario First Date"] = discrepancy_df["Scenario First Date"].where(
+        discrepancy_df["Scenario First Date"].notna(),
+        None,
+    )
+    discrepancy_df["Scenario Capacity"] = pd.to_numeric(
+        discrepancy_df.get("Scenario Capacity"),
+        errors="coerce",
+    ).round(2)
+    discrepancy_df["Scenario Capacity"] = discrepancy_df["Scenario Capacity"].where(
+        discrepancy_df["Scenario Capacity"].notna(),
+        None,
+    )
+    discrepancy_df[provider_capacity_display_column] = pd.to_numeric(
+        discrepancy_df.get(provider_capacity_column),
+        errors="coerce",
+    ).round(2)
+    discrepancy_df[provider_capacity_display_column] = discrepancy_df[
+        provider_capacity_display_column
+    ].where(
+        discrepancy_df[provider_capacity_display_column].notna(),
+        None,
+    )
+    if entity_output_column != entity_input_column:
+        discrepancy_df[entity_output_column] = discrepancy_df[entity_input_column]
+
+    discrepancy_df = discrepancy_df.drop(
+        columns=[
+            "__train_sort",
+            "__direction_sort",
+            "__provider_date_sort",
+            "__scenario_date_sort",
+        ],
+        errors="ignore",
+    )
+    return discrepancy_df[list(provider_config["capacity_columns"])]
+
+
+def _prepare_provider_discrepancy_grid_df(
+    provider: str,
+    grid_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    provider_config = _get_provider_discrepancy_config(provider)
+    if grid_df.empty:
+        return pd.DataFrame(), provider_config
+
+    discrepancy_df = grid_df.copy()
+    entity_input_column = str(provider_config["entity_input_column"])
+    provider_date_column = str(provider_config["provider_date_column"])
+    provider_capacity_column = str(provider_config["provider_capacity_change_column"])
+
+    discrepancy_df["Country"] = (
+        discrepancy_df.get("Country", pd.Series("", index=discrepancy_df.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    discrepancy_df[entity_input_column] = (
+        discrepancy_df.get(
+            entity_input_column,
+            pd.Series("", index=discrepancy_df.index),
+        )
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    discrepancy_df["Train"] = discrepancy_df.get(
+        "Train",
+        pd.Series("", index=discrepancy_df.index),
+    ).map(_format_train_label)
+    discrepancy_df[provider_date_column] = pd.to_datetime(
+        discrepancy_df.get(provider_date_column),
+        errors="coerce",
+    )
+    discrepancy_df["Scenario First Date"] = pd.to_datetime(
+        discrepancy_df.get("Scenario First Date"),
+        errors="coerce",
+    )
+    discrepancy_df[provider_capacity_column] = pd.to_numeric(
+        discrepancy_df.get(provider_capacity_column),
+        errors="coerce",
+    )
+    discrepancy_df["Scenario Capacity"] = pd.to_numeric(
+        discrepancy_df.get("Scenario Capacity"),
+        errors="coerce",
+    )
+
+    discrepancy_df["__train_sort"] = pd.to_numeric(
+        discrepancy_df["Train"],
+        errors="coerce",
+    )
+    discrepancy_df["__direction_sort"] = discrepancy_df.get("timeline_direction").map(
+        {"reduction": 0, "addition": 1}
+    ).fillna(2)
+    discrepancy_df["__provider_date_sort"] = pd.to_datetime(
+        discrepancy_df[provider_date_column],
+        errors="coerce",
+    )
+    discrepancy_df["__scenario_date_sort"] = pd.to_datetime(
+        discrepancy_df["Scenario First Date"],
+        errors="coerce",
+    )
+    return discrepancy_df, provider_config
+
+
+def _build_provider_timeline_discrepancy_df_from_timeline_grid(
+    provider: str,
+    grid_df: pd.DataFrame,
+    top_n: int | None = None,
+) -> pd.DataFrame:
+    discrepancy_df, provider_config = _prepare_provider_discrepancy_grid_df(
+        provider,
+        grid_df,
+    )
+    if discrepancy_df.empty:
+        return pd.DataFrame(columns=provider_config["timeline_columns"])
+
+    entity_input_column = str(provider_config["entity_input_column"])
+    entity_output_column = str(provider_config["entity_output_column"])
+    provider_date_column = str(provider_config["provider_date_column"])
+
+    provider_months = discrepancy_df[provider_date_column].map(_normalize_month_date)
+    scenario_months = discrepancy_df["Scenario First Date"].map(_normalize_month_date)
+    provider_date_present = provider_months.notna()
+    scenario_date_present = scenario_months.notna()
+
+    timeline_df = discrepancy_df[provider_date_present & scenario_date_present].copy()
+    if timeline_df.empty:
+        return pd.DataFrame(columns=provider_config["timeline_columns"])
+
+    timeline_df["__provider_month"] = provider_months[provider_date_present & scenario_date_present]
+    timeline_df["__scenario_month"] = scenario_months[provider_date_present & scenario_date_present]
+    timeline_df["Abs Timeline Delta (Months)"] = [
+        _month_distance_to_boundary(provider_month, scenario_month)
+        for provider_month, scenario_month in zip(
+            timeline_df["__provider_month"],
+            timeline_df["__scenario_month"],
+        )
+    ]
+    timeline_df = timeline_df[
+        pd.to_numeric(timeline_df["Abs Timeline Delta (Months)"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+        .gt(0)
+    ].copy()
+    if timeline_df.empty:
+        return pd.DataFrame(columns=provider_config["timeline_columns"])
+
+    timeline_df = timeline_df.sort_values(
+        [
+            "Abs Timeline Delta (Months)",
+            "Country",
+            entity_input_column,
+            "__train_sort",
+            "Train",
+            "__direction_sort",
+            "__provider_month",
+            "__scenario_month",
+        ],
+        ascending=[False, True, True, True, True, True, True, True],
+        na_position="last",
+    )
+    if top_n is not None:
+        timeline_df = timeline_df.head(top_n)
+    timeline_df = timeline_df.reset_index(drop=True)
+
+    timeline_df[provider_date_column] = timeline_df[provider_date_column].dt.strftime("%Y-%m-%d")
+    timeline_df[provider_date_column] = timeline_df[provider_date_column].where(
+        timeline_df[provider_date_column].notna(),
+        None,
+    )
+    timeline_df["Scenario First Date"] = timeline_df["Scenario First Date"].dt.strftime("%Y-%m-%d")
+    timeline_df["Scenario First Date"] = timeline_df["Scenario First Date"].where(
+        timeline_df["Scenario First Date"].notna(),
+        None,
+    )
+    timeline_df["Abs Timeline Delta (Months)"] = pd.to_numeric(
+        timeline_df["Abs Timeline Delta (Months)"],
+        errors="coerce",
+    ).astype("Int64")
+    if entity_output_column != entity_input_column:
+        timeline_df[entity_output_column] = timeline_df[entity_input_column]
+
+    timeline_df = timeline_df.drop(
+        columns=[
+            "__train_sort",
+            "__direction_sort",
+            "__provider_date_sort",
+            "__scenario_date_sort",
+            "__provider_month",
+            "__scenario_month",
+        ],
+        errors="ignore",
+    )
+    return timeline_df[list(provider_config["timeline_columns"])]
+
+
+def _build_provider_missing_internal_scenario_df_from_timeline_grid(
+    provider: str,
+    grid_df: pd.DataFrame,
+) -> pd.DataFrame:
+    discrepancy_df, provider_config = _prepare_provider_discrepancy_grid_df(
+        provider,
+        grid_df,
+    )
+    if discrepancy_df.empty:
+        return pd.DataFrame(columns=provider_config["missing_columns"])
+
+    entity_input_column = str(provider_config["entity_input_column"])
+    entity_output_column = str(provider_config["entity_output_column"])
+    provider_date_column = str(provider_config["provider_date_column"])
+    provider_capacity_column = str(provider_config["provider_capacity_change_column"])
+    provider_capacity_display_column = str(provider_config["provider_capacity_display_column"])
+
+    provider_row_present = (
+        discrepancy_df[provider_date_column].notna()
+        | pd.to_numeric(discrepancy_df.get(provider_capacity_column), errors="coerce").notna()
+    )
+    scenario_row_missing = (
+        discrepancy_df["Scenario First Date"].isna()
+        & pd.to_numeric(discrepancy_df.get("Scenario Capacity"), errors="coerce").isna()
+    )
+    missing_df = discrepancy_df[provider_row_present & scenario_row_missing].copy()
+    if missing_df.empty:
+        return pd.DataFrame(columns=provider_config["missing_columns"])
+
+    missing_df = missing_df.sort_values(
+        [
+            "Country",
+            entity_input_column,
+            "__train_sort",
+            "Train",
+            "__direction_sort",
+            "__provider_date_sort",
+        ],
+        ascending=[True, True, True, True, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    missing_df[provider_date_column] = missing_df[provider_date_column].dt.strftime("%Y-%m-%d")
+    missing_df[provider_date_column] = missing_df[provider_date_column].where(
+        missing_df[provider_date_column].notna(),
+        None,
+    )
+    missing_df[provider_capacity_display_column] = pd.to_numeric(
+        missing_df.get(provider_capacity_column),
+        errors="coerce",
+    ).round(2)
+    missing_df[provider_capacity_display_column] = missing_df[
+        provider_capacity_display_column
+    ].where(
+        missing_df[provider_capacity_display_column].notna(),
+        None,
+    )
+    if entity_output_column != entity_input_column:
+        missing_df[entity_output_column] = missing_df[entity_input_column]
+
+    missing_df = missing_df.drop(
+        columns=[
+            "__train_sort",
+            "__direction_sort",
+            "__provider_date_sort",
+            "__scenario_date_sort",
+        ],
+        errors="ignore",
+    )
+    return missing_df[list(provider_config["missing_columns"])]
+
+
+def _build_yearly_provider_discrepancy_payloads(
+    woodmac_raw_df: pd.DataFrame,
+    ea_raw_df: pd.DataFrame,
+    scenario_rows_df: pd.DataFrame,
+    selected_countries: list[str] | None,
+    other_countries_mode: str,
+    start_date: str | None,
+    end_date: str | None,
+) -> dict[str, dict[str, object]]:
+    timeline_grid_df = _build_train_timeline_grid_df_for_scope(
+        woodmac_raw_df,
+        ea_raw_df,
+        scenario_rows_df,
+        selected_countries,
+        other_countries_mode,
+        start_date,
+        end_date,
+        aggregate_from_date=start_date,
+    )
+    payloads: dict[str, dict[str, object]] = {}
+    for provider in ["woodmac", "energy_aspects"]:
+        payloads[provider] = {
+            "capacity_df": _build_provider_capacity_discrepancy_df_from_timeline_grid(
+                provider,
+                timeline_grid_df,
+            ),
+            "timeline_df": _build_provider_timeline_discrepancy_df_from_timeline_grid(
+                provider,
+                timeline_grid_df,
+            ),
+            "missing_df": _build_provider_missing_internal_scenario_df_from_timeline_grid(
+                provider,
+                timeline_grid_df,
+            ),
+        }
+
+    return payloads
+
+
 def _build_internal_scenario_change_log(
     scenario_rows_df: pd.DataFrame,
     selected_countries: list[str] | None,
@@ -3331,6 +4318,26 @@ def _get_capacity_scenario_option_map(options_data: list[dict] | None) -> dict[i
             continue
         option_map[int(scenario_id)] = option
     return option_map
+
+
+def _get_capacity_scenario_valid_ids_and_base_case_id(
+    options_data: list[dict] | None,
+) -> tuple[list[int], int | None]:
+    valid_ids: list[int] = []
+    base_case_id: int | None = None
+
+    for option in options_data or []:
+        scenario_id = pd.to_numeric(option.get("scenario_id"), errors="coerce")
+        if pd.isna(scenario_id):
+            continue
+
+        normalized_id = int(scenario_id)
+        valid_ids.append(normalized_id)
+        scenario_name = " ".join(str(option.get("scenario_name") or "").strip().split())
+        if scenario_name.casefold() == "base case":
+            base_case_id = normalized_id
+
+    return valid_ids, base_case_id
 
 
 def _build_capacity_scenario_badge_text(
@@ -3951,6 +4958,169 @@ def _create_top_capacity_selector_region() -> html.Div:
             "background": "linear-gradient(180deg, #f8fbff 0%, #f1f7ff 100%)",
             "boxShadow": "0 8px 24px rgba(15, 23, 42, 0.05)",
         },
+    )
+
+
+def _create_yearly_capacity_comparison_section(
+    title: str,
+    subtitle: str,
+    chart_id: str,
+    table_container_id: str,
+) -> html.Div:
+    header_children = [html.H3(title, className="balance-section-title")]
+    if subtitle:
+        header_children.append(html.P(subtitle, className="balance-section-subtitle"))
+
+    return html.Div(
+        [
+            html.Div(header_children, className="balance-section-header"),
+            html.Div(
+                [
+                    html.Div(
+                        dcc.Graph(
+                            id=chart_id,
+                            figure=_create_empty_capacity_figure(
+                                YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE
+                            ),
+                            config={"displayModeBar": False},
+                            style={"height": "100%"},
+                        ),
+                        style={"minWidth": "0"},
+                    ),
+                    html.Div(
+                        id=table_container_id,
+                        children=_create_empty_state(
+                            YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE
+                        ),
+                        className="balance-table-container",
+                        style={"minWidth": "0"},
+                    ),
+                ],
+                style={
+                    "display": "grid",
+                    "gridTemplateColumns": "repeat(auto-fit, minmax(320px, 1fr))",
+                    "gap": "24px",
+                    "alignItems": "start",
+                },
+            ),
+        ],
+        className="balance-section-card",
+    )
+
+
+def _create_yearly_discrepancy_subcard(
+    title: str,
+    table_container_id: str,
+) -> html.Div:
+    return html.Div(
+        [
+            html.Div(
+                title,
+                style={
+                    "fontSize": "12px",
+                    "fontWeight": "800",
+                    "letterSpacing": "0.06em",
+                    "textTransform": "uppercase",
+                    "color": "#334155",
+                },
+            ),
+            html.Div(
+                id=table_container_id,
+                children=_create_empty_state(YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE),
+                className="balance-table-container",
+                style={"minWidth": "0"},
+            ),
+        ],
+        style={
+            "display": "grid",
+            "gap": "10px",
+            "padding": "14px 16px",
+            "border": "1px solid #e2e8f0",
+            "borderRadius": "14px",
+            "background": "#fbfdff",
+            "boxShadow": "0 6px 20px rgba(15, 23, 42, 0.03)",
+            "minWidth": "0",
+        },
+    )
+
+
+def _create_yearly_provider_discrepancy_row(
+    provider_title: str,
+    cards: list[html.Div],
+) -> html.Div:
+    return html.Div(
+        [
+            html.Div(
+                provider_title,
+                style={
+                    "fontSize": "12px",
+                    "fontWeight": "800",
+                    "letterSpacing": "0.08em",
+                    "textTransform": "uppercase",
+                    "color": "#1e3a5f",
+                },
+            ),
+            html.Div(
+                cards,
+                style={
+                    "display": "grid",
+                    "gridTemplateColumns": "repeat(auto-fit, minmax(320px, 1fr))",
+                    "gap": "16px",
+                    "alignItems": "start",
+                },
+            ),
+        ],
+        style={"display": "grid", "gap": "12px"},
+    )
+
+
+def _create_yearly_provider_discrepancy_section(
+    title: str,
+    subtitle: str,
+) -> html.Div:
+    header_children = [html.H3(title, className="balance-section-title")]
+    if subtitle:
+        header_children.append(html.P(subtitle, className="balance-section-subtitle"))
+
+    return html.Div(
+        [
+            html.Div(header_children, className="balance-section-header"),
+            _create_yearly_provider_discrepancy_row(
+                "Woodmac",
+                [
+                    _create_yearly_discrepancy_subcard(
+                        "Woodmac Capacity Discrepancies",
+                        "capacity-page-yearly-woodmac-capacity-discrepancy-table-container",
+                    ),
+                    _create_yearly_discrepancy_subcard(
+                        "Woodmac Timeline Discrepancies",
+                        "capacity-page-yearly-woodmac-timeline-discrepancy-table-container",
+                    ),
+                    _create_yearly_discrepancy_subcard(
+                        "Plants And Trains Missing In Internal Scenario",
+                        "capacity-page-yearly-woodmac-missing-internal-table-container",
+                    ),
+                ],
+            ),
+            _create_yearly_provider_discrepancy_row(
+                "Energy Aspects",
+                [
+                    _create_yearly_discrepancy_subcard(
+                        "Energy Aspects Capacity Discrepancies",
+                        "capacity-page-yearly-ea-capacity-discrepancy-table-container",
+                    ),
+                    _create_yearly_discrepancy_subcard(
+                        "Energy Aspects Timeline Discrepancies",
+                        "capacity-page-yearly-ea-timeline-discrepancy-table-container",
+                    ),
+                    _create_yearly_discrepancy_subcard(
+                        "Plants And Trains Missing In Internal Scenario",
+                        "capacity-page-yearly-ea-missing-internal-table-container",
+                    ),
+                ],
+            ),
+        ],
+        className="balance-section-card",
     )
 
 
@@ -4750,6 +5920,100 @@ def _create_capacity_country_area_chart(
     return fig
 
 
+def _create_yearly_capacity_comparison_chart(
+    comparison_df: pd.DataFrame,
+) -> go.Figure:
+    if comparison_df.empty:
+        return _create_empty_capacity_figure(
+            "No overlapping yearly Woodmac and Energy Aspects values are available for the current selection."
+        )
+
+    plot_df = comparison_df.copy()
+    years = plot_df["Year"].fillna("").astype(str).tolist()
+    series_config = [
+        ("Woodmac", "#1d4ed8"),
+        ("Energy Aspects", "#f59e0b"),
+        ("Internal Scenario", "#0f766e"),
+    ]
+    numeric_df = plot_df[[label for label, _color in series_config]].apply(pd.to_numeric, errors="coerce")
+    max_value = float(numeric_df.max().max()) if numeric_df.notna().any().any() else 0.0
+    min_value = float(numeric_df.min().min()) if numeric_df.notna().any().any() else 0.0
+    tick_step = 50
+    lower_bound = min_value
+    upper_padding = max(float(tick_step), max(abs(max_value), 1.0) * 0.12)
+    upper_bound = max_value + upper_padding
+    if upper_bound <= lower_bound:
+        upper_bound = lower_bound + float(tick_step)
+    tick_start = math.floor(lower_bound / tick_step) * tick_step
+
+    fig = go.Figure()
+    for label, color in series_config:
+        y_values = pd.to_numeric(plot_df[label], errors="coerce")
+        fig.add_trace(
+            go.Scatter(
+                x=years,
+                y=[None if pd.isna(value) else float(value) for value in y_values],
+                mode="lines+markers",
+                name=label,
+                line=dict(color=color, width=2.5),
+                marker=dict(size=7, color=color),
+                connectgaps=False,
+                hovertemplate=f"<b>{label}</b><br>Year: %{{x}}<br>Capacity: %{{y:.1f}} MTPA<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        xaxis=dict(
+            title="",
+            type="category",
+            categoryorder="array",
+            categoryarray=years,
+            tickfont=dict(size=11, family="Arial", color="#475569"),
+            showgrid=False,
+            showline=False,
+            zeroline=False,
+        ),
+        yaxis=dict(
+            title=dict(
+                text="MTPA",
+                font=dict(size=12, family="Arial", color="#334155"),
+            ),
+            range=[lower_bound, upper_bound],
+            tickmode="linear",
+            tick0=tick_start,
+            dtick=tick_step,
+            showgrid=True,
+            gridcolor="rgba(148, 163, 184, 0.18)",
+            tickfont=dict(size=10, family="Arial", color="#475569"),
+            tickformat=",.0f",
+            showline=False,
+            zeroline=False,
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=460,
+        margin=dict(l=72, r=28, t=28, b=76),
+        hovermode="x unified",
+        hoverlabel=dict(
+            bgcolor="rgba(255, 255, 255, 0.96)",
+            bordercolor="rgba(203, 213, 225, 0.9)",
+            font=dict(size=11, family="Arial", color="#0f172a"),
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            font=dict(size=11, family="Arial", color="#334155"),
+            bgcolor="rgba(0, 0, 0, 0)",
+            borderwidth=0,
+        ),
+    )
+
+    return fig
+
+
 def _get_train_timeline_chart_options(
     selected_scenario_id,
     scenario_options_data,
@@ -5420,8 +6684,28 @@ def _build_train_change_log(
     if raw_df.empty:
         return pd.DataFrame(columns=empty_columns)
 
+    required_columns = {
+        "month",
+        "country_name",
+        "plant_name",
+        "capacity_mtpa",
+        "id_plant",
+        "id_lng_train",
+    }
+    if not required_columns.issubset(set(raw_df.columns)):
+        return pd.DataFrame(columns=empty_columns)
+
     train_df = raw_df.copy()
     train_df["month"] = pd.to_datetime(train_df["month"]).dt.to_period("M").dt.to_timestamp()
+
+    def _get_first_available_series(
+        column_names: list[str],
+        default_value: object = None,
+    ) -> pd.Series:
+        for column_name in column_names:
+            if column_name in train_df.columns:
+                return train_df[column_name]
+        return pd.Series(default_value, index=train_df.index)
 
     start_month = _normalize_month_date(start_date)
     end_month = _normalize_month_date(end_date)
@@ -5448,35 +6732,38 @@ def _build_train_change_log(
         return pd.DataFrame(columns=empty_columns)
 
     train_df["raw_plant_name"] = (
-        train_df.get("raw_plant_name", train_df.get("plant_name"))
+        _get_first_available_series(["raw_plant_name", "plant_name"], "")
         .fillna("")
         .astype(str)
         .str.strip()
     )
     train_df["raw_train_name"] = (
-        train_df.get("raw_train_name", train_df.get("lng_train_name_short"))
+        _get_first_available_series(["raw_train_name", "lng_train_name_short"], "")
         .fillna("")
         .astype(str)
         .str.strip()
     )
     train_df["raw_train_display_name"] = (
-        train_df.get(
-            "raw_train_display_name",
-            train_df.get("lng_train_name", train_df.get("raw_train_name", train_df.get("lng_train_name_short"))),
+        _get_first_available_series(
+            ["raw_train_display_name", "lng_train_name", "raw_train_name", "lng_train_name_short"],
+            "",
         )
         .fillna("")
         .astype(str)
         .str.strip()
     )
-    train_df["train"] = pd.to_numeric(train_df.get("train"), errors="coerce").astype("Int64")
+    train_df["train"] = pd.to_numeric(
+        _get_first_available_series(["train"]),
+        errors="coerce",
+    ).astype("Int64")
     train_df["train_mapping_applied"] = (
-        train_df.get("train_mapping_applied", False).fillna(False).astype(bool)
+        _get_first_available_series(["train_mapping_applied"], False).fillna(False).astype(bool)
     )
     train_df["plant_mapping_applied"] = (
-        train_df.get("plant_mapping_applied", False).fillna(False).astype(bool)
+        _get_first_available_series(["plant_mapping_applied"], False).fillna(False).astype(bool)
     )
     train_df["allocation_share"] = pd.to_numeric(
-        train_df.get("allocation_share", 1.0),
+        _get_first_available_series(["allocation_share"], 1.0),
         errors="coerce",
     ).fillna(1.0)
     train_df["capacity_mtpa"] = pd.to_numeric(train_df["capacity_mtpa"], errors="coerce").fillna(0.0)
@@ -6544,6 +7831,416 @@ def _create_capacity_table(
             "padding": "6px 8px",
         },
         style_cell_conditional=_build_responsive_column_styles(display_df),
+        style_data_conditional=style_data_conditional,
+    )
+
+
+def _create_yearly_capacity_comparison_table(
+    table_id: str,
+    comparison_df: pd.DataFrame,
+) -> dash_table.DataTable | html.Div:
+    if comparison_df.empty:
+        return _create_empty_state(
+            "No overlapping yearly Woodmac and Energy Aspects values are available for the current selection."
+        )
+
+    display_df = comparison_df.copy()
+    display_df = display_df.where(pd.notna(display_df), None)
+    base_config = StandardTableStyleManager.get_base_datatable_config()
+    numeric_columns = [
+        "Internal Scenario",
+        "Woodmac",
+        "Energy Aspects",
+        "Delta vs Woodmac",
+        "Delta vs Energy Aspects",
+    ]
+    columns = [
+        {"name": "Year", "id": "Year"},
+        *[
+            {
+                "name": column_name,
+                "id": column_name,
+                "type": "numeric",
+                "format": Format(precision=1, scheme=Scheme.fixed),
+            }
+            for column_name in numeric_columns
+        ],
+    ]
+
+    style_data_conditional = list(base_config["style_data_conditional"])
+    style_data_conditional.extend(
+        [
+            {
+                "if": {"column_id": "Year"},
+                "backgroundColor": "#f8fafc",
+                "fontWeight": "700",
+                "color": TABLE_COLORS["text_primary"],
+            },
+            {
+                "if": {"column_id": "Internal Scenario"},
+                "backgroundColor": "rgba(15, 118, 110, 0.08)",
+                "fontWeight": "600",
+                "color": "#0f766e",
+            },
+            {
+                "if": {"column_id": "Woodmac"},
+                "backgroundColor": "rgba(29, 78, 216, 0.08)",
+                "fontWeight": "600",
+                "color": "#1d4ed8",
+            },
+            {
+                "if": {"column_id": "Energy Aspects"},
+                "backgroundColor": "rgba(245, 158, 11, 0.08)",
+                "fontWeight": "600",
+                "color": "#b45309",
+            },
+        ]
+    )
+
+    for column_name in ["Delta vs Woodmac", "Delta vs Energy Aspects"]:
+        style_data_conditional.extend(
+            [
+                {
+                    "if": {
+                        "column_id": column_name,
+                        "filter_query": f"{{{column_name}}} > 0",
+                    },
+                    "color": "#166534",
+                    "fontWeight": "700",
+                },
+                {
+                    "if": {
+                        "column_id": column_name,
+                        "filter_query": f"{{{column_name}}} < 0",
+                    },
+                    "color": "#991b1b",
+                    "fontWeight": "700",
+                },
+                {
+                    "if": {
+                        "column_id": column_name,
+                        "filter_query": f"{{{column_name}}} = 0",
+                    },
+                    "color": "#64748b",
+                    "fontWeight": "600",
+                },
+            ]
+        )
+
+    return dash_table.DataTable(
+        id=table_id,
+        columns=columns,
+        data=display_df.to_dict("records"),
+        sort_action="native",
+        page_action="none",
+        fill_width=True,
+        fixed_rows={"headers": True},
+        style_table={
+            "overflowX": "auto",
+            "overflowY": "auto",
+            "maxHeight": "460px",
+            "width": "100%",
+            "minWidth": "100%",
+        },
+        style_header=base_config["style_header"],
+        style_cell={
+            **base_config["style_cell"],
+            "minWidth": "auto",
+            "width": "auto",
+            "maxWidth": "none",
+            "border": f"1px solid {TABLE_COLORS['border_light']}",
+            "padding": "6px 6px",
+        },
+        style_cell_conditional=_build_yearly_capacity_comparison_column_styles(),
+        style_data_conditional=style_data_conditional,
+    )
+
+
+def _create_provider_capacity_discrepancy_table(
+    table_id: str,
+    discrepancy_df: pd.DataFrame,
+    provider: str,
+    empty_message: str | None = None,
+) -> dash_table.DataTable | html.Div:
+    provider_config = _get_provider_discrepancy_config(provider)
+    provider_key = str(provider_config["provider_key"])
+    provider_capacity_column = str(provider_config["provider_capacity_display_column"])
+    entity_column = str(provider_config["entity_output_column"])
+    provider_color = str(provider_config["provider_color"])
+
+    if discrepancy_df.empty:
+        return _create_empty_state(empty_message or str(provider_config["capacity_empty_message"]))
+
+    display_df = discrepancy_df.copy().where(pd.notna(discrepancy_df), None)
+    base_config = StandardTableStyleManager.get_base_datatable_config()
+    numeric_columns = [
+        provider_capacity_column,
+        "Scenario Capacity",
+        "Abs Capacity Delta",
+    ]
+    columns = []
+    for column_name in display_df.columns:
+        column_config = {"name": column_name, "id": column_name}
+        if column_name in numeric_columns:
+            column_config |= {
+                "type": "numeric",
+                "format": Format(precision=1, scheme=Scheme.fixed),
+            }
+        columns.append(column_config)
+
+    style_data_conditional = list(base_config["style_data_conditional"])
+    style_data_conditional.extend(
+        [
+            {
+                "if": {"column_id": entity_column},
+                "backgroundColor": "#f8fafc",
+                "fontWeight": "700",
+                "color": TABLE_COLORS["text_primary"],
+            },
+            {
+                "if": {"column_id": provider_capacity_column},
+                "backgroundColor": (
+                    "rgba(29, 78, 216, 0.08)"
+                    if provider_key == "woodmac"
+                    else "rgba(245, 158, 11, 0.08)"
+                ),
+                "fontWeight": "600",
+                "color": provider_color,
+            },
+            {
+                "if": {"column_id": "Scenario Capacity"},
+                "backgroundColor": "rgba(15, 118, 110, 0.08)",
+                "fontWeight": "600",
+                "color": "#0f766e",
+            },
+            {
+                "if": {
+                    "column_id": "Abs Capacity Delta",
+                    "filter_query": "{Abs Capacity Delta} > 0",
+                },
+                "backgroundColor": "rgba(190, 24, 93, 0.08)",
+                "color": "#be123c",
+                "fontWeight": "700",
+            },
+            {
+                "if": {
+                    "column_id": "Abs Capacity Delta",
+                    "filter_query": "{Abs Capacity Delta} = 0",
+                },
+                "color": "#64748b",
+            },
+        ]
+    )
+
+    return dash_table.DataTable(
+        id=table_id,
+        columns=columns,
+        data=display_df.to_dict("records"),
+        sort_action="native",
+        sort_by=[{"column_id": "Abs Capacity Delta", "direction": "desc"}],
+        page_action="none",
+        fill_width=True,
+        fixed_rows={"headers": True},
+        style_table={
+            "overflowX": "auto",
+            "overflowY": "auto",
+            "maxHeight": YEARLY_PROVIDER_DISCREPANCY_TABLE_MAX_HEIGHT,
+            "width": "100%",
+            "minWidth": "100%",
+        },
+        style_header=base_config["style_header"],
+        style_cell={
+            **base_config["style_cell"],
+            "minWidth": "auto",
+            "width": "auto",
+            "maxWidth": "none",
+            "border": f"1px solid {TABLE_COLORS['border_light']}",
+            "padding": "5px 6px",
+        },
+        style_cell_conditional=_build_yearly_discrepancy_column_styles(provider),
+        style_data_conditional=style_data_conditional,
+    )
+
+
+def _create_provider_timeline_discrepancy_table(
+    table_id: str,
+    discrepancy_df: pd.DataFrame,
+    provider: str,
+    empty_message: str | None = None,
+) -> dash_table.DataTable | html.Div:
+    provider_config = _get_provider_discrepancy_config(provider)
+    provider_key = str(provider_config["provider_key"])
+    provider_date_column = str(provider_config["provider_date_column"])
+    entity_column = str(provider_config["entity_output_column"])
+    provider_color = str(provider_config["provider_color"])
+
+    if discrepancy_df.empty:
+        return _create_empty_state(empty_message or str(provider_config["timeline_empty_message"]))
+
+    display_df = discrepancy_df.copy().where(pd.notna(discrepancy_df), None)
+    base_config = StandardTableStyleManager.get_base_datatable_config()
+    columns = []
+    for column_name in display_df.columns:
+        column_config = {"name": column_name, "id": column_name}
+        if column_name == "Abs Timeline Delta (Months)":
+            column_config |= {
+                "type": "numeric",
+                "format": Format(precision=0, scheme=Scheme.fixed),
+            }
+        columns.append(column_config)
+
+    style_data_conditional = list(base_config["style_data_conditional"])
+    style_data_conditional.extend(
+        [
+            {
+                "if": {"column_id": entity_column},
+                "backgroundColor": "#f8fafc",
+                "fontWeight": "700",
+                "color": TABLE_COLORS["text_primary"],
+            },
+            {
+                "if": {"column_id": provider_date_column},
+                "backgroundColor": (
+                    "rgba(29, 78, 216, 0.08)"
+                    if provider_key == "woodmac"
+                    else "rgba(245, 158, 11, 0.08)"
+                ),
+                "fontWeight": "600",
+                "color": provider_color,
+            },
+            {
+                "if": {"column_id": "Scenario First Date"},
+                "backgroundColor": "rgba(15, 118, 110, 0.08)",
+                "fontWeight": "600",
+                "color": "#0f766e",
+            },
+            {
+                "if": {
+                    "column_id": "Abs Timeline Delta (Months)",
+                    "filter_query": "{Abs Timeline Delta (Months)} > 0",
+                },
+                "backgroundColor": "rgba(190, 24, 93, 0.08)",
+                "color": "#be123c",
+                "fontWeight": "700",
+            },
+        ]
+    )
+
+    return dash_table.DataTable(
+        id=table_id,
+        columns=columns,
+        data=display_df.to_dict("records"),
+        sort_action="native",
+        sort_by=[{"column_id": "Abs Timeline Delta (Months)", "direction": "desc"}],
+        page_action="none",
+        fill_width=True,
+        fixed_rows={"headers": True},
+        style_table={
+            "overflowX": "auto",
+            "overflowY": "auto",
+            "maxHeight": YEARLY_PROVIDER_DISCREPANCY_TABLE_MAX_HEIGHT,
+            "width": "100%",
+            "minWidth": "100%",
+        },
+        style_header=base_config["style_header"],
+        style_cell={
+            **base_config["style_cell"],
+            "minWidth": "auto",
+            "width": "auto",
+            "maxWidth": "none",
+            "border": f"1px solid {TABLE_COLORS['border_light']}",
+            "padding": "5px 6px",
+        },
+        style_cell_conditional=_build_yearly_timeline_discrepancy_column_styles(provider),
+        style_data_conditional=style_data_conditional,
+    )
+
+
+def _create_provider_missing_internal_scenario_table(
+    table_id: str,
+    missing_df: pd.DataFrame,
+    provider: str,
+    empty_message: str | None = None,
+) -> dash_table.DataTable | html.Div:
+    provider_config = _get_provider_discrepancy_config(provider)
+    provider_key = str(provider_config["provider_key"])
+    provider_date_column = str(provider_config["provider_date_column"])
+    entity_column = str(provider_config["entity_output_column"])
+    provider_capacity_column = str(provider_config["provider_capacity_display_column"])
+    provider_color = str(provider_config["provider_color"])
+
+    if missing_df.empty:
+        return _create_empty_state(empty_message or str(provider_config["missing_empty_message"]))
+
+    display_df = missing_df.copy().where(pd.notna(missing_df), None)
+    base_config = StandardTableStyleManager.get_base_datatable_config()
+    columns = []
+    for column_name in display_df.columns:
+        column_config = {"name": column_name, "id": column_name}
+        if column_name == provider_capacity_column:
+            column_config |= {
+                "type": "numeric",
+                "format": Format(precision=1, scheme=Scheme.fixed),
+            }
+        columns.append(column_config)
+
+    style_data_conditional = list(base_config["style_data_conditional"])
+    style_data_conditional.extend(
+        [
+            {
+                "if": {"column_id": entity_column},
+                "backgroundColor": "#f8fafc",
+                "fontWeight": "700",
+                "color": TABLE_COLORS["text_primary"],
+            },
+            {
+                "if": {"column_id": provider_date_column},
+                "backgroundColor": (
+                    "rgba(29, 78, 216, 0.08)"
+                    if provider_key == "woodmac"
+                    else "rgba(245, 158, 11, 0.08)"
+                ),
+                "fontWeight": "600",
+                "color": provider_color,
+            },
+            {
+                "if": {"column_id": provider_capacity_column},
+                "backgroundColor": (
+                    "rgba(29, 78, 216, 0.08)"
+                    if provider_key == "woodmac"
+                    else "rgba(245, 158, 11, 0.08)"
+                ),
+                "fontWeight": "600",
+                "color": provider_color,
+            },
+        ]
+    )
+
+    return dash_table.DataTable(
+        id=table_id,
+        columns=columns,
+        data=display_df.to_dict("records"),
+        sort_action="native",
+        page_action="none",
+        fill_width=True,
+        fixed_rows={"headers": True},
+        style_table={
+            "overflowX": "auto",
+            "overflowY": "auto",
+            "maxHeight": YEARLY_PROVIDER_DISCREPANCY_TABLE_MAX_HEIGHT,
+            "width": "100%",
+            "minWidth": "100%",
+        },
+        style_header=base_config["style_header"],
+        style_cell={
+            **base_config["style_cell"],
+            "minWidth": "auto",
+            "width": "auto",
+            "maxWidth": "none",
+            "border": f"1px solid {TABLE_COLORS['border_light']}",
+            "padding": "5px 6px",
+        },
+        style_cell_conditional=_build_yearly_missing_internal_column_styles(provider),
         style_data_conditional=style_data_conditional,
     )
 
@@ -9205,6 +10902,20 @@ layout = html.Div(
                     children=[
                         html.Div(
                             [
+                                _create_yearly_capacity_comparison_section(
+                                    "Yearly Capacity Comparison",
+                                    (
+                                        "December year-end snapshots only. Years shown only where Woodmac and Energy Aspects both have a yearly value within the selected Date Range."
+                                    ),
+                                    "capacity-page-yearly-capacity-comparison-chart",
+                                    "capacity-page-yearly-capacity-comparison-table-container",
+                                ),
+                                _create_yearly_provider_discrepancy_section(
+                                    "Provider Discrepancies",
+                                    (
+                                        "Compared against the selected Internal Scenario using the Train Timeline row logic. Capacity tables rank absolute MTPA gaps; timeline tables rank absolute first-date gaps in months."
+                                    ),
+                                ),
                                 _create_top_capacity_selector_region(),
                                 html.Div(
                                     [
@@ -9577,30 +11288,31 @@ def sync_capacity_scenario_controls(options_data, selected_scenario_id, dirty_da
     Input("capacity-page-capacity-scenario-dropdown-target-store", "data"),
     State("capacity-page-internal-scenario-dropdown", "value"),
 )
-def sync_capacity_scenario_dropdown_value(options_data, target_value, current_value):
-    valid_ids = []
-    base_case_id = None
-    for option in options_data or []:
-        scenario_id = pd.to_numeric(option.get("scenario_id"), errors="coerce")
-        if pd.notna(scenario_id):
-            normalized_id = int(scenario_id)
-            valid_ids.append(normalized_id)
-            scenario_name = " ".join(str(option.get("scenario_name") or "").strip().split())
-            if scenario_name.casefold() == "base case":
-                base_case_id = normalized_id
+def sync_capacity_scenario_dropdown_value(
+    options_data,
+    target_value,
+    current_value,
+):
+    valid_ids, base_case_id = _get_capacity_scenario_valid_ids_and_base_case_id(
+        options_data
+    )
 
     normalized_target = pd.to_numeric(target_value, errors="coerce")
     normalized_current = pd.to_numeric(current_value, errors="coerce")
     target_id = int(normalized_target) if pd.notna(normalized_target) else None
     current_id = int(normalized_current) if pd.notna(normalized_current) else None
 
+    if target_id is None and current_id is None and base_case_id in valid_ids:
+        return base_case_id
+    if target_id == current_id:
+        return no_update
     if target_id in valid_ids:
         return target_id
-    if current_id in valid_ids:
-        return no_update
-    if base_case_id in valid_ids:
+    if current_id is not None and current_id not in valid_ids:
+        return None
+    if current_id is None and base_case_id in valid_ids:
         return base_case_id
-    return None
+    return no_update
 
 
 @callback(
@@ -9623,29 +11335,22 @@ def toggle_capacity_scenario_source_dropdown(base_type, current_source_value):
     Output("capacity-page-capacity-scenario-working-store", "data", allow_duplicate=True),
     Output("capacity-page-capacity-scenario-dirty-store", "data", allow_duplicate=True),
     Output("capacity-page-capacity-scenario-pending-selection-store", "data", allow_duplicate=True),
-    Output("capacity-page-capacity-scenario-dropdown-target-store", "data", allow_duplicate=True),
     Output("capacity-page-capacity-scenario-message", "children", allow_duplicate=True),
     Output("capacity-page-capacity-scenario-switch-confirm", "displayed", allow_duplicate=True),
     Input("capacity-page-internal-scenario-dropdown", "value"),
-    Input("capacity-page-capacity-scenario-switch-confirm", "submit_n_clicks"),
-    Input("capacity-page-capacity-scenario-switch-confirm", "cancel_n_clicks"),
     State("capacity-page-capacity-scenario-selected-store", "data"),
     State("capacity-page-capacity-scenario-working-store", "data"),
     State("capacity-page-capacity-scenario-dirty-store", "data"),
-    State("capacity-page-capacity-scenario-pending-selection-store", "data"),
     State("capacity-page-capacity-scenario-options-store", "data"),
     State("capacity-page-train-capacity-data-store", "data"),
     State("capacity-page-ea-capacity-data-store", "data"),
-    prevent_initial_call=True,
+    prevent_initial_call="initial_duplicate",
 )
 def handle_capacity_scenario_selection(
     dropdown_value,
-    switch_submit_clicks,
-    switch_cancel_clicks,
     current_selected_scenario_id,
     current_working_store,
     current_dirty_store,
-    pending_selection_store,
     scenario_options_data,
     train_capacity_data,
     ea_capacity_data,
@@ -9653,8 +11358,6 @@ def handle_capacity_scenario_selection(
     trigger_prop = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
     current_selected_value = pd.to_numeric(current_selected_scenario_id, errors="coerce")
     current_selected = int(current_selected_value) if pd.notna(current_selected_value) else None
-    pending_selection_value = pd.to_numeric(pending_selection_store, errors="coerce")
-    pending_selection = int(pending_selection_value) if pd.notna(pending_selection_value) else None
     dirty_payload = (
         current_dirty_store
         if isinstance(current_dirty_store, dict)
@@ -9670,6 +11373,21 @@ def handle_capacity_scenario_selection(
     if trigger_prop == "capacity-page-internal-scenario-dropdown.value":
         next_selected_value = pd.to_numeric(dropdown_value, errors="coerce")
         next_selected = int(next_selected_value) if pd.notna(next_selected_value) else None
+        valid_ids, _base_case_id = _get_capacity_scenario_valid_ids_and_base_case_id(
+            scenario_options_data
+        )
+        if next_selected is not None and next_selected not in valid_ids:
+            return (
+                None,
+                None,
+                {"dirty": False},
+                None,
+                _build_capacity_scenario_message(
+                    "The selected internal scenario is no longer available. Please choose another one from the dropdown.",
+                    "warning",
+                ),
+                False,
+            )
         if next_selected == current_selected:
             raise PreventUpdate
 
@@ -9679,7 +11397,6 @@ def handle_capacity_scenario_selection(
                 no_update,
                 no_update,
                 next_selected,
-                no_update,
                 _build_capacity_scenario_message(
                     "Unsaved edits detected. Confirm the scenario switch to discard the working copy.",
                     "warning",
@@ -9692,7 +11409,6 @@ def handle_capacity_scenario_selection(
                 None,
                 None,
                 {"dirty": False},
-                None,
                 None,
                 html.Div(),
                 False,
@@ -9711,7 +11427,6 @@ def handle_capacity_scenario_selection(
             _serialize_rows(rebuilt_rows_df),
             {"dirty": False, "source": "rebuild" if was_rebuilt else None},
             None,
-            no_update,
             (
                 _build_capacity_scenario_message(
                     "Loaded a corrected source-matched working copy for this legacy scenario so the internal view matches the baseline source. Click Save if you want to persist the repaired rows.",
@@ -9720,46 +11435,6 @@ def handle_capacity_scenario_selection(
                 if was_rebuilt
                 else html.Div()
             ),
-            False,
-        )
-
-    if trigger_prop == "capacity-page-capacity-scenario-switch-confirm.submit_n_clicks":
-        if pending_selection is None:
-            raise PreventUpdate
-        selected_rows_df = fetch_capacity_scenario_rows(pending_selection, engine)
-        rebuilt_rows_df, was_rebuilt = _maybe_rebuild_legacy_capacity_scenario_rows(
-            pending_selection,
-            selected_rows_df,
-            scenario_options_data,
-            train_raw_df,
-            ea_raw_df,
-        )
-        return (
-            pending_selection,
-            _serialize_rows(rebuilt_rows_df),
-            {"dirty": False, "source": "rebuild" if was_rebuilt else None},
-            None,
-            pending_selection,
-            _build_capacity_scenario_message(
-                (
-                    "Scenario switched. Unsaved edits from the previous working copy were discarded. "
-                    "This selected scenario was also refreshed into a corrected working copy from the current source baseline; click Save if you want to persist that repair."
-                )
-                if was_rebuilt
-                else "Scenario switched. Unsaved edits from the previous working copy were discarded.",
-                "warning",
-            ),
-            False,
-        )
-
-    if trigger_prop == "capacity-page-capacity-scenario-switch-confirm.cancel_n_clicks":
-        return (
-            no_update,
-            no_update,
-            no_update,
-            None,
-            current_selected,
-            _build_capacity_scenario_message("Scenario switch cancelled.", "neutral"),
             False,
         )
 
@@ -9830,11 +11505,15 @@ def refresh_selected_capacity_scenario_working_copy(
     Input("capacity-page-capacity-scenario-save-button", "n_clicks"),
     Input("capacity-page-capacity-scenario-revert-button", "n_clicks"),
     Input("capacity-page-capacity-scenario-delete-button", "n_clicks"),
+    Input("capacity-page-capacity-scenario-switch-confirm", "submit_n_clicks"),
+    Input("capacity-page-capacity-scenario-switch-confirm", "cancel_n_clicks"),
     Input("capacity-page-capacity-scenario-delete-confirm", "submit_n_clicks"),
     Input("capacity-page-capacity-scenario-delete-confirm", "cancel_n_clicks"),
     State("capacity-page-capacity-scenario-selected-store", "data"),
     State("capacity-page-capacity-scenario-working-store", "data"),
     State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-capacity-scenario-pending-selection-store", "data"),
+    State("capacity-page-capacity-scenario-options-store", "data"),
     State("capacity-page-train-capacity-data-store", "data"),
     State("capacity-page-ea-capacity-data-store", "data"),
     State("capacity-page-capacity-scenario-create-name", "value"),
@@ -9842,18 +11521,21 @@ def refresh_selected_capacity_scenario_working_copy(
     State("capacity-page-capacity-scenario-create-source-dropdown", "value"),
     State("capacity-page-date-range", "start_date"),
     State("capacity-page-train-timeline-table", "rowData"),
-    prevent_initial_call=True,
 )
 def manage_capacity_scenario_state(
     create_clicks,
     save_clicks,
     revert_clicks,
     delete_clicks,
+    switch_submit_clicks,
+    switch_cancel_clicks,
     delete_submit_clicks,
     delete_cancel_clicks,
     current_selected_scenario_id,
     current_working_store,
     current_dirty_store,
+    pending_selection_store,
+    scenario_options_data,
     train_capacity_data,
     ea_capacity_data,
     create_name,
@@ -9863,8 +11545,13 @@ def manage_capacity_scenario_state(
     timeline_row_data,
 ):
     trigger_prop = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+    if trigger_prop in {"", "."}:
+        raise PreventUpdate
+
     current_selected_value = pd.to_numeric(current_selected_scenario_id, errors="coerce")
     current_selected = int(current_selected_value) if pd.notna(current_selected_value) else None
+    pending_selection_value = pd.to_numeric(pending_selection_store, errors="coerce")
+    pending_selection = int(pending_selection_value) if pd.notna(pending_selection_value) else None
     working_rows_df = _resolve_active_capacity_scenario_rows(
         current_working_store,
         current_dirty_store,
@@ -9873,6 +11560,51 @@ def manage_capacity_scenario_state(
 
     def _serialize_rows(rows_df: pd.DataFrame) -> str | None:
         return _serialize_dataframe(_prepare_capacity_scenario_rows_df(rows_df))
+
+    if trigger_prop == "capacity-page-capacity-scenario-switch-confirm.submit_n_clicks":
+        if pending_selection is None:
+            raise PreventUpdate
+
+        selected_rows_df = fetch_capacity_scenario_rows(pending_selection, engine)
+        rebuilt_rows_df, was_rebuilt = _maybe_rebuild_legacy_capacity_scenario_rows(
+            pending_selection,
+            selected_rows_df,
+            scenario_options_data,
+            _deserialize_dataframe(train_capacity_data),
+            _deserialize_dataframe(ea_capacity_data),
+        )
+        return (
+            pending_selection,
+            _serialize_rows(rebuilt_rows_df),
+            {"dirty": False, "source": "rebuild" if was_rebuilt else None},
+            no_update,
+            None,
+            pending_selection,
+            _build_capacity_scenario_message(
+                (
+                    "Scenario switched. Unsaved edits from the previous working copy were discarded. "
+                    "This selected scenario was also refreshed into a corrected working copy from the current source baseline; click Save if you want to persist that repair."
+                )
+                if was_rebuilt
+                else "Scenario switched. Unsaved edits from the previous working copy were discarded.",
+                "warning",
+            ),
+            False,
+            False,
+        )
+
+    if trigger_prop == "capacity-page-capacity-scenario-switch-confirm.cancel_n_clicks":
+        return (
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            None,
+            current_selected,
+            _build_capacity_scenario_message("Scenario switch cancelled.", "neutral"),
+            False,
+            False,
+        )
 
     if trigger_prop == "capacity-page-capacity-scenario-create-button.n_clicks":
         try:
@@ -10315,6 +12047,168 @@ def upload_train_timeline_scenario_workbook(
         _build_capacity_scenario_message(
             f"Imported {summary['updated']:,} update(s), {summary['added']:,} addition(s), and {summary['deleted']:,} deletion(s) into the working copy. Review the grid and click Save to persist.",
             "success",
+        ),
+    )
+
+
+@callback(
+    Output("capacity-page-yearly-capacity-comparison-chart", "figure"),
+    Output("capacity-page-yearly-capacity-comparison-table-container", "children"),
+    Input("capacity-page-woodmac-data-store", "data"),
+    Input("capacity-page-ea-capacity-data-store", "data"),
+    Input("capacity-page-capacity-scenario-selected-store", "data"),
+    Input("capacity-page-date-range", "start_date"),
+    Input("capacity-page-date-range", "end_date"),
+    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-train-timeline-table", "rowData"),
+)
+def render_yearly_capacity_comparison_section(
+    woodmac_data,
+    ea_capacity_data,
+    selected_scenario_id,
+    start_date,
+    end_date,
+    _scenario_refresh_timestamp,
+    working_store_data,
+    dirty_store,
+    timeline_row_data,
+):
+    selected_scenario_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    if pd.isna(selected_scenario_value):
+        return (
+            _create_empty_capacity_figure(YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE),
+            _create_empty_state(YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE),
+        )
+
+    woodmac_total_df = _deserialize_dataframe(woodmac_data)
+    ea_raw_df = _deserialize_dataframe(ea_capacity_data)
+    active_rows_df = _resolve_active_capacity_scenario_rows(
+        working_store_data,
+        dirty_store,
+        timeline_row_data,
+    )
+    comparison_df = _build_yearly_capacity_comparison_df(
+        woodmac_total_df,
+        ea_raw_df,
+        active_rows_df,
+        start_date,
+        end_date,
+    )
+    empty_message = (
+        "No overlapping yearly Woodmac and Energy Aspects values are available for the current selection."
+    )
+
+    return (
+        (
+            _create_yearly_capacity_comparison_chart(comparison_df)
+            if not comparison_df.empty
+            else _create_empty_capacity_figure(empty_message)
+        ),
+        (
+            _create_yearly_capacity_comparison_table(
+                "capacity-page-yearly-capacity-comparison-table",
+                comparison_df,
+            )
+            if not comparison_df.empty
+            else _create_empty_state(empty_message)
+        ),
+    )
+
+
+@callback(
+    Output("capacity-page-yearly-woodmac-capacity-discrepancy-table-container", "children"),
+    Output("capacity-page-yearly-woodmac-timeline-discrepancy-table-container", "children"),
+    Output("capacity-page-yearly-woodmac-missing-internal-table-container", "children"),
+    Output("capacity-page-yearly-ea-capacity-discrepancy-table-container", "children"),
+    Output("capacity-page-yearly-ea-timeline-discrepancy-table-container", "children"),
+    Output("capacity-page-yearly-ea-missing-internal-table-container", "children"),
+    Input("capacity-page-train-capacity-data-store", "data"),
+    Input("capacity-page-ea-capacity-data-store", "data"),
+    Input("capacity-page-capacity-scenario-selected-store", "data"),
+    Input("capacity-page-country-dropdown", "value"),
+    Input("capacity-page-other-country-mode", "value"),
+    Input("capacity-page-date-range", "start_date"),
+    Input("capacity-page-date-range", "end_date"),
+    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+    State("capacity-page-capacity-scenario-working-store", "data"),
+    State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-train-timeline-table", "rowData"),
+)
+def render_yearly_capacity_discrepancy_section(
+    train_capacity_data,
+    ea_capacity_data,
+    selected_scenario_id,
+    selected_countries,
+    other_countries_mode,
+    start_date,
+    end_date,
+    _scenario_refresh_timestamp,
+    working_store_data,
+    dirty_store,
+    timeline_row_data,
+):
+    selected_scenario_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    if pd.isna(selected_scenario_value):
+        return (
+            _create_empty_state(YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE),
+            _create_empty_state(YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE),
+            _create_empty_state(YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE),
+            _create_empty_state(YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE),
+            _create_empty_state(YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE),
+            _create_empty_state(YEARLY_CAPACITY_COMPARISON_EMPTY_MESSAGE),
+        )
+
+    woodmac_train_raw_df = _deserialize_dataframe(train_capacity_data)
+    ea_raw_df = _deserialize_dataframe(ea_capacity_data)
+    active_rows_df = _resolve_active_capacity_scenario_rows(
+        working_store_data,
+        dirty_store,
+        timeline_row_data,
+    )
+    discrepancy_payloads = _build_yearly_provider_discrepancy_payloads(
+        woodmac_train_raw_df,
+        ea_raw_df,
+        active_rows_df,
+        selected_countries,
+        other_countries_mode,
+        start_date,
+        end_date,
+    )
+    woodmac_payload = discrepancy_payloads["woodmac"]
+    ea_payload = discrepancy_payloads["energy_aspects"]
+
+    return (
+        _create_provider_capacity_discrepancy_table(
+            "capacity-page-yearly-woodmac-capacity-discrepancy-table",
+            woodmac_payload["capacity_df"],
+            "woodmac",
+        ),
+        _create_provider_timeline_discrepancy_table(
+            "capacity-page-yearly-woodmac-timeline-discrepancy-table",
+            woodmac_payload["timeline_df"],
+            "woodmac",
+        ),
+        _create_provider_missing_internal_scenario_table(
+            "capacity-page-yearly-woodmac-missing-internal-table",
+            woodmac_payload["missing_df"],
+            "woodmac",
+        ),
+        _create_provider_capacity_discrepancy_table(
+            "capacity-page-yearly-ea-capacity-discrepancy-table",
+            ea_payload["capacity_df"],
+            "energy_aspects",
+        ),
+        _create_provider_timeline_discrepancy_table(
+            "capacity-page-yearly-ea-timeline-discrepancy-table",
+            ea_payload["timeline_df"],
+            "energy_aspects",
+        ),
+        _create_provider_missing_internal_scenario_table(
+            "capacity-page-yearly-ea-missing-internal-table",
+            ea_payload["missing_df"],
+            "energy_aspects",
         ),
     )
 
