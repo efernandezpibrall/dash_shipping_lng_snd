@@ -421,6 +421,16 @@ DESTINATION_MERGE_COLUMNS = {
     'country_classification': 'destination_classification',
 }
 
+DESTINATION_LEVEL_DISPLAY_LABELS = {
+    'destination_country_name': 'Country',
+    'destination_shipping_region': 'Shipping Region',
+    'destination_basin': 'Basin',
+    'continent_destination_name': 'Continent',
+    'destination_subcontinent': 'Subcontinent',
+    'destination_classification_level1': 'Classification Level 1',
+    'destination_classification': 'Classification',
+}
+
 
 def _normalize_text_value(value, default='Unknown'):
     if pd.isna(value):
@@ -648,6 +658,148 @@ def _prepare_destination_summary_scope_df(scoped_trades_df, destination_level):
     summary_df['continent'] = _normalize_text_series(summary_df['continent'], default='Unknown')
     summary_df['country'] = _normalize_text_series(summary_df['country'], default='Unknown')
     return summary_df
+
+
+def _fetch_origin_plant_destination_trades(engine, origin_country, min_start_date=None):
+    from sqlalchemy import text as sa_text
+
+    current_date = pd.Timestamp(dt.date.today()).normalize()
+    start_date = pd.Timestamp(min_start_date or '2023-11-01').normalize()
+    start_date = min(start_date, current_date)
+
+    base_query = sa_text(f"""
+        SELECT
+            "start"::date AS start_date,
+            COALESCE(cargo_origin_cubic_meters, 0) * 0.6 / 1000 AS cargo_mcm,
+            COALESCE(NULLIF(BTRIM(zone_origin_name), ''), 'Unknown') AS origin_zone,
+            COALESCE(NULLIF(BTRIM(origin_location_name), ''), 'Unknown') AS origin_plant,
+            COALESCE(NULLIF(BTRIM(destination_country_name), ''), 'Unknown') AS destination_country,
+            COALESCE(NULLIF(BTRIM(continent_destination_name), ''), 'Unknown') AS destination_continent
+        FROM {DB_SCHEMA}.kpler_trades
+        WHERE upload_timestamp_utc = (SELECT MAX(upload_timestamp_utc) FROM {DB_SCHEMA}.kpler_trades)
+          AND origin_country_name = :origin_country
+          AND destination_country_name IS DISTINCT FROM :origin_country
+          AND "start" IS NOT NULL
+          AND "start"::date >= :min_start_date
+    """)
+
+    scoped_trades_df = pd.read_sql(
+        base_query,
+        engine,
+        params={
+            'origin_country': origin_country,
+            'min_start_date': start_date.date(),
+        }
+    )
+
+    expected_trade_columns = [
+        'start_date',
+        'cargo_mcm',
+        'origin_zone',
+        'origin_plant',
+        'destination_country',
+        'destination_continent',
+        'destination_shipping_region',
+        'destination_basin',
+        'destination_subcontinent',
+        'destination_classification_level1',
+        'destination_classification',
+    ]
+
+    if scoped_trades_df.empty:
+        return pd.DataFrame(columns=expected_trade_columns)
+
+    scoped_trades_df['start_date'] = pd.to_datetime(scoped_trades_df['start_date'], errors='coerce').dt.normalize()
+    scoped_trades_df = scoped_trades_df[scoped_trades_df['start_date'].notna()].copy()
+    scoped_trades_df['cargo_mcm'] = pd.to_numeric(scoped_trades_df['cargo_mcm'], errors='coerce').fillna(0.0)
+    scoped_trades_df['origin_zone'] = _normalize_text_series(scoped_trades_df['origin_zone'], default='Unknown')
+    scoped_trades_df['origin_plant'] = _normalize_text_series(scoped_trades_df['origin_plant'], default='Unknown')
+    scoped_trades_df['destination_country'] = _normalize_text_series(scoped_trades_df['destination_country'], default='Unknown')
+    scoped_trades_df['destination_continent'] = _normalize_text_series(scoped_trades_df['destination_continent'], default='Unknown')
+
+    mapping_df = _load_destination_mapping_df(engine)
+    merge_columns = ['country_name'] + list(DESTINATION_MERGE_COLUMNS.keys())
+    scoped_trades_df = pd.merge(
+        scoped_trades_df,
+        mapping_df[merge_columns],
+        how='left',
+        left_on='destination_country',
+        right_on='country_name'
+    )
+    scoped_trades_df = scoped_trades_df.drop(columns=['country_name'])
+
+    for mapping_col, destination_col in DESTINATION_MERGE_COLUMNS.items():
+        scoped_trades_df[destination_col] = _normalize_text_series(
+            scoped_trades_df[mapping_col],
+            default='Unknown'
+        )
+        scoped_trades_df = scoped_trades_df.drop(columns=[mapping_col])
+
+    return scoped_trades_df[expected_trade_columns]
+
+
+def _prepare_origin_plant_summary_scope_df(scoped_trades_df, destination_level):
+    if scoped_trades_df is None or scoped_trades_df.empty:
+        return pd.DataFrame(columns=['start_date', 'cargo_mcm', 'continent', 'country'])
+
+    config = DESTINATION_LEVEL_CONFIG.get(destination_level, DESTINATION_LEVEL_CONFIG['destination_country_name'])
+    destination_col = config['dest_col']
+    if destination_col not in scoped_trades_df.columns:
+        destination_col = DESTINATION_LEVEL_CONFIG['destination_country_name']['dest_col']
+
+    summary_df = scoped_trades_df[['start_date', 'cargo_mcm', 'origin_zone', destination_col]].copy()
+    summary_df = summary_df.rename(columns={
+        'origin_zone': 'continent',
+        destination_col: 'country',
+    })
+    summary_df['continent'] = _normalize_text_series(summary_df['continent'], default='Unknown')
+    summary_df['country'] = _normalize_text_series(summary_df['country'], default='Unknown')
+    return summary_df
+
+
+def _prepare_origin_plant_summary_display_df(df, expanded_zones=None, rolling_col=None):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['Zone', 'Destination'])
+
+    expanded_zones = expanded_zones or []
+    numeric_cols = [col for col in df.columns if col not in ['continent', 'country']]
+    display_rows = []
+
+    for zone in df['continent'].dropna().unique():
+        zone_data = df[df['continent'] == zone].copy()
+        zone_label = f"▼ {zone}" if zone in expanded_zones else f"▶ {zone}"
+        display_rows.append({
+            'Zone': zone_label,
+            'Destination': 'Total',
+            **{col: zone_data[col].sum() for col in numeric_cols}
+        })
+
+        if zone in expanded_zones:
+            sort_columns = []
+            sort_ascending = []
+            if rolling_col and rolling_col in zone_data.columns:
+                zone_data['__sort_rolling'] = pd.to_numeric(zone_data[rolling_col], errors='coerce').fillna(0.0)
+                sort_columns.append('__sort_rolling')
+                sort_ascending.append(False)
+            sort_columns.append('country')
+            sort_ascending.append(True)
+            zone_data = zone_data.sort_values(sort_columns, ascending=sort_ascending)
+
+            for _, row in zone_data.iterrows():
+                display_rows.append({
+                    'Zone': '',
+                    'Destination': f"    {row['country']}",
+                    **{col: row[col] for col in numeric_cols}
+                })
+
+    grand_total = {
+        'Zone': 'GRAND TOTAL',
+        'Destination': '',
+        **{col: df[col].sum() for col in numeric_cols}
+    }
+    display_rows.append(grand_total)
+
+    return pd.DataFrame(display_rows)
 
 
 def _build_destination_periods_pivot(summary_scope_df, period_type, current_date=None):
@@ -2467,20 +2619,35 @@ def fetch_destination_summary_data(engine, origin_country, status, vessel_type, 
         traceback.print_exc()
         return pd.DataFrame()
 
-def fetch_origin_plant_summary_data(engine, origin_country, rolling_window_days=30):
-    """Fetch origin plant summary data with expandable zone/plant hierarchy."""
+def fetch_origin_plant_summary_data(engine, origin_country, rolling_window_days=30,
+                                    destination_level='destination_country_name'):
+    """Fetch origin zone totals with expandable destination breakdown."""
     try:
-        zone_col = "COALESCE(NULLIF(zone_origin_name, ''), 'Unknown')"
-        plant_col = "COALESCE(NULLIF(origin_location_name, ''), 'Unknown')"
-        # Match Destination Summary behavior: drop only true domestic flows and keep null/blank destinations.
-        where_clause = f"origin_country_name = '{origin_country}' AND destination_country_name IS DISTINCT FROM '{origin_country}'"
+        if not origin_country:
+            return pd.DataFrame()
 
-        with engine.connect() as conn:
-            quarters_df = fetch_destination_periods_data_hierarchical(conn, zone_col, plant_col, where_clause, 'quarter')
-            months_df   = fetch_destination_periods_data_hierarchical(conn, zone_col, plant_col, where_clause, 'month')
-            weeks_df    = fetch_destination_periods_data_hierarchical(conn, zone_col, plant_col, where_clause, 'week')
-            rolling_df  = fetch_destination_rolling_windows_hierarchical(conn, zone_col, plant_col, where_clause, rolling_window_days)
-            return combine_destination_summary_data_hierarchical(quarters_df, months_df, weeks_df, rolling_df, rolling_window_days)
+        scoped_trades_df = _fetch_origin_plant_destination_trades(engine, origin_country)
+        summary_scope_df = _prepare_origin_plant_summary_scope_df(
+            scoped_trades_df,
+            destination_level or 'destination_country_name'
+        )
+        if summary_scope_df.empty:
+            return pd.DataFrame()
+
+        quarters_df = _build_destination_periods_pivot(summary_scope_df, 'quarter')
+        months_df = _build_destination_periods_pivot(summary_scope_df, 'month')
+        weeks_df = _build_destination_periods_pivot(summary_scope_df, 'week')
+        rolling_df = _build_destination_rolling_windows_pivot(
+            summary_scope_df,
+            rolling_window_days=rolling_window_days
+        )
+        return combine_destination_summary_data_hierarchical(
+            quarters_df,
+            months_df,
+            weeks_df,
+            rolling_df,
+            rolling_window_days
+        )
     except Exception:
         return pd.DataFrame()
 
@@ -6420,11 +6587,12 @@ def update_destination_summary_table(origin_country, rolling_window_days, status
      Input('us-region-status-dropdown', 'value'),
      Input('us-vessel-type-dropdown', 'value'),
      Input('origin-plant-expanded-zones', 'data'),
+     Input('destination-level-dropdown', 'value'),
      Input('volume-metric-dropdown', 'value')],
     prevent_initial_call=False
 )
-def update_origin_plant_summary_table(origin_country, rolling_window_days, status, vessel_type, expanded_zones, volume_metric):
-    """Update the origin plant summary table with expandable zone/plant hierarchy."""
+def update_origin_plant_summary_table(origin_country, rolling_window_days, status, vessel_type, expanded_zones, destination_level, volume_metric):
+    """Update the origin plant summary table with expandable destination rows by origin zone."""
     vol_info = VOLUME_CONVERSIONS.get(volume_metric or 'mcm_d', VOLUME_CONVERSIONS['mcm_d'])
     vol_factor = vol_info['factor']
     vol_label = vol_info['label']
@@ -6435,8 +6603,15 @@ def update_origin_plant_summary_table(origin_country, rolling_window_days, statu
 
     try:
         expanded_zones = expanded_zones or []
+        destination_level = destination_level or 'destination_country_name'
+        destination_label = DESTINATION_LEVEL_DISPLAY_LABELS.get(destination_level, 'Destination')
 
-        df = fetch_origin_plant_summary_data(engine, origin_country, rolling_window_days)
+        df = fetch_origin_plant_summary_data(
+            engine,
+            origin_country,
+            rolling_window_days,
+            destination_level=destination_level
+        )
 
         if df.empty:
             return html.Div("No data available for the selected filters.",
@@ -6453,37 +6628,36 @@ def update_origin_plant_summary_table(origin_country, rolling_window_days, statu
             zone_order = df.groupby('continent')[rolling_col].sum().sort_values(ascending=False).index.tolist()
             df = pd.concat([df[df['continent'] == z] for z in zone_order], ignore_index=True)
 
-        # Build flat zone-only table: sum each zone, no expand/collapse needed
-        numeric_cols = [c for c in df.columns if c not in ['continent', 'country']]
-        zone_rows = []
-        for zone in df['continent'].unique():
-            zone_data = df[df['continent'] == zone]
-            zone_rows.append({'Zone': zone, **{c: zone_data[c].sum() for c in numeric_cols}})
-        # Add GRAND TOTAL
-        zone_rows.append({'Zone': 'GRAND TOTAL', **{c: df[c].sum() for c in numeric_cols}})
-        display_df = pd.DataFrame(zone_rows)
+        display_df = _prepare_origin_plant_summary_display_df(
+            df,
+            expanded_zones=expanded_zones,
+            rolling_col=rolling_col
+        )
 
         # Column definitions
         columns = []
         for col in display_df.columns:
             if col == 'Zone':
-                columns.append({'name': col, 'id': col, 'type': 'text'})
+                columns.append({'name': 'Origin Zone', 'id': col, 'type': 'text'})
+            elif col == 'Destination':
+                columns.append({'name': f'Destination {destination_label}', 'id': col, 'type': 'text'})
             else:
                 columns.append({'name': col, 'id': col, 'type': 'numeric', 'format': {'specifier': '.0f'}})
 
         # Conditional styles
         conditional_styles = []
-        # Alternating blue/grey rows like continent total rows
-        conditional_styles.append({'if': {'filter_query': '{Zone} != "GRAND TOTAL"'}, 'backgroundColor': '#e3f2fd', 'fontWeight': 'bold'})
-        conditional_styles.append({'if': {'row_index': 'odd', 'filter_query': '{Zone} != "GRAND TOTAL"'}, 'backgroundColor': '#f5f5f5', 'fontWeight': 'bold'})
+        conditional_styles.append({'if': {'row_index': 'odd'}, 'backgroundColor': '#f5f5f5'})
+        conditional_styles.append({'if': {'filter_query': '{Destination} = "Total"'}, 'backgroundColor': '#e3f2fd', 'fontWeight': 'bold'})
+        conditional_styles.append({'if': {'filter_query': '{Zone} = ""'}, 'backgroundColor': '#f9f9f9', 'fontSize': '13px', 'fontWeight': '400'})
         conditional_styles.append({'if': {'column_id': 'Zone'}, 'textAlign': 'left'})
+        conditional_styles.append({'if': {'column_id': 'Destination'}, 'textAlign': 'left'})
 
         for col in display_df.columns:
-            if col != 'Zone':
+            if col not in ['Zone', 'Destination']:
                 conditional_styles.append({'if': {'column_id': col}, 'textAlign': 'right', 'paddingRight': '12px'})
 
         quarter_columns = [col for col in display_df.columns if col.startswith('Q') and "'" in col]
-        month_columns = [col for col in display_df.columns if "'" in col and not col.startswith('Q') and not col.startswith('W') and col != 'Zone']
+        month_columns = [col for col in display_df.columns if "'" in col and not col.startswith('Q') and not col.startswith('W') and col not in ['Zone', 'Destination']]
         week_columns = [col for col in display_df.columns if col.startswith('W') and "'" in col]
         rolling_window_columns = [col for col in display_df.columns if col == '7D' or (col.endswith('D') and col[:-1].isdigit())]
         delta_vs_window_column = next((col for col in display_df.columns if col.startswith('Δ 7D-')), None)

@@ -188,6 +188,7 @@ TRAIN_TIMELINE_EDITABLE_COLUMNS = {
 }
 TRAIN_TIMELINE_PROVIDER_COLUMNS = {
     "Woodmac Original Name",
+    "Woodmac FID Date",
     "Woodmac First Date",
     "Woodmac Capacity Change",
     "Energy Aspects Original Plant",
@@ -196,6 +197,7 @@ TRAIN_TIMELINE_PROVIDER_COLUMNS = {
     "Energy Aspects Capacity Change",
 }
 TRAIN_TIMELINE_DATE_COLUMNS = {
+    "Woodmac FID Date",
     "Woodmac First Date",
     "Energy Aspects First Date",
     "Scenario First Date",
@@ -473,13 +475,23 @@ WITH latest_plant_summary AS (
     FROM {DB_SCHEMA}.woodmac_lng_plant_summary AS plant_row
     ORDER BY plant_row.id_plant, plant_row.upload_timestamp_utc DESC
 ),
+latest_train_upload AS (
+    SELECT MAX(upload_timestamp_utc) AS upload_timestamp_utc
+    FROM {DB_SCHEMA}.woodmac_lng_plant_train
+),
 latest_train_metadata AS (
     SELECT DISTINCT ON (train_row.id_plant, train_row.id_lng_train)
         train_row.id_plant,
         train_row.id_lng_train,
+        train_row.lng_train_date_fid,
         to_jsonb(train_row) AS train_json
     FROM {DB_SCHEMA}.woodmac_lng_plant_train AS train_row
-    ORDER BY train_row.id_plant, train_row.id_lng_train, train_row.upload_timestamp_utc DESC
+    JOIN latest_train_upload AS latest_upload
+        ON train_row.upload_timestamp_utc = latest_upload.upload_timestamp_utc
+    ORDER BY
+        train_row.id_plant,
+        train_row.id_lng_train,
+        train_row.lng_train_date_fid DESC NULLS LAST
 ),
 latest_capacity AS (
     SELECT
@@ -517,6 +529,7 @@ latest_capacity AS (
             NULLIF(BTRIM(to_jsonb(source_row) ->> 'lng_train_name'), ''),
             CONCAT('Train ', source_row.id_lng_train::text)
         ) AS lng_train_name_short,
+        train_metadata.lng_train_date_fid AS woodmac_fid_date,
         source_row.metric_value AS capacity_mtpa
     FROM (
         SELECT DISTINCT ON (
@@ -577,6 +590,7 @@ latest_annual_output AS (
             NULLIF(BTRIM(annual_row.lng_train_name_short), ''),
             CONCAT('Train ', annual_row.id_lng_train::text)
         ) AS lng_train_name_short,
+        train_metadata.lng_train_date_fid AS woodmac_fid_date,
         annual_row.metric_value AS capacity_mtpa
     FROM {WOODMAC_ANNUAL_OUTPUT_SOURCE_TABLE} AS annual_row
     LEFT JOIN latest_plant_summary AS plant_summary
@@ -607,6 +621,7 @@ annual_train_bounds AS (
         MAX(annual_row.plant_name) AS plant_name,
         MAX(annual_row.lng_train_name) AS lng_train_name,
         MAX(annual_row.lng_train_name_short) AS lng_train_name_short,
+        MAX(annual_row.woodmac_fid_date) AS woodmac_fid_date,
         MIN(
             CASE
                 WHEN annual_row.capacity_mtpa > 0 THEN TO_DATE(
@@ -644,6 +659,7 @@ monthly_carry_forward_base AS (
         monthly_row.plant_name,
         monthly_row.lng_train_name,
         monthly_row.lng_train_name_short,
+        monthly_row.woodmac_fid_date,
         monthly_row.capacity_mtpa,
         monthly_bounds.last_monthly_month
     FROM monthly_train_bounds AS monthly_bounds
@@ -661,6 +677,7 @@ monthly_carry_forward AS (
         monthly_row.plant_name,
         monthly_row.lng_train_name,
         monthly_row.lng_train_name_short,
+        monthly_row.woodmac_fid_date,
         monthly_row.capacity_mtpa
     FROM monthly_carry_forward_base AS monthly_row
     CROSS JOIN coverage_horizon AS horizon
@@ -683,6 +700,7 @@ annual_only_fallback_base AS (
         annual_row.plant_name,
         annual_row.lng_train_name,
         annual_row.lng_train_name_short,
+        annual_row.woodmac_fid_date,
         annual_row.capacity_mtpa,
         annual_row.first_active_month,
         annual_row.last_annual_month
@@ -701,6 +719,7 @@ annual_only_fallback AS (
         annual_row.plant_name,
         annual_row.lng_train_name,
         annual_row.lng_train_name_short,
+        annual_row.woodmac_fid_date,
         annual_row.capacity_mtpa
     FROM annual_only_fallback_base AS annual_row
     CROSS JOIN LATERAL generate_series(
@@ -723,6 +742,7 @@ annual_only_carry_forward AS (
         annual_row.plant_name,
         annual_row.lng_train_name,
         annual_row.lng_train_name_short,
+        annual_row.woodmac_fid_date,
         annual_row.capacity_mtpa
     FROM annual_only_fallback_base AS annual_row
     CROSS JOIN coverage_horizon AS horizon
@@ -749,6 +769,7 @@ combined_capacity AS (
         plant_name,
         lng_train_name,
         lng_train_name_short,
+        woodmac_fid_date,
         capacity_mtpa
     FROM latest_capacity
 
@@ -762,6 +783,7 @@ combined_capacity AS (
         plant_name,
         lng_train_name,
         lng_train_name_short,
+        woodmac_fid_date,
         capacity_mtpa
     FROM monthly_carry_forward
 
@@ -775,6 +797,7 @@ combined_capacity AS (
         plant_name,
         lng_train_name,
         lng_train_name_short,
+        woodmac_fid_date,
         capacity_mtpa
     FROM annual_only_fallback
 
@@ -788,6 +811,7 @@ combined_capacity AS (
         plant_name,
         lng_train_name,
         lng_train_name_short,
+        woodmac_fid_date,
         capacity_mtpa
     FROM annual_only_carry_forward
 )
@@ -797,6 +821,7 @@ SELECT
     plant_name,
     lng_train_name,
     lng_train_name_short,
+    woodmac_fid_date,
     id_plant,
     id_lng_train,
     capacity_mtpa
@@ -1720,6 +1745,7 @@ def fetch_woodmac_train_capacity_raw_data(
                 "train_mapping_applied",
                 "lng_train_name",
                 "lng_train_name_short",
+                "woodmac_fid_date",
                 "id_plant",
                 "id_lng_train",
                 "capacity_mtpa",
@@ -1741,6 +1767,16 @@ def fetch_woodmac_train_capacity_raw_data(
     raw_df["id_lng_train"] = pd.to_numeric(raw_df["id_lng_train"], errors="coerce")
     if "lng_train_name" not in raw_df.columns:
         raw_df["lng_train_name"] = raw_df.get("lng_train_name_short", "Unknown")
+    if "woodmac_fid_date" not in raw_df.columns:
+        raw_df["woodmac_fid_date"] = None
+    raw_df["woodmac_fid_date"] = pd.to_datetime(
+        raw_df["woodmac_fid_date"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+    raw_df["woodmac_fid_date"] = raw_df["woodmac_fid_date"].where(
+        raw_df["woodmac_fid_date"].notna(),
+        "",
+    )
     raw_df["raw_plant_name"] = raw_df["plant_name"]
     raw_df["raw_train_name"] = raw_df["lng_train_name_short"]
     raw_df["raw_train_display_name"] = raw_df["lng_train_name"]
@@ -2668,6 +2704,7 @@ def _prepare_provider_timeline_event_rows(
         "Train",
         "Original Plant",
         "Original Train",
+        "Woodmac FID Date",
         "Effective Date",
         "Capacity Change",
         "timeline_direction",
@@ -2704,6 +2741,12 @@ def _prepare_provider_timeline_event_rows(
             .astype(str)
             .str.strip()
         )
+        fid_series = (
+            provider_df["Woodmac FID Date"]
+            if "Woodmac FID Date" in provider_df.columns
+            else pd.Series("", index=provider_df.index)
+        )
+        provider_df["Woodmac FID Date"] = fid_series.fillna("").astype(str).str.strip()
     elif provider_key == "energy_aspects":
         provider_df["Capacity Change"] = pd.to_numeric(
             provider_df["EA Net Delta (MTPA)"],
@@ -2711,6 +2754,7 @@ def _prepare_provider_timeline_event_rows(
         ).fillna(0.0)
         provider_df["Original Plant"] = provider_df.get("Source Name", "").fillna("").astype(str).str.strip()
         provider_df["Original Train"] = provider_df.get("Train Source Name", "").fillna("").astype(str).str.strip()
+        provider_df["Woodmac FID Date"] = ""
     else:
         raise ValueError(f"Unsupported provider '{provider}'.")
 
@@ -2733,6 +2777,7 @@ def _prepare_provider_timeline_event_rows(
                 "display_sort_train": "last",
                 "Original Plant": _combine_distinct_text_values,
                 "Original Train": _combine_distinct_text_values,
+                "Woodmac FID Date": _combine_distinct_text_values,
             }
         )
     )
@@ -2771,6 +2816,7 @@ def _build_provider_timeline_snapshot(
         "Train",
         "Original Plant",
         "Original Train",
+        "Woodmac FID Date",
         "First Date",
         "Capacity Change",
         "timeline_direction",
@@ -2804,6 +2850,7 @@ def _build_provider_timeline_snapshot(
                         "display_sort_train": "last",
                         "Original Plant": _combine_distinct_text_values,
                         "Original Train": _combine_distinct_text_values,
+                        "Woodmac FID Date": _combine_distinct_text_values,
                         "display_sort_country": "last",
                         "display_sort_plant": "last",
                     }
@@ -3072,6 +3119,7 @@ def _build_train_timeline_df(
         "Plant",
         "Train",
         "Woodmac Original Name",
+        "Woodmac FID Date",
         "Woodmac First Date",
         "Woodmac Capacity Change",
         "Energy Aspects Original Plant",
@@ -3106,6 +3154,7 @@ def _build_train_timeline_df(
             columns={
                 "scenario_row_key": "scenario_row_key_woodmac",
                 "Original Train": "Woodmac Original Name",
+                "Woodmac FID Date": "Woodmac FID Date",
                 "First Date": "Woodmac First Date",
                 "Capacity Change": "Woodmac Capacity Change",
                 "timeline_direction": "timeline_direction_woodmac",
@@ -3119,6 +3168,7 @@ def _build_train_timeline_df(
         ea_snapshot_df.rename(
             columns={
                 "scenario_row_key": "scenario_row_key_ea",
+                "Woodmac FID Date": "Woodmac FID Date_ea",
                 "Original Plant": "Energy Aspects Original Plant",
                 "Original Train": "Energy Aspects Original Train",
                 "First Date": "Energy Aspects First Date",
@@ -6678,6 +6728,7 @@ def _build_train_change_log(
         "Train Source Field",
         "Train Source Name",
         "Train Display Source Name",
+        "Woodmac FID Date",
         "Mapping Applied",
         "Train Mapping Applied",
     ]
@@ -6752,6 +6803,12 @@ def _build_train_change_log(
         .astype(str)
         .str.strip()
     )
+    train_df["woodmac_fid_date"] = (
+        _get_first_available_series(["woodmac_fid_date"], "")
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
     train_df["train"] = pd.to_numeric(
         _get_first_available_series(["train"]),
         errors="coerce",
@@ -6804,6 +6861,7 @@ def _build_train_change_log(
                 "plant_mapping_applied": "max",
                 "raw_train_name": "last",
                 "raw_train_display_name": "last",
+                "woodmac_fid_date": _combine_distinct_text_values,
                 "train": "last",
                 "train_mapping_applied": "max",
                 "train_series_key": "last",
@@ -6824,6 +6882,7 @@ def _build_train_change_log(
                 "plant_mapping_applied": "last",
                 "raw_train_name": "last",
                 "raw_train_display_name": "last",
+                "woodmac_fid_date": "last",
                 "train": "last",
                 "train_mapping_applied": "last",
             }
@@ -6896,6 +6955,7 @@ def _build_train_change_log(
         change_df["raw_train_display_name"].notna() & change_df["raw_train_display_name"].ne(""),
         change_df["Train Source Name"],
     )
+    change_df["Woodmac FID Date"] = change_df["woodmac_fid_date"].fillna("").astype(str).str.strip()
     change_df["Mapping Applied"] = (
         change_df["plant_mapping_applied"].fillna(False).astype(bool)
     )
@@ -9469,6 +9529,7 @@ def _get_train_timeline_columns(
 
     columns.extend(
         [
+            {"name": ["Woodmac", "FID Date"], "id": "Woodmac FID Date"},
             {"name": ["Woodmac", "First Date"], "id": "Woodmac First Date"},
             {
                 "name": ["Woodmac", "Capacity Change"],
@@ -9776,6 +9837,7 @@ def _build_train_timeline_grid_rows(
     ]
     reference_value_columns = [
         "Woodmac Original Name",
+        "Woodmac FID Date",
         "Woodmac First Date",
         "Woodmac Capacity Change",
         "Energy Aspects Original Plant",
@@ -9911,6 +9973,7 @@ def _build_train_timeline_grid_rows(
         grid_df = scenario_display_df.copy()
         for column_name in [
             "Woodmac Original Name",
+            "Woodmac FID Date",
             "Woodmac First Date",
             "Woodmac Capacity Change",
             "Energy Aspects Original Plant",
@@ -10099,6 +10162,14 @@ def _get_train_timeline_grid_column_defs(
         {
             "headerName": "Woodmac",
             "children": [
+                {
+                    "field": "Woodmac FID Date",
+                    "headerName": "FID Date",
+                    "minWidth": 105,
+                    "maxWidth": 125,
+                    "editable": False,
+                    "cellStyle": out_of_range_cell_style("__woodmac_out_of_range"),
+                },
                 {
                     "field": "Woodmac First Date",
                     "headerName": "First Date",

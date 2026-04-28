@@ -19,6 +19,9 @@ from pages.importer_detail import (
     _create_seasonal_line_chart,
     _empty_timeseries_chart,
     fetch_origin_summary_data,
+    VOLUME_METRIC_OPTIONS,
+    get_volume_metric_info,
+    convert_volume_metric_dataframe,
 )
 
 
@@ -126,6 +129,20 @@ def _create_top_importers_selector_region():
                     ),
                     html.Div(
                         [
+                            html.Div('Volume Metric', className='filter-group-header'),
+                            dcc.Dropdown(
+                                id='imp-overview-volume-metric-dropdown',
+                                options=VOLUME_METRIC_OPTIONS,
+                                value='mcm_d',
+                                clearable=False,
+                                className='filter-dropdown',
+                                style={'minWidth': '120px', 'width': '100%'}
+                            )
+                        ],
+                        className='filter-section filter-section-volume'
+                    ),
+                    html.Div(
+                        [
                             html.Div('Latest Upload', className='filter-group-header'),
                             html.Div(
                                 id='imp-overview-data-timestamp-display',
@@ -210,11 +227,12 @@ def _send_export_dataframe(export_df, filename_prefix, sheet_name):
     return dcc.send_bytes(output.getvalue(), f'{filename_prefix}_{timestamp}.xlsx')
 
 
-def _build_chart_export_df(charts_data):
+def _build_chart_export_df(charts_data, volume_metric='mcm_d'):
     """Flatten the chart-data store into a single export dataframe."""
     if not charts_data:
         return pd.DataFrame()
 
+    vol_label = get_volume_metric_info(volume_metric)['label']
     all_frames = []
     for entity_name, records in charts_data.items():
         if not records:
@@ -222,6 +240,9 @@ def _build_chart_export_df(charts_data):
         entity_df = pd.DataFrame(records)
         if entity_df.empty:
             continue
+        entity_df = convert_volume_metric_dataframe(entity_df, volume_metric, columns=['rolling_avg'])
+        if 'rolling_avg' in entity_df.columns:
+            entity_df = entity_df.rename(columns={'rolling_avg': f'rolling_avg ({vol_label})'})
         entity_df.insert(0, 'entity', entity_name)
         all_frames.append(entity_df)
 
@@ -952,13 +973,15 @@ def refresh_overview_data(n_clicks, classification_mode):
     Output('imp-overview-demand-charts-container', 'children'),
     Input('imp-overview-demand-data-store', 'data'),
     Input('imp-overview-chart-entities-store', 'data'),
+    Input('imp-overview-volume-metric-dropdown', 'value'),
     prevent_initial_call=False
 )
-def update_demand_charts(charts_data, importer_entities):
+def update_demand_charts(charts_data, importer_entities, volume_metric):
     """Render the demand chart grid using the exporter-page layout pattern."""
     if not charts_data or not importer_entities:
         return html.Div('No data available', style={'textAlign': 'center', 'padding': '20px'})
 
+    vol_label = get_volume_metric_info(volume_metric)['label']
     num_charts = len(importer_entities)
     if num_charts <= 4:
         chart_width = '25%'
@@ -977,7 +1000,8 @@ def update_demand_charts(charts_data, importer_entities):
         if entity_df.empty:
             fig = _empty_timeseries_chart(f'No LNG demand data available for {entity_name}')
         else:
-            fig = _create_seasonal_line_chart(entity_df, None, 'rolling_avg', 'mcm/d', 'Demand')
+            entity_df = convert_volume_metric_dataframe(entity_df, volume_metric, columns=['rolling_avg'])
+            fig = _create_seasonal_line_chart(entity_df, None, 'rolling_avg', vol_label, f'Demand ({vol_label})')
             fig = _update_chart_legend_visibility(fig, idx == len(importer_entities) - 1)
 
         charts.append(
@@ -1004,13 +1028,15 @@ def update_demand_charts(charts_data, importer_entities):
     Output('imp-overview-origin-continent-charts-container', 'children'),
     Input('imp-overview-origin-continent-data-store', 'data'),
     Input('imp-overview-chart-entities-store', 'data'),
+    Input('imp-overview-volume-metric-dropdown', 'value'),
     prevent_initial_call=False
 )
-def update_origin_continent_charts(charts_data, importer_entities):
+def update_origin_continent_charts(charts_data, importer_entities, volume_metric):
     """Render the origin-continent chart grid using the exporter-page layout pattern."""
     if not charts_data or not importer_entities:
         return html.Div('No data available', style={'textAlign': 'center', 'padding': '20px'})
 
+    vol_label = get_volume_metric_info(volume_metric)['label']
     num_charts = len(importer_entities)
     if num_charts <= 4:
         chart_width = '25%'
@@ -1029,12 +1055,13 @@ def update_origin_continent_charts(charts_data, importer_entities):
         if entity_df.empty:
             fig = _empty_timeseries_chart(f'No origin-continent supply data available for {entity_name}')
         else:
+            entity_df = convert_volume_metric_dataframe(entity_df, volume_metric, columns=['rolling_avg'])
             fig = _create_seasonal_line_chart(
                 entity_df,
                 'continent_origin',
                 'rolling_avg',
-                'mcm/d',
-                'Supply'
+                vol_label,
+                f'Supply ({vol_label})'
             )
             fig = _update_chart_legend_visibility(fig, idx == len(importer_entities) - 1)
 
@@ -1099,10 +1126,11 @@ def refresh_period_data(importer_entities, classification_mode, origin_level):
     Input('imp-overview-period-expanded-importers', 'data'),
     Input('imp-overview-period-expanded-origins', 'data'),
     Input('imp-overview-table-entities-store', 'data'),
+    Input('imp-overview-volume-metric-dropdown', 'value'),
     prevent_initial_call=False
 )
 def update_period_analysis_table(period_payload, classification_mode, origin_level,
-                                 expanded_importers, expanded_origins, importer_entities):
+                                 expanded_importers, expanded_origins, importer_entities, volume_metric):
     """Render the combined importer overview period-analysis table."""
     if not period_payload or not importer_entities:
         message = html.Div('No data available for the selected configuration.', style={'textAlign': 'center', 'padding': '20px'})
@@ -1118,6 +1146,13 @@ def update_period_analysis_table(period_payload, classification_mode, origin_lev
         message = html.Div('No period-analysis data is available for the overview importers.', style={'textAlign': 'center', 'padding': '20px'})
         return message, '', []
 
+    vol_label = get_volume_metric_info(volume_metric)['label']
+    display_df = convert_volume_metric_dataframe(
+        display_df,
+        volume_metric,
+        exclude_columns=['Importer', 'Origin Level', 'Country'],
+        precision=1
+    )
     origin_level_label = ORIGIN_LEVEL_LABELS.get(origin_level, 'Origin')
     importer_level_label = classification_mode.lower()
     if _is_country_origin_level(origin_level):
@@ -1132,7 +1167,7 @@ def update_period_analysis_table(period_payload, classification_mode, origin_lev
         )
 
     instructions = html.Span(
-        instruction_text,
+        f'{instruction_text} Values are shown in {vol_label}.',
         style={'fontSize': '14px', 'color': '#666', 'fontStyle': 'italic'}
     )
     return _create_period_analysis_table(display_df, origin_level), instructions, display_df.to_dict('records')
@@ -1205,14 +1240,15 @@ def toggle_period_row_expansion(active_cell, table_data, origin_level, expanded_
     Output('imp-overview-download-demand-excel', 'data'),
     Input('imp-overview-export-demand-button', 'n_clicks'),
     State('imp-overview-demand-data-store', 'data'),
+    State('imp-overview-volume-metric-dropdown', 'value'),
     prevent_initial_call=True
 )
-def export_demand_to_excel(n_clicks, charts_data):
+def export_demand_to_excel(n_clicks, charts_data, volume_metric):
     """Export the currently rendered demand-chart data."""
     if not n_clicks:
         raise PreventUpdate
 
-    export_df = _build_chart_export_df(charts_data)
+    export_df = _build_chart_export_df(charts_data, volume_metric)
     if export_df.empty:
         raise PreventUpdate
 
@@ -1227,14 +1263,15 @@ def export_demand_to_excel(n_clicks, charts_data):
     Output('imp-overview-download-origin-continent-excel', 'data'),
     Input('imp-overview-export-origin-continent-button', 'n_clicks'),
     State('imp-overview-origin-continent-data-store', 'data'),
+    State('imp-overview-volume-metric-dropdown', 'value'),
     prevent_initial_call=True
 )
-def export_origin_continent_to_excel(n_clicks, charts_data):
+def export_origin_continent_to_excel(n_clicks, charts_data, volume_metric):
     """Export the currently rendered origin-continent chart data."""
     if not n_clicks:
         raise PreventUpdate
 
-    export_df = _build_chart_export_df(charts_data)
+    export_df = _build_chart_export_df(charts_data, volume_metric)
     if export_df.empty:
         raise PreventUpdate
 

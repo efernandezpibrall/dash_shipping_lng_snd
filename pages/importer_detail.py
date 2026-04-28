@@ -41,6 +41,57 @@ DB_SCHEMA = config_reader.get('DATABASE', 'SCHEMA', fallback=None)
 # create engine
 engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
+MCM_PER_CUBIC_METER = 0.6 / 1000
+BCM_PER_MMTPA = 1.36
+DAYS_PER_YEAR = 365.25
+MCM_PER_BCM = 1000
+MCM_PER_MONTH_PER_MMTPA = BCM_PER_MMTPA * MCM_PER_BCM / 12
+MCM_D_PER_MMTPA = BCM_PER_MMTPA * MCM_PER_BCM / DAYS_PER_YEAR
+MMTPA_PER_MCM_D = DAYS_PER_YEAR / (BCM_PER_MMTPA * MCM_PER_BCM)
+
+# Volume unit conversion factors from the page's base mcm/d series.
+VOLUME_CONVERSIONS = {
+    'mcm_d': {'factor': 1.0, 'label': 'mcm/d'},
+    'mt': {'factor': 0.6, 'label': 'MT'},
+    'mtpa': {'factor': MMTPA_PER_MCM_D, 'label': 'MMTPA'},
+}
+
+VOLUME_METRIC_OPTIONS = [
+    {'label': 'mcm/d', 'value': 'mcm_d'},
+    {'label': 'MT', 'value': 'mt'},
+    {'label': 'MMTPA', 'value': 'mtpa'},
+]
+
+
+def get_volume_metric_info(volume_metric):
+    """Return conversion metadata for a selected volume metric."""
+    return VOLUME_CONVERSIONS.get(volume_metric or 'mcm_d', VOLUME_CONVERSIONS['mcm_d'])
+
+
+def convert_volume_metric_dataframe(df, volume_metric, columns=None, exclude_columns=None, precision=None):
+    """Convert selected numeric dataframe columns from mcm/d to the display metric."""
+    if df is None or df.empty:
+        return df
+
+    vol_info = get_volume_metric_info(volume_metric)
+    factor = vol_info['factor']
+    if factor == 1.0 and precision is None:
+        return df
+
+    converted_df = df.copy()
+    exclude_columns = set(exclude_columns or [])
+    if columns is None:
+        columns = [col for col in converted_df.columns if col not in exclude_columns]
+
+    for col in columns:
+        if col not in converted_df.columns or col in exclude_columns:
+            continue
+        numeric_series = pd.to_numeric(converted_df[col], errors='coerce') * factor
+        if precision is not None:
+            numeric_series = numeric_series.round(precision)
+        converted_df[col] = numeric_series.where(pd.notnull(numeric_series), None)
+    return converted_df
+
 
 # Desired vessel order (can be defined globally or inside the function)
 DESIRED_VESSEL_ORDER = ['XS (Pressure Gas)',
@@ -2073,6 +2124,24 @@ layout = html.Div([
                 ], style={'display': 'flex', 'gap': '8px', 'alignItems': 'flex-end'}),
             ], className='filter-section filter-section-origin'),
 
+            # --- Group 2b: Volume Metric ---
+            html.Div([
+                html.Div("Volume Metric", className='filter-group-header'),
+                html.Div([
+                    html.Div([
+                        html.Label("Volume Metric:", className='filter-label'),
+                        dcc.Dropdown(
+                            id='imp-volume-metric-dropdown',
+                            options=VOLUME_METRIC_OPTIONS,
+                            value='mcm_d',
+                            clearable=False,
+                            className='filter-dropdown',
+                            style={'min-width': '120px'}
+                        ),
+                    ], className='filter-group'),
+                ], style={'display': 'flex', 'gap': '8px', 'alignItems': 'flex-end'}),
+            ], className='filter-section filter-section-volume'),
+
             # --- Group 3: Analysis Settings ---
             html.Div([
                 html.Div("Analysis Settings", className='filter-group-header'),
@@ -2250,7 +2319,7 @@ layout = html.Div([
         # Left: Origin Analysis Summary
         html.Div([
             html.Div([
-                html.H3('Origin Analysis Summary (mcm/d)', className="section-title-inline"),
+                html.H3('Origin Analysis Summary (mcm/d)', id='imp-origin-summary-header', className="section-title-inline"),
             ], className="inline-section-header"),
             html.Div([
                 dcc.Loading(
@@ -2282,7 +2351,7 @@ layout = html.Div([
     # Origin Forecast Allocation Summary Section
     html.Div([
         html.Div([
-            html.H3('Origin Forecast Allocation Summary (WoodMac, mcm/d)', className="section-title-inline"),
+            html.H3('Origin Forecast Allocation Summary (WoodMac, mcm/d)', id='imp-origin-forecast-summary-header', className="section-title-inline"),
         ], className="inline-section-header"),
         html.Div(
             id='imp-origin-forecast-summary-subtitle',
@@ -2308,7 +2377,7 @@ layout = html.Div([
     # Supplier Maintenance Schedule Section
     html.Div([
         html.Div([
-            html.H3('Supplier Maintenance Schedule (MCM/D Impact)', className="section-title-inline"),
+            html.H3('Supplier Maintenance Schedule (MCM/D Impact)', id='imp-maintenance-summary-header', className="section-title-inline"),
         ], className="inline-section-header"),
 
         html.Div([
@@ -2394,7 +2463,6 @@ layout = html.Div([
 
 
 SUMMARY_LOOKBACK_START = dt.date(2023, 11, 1)
-MCM_PER_CUBIC_METER = 0.6 / 1000
 WOODMAC_IMPORT_EXPORTS_TABLE = 'at_lng.woodmac_gas_imports_exports_monthly__mmtpa'
 WOODMAC_LNG_CUBIC_METERS_PER_MMTPA_MONTH = 2222 * 1000 / 12
 WOODMAC_FORECAST_YEARS_AHEAD = 2
@@ -3741,8 +3809,20 @@ def _hex_to_rgba(color, alpha):
     return f"rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, {alpha})"
 
 
-def _create_total_import_chart_with_woodmac_forecast(historical_df, forecast_df):
+def _create_total_import_chart_with_woodmac_forecast(historical_df, forecast_df, volume_metric='mcm_d'):
+    vol_info = get_volume_metric_info(volume_metric)
+    vol_label = vol_info['label']
+    historical_df = convert_volume_metric_dataframe(
+        historical_df,
+        volume_metric,
+        columns=['rolling_avg']
+    )
     forecast_df = filter_woodmac_forecast_horizon(forecast_df)
+    forecast_df = convert_volume_metric_dataframe(
+        forecast_df,
+        volume_metric,
+        columns=['mcmd']
+    )
     if historical_df.empty and forecast_df.empty:
         return _empty_timeseries_chart("No data available")
 
@@ -3784,7 +3864,7 @@ def _create_total_import_chart_with_woodmac_forecast(historical_df, forecast_df)
             text=actual_data['month_day'],
             hovertemplate=(
                 f'<b>{year} (Historical)</b><br>%{{text}}'
-                '<br>Imports: %{y:.1f} mcm/d<extra></extra>'
+                f'<br>Imports: %{{y:.1f}} {vol_label}<extra></extra>'
             )
         ))
 
@@ -3800,7 +3880,7 @@ def _create_total_import_chart_with_woodmac_forecast(historical_df, forecast_df)
                 text=connect_data['month_day'],
                 hovertemplate=(
                     f'<b>{year} (Kpler Forecast)</b><br>%{{text}}'
-                    '<br>Imports: %{y:.1f} mcm/d<extra></extra>'
+                    f'<br>Imports: %{{y:.1f}} {vol_label}<extra></extra>'
                 ),
                 showlegend=False
             ))
@@ -3834,17 +3914,18 @@ def _create_total_import_chart_with_woodmac_forecast(historical_df, forecast_df)
             customdata=year_data['source'],
             hovertemplate=(
                 f'<b>{year} WoodMac Forecast</b><br>%{{text}}'
-                '<br>Imports: %{y:.1f} mcm/d'
+                f'<br>Imports: %{{y:.1f}} {vol_label}'
                 '<br>Source: %{customdata}<extra></extra>'
             ),
             visible=True if year == default_visible_forecast_year else 'legendonly'
         ))
 
-    return _apply_time_series_chart_layout(fig, 'mcm/d')
+    return _apply_time_series_chart_layout(fig, vol_label)
 
 
 def create_country_import_chart(destination_label, destination_countries, rolling_window_days=30,
-                                selected_destination_aggregation='country', selected_destination_value=None):
+                                selected_destination_aggregation='country', selected_destination_value=None,
+                                volume_metric='mcm_d'):
     historical_df = fetch_country_import_chart_data(
         destination_countries,
         rolling_window_days,
@@ -3855,11 +3936,12 @@ def create_country_import_chart(destination_label, destination_countries, rollin
     forecast_df = fetch_woodmac_country_import_forecast_data(destination_countries)
     if historical_df.empty and forecast_df.empty:
         return _empty_timeseries_chart(f"No import data available for {destination_label}")
-    return _create_total_import_chart_with_woodmac_forecast(historical_df, forecast_df)
+    return _create_total_import_chart_with_woodmac_forecast(historical_df, forecast_df, volume_metric)
 
 
 def create_continent_origin_chart(destination_label, destination_countries, rolling_window_days=30,
-                                  selected_destination_aggregation='country', selected_destination_value=None):
+                                  selected_destination_aggregation='country', selected_destination_value=None,
+                                  volume_metric='mcm_d'):
     df = fetch_continent_origin_chart_data(
         destination_countries,
         rolling_window_days,
@@ -3868,7 +3950,10 @@ def create_continent_origin_chart(destination_label, destination_countries, roll
     )
     if df.empty:
         return _empty_timeseries_chart(f"No origin-continent import data available for {destination_label}")
-    return _create_seasonal_line_chart(df, 'continent_origin', 'rolling_avg', 'mcm/d', 'Imports')
+    vol_info = get_volume_metric_info(volume_metric)
+    vol_label = vol_info['label']
+    df = convert_volume_metric_dataframe(df, volume_metric, columns=['rolling_avg'])
+    return _create_seasonal_line_chart(df, 'continent_origin', 'rolling_avg', vol_label, f'Imports ({vol_label})')
 
 
 def create_continent_origin_percentage_chart(destination_label, destination_countries, rolling_window_days=30,
@@ -3900,10 +3985,11 @@ def update_supply_analysis_title(rolling_window_days):
     Input('imp-destination-aggregation-dropdown', 'value'),
     Input('imp-destination-country-dropdown', 'value'),
     Input('imp-supply-rolling-window-input', 'value'),
+    Input('imp-volume-metric-dropdown', 'value'),
     Input('imp-destination-catalog-store', 'data')
 )
 def update_country_import_chart(selected_destination_aggregation, selected_destination, rolling_window_days,
-                                destination_catalog):
+                                volume_metric, destination_catalog):
     if not selected_destination:
         fig = go.Figure()
         fig.update_layout(height=400)
@@ -3920,7 +4006,8 @@ def update_country_import_chart(selected_destination_aggregation, selected_desti
             destination_context['destination_countries'],
             rolling_window_days,
             selected_destination_aggregation=selected_destination_aggregation,
-            selected_destination_value=selected_destination
+            selected_destination_value=selected_destination,
+            volume_metric=volume_metric or 'mcm_d'
         ),
         f"{destination_context['display_label']} - Total Imports + WoodMac Forecast"
     )
@@ -3932,14 +4019,16 @@ def update_country_import_chart(selected_destination_aggregation, selected_desti
     Input('imp-destination-aggregation-dropdown', 'value'),
     Input('imp-destination-country-dropdown', 'value'),
     Input('imp-supply-rolling-window-input', 'value'),
+    Input('imp-volume-metric-dropdown', 'value'),
     Input('imp-destination-catalog-store', 'data')
 )
 def update_continent_origin_chart(selected_destination_aggregation, selected_destination, rolling_window_days,
-                                  destination_catalog):
+                                  volume_metric, destination_catalog):
+    vol_label = get_volume_metric_info(volume_metric)['label']
     if not selected_destination:
         fig = go.Figure()
         fig.update_layout(height=400)
-        return fig, "By Origin Continent (mcm/d)"
+        return fig, f"By Origin Continent ({vol_label})"
 
     destination_context = resolve_destination_context(
         selected_destination_aggregation,
@@ -3951,9 +4040,10 @@ def update_continent_origin_chart(selected_destination_aggregation, selected_des
         destination_context['destination_countries'],
         rolling_window_days,
         selected_destination_aggregation=selected_destination_aggregation,
-        selected_destination_value=selected_destination
+        selected_destination_value=selected_destination,
+        volume_metric=volume_metric or 'mcm_d'
     ), (
-        f"{destination_context['display_label']} - By Origin Continent"
+        f"{destination_context['display_label']} - By Origin Continent ({vol_label})"
     )
 
 
@@ -3998,10 +4088,12 @@ def update_continent_origin_percentage_chart(selected_destination_aggregation, s
     State('imp-region-status-dropdown', 'value'),
     State('imp-vessel-type-dropdown', 'value'),
     State('imp-origin-level-dropdown', 'value'),
+    State('imp-volume-metric-dropdown', 'value'),
     prevent_initial_call=True
 )
 def export_import_analysis_to_excel(n_clicks, selected_destination_aggregation, selected_destination,
-                                    destination_catalog, rolling_window_days, status, vessel_type, origin_level):
+                                    destination_catalog, rolling_window_days, status, vessel_type, origin_level,
+                                    volume_metric):
     if not n_clicks or not selected_destination:
         raise PreventUpdate
 
@@ -4063,14 +4155,35 @@ def export_import_analysis_to_excel(n_clicks, selected_destination_aggregation, 
     if supply_df.empty and continent_df.empty and percentage_df.empty and summary_df.empty:
         raise PreventUpdate
 
+    vol_info = get_volume_metric_info(volume_metric)
+    vol_label = vol_info['label']
+    supply_df = convert_volume_metric_dataframe(supply_df, volume_metric, columns=['rolling_avg'])
+    continent_df = convert_volume_metric_dataframe(continent_df, volume_metric, columns=['rolling_avg'])
+    percentage_df = convert_volume_metric_dataframe(percentage_df, volume_metric, columns=['rolling_avg'])
+    summary_df = convert_volume_metric_dataframe(
+        summary_df,
+        volume_metric,
+        exclude_columns=['continent', 'country'],
+        precision=1
+    )
+
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         if not supply_df.empty:
-            supply_df.to_excel(writer, sheet_name='Total Imports', index=False)
+            supply_export_df = supply_df.copy()
+            if 'rolling_avg' in supply_export_df.columns:
+                supply_export_df = supply_export_df.rename(columns={'rolling_avg': f'rolling_avg ({vol_label})'})
+            supply_export_df.to_excel(writer, sheet_name='Total Imports', index=False)
         if not continent_df.empty:
-            continent_df.to_excel(writer, sheet_name='Origin Continent mcmd', index=False)
+            continent_export_df = continent_df.copy()
+            if 'rolling_avg' in continent_export_df.columns:
+                continent_export_df = continent_export_df.rename(columns={'rolling_avg': f'rolling_avg ({vol_label})'})
+            continent_export_df.to_excel(writer, sheet_name=f"Origin Continent {vol_label.replace('/', '_')}"[:31], index=False)
         if not percentage_df.empty:
-            percentage_df.to_excel(writer, sheet_name='Origin Continent Share', index=False)
+            percentage_export_df = percentage_df.copy()
+            if 'rolling_avg' in percentage_export_df.columns:
+                percentage_export_df = percentage_export_df.rename(columns={'rolling_avg': f'rolling_avg ({vol_label})'})
+            percentage_export_df.to_excel(writer, sheet_name='Origin Continent Share', index=False)
         if not summary_df.empty:
             summary_df.to_excel(writer, sheet_name='Origin Summary', index=False)
 
@@ -5306,6 +5419,7 @@ def create_origin_forecast_summary_table(display_df):
 
 
 @callback(
+    Output('imp-origin-forecast-summary-header', 'children'),
     Output('imp-origin-forecast-summary-subtitle', 'children'),
     Output('imp-origin-forecast-summary-table-container', 'children'),
     Input('imp-destination-aggregation-dropdown', 'value'),
@@ -5314,10 +5428,13 @@ def create_origin_forecast_summary_table(display_df):
     Input('imp-origin-forecast-expanded-continents', 'data'),
     Input('imp-destination-catalog-store', 'data'),
     Input('imp-origin-level-dropdown', 'value'),
+    Input('imp-volume-metric-dropdown', 'value'),
     prevent_initial_call=False
 )
 def update_origin_forecast_summary_table(selected_destination_aggregation, selected_destination, status,
-                                         expanded_continents, destination_catalog, origin_level):
+                                         expanded_continents, destination_catalog, origin_level, volume_metric):
+    vol_label = get_volume_metric_info(volume_metric)['label']
+    header_text = f'Origin Forecast Allocation Summary (WoodMac, {vol_label})'
     destination_context = resolve_destination_context(
         selected_destination_aggregation,
         selected_destination,
@@ -5325,11 +5442,13 @@ def update_origin_forecast_summary_table(selected_destination_aggregation, selec
     )
     if not destination_context['destination_countries']:
         return (
+            header_text,
             "Modeled supplier allocation from SQL outputs.",
             html.Div("Please select a destination.", style={'textAlign': 'center', 'padding': '20px'})
         )
     if status == 'non_laden':
         return (
+            header_text,
             "Modeled supplier allocation from SQL outputs.",
             html.Div(
                 "WoodMac origin forecast allocation is not shown for non-laden selections.",
@@ -5347,6 +5466,7 @@ def update_origin_forecast_summary_table(selected_destination_aggregation, selec
         subtitle = format_supply_allocation_run_subtitle(run_metadata)
         if run_metadata is None:
             return (
+                header_text,
                 subtitle,
                 html.Div(
                     "No compatible WoodMac supply-allocation SQL run is currently available.",
@@ -5359,8 +5479,15 @@ def update_origin_forecast_summary_table(selected_destination_aggregation, selec
             expanded_continents=expanded_continents,
             footer_rows=footer_rows
         )
+        display_df = convert_volume_metric_dataframe(
+            display_df,
+            volume_metric,
+            exclude_columns=['Continent', 'Country'],
+            precision=1
+        )
         if display_df.empty:
             return (
+                header_text,
                 subtitle,
                 html.Div(
                     f"No WoodMac origin forecast allocation data is available for {destination_context['display_label']}.",
@@ -5368,9 +5495,10 @@ def update_origin_forecast_summary_table(selected_destination_aggregation, selec
                 )
             )
 
-        return subtitle, create_origin_forecast_summary_table(display_df)
+        return header_text, subtitle, create_origin_forecast_summary_table(display_df)
     except Exception as e:
         return (
+            header_text,
             "Modeled supplier allocation from SQL outputs.",
             html.Div(
                 f"Error loading data: {str(e)}",
@@ -5381,6 +5509,7 @@ def update_origin_forecast_summary_table(selected_destination_aggregation, selec
 
 @callback(
     Output('imp-origin-summary-table-container', 'children'),
+    Output('imp-origin-summary-header', 'children'),
     Input('imp-destination-aggregation-dropdown', 'value'),
     Input('imp-destination-country-dropdown', 'value'),
     Input('imp-supply-rolling-window-input', 'value'),
@@ -5389,22 +5518,25 @@ def update_origin_forecast_summary_table(selected_destination_aggregation, selec
     Input('imp-origin-expanded-continents', 'data'),
     Input('imp-destination-catalog-store', 'data'),
     Input('imp-origin-level-dropdown', 'value'),
+    Input('imp-volume-metric-dropdown', 'value'),
     prevent_initial_call=False
 )
 def update_origin_summary_table(selected_destination_aggregation, selected_destination, rolling_window_days, status,
-                                vessel_type, expanded_continents, destination_catalog, origin_level):
+                                vessel_type, expanded_continents, destination_catalog, origin_level, volume_metric):
+    vol_label = get_volume_metric_info(volume_metric)['label']
+    header_text = f'Origin Analysis Summary ({vol_label})'
     destination_context = resolve_destination_context(
         selected_destination_aggregation,
         selected_destination,
         destination_catalog
     )
     if not destination_context['destination_countries']:
-        return html.Div("Please select a destination.", style={'textAlign': 'center', 'padding': '20px'})
+        return html.Div("Please select a destination.", style={'textAlign': 'center', 'padding': '20px'}), header_text
     if status == 'non_laden':
         return html.Div(
             "Origin summary is not available for non-laden trades because the raw SQL source has no discharge volume.",
             style={'textAlign': 'center', 'padding': '20px'}
-        )
+        ), header_text
 
     try:
         expanded_continents = expanded_continents or []
@@ -5419,9 +5551,15 @@ def update_origin_summary_table(selected_destination_aggregation, selected_desti
             selected_destination_value=selected_destination
         )
         if df.empty:
-            return html.Div("No data available for the selected filters.", style={'textAlign': 'center', 'padding': '20px'})
+            return html.Div("No data available for the selected filters.", style={'textAlign': 'center', 'padding': '20px'}), header_text
 
         display_df = prepare_origin_table_for_display(df, expanded_continents)
+        display_df = convert_volume_metric_dataframe(
+            display_df,
+            volume_metric,
+            exclude_columns=['Continent', 'Country'],
+            precision=1
+        )
         col_display_names = {'Continent': 'Origin Level', 'Country': 'Country'}
         columns = []
         for col in display_df.columns:
@@ -5514,7 +5652,7 @@ def update_origin_summary_table(selected_destination_aggregation, selected_desti
         if delta_yoy_column:
             header_styles.append({'if': {'column_id': delta_yoy_column}, 'borderLeft': '3px solid white'})
 
-        return dash_table.DataTable(
+        table = dash_table.DataTable(
             id={'type': 'imp-origin-expandable-table', 'index': 'summary'},
             data=display_df.to_dict('records'),
             columns=columns,
@@ -5540,8 +5678,9 @@ def update_origin_summary_table(selected_destination_aggregation, selected_desti
             page_size=50,
             fill_width=False
         )
+        return table, header_text
     except Exception as e:
-        return html.Div(f"Error loading data: {str(e)}", style={'textAlign': 'center', 'padding': '20px', 'color': 'red'})
+        return html.Div(f"Error loading data: {str(e)}", style={'textAlign': 'center', 'padding': '20px', 'color': 'red'}), header_text
 
 
 @callback(
@@ -6303,13 +6442,17 @@ def toggle_origin_forecast_continent_expansion(active_cells, table_data_list, ex
 
 @callback(
     Output('imp-maintenance-summary-container', 'children'),
+    Output('imp-maintenance-summary-header', 'children'),
     Input('imp-destination-aggregation-dropdown', 'value'),
     Input('imp-destination-country-dropdown', 'value'),
-    State('imp-maintenance-expanded-plants', 'data'),
-    Input('imp-destination-catalog-store', 'data')
+    Input('imp-destination-catalog-store', 'data'),
+    Input('imp-volume-metric-dropdown', 'value'),
+    State('imp-maintenance-expanded-plants', 'data')
 )
-def update_maintenance_table(selected_destination_aggregation, selected_destination, expanded_plants,
-                             destination_catalog):
+def update_maintenance_table(selected_destination_aggregation, selected_destination, destination_catalog,
+                             volume_metric, expanded_plants):
+    vol_label = get_volume_metric_info(volume_metric)['label']
+    header_text = f'Supplier Maintenance Schedule ({vol_label.upper()} Impact)'
     destination_context = resolve_destination_context(
         selected_destination_aggregation,
         selected_destination,
@@ -6317,7 +6460,7 @@ def update_maintenance_table(selected_destination_aggregation, selected_destinat
     )
     destination_label = destination_context['display_label']
     if not destination_context['destination_countries']:
-        return html.Div("Please select a destination.", style={'textAlign': 'center', 'padding': '20px'})
+        return html.Div("Please select a destination.", style={'textAlign': 'center', 'padding': '20px'}), header_text
 
     try:
         raw_data = fetch_train_maintenance_data(engine, destination_context['destination_countries'])
@@ -6325,16 +6468,22 @@ def update_maintenance_table(selected_destination_aggregation, selected_destinat
             return html.Div(
                 f"No supplier maintenance data available for cargoes serving {destination_label}.",
                 style={'textAlign': 'center', 'padding': '20px'}
-            )
+            ), header_text
 
         processed_data, comments_data = process_maintenance_periods_hierarchical(raw_data, expanded_plants)
         if processed_data.empty:
-            return html.Div("No maintenance data to display.", style={'textAlign': 'center', 'padding': '20px'})
+            return html.Div("No maintenance data to display.", style={'textAlign': 'center', 'padding': '20px'}), header_text
 
-        return create_maintenance_summary_table(processed_data, comments_data)
+        processed_data = convert_volume_metric_dataframe(
+            processed_data,
+            volume_metric,
+            exclude_columns=['Supplier Country', 'Plant', 'Train', 'Type', 'PlantKey'],
+            precision=1
+        )
+        return create_maintenance_summary_table(processed_data, comments_data), header_text
     except Exception as e:
         return html.Div(f"Error loading maintenance data: {str(e)}",
-                        style={'textAlign': 'center', 'padding': '20px', 'color': 'red'})
+                        style={'textAlign': 'center', 'padding': '20px', 'color': 'red'}), header_text
 
 
 @callback(
@@ -6345,12 +6494,13 @@ def update_maintenance_table(selected_destination_aggregation, selected_destinat
      State('imp-maintenance-expanded-plants', 'data'),
      State('imp-destination-aggregation-dropdown', 'value'),
      State('imp-destination-country-dropdown', 'value'),
-     State('imp-destination-catalog-store', 'data')],
+     State('imp-destination-catalog-store', 'data'),
+     State('imp-volume-metric-dropdown', 'value')],
     prevent_initial_call=True
 )
 def toggle_maintenance_plant_expansion(active_cells, table_data_list, expanded_plants,
                                        selected_destination_aggregation, selected_destination,
-                                       destination_catalog):
+                                       destination_catalog, volume_metric):
     if not any(active_cells):
         raise PreventUpdate
 
@@ -6395,6 +6545,12 @@ def toggle_maintenance_plant_expansion(active_cells, table_data_list, expanded_p
         if processed_data.empty:
             return expanded_plants, no_update
 
+        processed_data = convert_volume_metric_dataframe(
+            processed_data,
+            volume_metric,
+            exclude_columns=['Supplier Country', 'Plant', 'Train', 'Type', 'PlantKey'],
+            precision=1
+        )
         return expanded_plants, create_maintenance_summary_table(processed_data, comments_data)
     except PreventUpdate:
         raise

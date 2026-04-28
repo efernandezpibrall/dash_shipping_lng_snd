@@ -49,6 +49,55 @@ SUPPLY_DEST_TEXT_COLUMNS = [
     'Supply Country'
 ]
 
+BCM_PER_MMTPA = 1.36
+DAYS_PER_YEAR = 365.25
+MCM_PER_BCM = 1000
+MCM_PER_MONTH_PER_MMTPA = BCM_PER_MMTPA * MCM_PER_BCM / 12
+MCM_D_PER_MMTPA = BCM_PER_MMTPA * MCM_PER_BCM / DAYS_PER_YEAR
+MMTPA_PER_MCM_D = DAYS_PER_YEAR / (BCM_PER_MMTPA * MCM_PER_BCM)
+
+VOLUME_CONVERSIONS = {
+    'mcm_d': {'factor': 1.0, 'label': 'mcm/d'},
+    'mt': {'factor': 0.6, 'label': 'MT'},
+    'mtpa': {'factor': MMTPA_PER_MCM_D, 'label': 'MMTPA'},
+}
+
+VOLUME_METRIC_OPTIONS = [
+    {'label': 'mcm/d', 'value': 'mcm_d'},
+    {'label': 'MT', 'value': 'mt'},
+    {'label': 'MMTPA', 'value': 'mtpa'},
+]
+
+
+def _get_volume_metric_info(volume_metric):
+    """Return conversion metadata for the selected overview volume metric."""
+    return VOLUME_CONVERSIONS.get(volume_metric or 'mcm_d', VOLUME_CONVERSIONS['mcm_d'])
+
+
+def _convert_volume_metric_dataframe(df, volume_metric, columns=None, exclude_columns=None, precision=None):
+    """Convert selected numeric dataframe columns from mcm/d to the display metric."""
+    if df is None or df.empty:
+        return df
+
+    vol_info = _get_volume_metric_info(volume_metric)
+    factor = vol_info['factor']
+    if factor == 1.0 and precision is None:
+        return df
+
+    converted_df = df.copy()
+    exclude_columns = set(exclude_columns or [])
+    if columns is None:
+        columns = [col for col in converted_df.columns if col not in exclude_columns]
+
+    for col in columns:
+        if col not in converted_df.columns or col in exclude_columns:
+            continue
+        numeric_series = pd.to_numeric(converted_df[col], errors='coerce') * factor
+        if precision is not None:
+            numeric_series = numeric_series.round(precision)
+        converted_df[col] = numeric_series.where(pd.notnull(numeric_series), None)
+    return converted_df
+
 
 def _empty_supply_dest_period_analysis_payload():
     """Return the default empty payload for the supply-destination period-analysis store."""
@@ -409,11 +458,11 @@ def fetch_rolling_windows_data(engine, schema, classification_mode='Country'):
                         IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
                     AND (
                         -- Current 30-day window
-                        (kt.start >= CURRENT_DATE - INTERVAL '30 days' AND kt.start <= CURRENT_DATE)
+                        (kt.start >= CURRENT_DATE - INTERVAL '30 days' AND kt.start::date <= CURRENT_DATE)
                         OR
                         -- Same 30-day window last year
                         (kt.start >= CURRENT_DATE - INTERVAL '1 year' - INTERVAL '30 days' 
-                         AND kt.start <= CURRENT_DATE - INTERVAL '1 year')
+                         AND kt.start::date <= (CURRENT_DATE - INTERVAL '1 year')::date)
                     )
                 ORDER BY kt.start::date
                 """)
@@ -434,11 +483,11 @@ def fetch_rolling_windows_data(engine, schema, classification_mode='Country'):
                         IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
                     AND (
                         -- Current 30-day window
-                        (kt.start >= CURRENT_DATE - INTERVAL '30 days' AND kt.start <= CURRENT_DATE)
+                        (kt.start >= CURRENT_DATE - INTERVAL '30 days' AND kt.start::date <= CURRENT_DATE)
                         OR
                         -- Same 30-day window last year
                         (kt.start >= CURRENT_DATE - INTERVAL '1 year' - INTERVAL '30 days' 
-                         AND kt.start <= CURRENT_DATE - INTERVAL '1 year')
+                         AND kt.start::date <= (CURRENT_DATE - INTERVAL '1 year')::date)
                     )
                 ORDER BY kt.start::date
                 """)
@@ -573,7 +622,7 @@ def get_all_classification_groups(engine, schema):
                 , latest_data ld
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
                     AND kt.start >= CURRENT_DATE - INTERVAL '30 days'
-                    AND kt.start <= CURRENT_DATE
+                    AND kt.start::date <= CURRENT_DATE
                     AND kt.installation_origin_name IS NOT NULL
                     AND mc.country_classification_level1 IS NOT NULL
                     AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
@@ -850,11 +899,11 @@ def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Count
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
                     AND (
                         -- Current 30-day window
-                        (kt.start >= CURRENT_DATE - INTERVAL '30 days' AND kt.start <= CURRENT_DATE)
+                        (kt.start >= CURRENT_DATE - INTERVAL '30 days' AND kt.start::date <= CURRENT_DATE)
                         OR
                         -- Same 30-day window last year
                         (kt.start >= CURRENT_DATE - INTERVAL '1 year' - INTERVAL '30 days' 
-                         AND kt.start <= CURRENT_DATE - INTERVAL '1 year')
+                         AND kt.start::date <= (CURRENT_DATE - INTERVAL '1 year')::date)
                     )
                 ORDER BY kt.start::date
                 """)
@@ -873,11 +922,11 @@ def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Count
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
                     AND (
                         -- Current 30-day window
-                        (kt.start >= CURRENT_DATE - INTERVAL '30 days' AND kt.start <= CURRENT_DATE)
+                        (kt.start >= CURRENT_DATE - INTERVAL '30 days' AND kt.start::date <= CURRENT_DATE)
                         OR
                         -- Same 30-day window last year
                         (kt.start >= CURRENT_DATE - INTERVAL '1 year' - INTERVAL '30 days' 
-                         AND kt.start <= CURRENT_DATE - INTERVAL '1 year')
+                         AND kt.start::date <= (CURRENT_DATE - INTERVAL '1 year')::date)
                     )
                 ORDER BY kt.start::date
                 """)
@@ -1721,7 +1770,7 @@ def fetch_installation_data(engine, schema, classification_mode='Country'):
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
                     AND kt.start IS NOT NULL
                     AND kt.start >= '2022-01-01'
-                    AND kt.start <= CURRENT_DATE
+                    AND kt.start::date <= CURRENT_DATE
                     AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
                         IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
                 """)
@@ -1744,7 +1793,7 @@ def fetch_installation_data(engine, schema, classification_mode='Country'):
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
                     AND kt.start IS NOT NULL
                     AND kt.start >= '2022-01-01'
-                    AND kt.start <= CURRENT_DATE
+                    AND kt.start::date <= CURRENT_DATE
                     AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
                         IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
                 """)
@@ -1809,7 +1858,7 @@ def fetch_supply_destination_base_data(engine, schema):
             WHERE kt.upload_timestamp_utc = ld.max_timestamp
                 AND kt.start IS NOT NULL
                 AND kt.start >= '2022-01-01'
-                AND kt.start <= CURRENT_DATE
+                AND kt.start::date <= CURRENT_DATE
             """)
             
             df = pd.read_sql(base_query, conn)
@@ -2660,7 +2709,7 @@ def process_weeks_data(df, current_date, classification_mode='Country'):
     return final_df
 
 
-def create_continent_destination_chart(entity_name, engine, db_schema, classification_mode='Country'):
+def create_continent_destination_chart(entity_name, engine, db_schema, classification_mode='Country', volume_metric='mcm_d'):
     """Create seasonal comparison chart by continent destination for selected entity's LNG exports
     
     Args:
@@ -2669,7 +2718,9 @@ def create_continent_destination_chart(entity_name, engine, db_schema, classific
         db_schema: Database schema
         classification_mode: 'Country' or 'Classification Level 1'
     """
-    
+    vol_info = _get_volume_metric_info(volume_metric)
+    vol_label = vol_info['label']
+
     try:
         # Handle Global case
         if entity_name == "Global":
@@ -2794,6 +2845,7 @@ def create_continent_destination_chart(entity_name, engine, db_schema, classific
         
         params = {} if entity_name == "Global" else {'entity_name': entity_name}
         df = pd.read_sql(query, engine, params=params)
+        df = _convert_volume_metric_dataframe(df, volume_metric, columns=['rolling_avg'])
         
         if df.empty:
             fig = go.Figure()
@@ -2864,9 +2916,9 @@ def create_continent_destination_chart(entity_name, engine, db_schema, classific
                         legendgroup=continent,
                         line=dict(color=color, width=line_width, dash='solid'),
                         hovertemplate=f'<b>{continent} - {int(year)}</b><br>' +
-                                     '%{text}<br>' +
-                                     'Volume: %{y:.1f} mcm/d<br>' +
-                                     '<extra></extra>',
+                                      '%{text}<br>' +
+                                      f'Volume: %{{y:.1f}} {vol_label}<br>' +
+                                      '<extra></extra>',
                         text=historical_data['month_day'],
                         showlegend=show_legend
                     ))
@@ -2892,9 +2944,9 @@ def create_continent_destination_chart(entity_name, engine, db_schema, classific
                         line=dict(color=forecast_color, width=line_width, dash='solid'),
                         opacity=0.6,
                         hovertemplate=f'<b>{continent} - {int(year)} (Forecast)</b><br>' +
-                                     '%{text}<br>' +
-                                     'Volume: %{y:.1f} mcm/d<br>' +
-                                     '<extra></extra>',
+                                      '%{text}<br>' +
+                                      f'Volume: %{{y:.1f}} {vol_label}<br>' +
+                                      '<extra></extra>',
                         text=connect_data['month_day'],
                         showlegend=False
                     ))
@@ -2910,7 +2962,7 @@ def create_continent_destination_chart(entity_name, engine, db_schema, classific
                 tickfont=dict(size=10)
             ),
             yaxis=dict(
-                title=dict(text='mcm/d', font=dict(size=11)),
+                title=dict(text=vol_label, font=dict(size=11)),
                 showgrid=True,
                 gridcolor='rgba(200, 200, 200, 0.3)',
                 tickfont=dict(size=10)
@@ -4389,10 +4441,11 @@ def _render_supply_dest_period_analysis_table(period_payload, classification_mod
                                               view_type, period_view, period_count, comparison_basis,
                                               expanded_classifications=None, expanded_countries=None,
                                               expanded_supply_countries=None, period_sort_by=None,
-                                              country_grouping_mode='show_all'):
+                                              country_grouping_mode='show_all', volume_metric='mcm_d'):
     """Render the separate historical period-analysis table section."""
     selected_period_view = _normalize_supply_dest_period_view(period_view)
     country_grouping_mode = _normalize_supply_dest_country_grouping(country_grouping_mode)
+    vol_label = _get_volume_metric_info(volume_metric)['label']
     hierarchy_instruction_text = _get_supply_dest_hierarchy_instruction(
         classification_mode,
         demand_aggregation_mode
@@ -4435,6 +4488,14 @@ def _render_supply_dest_period_analysis_table(period_payload, classification_mod
                     hierarchy_instruction_text,
                     style={'fontSize': '13px', 'color': '#666', 'fontStyle': 'italic'}
                 )
+            )
+
+        if view_type != 'percentage':
+            display_df = _convert_volume_metric_dataframe(
+                display_df,
+                volume_metric,
+                exclude_columns=SUPPLY_DEST_TEXT_COLUMNS,
+                precision=1
             )
 
         visible_period_cols = period_meta.get('visible_period_cols', [])
@@ -4679,16 +4740,16 @@ def _render_supply_dest_period_analysis_table(period_payload, classification_mod
             value_label = (
                 'YoY change in market share, shown in percentage points'
                 if view_type == 'percentage'
-                else 'YoY change in bilateral trade flows in mcm/d'
+                else f'YoY change in bilateral trade flows in {vol_label}'
             )
         elif per_column_previous_mode:
             value_label = (
                 'change versus the previous period in market share, shown in percentage points'
                 if view_type == 'percentage'
-                else 'change versus the previous period in bilateral trade flows in mcm/d'
+                else f'change versus the previous period in bilateral trade flows in {vol_label}'
             )
         else:
-            value_label = 'market share' if view_type == 'percentage' else 'bilateral trade flows in mcm/d'
+            value_label = 'market share' if view_type == 'percentage' else f'bilateral trade flows in {vol_label}'
         footnote_parts = [
             html.Span('Note: ', style={'fontWeight': 'bold'}),
             html.Span(
@@ -4847,6 +4908,20 @@ def _create_top_exporters_selector_region():
                     ),
                     html.Div(
                         [
+                            html.Div('Volume Metric', className='filter-group-header'),
+                            dcc.Dropdown(
+                                id='exporters-volume-metric-dropdown',
+                                options=VOLUME_METRIC_OPTIONS,
+                                value='mcm_d',
+                                clearable=False,
+                                className='filter-dropdown',
+                                style={'minWidth': '120px', 'width': '100%'}
+                            )
+                        ],
+                        className='filter-section filter-section-volume'
+                    ),
+                    html.Div(
+                        [
                             html.Div('Latest Upload', className='filter-group-header'),
                             html.Div(
                                 id='data-timestamp-display',
@@ -4963,7 +5038,7 @@ layout = html.Div([
             dcc.Dropdown(
                 id='continent-chart-type',
                 options=[
-                    {'label': 'By Continent (mcm/d)', 'value': 'absolute'},
+                    {'label': 'By Continent', 'value': 'absolute'},
                     {'label': 'Market Share (%)', 'value': 'percentage'}
                 ],
                 value='absolute',
@@ -5009,7 +5084,7 @@ layout = html.Div([
                 dcc.Dropdown(
                     id='supply-dest-view-type',
                     options=[
-                        {'label': 'By Destination (mcm/d)', 'value': 'absolute'},
+                        {'label': 'By Destination', 'value': 'absolute'},
                         {'label': 'Market Share (%)', 'value': 'percentage'}
                     ],
                     value='absolute',
@@ -5130,7 +5205,7 @@ layout = html.Div([
     html.Div([
         # Header
         html.Div([
-            html.H3('LNG loadings on export countries and installations (mcm/d)', className="section-title-inline"),
+            html.H3('LNG loadings on export countries and installations', className="section-title-inline"),
         ], className="inline-section-header"),
         
         # Summary Table
@@ -5311,8 +5386,10 @@ def reset_supply_dest_expansion_state(classification_mode, demand_aggregation_mo
     return [], [], []
 
 
-def create_supply_chart(data, title_prefix="", show_legend=True):
+def create_supply_chart(data, title_prefix="", show_legend=True, volume_metric='mcm_d'):
     """Create seasonal comparison chart for LNG supply with professional styling"""
+    vol_info = _get_volume_metric_info(volume_metric)
+    vol_label = vol_info['label']
     
     if not data:
         # Return empty chart with message
@@ -5333,6 +5410,7 @@ def create_supply_chart(data, title_prefix="", show_legend=True):
     
     # Convert to DataFrame
     df = pd.DataFrame(data)
+    df = _convert_volume_metric_dataframe(df, volume_metric, columns=['rolling_avg'])
     df['date'] = pd.to_datetime(df['date'])
     
     # Filter for display (only show from 2024-01-01 onwards)
@@ -5374,7 +5452,7 @@ def create_supply_chart(data, title_prefix="", show_legend=True):
                     ),
                     hovertemplate=f'<b>{int(year) if pd.api.types.is_numeric_dtype(type(year)) else year} (Historical)</b><br>' +
                                  '%{text}<br>' +
-                                 'Supply: %{y:.1f} mcm/d<br>' +
+                                 f'Supply: %{{y:.1f}} {vol_label}<br>' +
                                  '<extra></extra>',
                     text=historical_data['month_day'],
                     showlegend=True
@@ -5406,7 +5484,7 @@ def create_supply_chart(data, title_prefix="", show_legend=True):
                     opacity=0.7,  # Additional opacity for visual distinction
                     hovertemplate=f'<b>{int(year) if pd.api.types.is_numeric_dtype(type(year)) else year} (Forecast)</b><br>' +
                                  '%{text}<br>' +
-                                 'Supply: %{y:.1f} mcm/d<br>' +
+                                 f'Supply: %{{y:.1f}} {vol_label}<br>' +
                                  '<extra></extra>',
                     text=connect_data['month_day'],
                     showlegend=False  # Don't show separate legend entry for forecast
@@ -5424,7 +5502,7 @@ def create_supply_chart(data, title_prefix="", show_legend=True):
                 ),
                 hovertemplate=f'<b>{int(year) if pd.api.types.is_numeric_dtype(type(year)) else year}</b><br>' +
                              '%{text}<br>' +
-                             'Supply: %{y:.1f} mcm/d<br>' +
+                             f'Supply: %{{y:.1f}} {vol_label}<br>' +
                              '<extra></extra>',
                 text=year_data['month_day']
             ))
@@ -5447,7 +5525,7 @@ def create_supply_chart(data, title_prefix="", show_legend=True):
         
         # Y-Axis Professional Styling
         yaxis=dict(
-            title=dict(text='mcm/d', font=dict(size=13, color='#4A4A4A')),
+            title=dict(text=vol_label, font=dict(size=13, color='#4A4A4A')),
             showgrid=True,
             gridcolor='rgba(200, 200, 200, 0.3)',
             gridwidth=0.5,
@@ -5585,17 +5663,21 @@ def update_malaysia_supply_chart(malaysia_data):
     [Input('summary-data-store', 'data'),
      Input('summary-expanded-countries', 'data'),
      Input('summary-expanded-classifications', 'data'),
-     Input('country-classification-mode', 'data')],
+     Input('country-classification-mode', 'data'),
+     Input('exporters-volume-metric-dropdown', 'value')],
     prevent_initial_call=False
 )
-def update_summary_table(summary_data, expanded_countries, expanded_classifications, classification_mode):
+def update_summary_table(summary_data, expanded_countries, expanded_classifications, classification_mode,
+                         volume_metric):
     """Update the summary table with 5 quarters, 3 months, 3 weeks data with expandable rows"""
-    
+    vol_label = _get_volume_metric_info(volume_metric)['label']
+
     # Set instruction text based on mode
     if classification_mode == 'Classification Level 1':
         instruction_text = "Click on ▶ classification row to expand and see countries and installations"
     else:
         instruction_text = "Click on ▶ country row to expand and see installations"
+    instruction_text = f"{instruction_text}. Values are shown in {vol_label}"
     
     instruction_element = html.Span(instruction_text, 
                                    style={'fontSize': '14px', 'color': '#666', 'fontStyle': 'italic'})
@@ -5619,8 +5701,14 @@ def update_summary_table(summary_data, expanded_countries, expanded_classificati
         expanded_classifications = expanded_classifications or []
         
         # Prepare data for display with expandable rows
-        display_df, columns = prepare_table_for_display(df, 'summary', expanded_countries, 
+        display_df, columns = prepare_table_for_display(df, 'summary', expanded_countries,
                                                        classification_mode, expanded_classifications)
+        display_df = _convert_volume_metric_dataframe(
+            display_df,
+            volume_metric,
+            exclude_columns=['Country', 'Installation'],
+            precision=1
+        )
         
         if display_df.empty:
             return (html.Div("No data to display.", 
@@ -5852,7 +5940,8 @@ def update_summary_table(summary_data, expanded_countries, expanded_classificati
                 html.Span('Note: ', style={'fontWeight': 'bold'}),
                 html.Span(f'30D: {date_30d_start} to {date_today} | ', style={'color': '#666'}),
                 html.Span(f'7D: {date_7d_start} to {date_today} | ', style={'color': '#666'}),
-                html.Span(f'30D Y-1: {date_30d_y1_start} to {date_30d_y1_end}', style={'color': '#666'})
+                html.Span(f'30D Y-1: {date_30d_y1_start} to {date_30d_y1_end} | ', style={'color': '#666'}),
+                html.Span(f'Values shown in {vol_label}', style={'color': '#666'})
             ], style={'fontSize': '12px', 'fontStyle': 'italic', 'marginTop': '10px', 'color': '#666'})
         ])
         
@@ -5876,14 +5965,17 @@ def update_summary_table(summary_data, expanded_countries, expanded_classificati
      Input('country-classification-mode', 'data'),
      Input('supply-dest-view-type', 'value'),
      Input('aggregation-demand-dropdown', 'value'),
-     Input('supply-dest-country-grouping-dropdown', 'value')],
+     Input('supply-dest-country-grouping-dropdown', 'value'),
+     Input('exporters-volume-metric-dropdown', 'value')],
     [State('supply-dest-sort-by', 'data')],
     prevent_initial_call=False
 )
 def update_supply_dest_table(supply_dest_data, expanded_classifications, expanded_countries,
                              expanded_supply_countries, classification_mode, view_type,
-                             demand_aggregation_mode, country_grouping_mode, supply_dest_sort_by):
+                             demand_aggregation_mode, country_grouping_mode, volume_metric,
+                             supply_dest_sort_by):
     """Update the supply-destination table with expandable rows"""
+    vol_label = _get_volume_metric_info(volume_metric)['label']
     show_demand_aggregation = use_demand_classification_mode(classification_mode, demand_aggregation_mode)
     show_demand_country = use_demand_country_mode(demand_aggregation_mode)
     country_grouping_mode = _normalize_supply_dest_country_grouping(country_grouping_mode)
@@ -6260,6 +6352,14 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
             
             if '30D_Y1' in display_df.columns:
                 display_df = display_df.drop('30D_Y1', axis=1)
+
+        if view_type != 'percentage':
+            display_df = _convert_volume_metric_dataframe(
+                display_df,
+                volume_metric,
+                exclude_columns=SUPPLY_DEST_TEXT_COLUMNS,
+                precision=1
+            )
         
         # Get conditional styles (includes alternating rows, country totals, grand total)
         conditional_styles = get_table_conditional_styles()
@@ -6517,7 +6617,7 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
                 html.Span(f'30D: {date_30d_start} to {date_today} | ', style={'color': '#666'}),
                 html.Span(f'7D: {date_7d_start} to {date_today} | ', style={'color': '#666'}),
                 html.Span(f'30D Y-1: {date_30d_y1_start} to {date_30d_y1_end} | ', style={'color': '#666'}),
-                html.Span(f'Values shown are bilateral trade flows in mcm/d', style={'color': '#666'})
+                html.Span(f'Values shown are bilateral trade flows in {vol_label}', style={'color': '#666'})
             ], style={'fontSize': '12px', 'fontStyle': 'italic', 'marginTop': '10px', 'color': '#666'})
         ])
         
@@ -6544,7 +6644,8 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
      Input('supply-dest-period-count-dropdown', 'value'),
      Input('supply-dest-comparison-basis-dropdown', 'value'),
      Input('supply-dest-country-grouping-dropdown', 'value'),
-     Input('supply-dest-period-sort-by', 'data')],
+     Input('supply-dest-period-sort-by', 'data'),
+     Input('exporters-volume-metric-dropdown', 'value')],
     prevent_initial_call=False
 )
 def update_supply_dest_period_table(supply_dest_period_data, expanded_classifications,
@@ -6552,7 +6653,7 @@ def update_supply_dest_period_table(supply_dest_period_data, expanded_classifica
                                     classification_mode, view_type, demand_aggregation_mode,
                                     period_view, period_count, comparison_basis,
                                     country_grouping_mode,
-                                    supply_dest_period_sort_by):
+                                    supply_dest_period_sort_by, volume_metric):
     """Render the separate historical supply-destination table section."""
     return _render_supply_dest_period_analysis_table(
         supply_dest_period_data,
@@ -6566,7 +6667,8 @@ def update_supply_dest_period_table(supply_dest_period_data, expanded_classifica
         expanded_countries,
         expanded_supply_countries,
         supply_dest_period_sort_by,
-        country_grouping_mode
+        country_grouping_mode,
+        volume_metric
     )
 
 
@@ -6965,10 +7067,11 @@ def handle_supply_dest_period_row_expansion(active_cells, table_data_list, expan
     Output('continent-charts-container', 'children'),
     [Input('continent-charts-data', 'data'),
      Input('continent-chart-type', 'value'),
-     Input('country-classification-mode', 'data')],
+     Input('country-classification-mode', 'data'),
+     Input('exporters-volume-metric-dropdown', 'value')],
     prevent_initial_call=False
 )
-def update_continent_charts(entities_list, chart_type, classification_mode):
+def update_continent_charts(entities_list, chart_type, classification_mode, volume_metric):
     """Dynamically generate continent charts based on classification mode"""
     if not entities_list:
         return html.Div("No data available", style={'textAlign': 'center', 'padding': '20px'})
@@ -6995,7 +7098,13 @@ def update_continent_charts(entities_list, chart_type, classification_mode):
         if chart_type == 'percentage':
             fig = create_continent_percentage_chart(entity_name, engine_inst, schema, classification_mode or 'Country')
         else:
-            fig = create_continent_destination_chart(entity_name, engine_inst, schema, classification_mode or 'Country')
+            fig = create_continent_destination_chart(
+                entity_name,
+                engine_inst,
+                schema,
+                classification_mode or 'Country',
+                volume_metric or 'mcm_d'
+            )
 
         # Create chart container
         chart_div = html.Div([
@@ -7020,10 +7129,11 @@ def update_continent_charts(entities_list, chart_type, classification_mode):
 @callback(
     Output('supply-charts-container', 'children'),
     [Input('supply-charts-data', 'data'),
-     Input('country-classification-mode', 'data')],
+     Input('country-classification-mode', 'data'),
+     Input('exporters-volume-metric-dropdown', 'value')],
     prevent_initial_call=False
 )
-def update_supply_charts(charts_data, classification_mode):
+def update_supply_charts(charts_data, classification_mode, volume_metric):
     """Dynamically generate supply charts based on classification mode"""
     if not charts_data:
         return html.Div("No data available", style={'textAlign': 'center', 'padding': '20px'})
@@ -7044,7 +7154,7 @@ def update_supply_charts(charts_data, classification_mode):
     # Create chart for each entity (country or classification group)
     for idx, (entity_name, entity_data) in enumerate(charts_data.items()):
         # Create the figure
-        fig = create_supply_chart(entity_data, entity_name, show_legend=False)
+        fig = create_supply_chart(entity_data, entity_name, show_legend=False, volume_metric=volume_metric or 'mcm_d')
 
         # Create chart container
         chart_div = html.Div([
@@ -7188,18 +7298,22 @@ def export_supply_dest_period_table_to_excel(n_clicks, derived_virtual_data_list
     Input('export-supply-charts-button', 'n_clicks'),
     State('supply-charts-data', 'data'),
     State('country-classification-mode', 'data'),
+    State('exporters-volume-metric-dropdown', 'value'),
     prevent_initial_call=True
 )
-def export_supply_charts_to_excel(n_clicks, charts_data, classification_mode):
+def export_supply_charts_to_excel(n_clicks, charts_data, classification_mode, volume_metric):
     """Export LNG Supply 30-Day Rolling Average data to Excel"""
     if n_clicks == 0 or not charts_data:
         return None
+    vol_label = _get_volume_metric_info(volume_metric)['label']
+    rolling_col = f'rolling_avg ({vol_label})'
 
     # Convert all entities' data to DataFrames
     all_data = []
     for entity_name, entity_data in charts_data.items():
         if entity_data:
             df = pd.DataFrame(entity_data)
+            df = _convert_volume_metric_dataframe(df, volume_metric, columns=['rolling_avg'])
             df['entity'] = entity_name
             all_data.append(df)
 
@@ -7211,8 +7325,10 @@ def export_supply_charts_to_excel(n_clicks, charts_data, classification_mode):
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         # Combined sheet with all data
         combined_df = safe_concat(all_data, ignore_index=True)
+        if 'rolling_avg' in combined_df.columns:
+            combined_df = combined_df.rename(columns={'rolling_avg': rolling_col})
         # Reorder columns for better readability
-        cols = ['entity', 'date', 'year', 'month_day', 'rolling_avg', 'is_forecast']
+        cols = ['entity', 'date', 'year', 'month_day', rolling_col, 'is_forecast']
         cols = [c for c in cols if c in combined_df.columns]
         combined_df = combined_df[cols]
         combined_df.to_excel(writer, sheet_name='All Data', index=False)
@@ -7221,9 +7337,12 @@ def export_supply_charts_to_excel(n_clicks, charts_data, classification_mode):
         for entity_name, entity_data in charts_data.items():
             if entity_data:
                 df = pd.DataFrame(entity_data)
+                df = _convert_volume_metric_dataframe(df, volume_metric, columns=['rolling_avg'])
+                if 'rolling_avg' in df.columns:
+                    df = df.rename(columns={'rolling_avg': rolling_col})
                 # Excel sheet name limit is 31 characters
                 sheet_name = entity_name[:31].replace('/', '-').replace('\\', '-')
-                sheet_cols = ['date', 'year', 'month_day', 'rolling_avg', 'is_forecast']
+                sheet_cols = ['date', 'year', 'month_day', rolling_col, 'is_forecast']
                 sheet_cols = [c for c in sheet_cols if c in df.columns]
                 df = df[sheet_cols]
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -7257,12 +7376,14 @@ def export_supply_charts_to_excel(n_clicks, charts_data, classification_mode):
     State('continent-charts-data', 'data'),
     State('continent-chart-type', 'value'),
     State('country-classification-mode', 'data'),
+    State('exporters-volume-metric-dropdown', 'value'),
     prevent_initial_call=True
 )
-def export_continent_charts_to_excel(n_clicks, entities_list, chart_type, classification_mode):
+def export_continent_charts_to_excel(n_clicks, entities_list, chart_type, classification_mode, volume_metric):
     """Export LNG Supply by Destination Continent data to Excel"""
     if n_clicks == 0 or not entities_list:
         return None
+    vol_label = _get_volume_metric_info(volume_metric)['label']
 
     engine_inst, schema = setup_database_connection()
 
@@ -7487,6 +7608,8 @@ def export_continent_charts_to_excel(n_clicks, entities_list, chart_type, classi
             df = pd.read_sql(query, engine_inst, params=params)
 
             if not df.empty:
+                if chart_type != 'percentage':
+                    df = _convert_volume_metric_dataframe(df, volume_metric, columns=['rolling_avg'])
                 df['entity'] = entity_name
                 all_data.append(df)
 
@@ -7505,7 +7628,10 @@ def export_continent_charts_to_excel(n_clicks, entities_list, chart_type, classi
         if chart_type == 'percentage':
             cols = ['entity', 'date', 'continent_destination', 'year', 'month_day', 'percentage', 'is_forecast']
         else:
-            cols = ['entity', 'date', 'continent_destination', 'year', 'month_day', 'rolling_avg', 'is_forecast']
+            rolling_col = f'rolling_avg ({vol_label})'
+            if 'rolling_avg' in combined_df.columns:
+                combined_df = combined_df.rename(columns={'rolling_avg': rolling_col})
+            cols = ['entity', 'date', 'continent_destination', 'year', 'month_day', rolling_col, 'is_forecast']
         cols = [c for c in cols if c in combined_df.columns]
         combined_df = combined_df[cols]
         combined_df.to_excel(writer, sheet_name='All Data', index=False)
@@ -7517,7 +7643,9 @@ def export_continent_charts_to_excel(n_clicks, entities_list, chart_type, classi
             if chart_type == 'percentage':
                 sheet_cols = ['date', 'continent_destination', 'year', 'month_day', 'percentage', 'is_forecast']
             else:
-                sheet_cols = ['date', 'continent_destination', 'year', 'month_day', 'rolling_avg', 'is_forecast']
+                rolling_col = f'rolling_avg ({vol_label})'
+                entity_df = entity_df.rename(columns={'rolling_avg': rolling_col})
+                sheet_cols = ['date', 'continent_destination', 'year', 'month_day', rolling_col, 'is_forecast']
             sheet_cols = [c for c in sheet_cols if c in entity_df.columns]
             entity_df[sheet_cols].to_excel(writer, sheet_name=sheet_name, index=False)
 
