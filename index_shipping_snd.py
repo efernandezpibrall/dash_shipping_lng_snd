@@ -117,7 +117,7 @@ def display_page(pathname):
     elif pathname == '/importer_detail':
         return pages.importer_detail.layout
     elif pathname == '/contracts':
-        return pages.contracts.layout
+        return pages.contracts.layout()
     elif pathname == '/terminals':
         return dcc.Location(pathname='/capacity', id='redirect-capacity-from-terminals')
     elif pathname == '/production':

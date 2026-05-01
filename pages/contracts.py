@@ -1604,12 +1604,6 @@ def create_pricing_analysis_content(contracts_df, price_assumptions_df):
 
 ############################################ Main Layout ###################################################
 
-# Load initial data
-contracts_df = load_contracts_data()
-demand_df = load_annual_demand_data()
-price_assumptions_df = load_price_assumptions_data()
-price_formula_df = load_price_formula_data()
-
 # Add detailed pricing type to contracts_df for filtering
 def get_detailed_pricing_type(row):
     """Generate detailed pricing type label for a contract"""
@@ -1695,88 +1689,161 @@ def get_detailed_pricing_type(row):
     else:
         return str(pricing_type)
 
-# Enhance contracts with oil/gas pricing structures if available
-if not price_assumptions_df.empty:
-    # Merge pricing structures
-    pricing_cols = ['id_contract', 'indexation_category', 'indexation_point', 'oil_pricing_structure', 'gas_pricing_structure']
-    available_pricing_cols = [col for col in pricing_cols if col in price_assumptions_df.columns]
-    if available_pricing_cols:
-        pricing_data = price_assumptions_df[available_pricing_cols].drop_duplicates('id_contract')
-        contracts_df = contracts_df.merge(pricing_data, on='id_contract', how='left', suffixes=('', '_pa'))
-        
-        # Use enhanced indexation if available
-        if 'indexation_category_pa' in contracts_df.columns:
-            contracts_df['indexation_category'] = contracts_df['indexation_category'].combine_first(contracts_df['indexation_category_pa'])
-        if 'indexation_point_pa' in contracts_df.columns:
-            contracts_df['indexation_point'] = contracts_df['indexation_point'].combine_first(contracts_df['indexation_point_pa'])
 
-# Add detailed pricing type column
-contracts_df['detailed_pricing_type'] = contracts_df.apply(get_detailed_pricing_type, axis=1)
+CONTRACTS_RUNTIME_COLUMNS = CONTRACTS_DATA_COLUMNS + ['detailed_pricing_type']
+contracts_df = pd.DataFrame(columns=CONTRACTS_RUNTIME_COLUMNS)
+demand_df = pd.DataFrame(columns=ANNUAL_DEMAND_DATA_COLUMNS)
+price_assumptions_df = pd.DataFrame(columns=PRICE_ASSUMPTIONS_COLUMNS)
+price_formula_df = pd.DataFrame(columns=PRICE_FORMULA_COLUMNS)
 
-# Calculate year range from data
-from datetime import datetime
-current_year = datetime.now().year
+_contracts_data_loaded = False
+_contracts_year_settings = None
 
-# Get min year from contract signing dates
-valid_sign_years = contracts_df['contract_year_signed'].dropna()
-if not valid_sign_years.empty:
-    min_year = int(valid_sign_years.min())
-else:
+
+def _default_year_settings():
+    current_year = datetime.now().year
     min_year = 2000
+    max_year = current_year + 30
+    return {
+        'min_year': min_year,
+        'max_year': max_year,
+        'default_start': max(min_year, current_year - 1),
+        'default_end': max_year,
+    }
 
-# Get max year from contract end dates
-# Parse contract_date_end to extract years (format might be YYYY-MM-DD or similar)
-end_years = []
-if 'contract_date_end' in contracts_df.columns:
-    end_dates = contracts_df['contract_date_end'].dropna()
-    for date_str in end_dates:
-        try:
-            # Try to extract year from string - handle various formats
-            date_str = str(date_str).strip()
-            if date_str and date_str not in ['', 'None', 'nan', 'NaT']:
-                # Extract year (assuming it's 4 digits)
-                import re
-                year_match = re.search(r'20\d{2}|19\d{2}', date_str)
-                if year_match:
-                    end_years.append(int(year_match.group()))
-        except:
-            continue
-    
-    if end_years:
-        max_year = max(end_years)
+
+def _calculate_contract_year_settings(loaded_contracts_df):
+    current_year = datetime.now().year
+    valid_sign_years = loaded_contracts_df['contract_year_signed'].dropna()
+    if not valid_sign_years.empty:
+        min_year = int(valid_sign_years.min())
     else:
-        # Fallback to max signing year if no valid end dates
+        min_year = 2000
+
+    end_years = []
+    if 'contract_date_end' in loaded_contracts_df.columns:
+        end_dates = loaded_contracts_df['contract_date_end'].dropna()
+        for date_str in end_dates:
+            try:
+                date_str = str(date_str).strip()
+                if date_str and date_str not in ['', 'None', 'nan', 'NaT']:
+                    import re
+                    year_match = re.search(r'20\d{2}|19\d{2}', date_str)
+                    if year_match:
+                        end_years.append(int(year_match.group()))
+            except:
+                continue
+
+        if end_years:
+            max_year = max(end_years)
+        else:
+            max_year = int(valid_sign_years.max()) if not valid_sign_years.empty else current_year
+    else:
         max_year = int(valid_sign_years.max()) if not valid_sign_years.empty else current_year
-else:
-    max_year = int(valid_sign_years.max()) if not valid_sign_years.empty else current_year
 
-# Ensure max_year is reasonable (not too far in future)
-max_year = min(max_year, current_year + 30)  # Cap at 30 years from now
+    max_year = min(max_year, current_year + 30)
+    return {
+        'min_year': min_year,
+        'max_year': max_year,
+        'default_start': max(min_year, current_year - 1),
+        'default_end': max_year,
+    }
 
-# Default range: previous year to last available year
-default_start = max(min_year, current_year - 1)  # Ensure start is not before min_year
-default_end = max_year
+
+def _enhance_contracts_data(loaded_contracts_df, loaded_price_assumptions_df):
+    enhanced_contracts_df = loaded_contracts_df.copy()
+
+    if not loaded_price_assumptions_df.empty:
+        pricing_cols = [
+            'id_contract', 'indexation_category', 'indexation_point',
+            'oil_pricing_structure', 'gas_pricing_structure'
+        ]
+        available_pricing_cols = [
+            col for col in pricing_cols
+            if col in loaded_price_assumptions_df.columns
+        ]
+        if available_pricing_cols:
+            pricing_data = loaded_price_assumptions_df[available_pricing_cols].drop_duplicates('id_contract')
+            enhanced_contracts_df = enhanced_contracts_df.merge(
+                pricing_data,
+                on='id_contract',
+                how='left',
+                suffixes=('', '_pa'),
+            )
+
+            if 'indexation_category_pa' in enhanced_contracts_df.columns:
+                enhanced_contracts_df['indexation_category'] = (
+                    enhanced_contracts_df['indexation_category']
+                    .combine_first(enhanced_contracts_df['indexation_category_pa'])
+                )
+            if 'indexation_point_pa' in enhanced_contracts_df.columns:
+                enhanced_contracts_df['indexation_point'] = (
+                    enhanced_contracts_df['indexation_point']
+                    .combine_first(enhanced_contracts_df['indexation_point_pa'])
+                )
+
+    enhanced_contracts_df['detailed_pricing_type'] = enhanced_contracts_df.apply(
+        get_detailed_pricing_type,
+        axis=1,
+    )
+    return enhanced_contracts_df
 
 
-layout = html.Div([
-    # Filter Controls
-    create_filter_controls(min_year, max_year, default_start, default_end),
-    
-    # Main Sections (replace tabs)
-    create_contracts_sections_layout(),
-    
-    # Interactive Data Table
-    create_contracts_table(),
-    
-    # Hidden div to store data
-    html.Div(id='contracts-data-store', style={'display': 'none'}),
-    
-    # Stores for expanded states in volume tables
-    dcc.Store(id='volume-country-expanded-store', data=[]),
-    dcc.Store(id='volume-seller-expanded-store', data=[]),
-    dcc.Store(id='volume-destination-expanded-store', data=[]),
-    dcc.Store(id='volume-buyer-expanded-store', data=[])
-])
+def _ensure_contracts_data_loaded():
+    global contracts_df
+    global demand_df
+    global price_assumptions_df
+    global price_formula_df
+    global _contracts_data_loaded
+    global _contracts_year_settings
+
+    if _contracts_data_loaded:
+        return
+
+    loaded_contracts_df = load_contracts_data()
+    loaded_demand_df = load_annual_demand_data()
+    loaded_price_assumptions_df = load_price_assumptions_data()
+    loaded_price_formula_df = load_price_formula_data()
+
+    contracts_df = _enhance_contracts_data(
+        loaded_contracts_df,
+        loaded_price_assumptions_df,
+    )
+    demand_df = loaded_demand_df
+    price_assumptions_df = loaded_price_assumptions_df
+    price_formula_df = loaded_price_formula_df
+    _contracts_year_settings = _calculate_contract_year_settings(contracts_df)
+    _contracts_data_loaded = True
+
+
+def layout():
+    _ensure_contracts_data_loaded()
+    year_settings = _contracts_year_settings or _default_year_settings()
+
+    return html.Div([
+        # Filter Controls
+        create_filter_controls(
+            year_settings['min_year'],
+            year_settings['max_year'],
+            year_settings['default_start'],
+            year_settings['default_end'],
+        ),
+
+        # Main Sections (replace tabs)
+        create_contracts_sections_layout(),
+
+        # Interactive Data Table
+        create_contracts_table(),
+
+        # Hidden div to store data
+        html.Div(id='contracts-data-store', style={'display': 'none'}),
+
+        # Stores for expanded states in volume tables
+        dcc.Store(id='volume-country-expanded-store', data=[]),
+        dcc.Store(id='volume-seller-expanded-store', data=[]),
+        dcc.Store(id='volume-destination-expanded-store', data=[]),
+        dcc.Store(id='volume-buyer-expanded-store', data=[])
+    ])
 
 ############################################ Callbacks ###################################################
 
