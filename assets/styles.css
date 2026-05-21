@@ -258,6 +258,589 @@ button:hover {
     background-color: var(--color-bg-lighter);
 }
 
+/* Compact AG Grid tables for Fleet Metrics */
+.ag-theme-alpine.fleet-metrics-grid {
+    --ag-font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --ag-font-size: 12px;
+    --ag-grid-size: 3px;
+    --ag-row-height: 30px;
+    --ag-header-height: 32px;
+    --ag-cell-horizontal-padding: 4px;
+    --ag-header-background-color: var(--color-primary);
+    --ag-header-foreground-color: var(--color-text-white);
+    --ag-border-color: transparent;
+    --ag-row-border-color: transparent;
+    --ag-odd-row-background-color: #f9fafb;
+    --ag-row-hover-color: #f0f9ff;
+    --ag-selected-row-background-color: #dbeafe;
+    border: none !important;
+    border-radius: 0;
+    overflow: hidden;
+}
+
+.fleet-metrics-table-heading {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 0 0 10px;
+}
+
+.fleet-metrics-table-subtitle {
+    color: #64748b;
+    font-size: 12px;
+    line-height: 1.25;
+    text-align: right;
+}
+
+.fleet-metrics-top-table-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+}
+
+.fleet-metrics-seasonal-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(560px, 1fr));
+    gap: 10px;
+    align-items: start;
+}
+
+.fleet-metrics-diversion-seasonal-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+    align-items: start;
+}
+
+.fleet-metrics-diversion-chart-panel {
+    min-width: 0;
+}
+
+.fleet-metrics-diversion-chart-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+    padding: 2px 4px 0;
+}
+
+.fleet-metrics-diversion-chart-title {
+    color: #0f172a;
+    font-size: 15px;
+    font-weight: 800;
+    line-height: 1.2;
+}
+
+.fleet-metrics-diversion-chart-subtitle {
+    color: #64748b;
+    font-size: 11px;
+    line-height: 1.2;
+    text-align: right;
+}
+
+.fleet-metrics-matrix-legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px 14px;
+    margin: 2px 2px 8px;
+    padding: 8px 10px;
+    background: #f8fafc;
+    border: 1px solid #dbe5f0;
+    border-radius: 6px;
+}
+
+.fleet-metrics-matrix-legend > .fleet-metrics-matrix-legend-group {
+    flex: 1 1 360px;
+}
+
+.fleet-metrics-matrix-legend-group {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 7px 9px;
+    min-width: 0;
+}
+
+.fleet-metrics-matrix-legend-label {
+    color: #0f172a;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.fleet-metrics-matrix-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: #334155;
+    font-size: 10px;
+    font-weight: 650;
+    line-height: 1;
+    white-space: nowrap;
+}
+
+.fleet-metrics-matrix-legend-item.muted {
+    color: #64748b;
+    font-weight: 600;
+}
+
+.fleet-metrics-matrix-region-legend-grid {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 8px;
+    width: 100%;
+}
+
+.fleet-metrics-matrix-region-legend-card {
+    min-width: 0;
+    padding: 7px 8px;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+}
+
+.fleet-metrics-matrix-region-legend-title {
+    color: #0f172a;
+    font-size: 10px;
+    font-weight: 850;
+    line-height: 1.1;
+    margin-bottom: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.fleet-metrics-matrix-region-legend-items {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px 7px;
+}
+
+.fleet-region-definitions-section {
+    background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+}
+
+.fleet-region-definitions-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.85fr);
+    gap: 18px;
+    align-items: end;
+    padding-bottom: 14px;
+    border-bottom: 1px solid #dbe5f0;
+    margin-bottom: 14px;
+}
+
+.fleet-region-definitions-kicker {
+    color: #2E86C1;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}
+
+.fleet-region-definitions-title {
+    margin: 0;
+    color: #102a43;
+    font-size: 18px;
+    font-weight: 800;
+    line-height: 1.2;
+}
+
+.fleet-region-definitions-subtitle {
+    color: #475569;
+    font-size: 13px;
+    line-height: 1.45;
+    margin-top: 6px;
+    max-width: 920px;
+}
+
+.fleet-region-definition-principles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    justify-content: flex-end;
+    align-items: center;
+}
+
+.fleet-region-definition-principle {
+    border: 1px solid #bfdbfe;
+    background: #eff6ff;
+    color: #0f3e63;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.2;
+    padding: 6px 9px;
+    white-space: nowrap;
+}
+
+.fleet-region-definition-card-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    align-items: stretch;
+}
+
+.fleet-region-definition-card {
+    background: #ffffff;
+    border: 1px solid #dbe5f0;
+    border-radius: 8px;
+    box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+    padding: 14px;
+    min-width: 0;
+}
+
+.fleet-region-definition-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 10px;
+    min-height: 62px;
+}
+
+.fleet-region-definition-title {
+    color: #0f2f4a;
+    font-size: 15px;
+    font-weight: 800;
+    line-height: 1.2;
+    margin: 0;
+}
+
+.fleet-region-definition-summary {
+    color: #64748b;
+    font-size: 11.5px;
+    line-height: 1.35;
+    margin-top: 5px;
+}
+
+.fleet-region-definition-badge {
+    flex: 0 0 auto;
+    background: #e0f2fe;
+    color: #0f3e63;
+    border: 1px solid #bae6fd;
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 800;
+    line-height: 1.15;
+    padding: 5px 7px;
+    white-space: nowrap;
+}
+
+.fleet-region-definition-group {
+    border-top: 1px solid #e2e8f0;
+    margin-top: 10px;
+    padding-top: 9px;
+}
+
+.fleet-region-definition-group-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 7px;
+}
+
+.fleet-region-definition-group-title {
+    color: #102a43;
+    font-size: 11.5px;
+    font-weight: 800;
+    line-height: 1.2;
+}
+
+.fleet-region-definition-group-meta {
+    color: #64748b;
+    font-size: 10.5px;
+    line-height: 1.2;
+    text-align: right;
+}
+
+.fleet-region-definition-pill-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+}
+
+.fleet-region-definition-pill {
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 650;
+    line-height: 1.2;
+    padding: 4px 7px;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+}
+
+.fleet-region-definition-pill--zone {
+    background: #eef6ff;
+    border: 1px solid #bfdbfe;
+    color: #123f60;
+}
+
+.fleet-region-definition-pill--country {
+    background: #ecfdf5;
+    border: 1px solid #bbf7d0;
+    color: #14532d;
+}
+
+.fleet-region-definition-pill--area {
+    background: #fff7ed;
+    border: 1px solid #fed7aa;
+    color: #7c2d12;
+}
+
+@media (max-width: 1100px) {
+    .fleet-metrics-top-table-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .fleet-metrics-seasonal-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .fleet-metrics-diversion-seasonal-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .fleet-metrics-matrix-region-legend-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .fleet-region-definitions-header {
+        grid-template-columns: minmax(0, 1fr);
+        align-items: start;
+    }
+
+    .fleet-region-definition-principles {
+        justify-content: flex-start;
+    }
+
+    .fleet-region-definition-card-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+@media (min-width: 1101px) and (max-width: 1500px) {
+    .fleet-metrics-matrix-region-legend-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .fleet-region-definition-card-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-root-wrapper,
+.ag-theme-alpine.fleet-metrics-grid .ag-root,
+.ag-theme-alpine.fleet-metrics-grid .ag-body-viewport {
+    border: none !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-header {
+    background-color: transparent !important;
+    border-bottom: none !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-header-cell,
+.ag-theme-alpine.fleet-metrics-grid .ag-header-group-cell {
+    background-color: #2E86C1 !important;
+    color: white !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif !important;
+    padding: 2px 3px !important;
+    border-right: 1px solid rgba(255, 255, 255, 0.35);
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-header-group-cell {
+    background-color: #1B4F72 !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.45);
+    text-transform: uppercase;
+    letter-spacing: 0;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-header-cell[col-id="region"],
+.ag-theme-alpine.fleet-metrics-grid .ag-pinned-left-header .ag-header-cell {
+    background-color: #1B4F72 !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-header-cell-label,
+.ag-theme-alpine.fleet-metrics-grid .ag-header-group-cell-label {
+    color: white !important;
+    justify-content: center !important;
+    gap: 0 !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-header-cell-text,
+.ag-theme-alpine.fleet-metrics-grid .ag-header-group-text {
+    color: white !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: normal !important;
+    text-align: center;
+    line-height: 1.1;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-header-icon,
+.ag-theme-alpine.fleet-metrics-grid .ag-sort-indicator-container {
+    display: none !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-cell {
+    border: none !important;
+    color: var(--color-text-primary);
+    font-size: 12px !important;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif !important;
+    line-height: 1.25 !important;
+    padding: 3px 4px !important;
+    border-right: 1px solid rgba(226, 232, 240, 0.7) !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid--comparison,
+.ag-theme-alpine.fleet-metrics-grid--signals {
+    --ag-row-height: 28px;
+    --ag-header-height: 30px;
+    --ag-cell-horizontal-padding: 2px;
+}
+
+.ag-theme-alpine.fleet-metrics-grid--comparison .ag-header-cell,
+.ag-theme-alpine.fleet-metrics-grid--comparison .ag-header-group-cell,
+.ag-theme-alpine.fleet-metrics-grid--signals .ag-header-cell,
+.ag-theme-alpine.fleet-metrics-grid--signals .ag-header-group-cell {
+    font-size: 10.5px !important;
+    padding: 1px 2px !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid--comparison .ag-cell,
+.ag-theme-alpine.fleet-metrics-grid--signals .ag-cell {
+    font-size: 11px !important;
+    padding: 2px 3px !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-row {
+    border-bottom: none !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-row-odd {
+    background-color: #f9fafb !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-row-even {
+    background-color: white !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-row-hover {
+    background-color: #f0f9ff !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-row-hover .ag-cell {
+    background-color: #f0f9ff !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-pinned-left-cols-container .ag-cell {
+    background-color: #f8fafc !important;
+    border-right: 2px solid #dbeafe !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-selected-region-row .ag-cell {
+    background-color: #eaf5ff !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-selected-region-row .ag-pinned-left-cols-container .ag-cell,
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-selected-region-row .ag-cell[col-id="region"] {
+    border-left: 4px solid #1B4F72 !important;
+    color: #0f3e63 !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-global-row .ag-cell {
+    border-top: 1px solid #cbd5e1 !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-left-cell {
+    text-align: left;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-strong-cell {
+    font-weight: 700;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-number-cell {
+    font-variant-numeric: tabular-nums;
+    text-align: right !important;
+    justify-content: flex-end;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-group-start {
+    border-left: 2px solid #e2e8f0 !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-metric-anchor {
+    font-weight: 700;
+    color: #1B4F72;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-positive-cell {
+    color: #166534;
+    font-weight: 700;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-negative-cell {
+    color: #991b1b;
+    font-weight: 700;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-muted-cell {
+    color: #64748b;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-pressure-medium {
+    background-color: #fff7ed !important;
+    color: #9a3412 !important;
+    font-weight: 700;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-pressure-high {
+    background-color: #fff1f2 !important;
+    color: #9f1239 !important;
+    font-weight: 800;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-status-cell {
+    text-align: center;
+    font-weight: 700;
+    justify-content: center;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-status-ok {
+    color: #0f3e63;
+    background-color: #e0f2fe !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-status-stale {
+    color: #b45309;
+    background-color: #fff7ed !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .fleet-metrics-status-empty {
+    color: #64748b;
+    background-color: #f8fafc !important;
+}
+
+.ag-theme-alpine.fleet-metrics-grid .ag-paging-panel {
+    min-height: 34px;
+    height: 34px;
+    color: #475569;
+    font-size: 11px;
+    border-top: 1px solid #e5e7eb;
+}
+
 /* Professional Dropdown Styles */
 .professional-dropdown {
     width: 160px;
@@ -1834,6 +2417,10 @@ button.show-hide { display: none; }
 
 /* Enterprise Responsive Design */
 @media (max-width: 768px) {
+    .fleet-metrics-matrix-region-legend-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
     .inline-section-header {
         flex-direction: column;
         align-items: flex-start;

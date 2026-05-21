@@ -50,9 +50,6 @@ if not DB_CONNECTION_STRING:
 engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
 
-
-
-
 def prepare_table_data(df, metric, selected_regions=None, selected_year=None, selected_statuses=None,
                        is_intracountry=False):
     """
@@ -498,7 +495,7 @@ layout = html.Div([
                             value='quarterly',
                             clearable=False,
                             className='filter-dropdown',
-                            style={'min-width': '160px'}
+                            style={'minWidth': '160px'}
                         ),
                     ], className='filter-group'),
                     html.Div([
@@ -630,7 +627,7 @@ layout = html.Div([
                             style={'width': '200px', 'display': 'none'}
                         )
                     ], style={'marginBottom': '12px'}),
-                    html.Div(id='demand-regional-table-container', style={'overflow-x': 'auto'}),
+                    html.Div(id='demand-regional-table-container', style={'overflowX': 'auto'}),
 
                     # Laden Days Chart
                     html.Div([
@@ -737,7 +734,7 @@ layout = html.Div([
                             style={'width': '200px', 'display': 'none'}
                         )
                     ], style={'marginBottom': '12px'}),
-                    html.Div(id='supply-regional-table-container', style={'overflow-x': 'auto'}),
+                    html.Div(id='supply-regional-table-container', style={'overflowX': 'auto'}),
 
                     # Laden Days Chart
                     html.Div([
