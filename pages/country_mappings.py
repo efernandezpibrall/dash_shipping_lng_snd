@@ -1,17 +1,14 @@
-from dash import html, dcc, dash_table, callback, Output, Input, State
-from dash.dash_table.Format import Format
+from dash import html, dcc, callback, Output, Input
+from utils.ag_grid_tables import create_ag_grid_from_datatable
 import dash_bootstrap_components as dbc
-import plotly.graph_objects as go
-import plotly.express as px
 import pandas as pd
 import configparser
 import os
 from sqlalchemy import create_engine, text
 from utils.mappings_section import create_mappings_section_header
-from utils.table_styles import StandardTableStyleManager, TABLE_COLORS
-from app import app
+from utils.mapping_page_figures import build_summary_card_row as _build_summary_card_row
+from utils.table_styles import StandardTableStyleManager
 import dash_leaflet as dl
-import json
 import requests
 
 ############################################ postgres sql connection ###################################################
@@ -19,15 +16,13 @@ try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))
     CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except:
+except Exception:
     CONFIG_FILE_PATH = 'config.ini'
 
 config_reader = configparser.ConfigParser(interpolation=None)
 config_reader.read(CONFIG_FILE_PATH)
 
 DB_CONNECTION_STRING = config_reader.get('DATABASE', 'CONNECTION_STRING', fallback=None)
-DB_SCHEMA = config_reader.get('DATABASE', 'SCHEMA', fallback=None)
-
 engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
 def fetch_country_mappings_data(engine, schema='at_lng'):
@@ -71,54 +66,15 @@ def create_summary_cards(df):
     
     classification_counts = df.groupby('country_classification_level1')['country_name'].nunique()
     continent_counts = df.groupby('continent')['country_name'].nunique()
-    
-    cards = []
-    
-    cards.append(
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H6("Total Countries", className="text-secondary", style={'marginBottom': '8px'}),
-                    html.H3(f"{total_countries:,}", className="text-primary font-bold"),
-                ])
-            ], className="shadow-sm h-100")
-        ], width=3)
-    )
-    
-    cards.append(
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H6("Continents", className="text-secondary", style={'marginBottom': '8px'}),
-                    html.H3(f"{len(continent_counts)}", className="text-primary font-bold"),
-                ])
-            ], className="shadow-sm h-100")
-        ], width=3)
-    )
-    
-    cards.append(
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H6("Classification Levels", className="text-secondary", style={'marginBottom': '8px'}),
-                    html.H3(f"{len(classification_counts)}", className="text-primary font-bold"),
-                ])
-            ], className="shadow-sm h-100")
-        ], width=3)
-    )
-    
-    cards.append(
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H6("Shipping Regions", className="text-secondary", style={'marginBottom': '8px'}),
-                    html.H3(f"{df['shipping_region'].nunique()}", className="text-primary font-bold"),
-                ])
-            ], className="shadow-sm h-100")
-        ], width=3)
-    )
-    
-    return dbc.Row(cards, className="mb-4")
+
+    card_specs = [
+        ("Total Countries", f"{total_countries:,}"),
+        ("Continents", f"{len(continent_counts)}"),
+        ("Classification Levels", f"{len(classification_counts)}"),
+        ("Shipping Regions", f"{df['shipping_region'].nunique()}"),
+    ]
+
+    return _build_summary_card_row(card_specs)
 
 def create_world_map(df, category='continent'):
     """Create a choropleth world map using dash-leaflet with iso3 codes"""
@@ -188,7 +144,6 @@ def create_world_map(df, category='continent'):
     ]
     
     if len(unique_values) > len(colors):
-        import random
         # Generate additional distinct colors if needed
         for i in range(len(unique_values) - len(colors)):
             # Generate colors with good contrast
@@ -325,7 +280,6 @@ def create_world_map(df, category='continent'):
             children=[
                 dl.TileLayer(url="https://cartodb-basemaps-{s}.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png"),
                 geojson,
-                dl.GeoJSON(id="info", children=[dl.Tooltip(id="tooltip")])
             ],
             style={'width': '100%', 'height': '650px'},
             center=[20, 0],
@@ -497,7 +451,7 @@ layout = html.Div([
     [Input('country-mappings-load-trigger', 'n_intervals'),
      Input('global-refresh-button', 'n_clicks')]
 )
-def load_data(_, n_clicks):
+def load_data(_, _n_clicks):
     """Load country mappings data on page load or when refresh button is clicked"""
     df = fetch_country_mappings_data(engine)
     if not df.empty:
@@ -552,7 +506,7 @@ def update_table(data, continents, classifications, basins):
     
     table_config = StandardTableStyleManager.get_base_datatable_config()
     
-    return dash_table.DataTable(
+    return create_ag_grid_from_datatable(
         id='country-mappings-table',
         columns=[
             {"name": "Country", "id": "country_name"},
@@ -569,10 +523,7 @@ def update_table(data, continents, classifications, basins):
         page_action='native' if len(df) > 50 else 'none',
         page_size=50,
         export_format='xlsx',
-        export_headers='display',
         style_table=table_config['style_table'],
-        style_header=table_config['style_header'],
-        style_cell=table_config['style_cell'],
         style_data_conditional=table_config['style_data_conditional'],
         style_cell_conditional=[
             {
@@ -593,23 +544,6 @@ def update_table(data, continents, classifications, basins):
 def clear_filters(_):
     """Clear all filters"""
     return None, None, None
-
-# Callback to handle tooltips for the leaflet map
-@app.callback(
-    Output("tooltip", "children"),
-    [Input("geojson-layer", "hover_feature")],
-    prevent_initial_call=True
-)
-def update_tooltip(feature):
-    """Display country information on hover"""
-    if not feature:
-        return None
-    
-    if feature and 'properties' in feature:
-        # Get tooltip text from properties
-        tooltip_text = feature['properties'].get('tooltip', 'No data')
-        # Return formatted tooltip
-        return tooltip_text
 
 @callback(
     Output('world-map-visualization', 'children'),

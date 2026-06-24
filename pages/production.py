@@ -1,11 +1,13 @@
-from dash import html, dcc, dash_table, callback, Input, Output, State
+from dash import html, dcc, callback, Input, Output, State, no_update
 import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime
+from functools import lru_cache
 from io import BytesIO
 import os
 import sys
 from dash.dash_table.Format import Format, Scheme
+from utils.ag_grid_tables import create_ag_grid_from_datatable
 from dash.exceptions import PreventUpdate
 
 # Add project root to path for imports
@@ -19,7 +21,11 @@ from utils.export_flow_data import (
     default_selected_countries,
     get_available_countries,
 )
-from utils.table_styles import StandardTableStyleManager, TABLE_COLORS
+from utils.table_styles import (
+    StandardTableStyleManager,
+    TABLE_COLORS,
+    format_table_cell_value_2dp as _format_table_cell_value,
+)
 from pages.terminals import (
     PRIMARY_COLORS,
     convert_to_mcmd,
@@ -62,16 +68,6 @@ def _get_total_output_label(selected_unit='mtpa'):
     return 'Total MTPA' if selected_unit == 'mtpa' else 'Total Mcm/d'
 
 
-def _format_table_cell_value(value):
-    if pd.isna(value):
-        return ""
-
-    if isinstance(value, (int, float)):
-        return f"{float(value):.2f}"
-
-    return str(value)
-
-
 def _build_volume_table_column_styles(df):
     """Create responsive widths so wide country matrices remain readable."""
     column_styles = []
@@ -111,15 +107,21 @@ def _build_volume_table_column_styles(df):
     return column_styles
 
 
-def _prepare_volume_country_dataframe(
-    scenario='base_view',
-    selected_unit='mtpa',
-    new_capacity_only=False,
-    start_year=2025,
-    end_year=2040,
-    breakdown='country',
+@lru_cache(maxsize=64)
+def _get_available_scenarios_cached(_refresh_token=None):
+    return tuple(get_available_scenarios(engine))
+
+
+@lru_cache(maxsize=64)
+def _fetch_volume_country_dataframe_cached(
+    scenario,
+    new_capacity_only,
+    start_year,
+    end_year,
+    breakdown,
+    _refresh_token=None,
 ):
-    """Fetch the production-page data in a month/group_name shape."""
+    """Fetch production data once per refresh-sensitive filter set."""
     raw_df = fetch_volume_data(
         start_year=start_year,
         end_year=end_year,
@@ -136,10 +138,32 @@ def _prepare_volume_country_dataframe(
     country_df = country_df.rename(columns={'group_name': 'country_name'})
     country_df['month'] = pd.to_datetime(country_df[['year', 'month']].assign(day=1))
 
+    return country_df[['month', 'country_name', 'total_output']]
+
+
+def _prepare_volume_country_dataframe(
+    scenario='base_view',
+    selected_unit='mtpa',
+    new_capacity_only=False,
+    start_year=2025,
+    end_year=2040,
+    breakdown='country',
+    refresh_token=None,
+):
+    """Return the production-page data in the selected display unit."""
+    country_df = _fetch_volume_country_dataframe_cached(
+        scenario,
+        bool(new_capacity_only),
+        int(start_year),
+        int(end_year),
+        breakdown or 'country',
+        refresh_token,
+    ).copy()
+
     if selected_unit == 'mcmd':
         country_df['total_output'] = convert_to_mcmd(country_df['total_output'])
 
-    return country_df[['month', 'country_name', 'total_output']]
+    return country_df
 
 
 def _build_direct_pivot_matrix(raw_df, selected_unit='mtpa'):
@@ -256,14 +280,13 @@ def _create_volume_country_table(table_id, df):
                 }
             )
 
-    return dash_table.DataTable(
+    return create_ag_grid_from_datatable(
         id=table_id,
         columns=columns,
         data=df.to_dict('records'),
         sort_action='native',
         page_action='none',
         fill_width=True,
-        fixed_rows={"headers": True},
         fixed_columns={"headers": True, "data": 1},
         style_table={
             "overflowX": "auto",
@@ -272,15 +295,6 @@ def _create_volume_country_table(table_id, df):
             "width": "100%",
             "minWidth": "100%",
             "marginTop": "20px",
-        },
-        style_header=base_config['style_header'],
-        style_cell={
-            **base_config['style_cell'],
-            "minWidth": "72px",
-            "width": "72px",
-            "maxWidth": "none",
-            "border": f"1px solid {TABLE_COLORS['border_light']}",
-            "padding": "6px 8px",
         },
         style_cell_conditional=_build_volume_table_column_styles(df),
         style_data_conditional=style_data_conditional,
@@ -391,194 +405,213 @@ def create_volume_country_area_chart(matrix_df, selected_unit='mtpa'):
     return fig
 
 
-layout = html.Div([
-    html.Div(
-        [
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div("Scenario", className="filter-group-header"),
-                            html.Label("View:", className="filter-label"),
-                            dcc.Dropdown(
-                                id='capacity-scenario-dropdown',
-                                options=[{'label': s, 'value': s} for s in get_available_scenarios(engine)],
-                                value='base_view',
-                                clearable=False,
-                                className='filter-dropdown',
-                                style={'width': '100%'}
+def layout():
+    return html.Div([
+        html.Div(
+            [
+                            html.Div(
+                                [
+                                    html.Div("Scenario", className="filter-group-header"),
+                                    html.Div(
+                                        [
+                                            dcc.Dropdown(
+                                                id='capacity-scenario-dropdown',
+                                                options=[],
+                                                value='base_view',
+                                                clearable=False,
+                                                className='filter-dropdown',
+                                                style={'minWidth': '180px', 'width': '180px'}
+                                            ),
+                                            html.A(
+                                                html.Button(
+                                                    'Manage Adjustments',
+                                                    style={
+                                                        'padding': '8px 12px',
+                                                        'backgroundColor': '#2E86C1',
+                                                        'color': 'white',
+                                                        'border': 'none',
+                                                        'borderRadius': '4px',
+                                                        'cursor': 'pointer',
+                                                        'fontWeight': 'bold',
+                                                        'fontSize': '12px',
+                                                        'whiteSpace': 'nowrap'
+                                                    }
+                                                ),
+                                                href='/terminal_adjustments',
+                                                style={'textDecoration': 'none'}
+                                            ),
+                                        ],
+                                        style={
+                                            'display': 'flex',
+                                            'gap': '8px',
+                                            'alignItems': 'center',
+                                            'flexWrap': 'nowrap',
+                                        }
+                                    ),
+                                ],
+                                className="filter-group",
+                                style={'minWidth': '330px'},
                             ),
-                            html.A(
-                                html.Button(
-                                    'Manage Adjustments',
+                            html.Div(
+                                [
+                                    html.Div("Unit of Measure", className="filter-group-header"),
+                                    dcc.Dropdown(
+                                        id='capacity-unit-dropdown',
+                                    options=[
+                                        {'label': 'MTPA (Million Tonnes Per Annum)', 'value': 'mtpa'},
+                                        {'label': 'Mcm/d (Million Cubic Meters per Day)', 'value': 'mcmd'}
+                                    ],
+                                    value='mtpa',
+                                    clearable=False,
+                                    className='filter-dropdown',
+                                    style={'width': '100%'}
+                                ),
+                            ],
+                            className="filter-group",
+                        ),
+                            html.Div(
+                                [
+                                    html.Div("Scope", className="filter-group-header"),
+                                    dcc.Checklist(
+                                        id='capacity-new-capacity-checkbox',
+                                    options=[{'label': ' New capacity only', 'value': 'new_only'}],
+                                    value=[],
+                                    style={'fontSize': '14px', 'fontWeight': '600'}
+                                ),
+                            ],
+                            className="filter-group",
+                        ),
+                            html.Div(
+                                [
+                                    html.Div("Group By", className="filter-group-header"),
+                                    dcc.Dropdown(
+                                        id='capacity-breakdown-dropdown',
+                                    options=[
+                                        {'label': 'Country', 'value': 'country'},
+                                        {'label': 'Plant', 'value': 'project'},
+                                        {'label': 'Train', 'value': 'train'},
+                                    ],
+                                    value='country',
+                                    clearable=False,
+                                    className='filter-dropdown',
+                                    style={'width': '100%'}
+                                ),
+                            ],
+                            className="filter-group",
+                        ),
+                            html.Div(
+                                [
+                                    html.Div("Country Columns", className="filter-group-header"),
+                                    dcc.Dropdown(
+                                        id='capacity-country-columns-dropdown',
+                                    options=[],
+                                    value=None,
+                                    multi=True,
+                                    placeholder='Select countries to keep as separate columns',
+                                    className='filter-dropdown',
+                                    style={'width': '100%'}
+                                ),
+                            ],
+                            id='capacity-country-columns-section',
+                            className="filter-group",
+                        ),
+                            html.Div(
+                                [
+                                    html.Div("Other Countries", className="filter-group-header"),
+                                    dcc.RadioItems(
+                                        id='capacity-other-country-mode',
+                                    options=[
+                                        {
+                                            'label': 'Include as Rest of the World',
+                                            'value': 'rest_of_world',
+                                        },
+                                        {
+                                            'label': 'Exclude from the chart and table',
+                                            'value': 'exclude',
+                                        },
+                                    ],
+                                    value='rest_of_world',
+                                    className='balance-radio-group',
+                                    labelStyle={'display': 'inline-flex', 'alignItems': 'center'},
+                                    inputStyle={'marginRight': '6px'},
+                                ),
+                            ],
+                            id='capacity-other-country-section',
+                            className="filter-group",
+                        ),
+                            html.Div(
+                                [
+                                    html.Div("Export", className="filter-group-header"),
+                                    html.Button(
+                                        'Export to Excel',
+                                    id='capacity-export-excel-button',
+                                    n_clicks=0,
                                     style={
-                                        'padding': '5px 12px',
+                                        'padding': '8px 16px',
                                         'backgroundColor': '#2E86C1',
                                         'color': 'white',
                                         'border': 'none',
                                         'borderRadius': '4px',
                                         'cursor': 'pointer',
                                         'fontWeight': 'bold',
-                                        'fontSize': '12px',
-                                        'marginTop': '4px'
+                                        'fontSize': '14px'
                                     }
                                 ),
-                                href='/terminal_adjustments',
-                            ),
-                        ],
-                        className="filter-section filter-section-destination",
-                    ),
-                    html.Div(
-                        [
-                            html.Div("Unit of Measure", className="filter-group-header"),
-                            html.Label("Display:", className="filter-label"),
-                            dcc.Dropdown(
-                                id='capacity-unit-dropdown',
-                                options=[
-                                    {'label': 'MTPA (Million Tonnes Per Annum)', 'value': 'mtpa'},
-                                    {'label': 'Mcm/d (Million Cubic Meters per Day)', 'value': 'mcmd'}
-                                ],
-                                value='mtpa',
-                                clearable=False,
-                                className='filter-dropdown',
-                                style={'width': '100%'}
-                            ),
-                        ],
-                        className="filter-section filter-section-origin",
-                    ),
-                    html.Div(
-                        [
-                            html.Div("Scope", className="filter-group-header"),
-                            html.Label("View:", className="filter-label"),
-                            dcc.Checklist(
-                                id='capacity-new-capacity-checkbox',
-                                options=[{'label': ' New capacity only', 'value': 'new_only'}],
-                                value=[],
-                                style={'fontSize': '14px', 'fontWeight': '600'}
-                            ),
-                        ],
-                        className="filter-section filter-section-destination",
-                    ),
-                    html.Div(
-                        [
-                            html.Div("Group By", className="filter-group-header"),
-                            html.Label("Level:", className="filter-label"),
-                            dcc.Dropdown(
-                                id='capacity-breakdown-dropdown',
-                                options=[
-                                    {'label': 'Country', 'value': 'country'},
-                                    {'label': 'Plant', 'value': 'project'},
-                                    {'label': 'Train', 'value': 'train'},
-                                ],
-                                value='country',
-                                clearable=False,
-                                className='filter-dropdown',
-                                style={'width': '100%'}
-                            ),
-                        ],
-                        className="filter-section filter-section-volume",
-                    ),
-                    html.Div(
-                        [
-                            html.Div("Country Columns", className="filter-group-header"),
-                            html.Label("Countries:", className="filter-label"),
-                            dcc.Dropdown(
-                                id='capacity-country-columns-dropdown',
-                                options=[],
-                                value=None,
-                                multi=True,
-                                placeholder='Select countries to keep as separate columns',
-                                className='filter-dropdown',
-                                style={'width': '100%'}
-                            ),
-                        ],
-                        id='capacity-country-columns-section',
-                        className="filter-section filter-section-origin-exp",
-                    ),
-                    html.Div(
-                        [
-                            html.Div("Other Countries", className="filter-group-header"),
-                            html.Label("Handling:", className="filter-label"),
-                            dcc.RadioItems(
-                                id='capacity-other-country-mode',
-                                options=[
-                                    {
-                                        'label': 'Include as Rest of the World',
-                                        'value': 'rest_of_world',
-                                    },
-                                    {
-                                        'label': 'Exclude from the chart and table',
-                                        'value': 'exclude',
-                                    },
-                                ],
-                                value='rest_of_world',
-                                className='balance-radio-group',
-                                labelStyle={'display': 'inline-flex', 'alignItems': 'center'},
-                                inputStyle={'marginRight': '6px'},
-                            ),
-                        ],
-                        id='capacity-other-country-section',
-                        className="filter-section filter-section-volume",
-                    ),
-                    html.Div(
-                        [
-                            html.Div("Export", className="filter-group-header"),
-                            html.Label("Visible matrix:", className="filter-label"),
-                            html.Button(
-                                'Export to Excel',
-                                id='capacity-export-excel-button',
-                                n_clicks=0,
-                                style={
-                                    'padding': '8px 16px',
-                                    'backgroundColor': '#2E86C1',
-                                    'color': 'white',
-                                    'border': 'none',
-                                    'borderRadius': '4px',
-                                    'cursor': 'pointer',
-                                    'fontWeight': 'bold',
-                                    'fontSize': '14px'
-                                }
-                            ),
-                            dcc.Download(id='capacity-download-excel')
-                        ],
-                        className="filter-section filter-section-analysis",
-                    ),
-                ],
-                className="filter-bar-grouped",
-            )
-        ],
-        className="professional-section-header",
-        style={'margin': '0'}
-    ),
-    html.Div([
+                                dcc.Download(id='capacity-download-excel')
+                            ],
+                            className="filter-group",
+                        ),
+                    ],
+            className="professional-section-header",
+            style={
+                'display': 'flex',
+                'gap': '12px',
+                'alignItems': 'flex-start',
+                'flexWrap': 'wrap',
+                'margin': '0',
+            }
+        ),
         html.Div([
-            html.Label("Year Range:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
-            dcc.RangeSlider(
-                id='capacity-year-range-slider',
-                min=2000,
-                max=2055,
-                step=1,
-                value=[2025, 2040],
-                marks={year: str(year) for year in range(2000, 2056, 5)},
-                tooltip={"placement": "bottom", "always_visible": True},
-                className='year-range-slider'
+            html.Div([
+                html.Label("Year Range:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
+                dcc.RangeSlider(
+                    id='capacity-year-range-slider',
+                    min=2000,
+                    max=2055,
+                    step=1,
+                    value=[2025, 2040],
+                    marks={year: str(year) for year in range(2000, 2056, 5)},
+                    tooltip={"placement": "bottom", "always_visible": True},
+                    className='year-range-slider'
+                )
+            ], style={'width': '80%', 'margin': '0 auto', 'marginBottom': '20px'})
+        ], style={'textAlign': 'center'}),
+        html.Div([
+            dcc.Graph(
+                id='capacity-volume-area-chart',
+                figure=_create_empty_volume_figure("Loading capacity data..."),
+                config={'displayModeBar': True, 'displaylogo': False},
+                style={'height': '100%'}
             )
-        ], style={'width': '80%', 'margin': '0 auto', 'marginBottom': '20px'})
-    ], style={'textAlign': 'center'}),
-    html.Div([
-        dcc.Graph(
-            id='capacity-volume-area-chart',
-            figure=_create_empty_volume_figure("Loading capacity data..."),
-            config={'displayModeBar': True, 'displaylogo': False},
-            style={'height': '100%'}
+        ], style={'marginTop': '20px'}),
+        html.Div(
+            id='capacity-country-table-container',
+            children=_create_empty_table_state("Loading capacity data..."),
+            style={'marginTop': '20px'}
         )
-    ], style={'marginTop': '20px'}),
-    html.Div(
-        id='capacity-country-table-container',
-        children=_create_empty_table_state("Loading capacity data..."),
-        style={'marginTop': '20px'}
-    )
-])
+    ])
+
+
+@callback(
+    Output('capacity-scenario-dropdown', 'options'),
+    Input('global-refresh-button', 'n_clicks'),
+)
+def populate_capacity_scenario_options(_):
+    """Load scenarios on page render instead of during app import."""
+    return [
+        {'label': scenario, 'value': scenario}
+        for scenario in _get_available_scenarios_cached(_)
+    ]
 
 
 @callback(
@@ -608,6 +641,8 @@ def populate_capacity_country_columns(
     is_country = (breakdown or 'country') == 'country'
     hidden = {'display': 'none'}
     visible = None  # let CSS class control the style
+    if not is_country:
+        return no_update, no_update, hidden, hidden
 
     new_capacity_only = 'new_only' in (new_capacity_checkbox or [])
     start_year, end_year = year_range if year_range else [2025, 2040]
@@ -619,6 +654,7 @@ def populate_capacity_country_columns(
         start_year=start_year,
         end_year=end_year,
         breakdown='country',
+        refresh_token=n_clicks,
     )
     available_countries = _get_available_volume_countries(raw_df)
     options = [{'label': country, 'value': country} for country in available_countries]
@@ -657,7 +693,7 @@ def update_capacity_section(
     selected_countries,
     other_countries_mode,
     year_range,
-    n_clicks,
+    refresh_clicks,
 ):
     """Update the production page chart and table from one shared dataset."""
     if not scenario or not selected_unit:
@@ -674,6 +710,7 @@ def update_capacity_section(
         start_year=start_year,
         end_year=end_year,
         breakdown=breakdown,
+        refresh_token=refresh_clicks,
     )
 
     if raw_df.empty:
@@ -726,6 +763,7 @@ def update_capacity_section(
     State('capacity-country-columns-dropdown', 'value'),
     State('capacity-other-country-mode', 'value'),
     State('capacity-year-range-slider', 'value'),
+    State('global-refresh-button', 'n_clicks'),
     prevent_initial_call=True
 )
 def export_capacity_to_excel(
@@ -737,6 +775,7 @@ def export_capacity_to_excel(
     selected_countries,
     other_countries_mode,
     year_range,
+    refresh_clicks,
 ):
     """Export the visible month-by-group matrix to Excel."""
     if n_clicks == 0:
@@ -753,6 +792,7 @@ def export_capacity_to_excel(
         start_year=start_year,
         end_year=end_year,
         breakdown=breakdown,
+        refresh_token=refresh_clicks,
     )
 
     if raw_df.empty:

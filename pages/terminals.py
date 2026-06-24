@@ -1,19 +1,7 @@
-from dash import html, dcc, callback, Output, Input
-import plotly.graph_objects as go
 import pandas as pd
-import numpy as np
-from datetime import datetime
 import configparser
 import os
-import sys
 from sqlalchemy import create_engine
-
-# Add project root to path for imports
-script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
-sys.path.insert(0, project_root)
-
-from fundamentals.terminals.scenario_utils import get_available_scenarios
 
 ############################################ postgres sql connection ###################################################
 #------ code to be able to access config.ini, even having the path in the .virtualenvs is not working without it ------#
@@ -24,7 +12,7 @@ try:
     # Adjust the number of '..' as needed to reach the correct directory
     config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))  # Go up two levels
     CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except:
+except Exception:
     CONFIG_FILE_PATH = 'config.ini'  # Assumes it's in the same directory or the path it is detected
 
 
@@ -483,7 +471,7 @@ def fetch_volume_data(start_year=2025, end_year=2040, breakdown='country', new_c
                 AND a.id_lng_train = mc.id_lng_train
                 AND a.year = mc.year
             WHERE (mc.has_monthly_data IS NULL OR mc.has_monthly_data = false)
-              AND a.year >= {start_year} AND a.year <= {end_year}
+              AND a.year >= %(start_year)s AND a.year <= %(end_year)s
         ),
         monthly_data AS (
             SELECT
@@ -497,7 +485,7 @@ def fetch_volume_data(start_year=2025, end_year=2040, breakdown='country', new_c
                 metric_value,
                 'monthly' as source_type
             FROM latest_monthly
-            WHERE year >= {start_year} AND year <= {end_year}
+            WHERE year >= %(start_year)s AND year <= %(end_year)s
         ),
         combined_data AS (
             SELECT * FROM monthly_data
@@ -520,7 +508,11 @@ def fetch_volume_data(start_year=2025, end_year=2040, breakdown='country', new_c
         FROM combined_data
         ORDER BY year, month, plant_name, id_lng_train
         """
-        df = pd.read_sql_query(query, engine)
+        df = pd.read_sql_query(
+            query,
+            engine,
+            params={'start_year': start_year, 'end_year': end_year},
+        )
     else:
         # Other scenarios: Apply volume adjustments if they exist
         query = f"""
@@ -574,7 +566,7 @@ def fetch_volume_data(start_year=2025, end_year=2040, breakdown='country', new_c
                 AND a.id_lng_train = mc.id_lng_train
                 AND a.year = mc.year
             WHERE (mc.has_monthly_data IS NULL OR mc.has_monthly_data = false)
-              AND a.year >= {start_year} AND a.year <= {end_year}
+              AND a.year >= %(start_year)s AND a.year <= %(end_year)s
         ),
         monthly_data AS (
             SELECT
@@ -587,7 +579,7 @@ def fetch_volume_data(start_year=2025, end_year=2040, breakdown='country', new_c
                 lng_train_name_short,
                 metric_value
             FROM latest_monthly
-            WHERE year >= {start_year} AND year <= {end_year}
+            WHERE year >= %(start_year)s AND year <= %(end_year)s
         ),
         woodmac_baseline AS (
             SELECT * FROM monthly_data
@@ -626,7 +618,15 @@ def fetch_volume_data(start_year=2025, end_year=2040, breakdown='country', new_c
             AND wb.month = la.month
         ORDER BY wb.year, wb.month, wb.plant_name, wb.id_lng_train
         """
-        df = pd.read_sql_query(query, engine, params={'scenario': scenario})
+        df = pd.read_sql_query(
+            query,
+            engine,
+            params={
+                'scenario': scenario,
+                'start_year': start_year,
+                'end_year': end_year,
+            },
+        )
 
     # Filter by selected countries if provided
     if selected_countries and len(selected_countries) > 0:
@@ -659,555 +659,3 @@ def fetch_volume_data(start_year=2025, end_year=2040, breakdown='country', new_c
         df = df[['year', 'month', 'group_name', 'plant_name', 'country_name', 'total_output']]
 
     return df
-
-
-def create_timeline_figure(selected_unit='mtpa', scenario='base_view', year_range=None):
-    """
-    Create the Plotly timeline figure showing LNG train capacity additions using bar charts.
-
-    Args:
-        selected_unit: 'mtpa' or 'mcmd'
-        scenario: Scenario name for adjustments ('base_view', 'best_view', etc.)
-        year_range: List with [start_year, end_year] for filtering (default: [2025, 2028])
-
-    Returns:
-        plotly.graph_objects.Figure
-    """
-    # Fetch data with scenario
-    df = fetch_train_data(scenario=scenario)
-
-    if df.empty:
-        # Return empty figure with message
-        fig = go.Figure()
-        fig.add_annotation(
-            text="No data available",
-            xref="paper", yref="paper",
-            x=0.5, y=0.5, showarrow=False,
-            font=dict(size=20)
-        )
-        return fig
-
-    # Apply year range filter
-    if year_range is None:
-        year_range = [2025, 2028]
-
-    start_year, end_year = year_range
-    df['train_year'] = pd.to_datetime(df['lng_train_date_start_est']).dt.year
-    df = df[(df['train_year'] >= start_year) & (df['train_year'] <= end_year)].copy()
-
-    if df.empty:
-        # Return empty figure with message if no data in range
-        fig = go.Figure()
-        fig.add_annotation(
-            text=f"No data available for {start_year}-{end_year}",
-            xref="paper", yref="paper",
-            x=0.5, y=0.5, showarrow=False,
-            font=dict(size=20)
-        )
-        return fig
-
-    # Convert to Mcm/d if needed
-    if selected_unit == 'mcmd':
-        df['capacity'] = convert_to_mcmd(df['capacity'])
-
-    # Create month-year column for aggregation (set to 1st of month)
-    df['month_start'] = df['lng_train_date_start_est'].dt.to_period('M').dt.to_timestamp()
-
-    # Sort by country and then by plant name
-    df = df.sort_values(['country_name', 'plant_name', 'month_start'])
-
-    # Aggregate by plant and month - sum capacity and count trains
-    monthly_df = df.groupby(['country_name', 'plant_name', 'month_start']).agg({
-        'capacity': 'sum',
-        'lng_train_date_start_est': 'count'  # Count of trains
-    }).reset_index()
-    monthly_df.rename(columns={'lng_train_date_start_est': 'train_count'}, inplace=True)
-
-    # Get unique plants with their countries, maintaining order
-    plants_df = monthly_df.groupby(['country_name', 'plant_name']).first().reset_index()
-
-    # Calculate dynamic date range based on NEW capacity additions (train start dates)
-    # Use original df with actual train start dates, not monthly_df which is aggregated
-    if not df.empty:
-        # Get actual train start dates (when new capacity is added)
-        train_start_dates = pd.to_datetime(df['lng_train_date_start_est'])
-        data_min_date = train_start_dates.min()
-        data_max_date = train_start_dates.max()  # Last date with NEW capacity addition
-
-        # Add minimal buffer: start 15 days before first addition, end 15 days after last addition
-        chart_start_date = (data_min_date - pd.DateOffset(days=15)).strftime('%Y-%m-%d')
-        chart_end_date = (data_max_date + pd.DateOffset(days=15)).strftime('%Y-%m-%d')
-
-        # For grid lines - get years to iterate (use actual capacity addition years only)
-        min_year = data_min_date.year
-        max_year = data_max_date.year
-
-        # Title date range
-        title_date_range = f"{data_min_date.strftime('%B %Y')} - {data_max_date.strftime('%B %Y')}"
-    else:
-        # Fallback if no data
-        chart_start_date = '2024-12-15'
-        chart_end_date = '2028-02-01'
-        min_year = 2025
-        max_year = 2028
-        title_date_range = 'January 2025 - January 2028'
-
-    # Create figure
-    fig = go.Figure()
-
-    # Track y positions and labels
-    y_position = 0
-    y_labels = []
-    y_ticks = []
-    plant_to_y = {}
-
-    # Add bars for each plant
-    for idx, (_, plant_info) in enumerate(plants_df.iterrows()):
-        country = plant_info['country_name']
-        plant = plant_info['plant_name']
-
-        plant_to_y[plant] = y_position
-
-        # Get all monthly aggregations for this plant
-        plant_months = monthly_df[
-            (monthly_df['country_name'] == country) &
-            (monthly_df['plant_name'] == plant)
-        ]
-
-        # Get color for country
-        color = PRIMARY_COLORS.get(country, '#666666')
-
-        # Add bars using scatter with mode='markers'
-        for _, month_data in plant_months.iterrows():
-            capacity = month_data['capacity']
-            train_count = month_data['train_count']
-            month_date = month_data['month_start']
-
-            # Add bar using marker
-            fig.add_trace(go.Bar(
-                x=[month_date],
-                y=[capacity],
-                base=y_position - 0.3,
-                width=10 * 24 * 60 * 60 * 1000,  # 10 days in milliseconds
-                marker=dict(
-                    color=color,
-                    line=dict(color=color if capacity > (15 if selected_unit == 'mtpa' else 50) else color, width=0),
-                    opacity=0.85
-                ),
-                orientation='v',
-                showlegend=False,
-                hovertemplate=f'<b>{plant}</b><br>{country}<br>Capacity: {capacity:.1f} {selected_unit.upper()}<br>Date: %{{x|%b %Y}}<extra></extra>',
-                customdata=[[plant, country, capacity, train_count]]
-            ))
-
-            # Add capacity label - only for significant capacity (>= 3 MTPA or 10 Mcm/d) to reduce clutter
-            min_threshold = 3.0 if selected_unit == 'mtpa' else 10.0
-            if capacity >= min_threshold:
-                label_text = f"{capacity:.1f}" if selected_unit == 'mtpa' else f"{capacity:.0f}"
-                fig.add_annotation(
-                    x=month_date,
-                    y=y_position + capacity + 0.3,
-                    text=label_text,
-                    showarrow=False,
-                    font=dict(size=9, color=color, family="Arial", weight='bold'),
-                    xanchor='center',
-                    yanchor='bottom'
-                )
-
-            # Add train count if multiple trains (always show this as it's important info)
-            if train_count > 1:
-                fig.add_annotation(
-                    x=month_date,
-                    y=y_position - 0.4,
-                    text=str(train_count),
-                    showarrow=False,
-                    font=dict(size=7, color=color, family="Arial"),
-                    xanchor='center',
-                    yanchor='top',
-                    opacity=0.9
-                )
-
-        y_labels.append(plant)
-        y_ticks.append(y_position)
-        y_position += (monthly_df['capacity'].max() * 1.5 if len(monthly_df) > 0 else 10)
-
-    # Add background shading for each plant row based on country color
-    for idx, (_, plant_info) in enumerate(plants_df.iterrows()):
-        country = plant_info['country_name']
-        color = PRIMARY_COLORS.get(country, '#666666')
-
-        # Calculate row boundaries
-        y_center = y_ticks[idx]
-        if idx < len(y_ticks) - 1:
-            y_bottom = (y_ticks[idx] + y_ticks[idx + 1]) / 2
-        else:
-            y_bottom = y_position
-
-        if idx > 0:
-            y_top = (y_ticks[idx - 1] + y_ticks[idx]) / 2
-        else:
-            y_top = y_ticks[idx] - (monthly_df['capacity'].max() * 0.75 if len(monthly_df) > 0 else 5)
-
-        # Add very light background rectangle for this plant
-        fig.add_shape(
-            type="rect",
-            x0=chart_start_date, x1=chart_end_date,
-            y0=y_top, y1=y_bottom,
-            fillcolor=color,
-            opacity=0.05,  # Very light - only 5% opacity
-            line_width=0,
-            layer='below'
-        )
-
-    # Add horizontal separator lines between plants
-    for i in range(len(y_ticks) - 1):
-        mid_y = (y_ticks[i] + y_ticks[i+1]) / 2
-        fig.add_shape(
-            type="line",
-            x0=chart_start_date, x1=chart_end_date,
-            y0=mid_y, y1=mid_y,
-            line=dict(color='#E0E0E0', width=0.5),
-            layer='below'
-        )
-
-    # Calculate y-axis range (minimum is bottom of first plant)
-    if len(y_ticks) > 0:
-        y_min = y_ticks[0] - (monthly_df['capacity'].max() * 0.75 if len(monthly_df) > 0 else 5)
-        y_max = y_position
-    else:
-        y_min = 0
-        y_max = 10
-
-    # Add vertical grid lines - only yearly for performance (not monthly)
-    for year in range(min_year, max_year + 1):
-        date = pd.Timestamp(f'{year}-01-01')
-        if pd.Timestamp(chart_start_date) <= date <= pd.Timestamp(chart_end_date):
-            fig.add_shape(
-                type="line",
-                x0=date, x1=date,
-                y0=y_min, y1=y_max,
-                line=dict(color='#999999', width=1, dash='solid'),
-                opacity=0.4,
-                layer='below'
-            )
-
-    # Add "Today" marker
-    current_date = datetime.now()
-    first_of_month = pd.Timestamp(current_date.replace(day=1))
-    if pd.Timestamp(chart_start_date) <= first_of_month <= pd.Timestamp(chart_end_date):
-        fig.add_shape(
-            type="line",
-            x0=first_of_month, x1=first_of_month,
-            y0=y_min, y1=y_max,
-            line=dict(color='#E74C3C', width=2, dash='dash'),
-            layer='above'
-        )
-        fig.add_annotation(
-            x=first_of_month,
-            y=y_max * 0.98,
-            text='Today',
-            showarrow=False,
-            font=dict(size=10, color='#E74C3C', family="Arial", weight='bold'),
-            bgcolor='white',
-            bordercolor='#E74C3C',
-            borderwidth=1,
-            borderpad=3
-        )
-
-    # Add arrows for adjusted trains showing change from Woodmac baseline
-    adjusted_trains = df[df['data_source'] == 'adjusted'].copy()
-
-    for _, train in adjusted_trains.iterrows():
-        if pd.notna(train['woodmac_date']) and pd.notna(train['internal_date']):
-            plant_name = train['plant_name']
-            woodmac_date = pd.to_datetime(train['woodmac_date'])
-            internal_date = pd.to_datetime(train['internal_date'])
-
-            # Get y position for this plant
-            y_pos = plant_to_y.get(plant_name)
-            if y_pos is not None:
-                # Only show arrow if dates are different and within our chart range
-                if (woodmac_date != internal_date and
-                    pd.Timestamp(chart_start_date) <= woodmac_date <= pd.Timestamp(chart_end_date) and
-                    pd.Timestamp(chart_start_date) <= internal_date <= pd.Timestamp(chart_end_date)):
-
-                    # Position arrow below the baseline
-                    arrow_y = y_pos - 1.5
-
-                    # Determine arrow color based on direction
-                    if internal_date < woodmac_date:  # Moved earlier
-                        arrow_color = '#2E8B57'  # Sea green for earlier
-                    else:  # Moved later
-                        arrow_color = '#B22222'  # Fire brick for later
-
-                    # Add arrow annotation
-                    fig.add_annotation(
-                        x=internal_date,
-                        y=arrow_y,
-                        ax=woodmac_date,
-                        ay=arrow_y,
-                        xref='x',
-                        yref='y',
-                        axref='x',
-                        ayref='y',
-                        showarrow=True,
-                        arrowhead=2,
-                        arrowsize=1.5,
-                        arrowwidth=2,
-                        arrowcolor=arrow_color,
-                        opacity=0.8
-                    )
-
-                    # Add label showing the change in months
-                    mid_date = woodmac_date + (internal_date - woodmac_date) / 2
-                    days_diff = abs((internal_date - woodmac_date).days)
-                    months_diff = round(days_diff / 30.44, 1)  # Average days per month
-                    label_text = f"{months_diff:.0f}m"
-
-                    fig.add_annotation(
-                        x=mid_date,
-                        y=arrow_y + 0.8,
-                        text=label_text,
-                        showarrow=False,
-                        font=dict(size=8, color=arrow_color, family="Arial", weight='bold'),
-                        bgcolor='white',
-                        bordercolor=arrow_color,
-                        borderwidth=0.5,
-                        borderpad=2,
-                        opacity=0.9
-                    )
-
-    # Update layout
-    unit_label = 'MTPA' if selected_unit == 'mtpa' else 'Mcm/d'
-
-    # Calculate smart tick interval based on date range
-    date_range_years = max_year - min_year + 1
-    if date_range_years <= 3:
-        dtick = 'M3'  # Every 3 months for short ranges
-        tickformat = '%b\n%Y'
-    elif date_range_years <= 7:
-        dtick = 'M6'  # Every 6 months for medium ranges
-        tickformat = '%b\n%Y'
-    elif date_range_years <= 15:
-        dtick = 'M12'  # Annually for longer ranges
-        tickformat = '%Y'
-    else:
-        dtick = 'M24'  # Every 2 years for very long ranges
-        tickformat = '%Y'
-
-    fig.update_layout(
-        title={
-            'text': f'LNG Train Start Dates and Capacity ({unit_label}) | {title_date_range}',
-            'font': {'size': 20, 'family': 'Arial', 'color': '#333333'},
-            'x': 0.5,
-            'xanchor': 'center',
-            'y': 0.98,
-            'yanchor': 'top'
-        },
-        xaxis=dict(
-            title='',
-            range=[chart_start_date, chart_end_date],
-            type='date',
-            tickformat=tickformat,
-            dtick=dtick,
-            tickfont=dict(size=10, family='Arial', color='#333333'),
-            tickangle=0,
-            showgrid=False,
-            showline=True,
-            linewidth=1,
-            linecolor='#CCCCCC',
-            zeroline=False
-        ),
-        yaxis=dict(
-            title='',
-            range=[y_min, y_max],
-            tickmode='array',
-            tickvals=y_ticks,
-            ticktext=y_labels,
-            tickfont=dict(size=11, family='Arial', color='#333333'),
-            showgrid=False,
-            showline=True,
-            linewidth=1,
-            linecolor='#CCCCCC',
-            zeroline=False,
-            side='left'
-        ),
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        height=max(800, len(y_ticks) * 50),
-        margin=dict(l=200, r=200, t=60, b=80),
-        hovermode='closest',
-        showlegend=False,
-        bargap=0,
-        barmode='overlay',
-        # Performance optimizations
-        uirevision='constant',  # Preserve zoom/pan state
-        dragmode='pan',  # Default to pan mode (faster than zoom)
-    )
-
-    # Optimize for faster rendering
-    fig.update_xaxes(automargin=False)
-    fig.update_yaxes(automargin=False)
-
-    # Color y-axis labels by country
-    country_colors = {}
-    for idx, (_, plant_info) in enumerate(plants_df.iterrows()):
-        country = plant_info['country_name']
-        country_colors[idx] = PRIMARY_COLORS.get(country, '#666666')
-
-    # Add country labels on the right
-    country_sections = {}
-    current_country = None
-    country_start_idx = 0
-
-    for idx, (_, plant_info) in enumerate(plants_df.iterrows()):
-        country = plant_info['country_name']
-        if country != current_country:
-            if current_country is not None:
-                # Add label for previous country
-                mid_y = (y_ticks[country_start_idx] + y_ticks[idx-1]) / 2
-                fig.add_annotation(
-                    x=1.005,  # Reduced from 1.05 to 1.005 for minimal spacing
-                    y=mid_y,
-                    xref='paper',
-                    yref='y',
-                    text=current_country,
-                    showarrow=False,
-                    font=dict(size=12, color=PRIMARY_COLORS.get(current_country, '#666666'), family='Arial', weight='bold'),
-                    xanchor='left',
-                    yanchor='middle'
-                )
-            current_country = country
-            country_start_idx = idx
-
-    # Add last country label
-    if current_country is not None:
-        mid_y = (y_ticks[country_start_idx] + y_ticks[len(y_ticks)-1]) / 2
-        fig.add_annotation(
-            x=1.005,  # Reduced from 1.05 to 1.005 for minimal spacing
-            y=mid_y,
-            xref='paper',
-            yref='y',
-            text=current_country,
-            showarrow=False,
-            font=dict(size=12, color=PRIMARY_COLORS.get(current_country, '#666666'), family='Arial', weight='bold'),
-            xanchor='left',
-            yanchor='middle'
-        )
-
-    # Add note at bottom left
-    note_text = 'Bar height represents cumulative monthly capacity • Number below bar indicates multiple trains in same month • Arrows show internal adjustments vs Woodmac baseline'
-    fig.add_annotation(
-        x=0,
-        y=-0.08,  # Position below the x-axis with more space
-        xref='paper',
-        yref='paper',
-        text=note_text,
-        showarrow=False,
-        font=dict(size=9, color='#666666', family='Arial', style='italic'),
-        xanchor='left',
-        yanchor='top'
-    )
-
-    return fig
-
-
-# Page Layout
-layout = html.Div([
-    # Page title
-    html.H1(
-        "LNG Train Timeline - Capacity Additions 2025-2028",
-        style={'textAlign': 'center', 'marginBottom': '20px', 'color': '#2E86C1'}
-    ),
-
-    # Scenario selector and controls section
-    html.Div([
-        html.Div([
-            html.Label("Scenario:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
-            dcc.Dropdown(
-                id='scenario-selector-dropdown',
-                options=[{'label': s, 'value': s} for s in get_available_scenarios(engine)],
-                value='base_view',
-                clearable=False,
-                className='inline-dropdown',
-                style={'width': '200px', 'marginRight': '20px'}
-            ),
-            html.A(
-                html.Button(
-                    'Manage Adjustments',
-                    style={
-                        'padding': '6px 14px',
-                        'backgroundColor': '#2E86C1',
-                        'color': 'white',
-                        'border': 'none',
-                        'borderRadius': '4px',
-                        'cursor': 'pointer',
-                        'fontWeight': 'bold',
-                        'fontSize': '13px'
-                    }
-                ),
-                href='/terminal_adjustments',
-                style={'marginRight': '30px'}
-            ),
-            html.Label("Unit of Measure:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
-            dcc.Dropdown(
-                id='unit-dropdown',
-                options=[
-                    {'label': 'MTPA (Million Tonnes Per Annum)', 'value': 'mtpa'},
-                    {'label': 'Mcm/d (Million Cubic Meters per Day)', 'value': 'mcmd'}
-                ],
-                value='mtpa',
-                clearable=False,
-                className='inline-dropdown',
-                style={'width': '350px'}
-            )
-        ], style={'display': 'inline-flex', 'alignItems': 'center', 'marginBottom': '10px', 'justifyContent': 'center'}),
-
-        # Date range filter
-        html.Div([
-            html.Label("Year Range:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
-            dcc.RangeSlider(
-                id='year-range-slider',
-                min=2000,
-                max=2055,
-                step=1,
-                value=[2025, 2028],
-                marks={year: str(year) for year in range(2000, 2056, 5)},
-                tooltip={"placement": "bottom", "always_visible": True},
-                className='year-range-slider'
-            )
-        ], style={'width': '80%', 'margin': '0 auto', 'marginBottom': '20px'})
-    ], style={'textAlign': 'center'}),
-
-    # Timeline chart
-    html.Div([
-        dcc.Graph(
-            id='train-timeline-graph',
-            config={'displayModeBar': True, 'displaylogo': False},
-            style={'height': '100%'}
-        )
-    ]),
-    html.Div(
-        [
-            dcc.Link(
-                "Open the cumulative monthly LNG output chart and table on the Production page",
-                href='/production',
-                className='nav-link-secondary'
-            )
-        ],
-        style={'textAlign': 'center', 'marginTop': '24px'}
-    )
-])
-
-
-# Callback to update timeline chart (depends on unit, scenario, and year range)
-@callback(
-    Output('train-timeline-graph', 'figure'),
-    Input('scenario-selector-dropdown', 'value'),
-    Input('unit-dropdown', 'value'),
-    Input('year-range-slider', 'value'),
-    Input('global-refresh-button', 'n_clicks')
-)
-def update_timeline_chart(scenario, selected_unit, year_range, n_clicks):
-    """Update timeline chart based on scenario, unit, and year range."""
-    return create_timeline_figure(selected_unit, scenario=scenario, year_range=year_range)

@@ -1,6 +1,6 @@
 # index.py
-from dash import html, dcc, clientside_callback, ClientsideFunction, callback, callback_context
-from dash.dependencies import Input, Output, State
+from dash import html, dcc
+from dash.dependencies import Input, Output
 from app import app
 import pages.shipping_balance
 import pages.fleet_metrics
@@ -19,48 +19,20 @@ import pages.capacity
 import pages.production
 import pages.terminal_adjustments
 
-import pandas as pd
-import configparser
-import os
-from sqlalchemy import create_engine
-import subprocess
-import threading
-import dash_bootstrap_components as dbc
-import sys
-
-############################################ postgres sql connection ###################################################
-try:
-    # Get the directory where your script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Navigate to the directory containing config.ini
-    config_dir = os.path.abspath(os.path.join(script_dir, '..'))  # Go up one level
-    CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except:
-    CONFIG_FILE_PATH = 'config.ini'  # Assumes it's in the same directory or the path it is detected
-
-# --- Load Configuration from INI File ---
-config_reader = configparser.ConfigParser(interpolation=None)
-config_reader.read(CONFIG_FILE_PATH)
-
-# Read values from the ini file sections
-DB_CONNECTION_STRING = config_reader.get('DATABASE', 'CONNECTION_STRING', fallback=None)
-DB_SCHEMA = config_reader.get('DATABASE', 'SCHEMA', fallback=None)
-
-# --- Essential Variable Checks ---
-if not DB_CONNECTION_STRING:
-    raise ValueError(f"Missing DATABASE CONNECTION_STRING in {CONFIG_FILE_PATH}")
-
-# create engine
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
-
 # Professional Navigation Bar with Option B Blue System
 nav_links = html.Header([
     html.Div([
         # Primary navigation section
         html.Nav([
-            # Navigation group
+            dcc.Link(
+                'Shipping Balance',
+                href='/shipping_balance',
+                id='nav-shipping-balance',
+                className='nav-link-primary'
+            ),
+
+            # Secondary navigation group
             html.Div([
-                dcc.Link('Shipping Balance', href='/shipping_balance', id='nav-shipping-balance', className='nav-link-secondary'),
                 dcc.Link('Fleet Metrics', href='/fleet_metrics', id='nav-fleet-metrics', className='nav-link-secondary'),
                 dcc.Link('Supply', href='/supply', id='nav-supply', className='nav-link-secondary'),
                 dcc.Link('Demand', href='/demand', id='nav-demand', className='nav-link-secondary'),
@@ -125,11 +97,11 @@ def display_page(pathname):
     elif pathname == '/terminals':
         return dcc.Location(pathname='/capacity', id='redirect-capacity-from-terminals')
     elif pathname == '/production':
-        return pages.production.layout
+        return pages.production.layout()
     elif pathname == '/capacity':
         return pages.capacity.layout
     elif pathname == '/terminal_adjustments':
-        return pages.terminal_adjustments.layout
+        return pages.terminal_adjustments.layout()
     elif pathname == '/mappings':
         return pages.country_mappings.layout
     elif pathname == '/country_mappings':

@@ -1,8 +1,6 @@
-from dash import html, dcc, dash_table, callback, Output, Input, State, no_update
+from dash import html, dcc, callback, Output, Input, State, no_update
 from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
-import plotly.express as px
-import plotly.graph_objects as go
 import pandas as pd
 import configparser
 import math
@@ -10,7 +8,15 @@ import os
 from sqlalchemy import create_engine, text
 
 from utils.mappings_section import create_mappings_section_header
-from utils.table_styles import StandardTableStyleManager
+from utils.mapping_page_figures import (
+    build_bar_figure as _build_bar_figure,
+    build_dropdown_options as _build_dropdown_options,
+    build_empty_figure as _build_empty_figure,
+    build_mapping_table as _build_mapping_table,
+    build_summary_card_row as _build_summary_card_row,
+    clean_text_value as _clean_text_value,
+    filter_mapping_dataframe as _filter_mapping_dataframe,
+)
 
 
 try:
@@ -54,17 +60,6 @@ RAW_SOURCE_KEY_COLUMNS = [
     "source_field",
     "source_name",
 ]
-
-
-def _clean_text_value(value):
-    if pd.isna(value):
-        return ""
-
-    text_value = str(value).strip()
-    if not text_value:
-        return ""
-
-    return " ".join(text_value.split())
 
 
 def _clean_train_value(value):
@@ -158,80 +153,7 @@ def create_summary_cards(df):
         ("Providers", f"{providers:,}"),
     ]
 
-    cards = []
-    for label, value in card_specs:
-        cards.append(
-            dbc.Col(
-                [
-                    dbc.Card(
-                        [
-                            dbc.CardBody(
-                                [
-                                    html.H6(
-                                        label,
-                                        className="text-secondary",
-                                        style={"marginBottom": "8px"},
-                                    ),
-                                    html.H3(value, className="text-primary font-bold"),
-                                ]
-                            )
-                        ],
-                        className="shadow-sm h-100",
-                    )
-                ],
-                width=3,
-            )
-        )
-
-    return dbc.Row(cards, className="mb-4")
-
-
-def _build_empty_figure(message: str) -> go.Figure:
-    fig = go.Figure()
-    fig.add_annotation(
-        text=message,
-        x=0.5,
-        y=0.5,
-        xref="paper",
-        yref="paper",
-        showarrow=False,
-        font={"size": 16, "color": "#64748b"},
-    )
-    fig.update_layout(
-        template="plotly_white",
-        margin={"l": 20, "r": 20, "t": 40, "b": 20},
-        xaxis={"visible": False},
-        yaxis={"visible": False},
-    )
-    return fig
-
-
-def _build_bar_figure(series: pd.Series, title: str, color: str) -> go.Figure:
-    if series.empty:
-        return _build_empty_figure("No data available for the current selection.")
-
-    plot_df = series.reset_index()
-    plot_df.columns = ["label", "count"]
-
-    fig = px.bar(
-        plot_df,
-        x="count",
-        y="label",
-        orientation="h",
-        text="count",
-    )
-    fig.update_traces(marker_color=color, textposition="outside", cliponaxis=False)
-    fig.update_layout(
-        template="plotly_white",
-        title=title,
-        height=max(320, 60 + (len(plot_df) * 28)),
-        margin={"l": 20, "r": 20, "t": 50, "b": 20},
-        xaxis_title="Rows",
-        yaxis_title="",
-        showlegend=False,
-    )
-    fig.update_yaxes(categoryorder="total ascending")
-    return fig
+    return _build_summary_card_row(card_specs)
 
 
 def _filter_mapping_df(
@@ -244,66 +166,35 @@ def _filter_mapping_df(
     scope_hints,
     search_text,
 ) -> pd.DataFrame:
-    filtered_df = df.copy()
-
-    if countries:
-        filtered_df = filtered_df[filtered_df["country_name"].isin(countries)]
-    if plants:
-        filtered_df = filtered_df[filtered_df["plant_name"].isin(plants)]
-    if providers:
-        filtered_df = filtered_df[filtered_df["provider"].isin(providers)]
-    if parent_source_fields:
-        filtered_df = filtered_df[filtered_df["parent_source_field"].isin(parent_source_fields)]
-    if source_fields:
-        filtered_df = filtered_df[filtered_df["source_field"].isin(source_fields)]
-    if scope_hints:
-        filtered_df = filtered_df[filtered_df["scope_hint"].isin(scope_hints)]
-
-    search_value = _clean_text_value(search_text).lower()
-    if search_value:
-        search_columns = [
+    return _filter_mapping_dataframe(
+        df,
+        [
+            ("country_name", countries),
+            ("plant_name", plants),
+            ("provider", providers),
+            ("parent_source_field", parent_source_fields),
+            ("source_field", source_fields),
+            ("scope_hint", scope_hints),
+        ],
+        [
             "country_name",
             "plant_name",
             "parent_source_name",
             "source_name",
             "component_hint",
             "notes",
-        ]
-        combined_search = filtered_df[search_columns].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
-        filtered_df = filtered_df[combined_search.str.contains(search_value, regex=False)]
-
-    return filtered_df.reset_index(drop=True)
+        ],
+        search_text,
+    )
 
 
 def _create_mapping_table():
-    table_config = StandardTableStyleManager.get_base_datatable_config()
-
-    columns = []
-    for column_name in DISPLAY_COLUMNS:
-        column_config = {
-            "name": column_name.replace("_", " ").title(),
-            "id": column_name,
-            "editable": column_name in EDITABLE_COLUMNS,
-        }
-        if column_name in {"train", "allocation_share"}:
-            column_config["type"] = "numeric"
-        columns.append(column_config)
-
-    return dash_table.DataTable(
-        id="train-name-mappings-table",
-        columns=columns,
-        data=[],
-        editable=True,
-        sort_action="native",
-        filter_action="native",
-        page_action="native",
-        page_size=50,
-        export_format="xlsx",
-        export_headers="display",
-        style_table=table_config["style_table"],
-        style_header=table_config["style_header"],
-        style_cell=table_config["style_cell"],
-        style_data_conditional=table_config["style_data_conditional"] + [
+    return _build_mapping_table(
+        table_id="train-name-mappings-table",
+        display_columns=DISPLAY_COLUMNS,
+        editable_columns=EDITABLE_COLUMNS,
+        numeric_columns={"train", "allocation_share"},
+        style_data_conditional=[
             {
                 "if": {"column_id": "source_name"},
                 "backgroundColor": "#f8fafc",
@@ -583,12 +474,12 @@ def update_filter_options_and_summary(data):
         return [], [], [], [], [], [], html.Div("Loading...")
 
     df = pd.DataFrame(data)
-    country_options = [{"label": value, "value": value} for value in sorted(df["country_name"].replace("", pd.NA).dropna().unique())]
-    plant_options = [{"label": value, "value": value} for value in sorted(df["plant_name"].replace("", pd.NA).dropna().unique())]
-    provider_options = [{"label": value, "value": value} for value in sorted(df["provider"].replace("", pd.NA).dropna().unique())]
-    parent_source_field_options = [{"label": value, "value": value} for value in sorted(df["parent_source_field"].replace("", pd.NA).dropna().unique())]
-    source_field_options = [{"label": value, "value": value} for value in sorted(df["source_field"].replace("", pd.NA).dropna().unique())]
-    scope_options = [{"label": value, "value": value} for value in sorted(df["scope_hint"].replace("", pd.NA).dropna().unique())]
+    country_options = _build_dropdown_options(df["country_name"])
+    plant_options = _build_dropdown_options(df["plant_name"])
+    provider_options = _build_dropdown_options(df["provider"])
+    parent_source_field_options = _build_dropdown_options(df["parent_source_field"])
+    source_field_options = _build_dropdown_options(df["source_field"])
+    scope_options = _build_dropdown_options(df["scope_hint"])
 
     return (
         country_options,
@@ -603,7 +494,7 @@ def update_filter_options_and_summary(data):
 
 @callback(
     Output("train-name-mappings-table-summary", "children"),
-    Output("train-name-mappings-table", "data"),
+    Output("train-name-mappings-table", "rowData"),
     Output("train-name-provider-chart", "figure"),
     Output("train-name-plant-chart", "figure"),
     Output("train-name-scope-chart", "figure"),
@@ -676,7 +567,7 @@ def clear_filters(_):
     Output("train-name-save-message", "children"),
     Output("train-name-mappings-data-store", "data", allow_duplicate=True),
     Input("train-name-save-btn", "n_clicks"),
-    State("train-name-mappings-table", "data"),
+    State("train-name-mappings-table", "rowData"),
     prevent_initial_call=True,
 )
 def save_train_name_mappings(n_clicks, table_data):

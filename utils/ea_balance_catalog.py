@@ -1,97 +1,20 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import TYPE_CHECKING
 
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+
+if TYPE_CHECKING:
+    from typing import Tuple
+
+    from sqlalchemy.engine import Engine
 
 
 EA_DATASET_CATALOG_VIEW = "ea_dataset_catalog"
 EA_LNG_BALANCE_SELECTION_TABLE = "fundamentals_ea_lng_balance_dataset_selection"
-EA_LNG_BALANCE_RESOLVED_VIEW = "fundamentals_ea_lng_balance_datasets_resolved"
 EA_LNG_BALANCE_LEGACY_TABLE = "fundamentals_ea_lng_balance_datasets"
 
 _object_support_cache: dict[tuple[int, str], tuple[bool, bool, bool]] = {}
-
-
-def build_ea_dataset_catalog_view_sql(schema: str) -> str:
-    return f"""
-CREATE OR REPLACE VIEW {schema}.{EA_DATASET_CATALOG_VIEW} AS
-WITH ranked_metadata AS (
-    SELECT
-        CAST(dataset_id AS INTEGER) AS dataset_id,
-        type,
-        NULLIF(TRIM(value), '') AS value,
-        upload_timestamp_utc,
-        ROW_NUMBER() OVER (
-            PARTITION BY dataset_id, type
-            ORDER BY upload_timestamp_utc DESC NULLS LAST
-        ) AS row_num
-    FROM {schema}.ea_metadata
-    WHERE dataset_id ~ '^[0-9]+$'
-),
-latest_metadata AS (
-    SELECT
-        dataset_id,
-        type,
-        value,
-        upload_timestamp_utc
-    FROM ranked_metadata
-    WHERE row_num = 1
-)
-SELECT
-    dataset_id,
-    MAX(CASE WHEN type = 'country' THEN value END) AS country,
-    MAX(CASE WHEN type = 'country_iso' THEN value END) AS country_iso,
-    MAX(CASE WHEN type = 'region' THEN value END) AS region,
-    MAX(CASE WHEN type = 'sub_region' THEN value END) AS sub_region,
-    MAX(CASE WHEN type = 'description' THEN value END) AS description,
-    MAX(CASE WHEN type = 'aspect' THEN value END) AS aspect,
-    MAX(CASE WHEN type = 'aspect_subtype' THEN value END) AS aspect_subtype,
-    MAX(CASE WHEN type = 'category' THEN value END) AS category,
-    MAX(CASE WHEN type = 'category_subtype' THEN value END) AS category_subtype,
-    MAX(CASE WHEN type = 'frequency' THEN value END) AS frequency,
-    MAX(CASE WHEN type = 'lifecycle_stage' THEN value END) AS lifecycle_stage,
-    MAX(CASE WHEN type = 'source' THEN value END) AS source,
-    MAX(CASE WHEN type = 'unit' THEN value END) AS unit,
-    MAX(CASE WHEN type = 'forecast_start_date' THEN value END) AS forecast_start_date,
-    MAX(CASE WHEN type = 'release_date' THEN value END) AS release_date,
-    MAX(upload_timestamp_utc) AS metadata_upload_timestamp_utc
-FROM latest_metadata
-GROUP BY dataset_id
-"""
-
-
-def build_ea_lng_balance_selection_table_sql(schema: str) -> str:
-    return f"""
-CREATE TABLE IF NOT EXISTS {schema}.{EA_LNG_BALANCE_SELECTION_TABLE} (
-    dataset_id INTEGER PRIMARY KEY
-)
-"""
-
-
-def build_ea_lng_balance_resolved_view_sql(schema: str) -> str:
-    return f"""
-CREATE OR REPLACE VIEW {schema}.{EA_LNG_BALANCE_RESOLVED_VIEW} AS
-SELECT
-    catalog.dataset_id,
-    catalog.country,
-    catalog.country_iso,
-    catalog.region,
-    catalog.sub_region,
-    catalog.description,
-    catalog.aspect,
-    catalog.aspect_subtype,
-    catalog.category,
-    catalog.category_subtype,
-    catalog.frequency,
-    catalog.lifecycle_stage,
-    catalog.source,
-    catalog.unit
-FROM {schema}.{EA_LNG_BALANCE_SELECTION_TABLE} selection
-JOIN {schema}.{EA_DATASET_CATALOG_VIEW} catalog
-    ON catalog.dataset_id = selection.dataset_id
-"""
 
 
 def _relation_exists(

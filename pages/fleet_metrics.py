@@ -1,6 +1,7 @@
 import datetime as dt
 import os
 import configparser
+import logging
 import math
 
 import dash_ag_grid as dag
@@ -10,6 +11,8 @@ from dash import callback, dcc, html
 from dash.dependencies import Input, Output
 from plotly.subplots import make_subplots
 from sqlalchemy import bindparam, create_engine, text
+
+logger = logging.getLogger(__name__)
 
 
 try:
@@ -33,16 +36,15 @@ engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
 KPLER_FLEET_METRICS_TABLE = "kpler_lng_fleet_metrics_series"
 KPLER_REGIONAL_SIGNAL_TABLE = "kpler_lng_regional_signal_series"
-KPLER_TRADES_TABLE = "kpler_trades"
 KPLER_DIVERSIONS_TABLE = "kpler_lng_diversions"
 PRICE_CURVE_TABLE = "curve"
 KPLER_FLEET_DEFAULT_ZONE_FILTER = "asia_pacific_oceans"
 KPLER_FLEET_DEFAULT_START_DATE = dt.date(2021, 1, 1)
 PRICE_FRESHNESS_DAYS = 7
+RELATION_EXISTS_CACHE_SECONDS = 300
 CHART_HEIGHT = 500
-COMPACT_CHART_HEIGHT = 380
-SIGNAL_CHART_HEIGHT = 360
 SIGNAL_REGION_ROW_CHART_HEIGHT = 430
+CONGESTION_SIGNAL_CHART_HEIGHT = 720
 SEASONAL_CHART_HEIGHT = 481
 DIVERSION_SEASONAL_CHART_HEIGHT = 440
 REGION_DETAIL_MATRIX_HEIGHT = 1500
@@ -65,14 +67,6 @@ KPLER_FLEET_DIVERSION_REGION_ORDER = [
     zone_filter for zone_filter in KPLER_FLEET_REGION_ORDER if zone_filter != "global"
 ]
 KPLER_FLEET_ZONE_SHORT_LABELS = {option["value"]: option["label"] for option in KPLER_FLEET_ZONE_OPTIONS}
-KPLER_FLEET_ZONE_FILTER_LABELS = {
-    "asia_pacific_oceans": "Eastern Asia, South-East Asia, North East Pacific Ocean (& 5 others)",
-    "europe_basin": "Europe, North Sea, Mediterranean Sea, North East Atlantic Ocean (& 4 others)",
-    "americas_basin": "Americas, Gulf of Mexico, Caribbean Sea, Atlantic approaches",
-    "middle_east_indian_ocean": "Middle East, South-Central Asia, Indian Ocean, Red Sea (& 4 others)",
-    "atlantic_basin": "Atlantic Basin",
-    "global": "Global",
-}
 KPLER_REGION_DEFINITION_SUMMARIES = {
     "asia_pacific_oceans": "Asian LNG demand basin plus Pacific waiting and approach areas.",
     "europe_basin": "European receiving market plus the nearby seas and Atlantic approach used for delivery pressure.",
@@ -370,7 +364,6 @@ FLEET_METRICS_AG_GRID_DEFAULT_COL_DEF = {
     "resizable": True,
     "suppressHeaderMenuButton": True,
     "suppressHeaderFilterButton": True,
-    "suppressMenu": True,
     "wrapHeaderText": True,
     "autoHeaderHeight": True,
     "headerClass": "fleet-metrics-grid-header",
@@ -394,6 +387,7 @@ FLEET_METRICS_AG_GRID_OPTIONS = {
         "fleet-metrics-global-row": "params.data && params.data.zone_filter === 'global'",
     },
 }
+_RELATION_EXISTS_CACHE = {}
 
 
 def _schema_name():
@@ -408,14 +402,24 @@ def _table_ref(table_name):
 
 
 def _relation_exists(table_name):
+    cache_key = (_schema_name(), table_name)
+    cached = _RELATION_EXISTS_CACHE.get(cache_key)
+    now = dt.datetime.now(dt.timezone.utc)
+    if cached is not None:
+        cached_at, cached_value = cached
+        if (now - cached_at).total_seconds() <= RELATION_EXISTS_CACHE_SECONDS:
+            return cached_value
+
     try:
         with engine.connect() as connection:
-            return bool(
+            exists = bool(
                 connection.execute(
                     text("SELECT to_regclass(:table_name)"),
                     {"table_name": f"{_schema_name()}.{table_name}"},
                 ).scalar()
             )
+            _RELATION_EXISTS_CACHE[cache_key] = (now, exists)
+            return exists
     except Exception:
         return False
 
@@ -426,10 +430,6 @@ def _fleet_metrics_table_exists():
 
 def _regional_signal_table_exists():
     return _relation_exists(KPLER_REGIONAL_SIGNAL_TABLE)
-
-
-def _trades_table_exists():
-    return _relation_exists(KPLER_TRADES_TABLE)
 
 
 def _diversions_table_exists():
@@ -463,10 +463,6 @@ def _area_display_name(area_name):
 
 def _region_label(zone_filter):
     return KPLER_FLEET_ZONE_SHORT_LABELS.get(zone_filter, zone_filter.replace("_", " ").title())
-
-
-def _full_region_label(zone_filter):
-    return KPLER_FLEET_ZONE_FILTER_LABELS.get(zone_filter, _region_label(zone_filter))
 
 
 def _format_number(value, decimals=1, suffix=""):
@@ -549,63 +545,12 @@ def fetch_area_options(split_dimension, zone_filter):
         return _default_area_candidates(zone_filter, split_dimension)
 
 
-def fetch_fleet_metrics_daily(
-    split_dimension,
-    start_date,
-    end_date,
-    zone_filter=None,
-    area_names=None,
-    metrics=("loaded_vessels", "floating_storage"),
-):
-    if not _fleet_metrics_table_exists():
-        return pd.DataFrame()
-
-    filters = [
-        "period = 'daily'",
-        "split_dimension = :split_dimension",
-        "metric IN :metrics",
-        "date BETWEEN :start_date AND :end_date",
-    ]
-    params = {
-        "split_dimension": split_dimension,
-        "metrics": tuple(metrics),
-        "start_date": start_date,
-        "end_date": end_date,
-    }
-
-    if zone_filter:
-        filters.append("zone_filter = :zone_filter")
-        params["zone_filter"] = zone_filter
-    if area_names:
-        filters.append("area_name IN :area_names")
-        params["area_names"] = tuple(area_names)
-
-    where_clause = "\n          AND ".join(filters)
-    bind_params = [bindparam("metrics", expanding=True)]
-    if area_names:
-        bind_params.append(bindparam("area_names", expanding=True))
-
-    query = text(f"""
-        SELECT
-            zone_filter,
-            metric,
-            date,
-            area_name,
-            quantity_mtonnes,
-            upload_timestamp_utc
-        FROM {_table_ref(KPLER_FLEET_METRICS_TABLE)}
-        WHERE {where_clause}
-        ORDER BY zone_filter, metric, area_name, date
-    """).bindparams(*bind_params)
-
-    return pd.read_sql(query, engine, params=params)
-
-
 def fetch_fleet_metrics_weekly(
     split_dimension,
     start_date,
     end_date,
     zone_filter=None,
+    zone_filters=None,
     area_names=None,
     metrics=("loaded_vessels", "floating_storage"),
 ):
@@ -628,12 +573,20 @@ def fetch_fleet_metrics_weekly(
     if zone_filter:
         filters.append("zone_filter = :zone_filter")
         params["zone_filter"] = zone_filter
+    elif zone_filters is not None:
+        zone_filters = tuple(zone_filters)
+        if not zone_filters:
+            return pd.DataFrame()
+        filters.append("zone_filter IN :zone_filters")
+        params["zone_filters"] = zone_filters
     if area_names:
         filters.append("area_name IN :area_names")
         params["area_names"] = tuple(area_names)
 
     where_clause = "\n              AND ".join(filters)
     bind_params = [bindparam("metrics", expanding=True)]
+    if zone_filters is not None and not zone_filter:
+        bind_params.append(bindparam("zone_filters", expanding=True))
     if area_names:
         bind_params.append(bindparam("area_names", expanding=True))
 
@@ -755,22 +708,35 @@ def fetch_regional_signals(start_date, end_date):
         SELECT
             endpoint,
             metric,
-            period,
             date,
             zone_filter,
-            zone_filter_label,
-            split_dimension,
             area_name,
-            value,
-            unit,
-            upload_timestamp_utc
+            value
         FROM {_table_ref(KPLER_REGIONAL_SIGNAL_TABLE)}
         WHERE date BETWEEN :start_date AND :end_date
           AND (
-              zone_filter IN :zone_filters
-              OR endpoint = 'freight_metrics'
+              (
+                  zone_filter IN :zone_filters
+                  AND endpoint = 'flows'
+                  AND metric = 'inbound_tonnes'
+              )
+              OR (
+                  zone_filter IN :zone_filters
+                  AND endpoint = 'fleet_utilization'
+                  AND metric = 'vessel_count'
+              )
+              OR (
+                  zone_filter IN :zone_filters
+                  AND endpoint = 'congestion'
+                  AND metric IN ('waiting_count', 'waiting_duration_days')
+              )
+              OR (
+                  zone_filter = 'global'
+                  AND endpoint = 'freight_metrics'
+                  AND metric IN ('loaded_ton_miles', 'avg_loaded_distance', 'avg_loaded_speed')
+              )
           )
-        ORDER BY endpoint, metric, zone_filter, split_dimension, area_name, date
+        ORDER BY endpoint, metric, zone_filter, area_name, date
     """).bindparams(bindparam("zone_filters", expanding=True))
 
     return pd.read_sql(
@@ -797,25 +763,15 @@ def fetch_recent_diversions(start_date=None, end_date=None):
             FROM {_table_ref(KPLER_DIVERSIONS_TABLE)}
         )
         SELECT
-            vessel_name,
             diversion_date::date AS diversion_date,
             diverted_from_country_name,
             diverted_from_subcontinent_name,
             diverted_from_zone_name,
-            diverted_from_location_name,
             diverted_from_date::date AS diverted_from_date,
             new_destination_country_name,
             new_destination_subcontinent_name,
             new_destination_zone_name,
-            new_destination_location_name,
-            new_destination_date::date AS new_destination_date,
-            new_destination_eta_source,
-            vessel_state,
-            charterer_name,
-            cargo_origin_tons,
-            cargo_origin_cubic_meters,
-            voyage_id,
-            upload_timestamp_utc
+            new_destination_date::date AS new_destination_date
         FROM {_table_ref(KPLER_DIVERSIONS_TABLE)}
         JOIN latest_upload USING (upload_timestamp_utc)
         WHERE COALESCE(new_destination_date::date, diversion_date::date) BETWEEN :start_date AND :end_date
@@ -830,6 +786,29 @@ def fetch_recent_diversions(start_date=None, end_date=None):
         )
     except Exception:
         return pd.DataFrame()
+
+
+def _filter_diversions_by_event_window(diversions_df, start_date, end_date):
+    if diversions_df.empty:
+        return diversions_df.copy()
+
+    start_ts = pd.to_datetime(start_date).normalize()
+    end_ts = pd.to_datetime(end_date).normalize()
+    working = diversions_df.copy()
+
+    def _date_series(column_name):
+        if column_name not in working.columns:
+            return pd.Series(pd.NaT, index=working.index)
+        return pd.to_datetime(working[column_name], errors="coerce").dt.normalize()
+
+    diversion_dates = _date_series("diversion_date")
+    inbound_dates = _date_series("new_destination_date").fillna(diversion_dates)
+    outbound_dates = _date_series("diverted_from_date").fillna(diversion_dates)
+    mask = (
+        inbound_dates.between(start_ts, end_ts, inclusive="both")
+        | outbound_dates.between(start_ts, end_ts, inclusive="both")
+    )
+    return working[mask].copy()
 
 
 def derive_weekly_fleet_metrics(daily_df, include_incomplete_weeks=False):
@@ -916,9 +895,8 @@ def _percentile_of_latest(series):
     return float((clean <= latest).mean() * 100.0)
 
 
-def compute_region_summaries(summary_daily, end_date):
-    weekly = derive_weekly_fleet_metrics(summary_daily)
-    totals = _weekly_metric_totals(weekly)
+def compute_region_summaries(summary_weekly, end_date):
+    totals = _weekly_metric_totals(summary_weekly)
     summaries = {}
 
     for zone_filter in KPLER_FLEET_REGION_ORDER:
@@ -1236,7 +1214,7 @@ def fetch_price_context():
                 WHERE curve.code IN ('ICE_JKM_MO', 'ICE_TFU_MO')
                   AND curve.expiry >= curve.cob
             )
-            SELECT *
+            SELECT code, cob, contract, value, currency, units
             FROM ranked
             WHERE row_number = 1
             ORDER BY code
@@ -1268,107 +1246,6 @@ def fetch_price_context():
         "currency": jkm["currency"] if jkm is not None else None,
         "units": jkm["units"] if jkm is not None else None,
     }
-
-
-def build_metric_chart(
-    weekly_df,
-    metric,
-    selected_areas,
-    split_dimension,
-    zone_filter,
-):
-    title = KPLER_FLEET_METRIC_LABELS.get(metric, metric.replace("_", " ").title())
-    metric_df = weekly_df[weekly_df["metric"] == metric].copy() if not weekly_df.empty else pd.DataFrame()
-
-    if metric_df.empty:
-        return _empty_figure(f"No {title.lower()} data for the selected areas")
-
-    fig = go.Figure()
-    available_areas = set(metric_df["area_name"])
-    selected_areas = [area for area in selected_areas if area in available_areas]
-    ranked_areas = (
-        metric_df.groupby("area_name")["quantity_mtonnes"]
-        .sum()
-        .sort_values(ascending=False)
-        .index
-        .tolist()
-    )
-    area_order = selected_areas + [area for area in ranked_areas if area not in selected_areas]
-
-    bar_color_idx = 0
-    for area_name in area_order:
-        area_df = metric_df[metric_df["area_name"] == area_name].sort_values("date")
-        if area_df["quantity_mtonnes"].abs().sum() == 0:
-            continue
-        marker_color = KPLER_FLEET_SPECIAL_AREA_COLORS.get(area_name)
-        if marker_color is None:
-            marker_color = KPLER_FLEET_COLORS[bar_color_idx % len(KPLER_FLEET_COLORS)]
-            bar_color_idx += 1
-        fig.add_trace(
-            go.Bar(
-                x=area_df["date"],
-                y=area_df["quantity_mtonnes"],
-                name=_area_display_name(area_name),
-                marker_color=marker_color,
-                hovertemplate="%{fullData.name}<br>%{x|%d %b %Y}<br>%{y:.2f} mt<extra></extra>",
-            )
-        )
-
-    total_df = (
-        metric_df.groupby("date", as_index=False)["quantity_mtonnes"]
-        .sum()
-        .sort_values("date")
-    )
-    total_df["four_week_ma"] = total_df["quantity_mtonnes"].rolling(4, min_periods=1).mean()
-    fig.add_trace(
-        go.Scatter(
-            x=total_df["date"],
-            y=total_df["four_week_ma"],
-            name="4-week MA",
-            mode="lines",
-            line=dict(color=KPLER_FLEET_MA_COLOR, width=2.5),
-            hovertemplate="4-week MA<br>%{x|%d %b %Y}<br>%{y:.2f} mt<extra></extra>",
-        )
-    )
-
-    subtitle = KPLER_FLEET_SPLIT_TITLE_LABELS.get(split_dimension, split_dimension.replace("_", " "))
-    fig.update_layout(
-        title=dict(
-            text=f"{_full_region_label(zone_filter)} weekly {title} (lng, by {subtitle})",
-            x=0.01,
-            xanchor="left",
-            font=dict(size=15, color="#1f2937"),
-        ),
-        template="plotly_white",
-        barmode="stack",
-        height=CHART_HEIGHT,
-        margin=dict(l=55, r=25, t=104, b=50),
-        plot_bgcolor="#ffffff",
-        paper_bgcolor="#ffffff",
-        hovermode="x unified",
-        legend=dict(
-            orientation="h",
-            yanchor="top",
-            y=0.98,
-            xanchor="left",
-            x=0,
-            font=dict(size=10),
-        ),
-        yaxis=dict(
-            title="mtons",
-            rangemode="tozero",
-            gridcolor="rgba(148, 163, 184, 0.25)",
-            zerolinecolor="rgba(148, 163, 184, 0.45)",
-            domain=[0, 0.75],
-        ),
-        xaxis=dict(
-            title=None,
-            tickformat="%b %Y",
-            dtick="M2",
-            gridcolor="rgba(148, 163, 184, 0.18)",
-        ),
-    )
-    return fig
 
 
 def _build_weekly_5y_envelope(metric_df, current_year, value_column="quantity_mtonnes"):
@@ -1494,9 +1371,8 @@ def _seasonal_y_axis_settings(metric_df, metric):
     return tick_step, global_range, regional_range
 
 
-def build_region_seasonal_chart(summary_daily, metric):
-    weekly = derive_weekly_fleet_metrics(summary_daily)
-    totals = _weekly_metric_totals_long(weekly)
+def build_region_seasonal_chart(summary_weekly, metric):
+    totals = _weekly_metric_totals_long(summary_weekly)
     metric_df = totals[totals["metric"] == metric].copy() if not totals.empty else pd.DataFrame()
     title = "Loaded on water" if metric == "loaded_vessels" else "Floating storage"
 
@@ -2064,70 +1940,6 @@ def _floating_day_bucket(value):
     return "60d+"
 
 
-def build_floating_days_chart(weekly_df, zone_filter):
-    if weekly_df.empty:
-        return _empty_figure("No floating-days data loaded for this region", height=COMPACT_CHART_HEIGHT)
-
-    fig = go.Figure()
-    metric_df = weekly_df[weekly_df["metric"] == "floating_storage"].copy()
-    if metric_df.empty:
-        return _empty_figure("No floating-days data loaded for this region", height=COMPACT_CHART_HEIGHT)
-
-    metric_df["age_bucket"] = metric_df["area_name"].map(_floating_day_bucket)
-    metric_df = (
-        metric_df.groupby(["date", "age_bucket"], as_index=False)["quantity_mtonnes"]
-        .sum()
-        .sort_values(["date", "age_bucket"])
-    )
-    area_order = [
-        bucket
-        for bucket in FLOATING_DAY_BUCKET_ORDER
-        if bucket in set(metric_df["age_bucket"])
-    ]
-    for idx, area_name in enumerate(area_order):
-        area_df = metric_df[metric_df["age_bucket"] == area_name].sort_values("date")
-        fig.add_trace(
-            go.Bar(
-                x=area_df["date"],
-                y=area_df["quantity_mtonnes"],
-                name=area_name,
-                marker_color=KPLER_FLEET_COLORS[idx % len(KPLER_FLEET_COLORS)],
-                hovertemplate="%{fullData.name}<br>%{x|%d %b %Y}<br>%{y:.2f} mt<extra></extra>",
-            )
-        )
-
-    total_df = metric_df.groupby("date", as_index=False)["quantity_mtonnes"].sum().sort_values("date")
-    total_df["four_week_ma"] = total_df["quantity_mtonnes"].rolling(4, min_periods=1).mean()
-    fig.add_trace(
-        go.Scatter(
-            x=total_df["date"],
-            y=total_df["four_week_ma"],
-            name="4-week MA",
-            mode="lines",
-            line=dict(color=KPLER_FLEET_MA_COLOR, width=2.2),
-            hovertemplate="4-week MA<br>%{x|%d %b %Y}<br>%{y:.2f} mt<extra></extra>",
-        )
-    )
-
-    fig.update_layout(
-        title=dict(
-            text=f"{_region_label(zone_filter)} floating storage age buckets",
-            x=0.01,
-            xanchor="left",
-            font=dict(size=15, color="#1f2937"),
-        ),
-        template="plotly_white",
-        barmode="stack",
-        height=COMPACT_CHART_HEIGHT,
-        margin=dict(l=55, r=25, t=92, b=45),
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="top", y=0.98, xanchor="left", x=0, font=dict(size=10)),
-        yaxis=dict(title="mtons", rangemode="tozero", gridcolor="rgba(148, 163, 184, 0.25)", domain=[0, 0.72]),
-        xaxis=dict(title=None, tickformat="%b %Y", dtick="M2", gridcolor="rgba(148, 163, 184, 0.18)"),
-    )
-    return fig
-
-
 def _detail_matrix_area_order(metric_df, zone_filter, split_dimension):
     if metric_df.empty:
         return []
@@ -2243,7 +2055,6 @@ def _add_detail_metric_matrix_cell(
     weekly_df,
     metric,
     zone_filter,
-    split_dimension,
     row,
     col,
     color_map,
@@ -2318,7 +2129,10 @@ def _add_detail_floating_days_matrix_cell(fig, weekly_df, zone_filter, row, col)
         return
 
     metric_df["date"] = pd.to_datetime(metric_df["date"])
-    metric_df["age_bucket"] = metric_df["area_name"].map(_floating_day_bucket)
+    if "age_bucket" in metric_df.columns:
+        metric_df["age_bucket"] = metric_df["age_bucket"].fillna("Unknown").astype(str)
+    else:
+        metric_df["age_bucket"] = metric_df["area_name"].map(_floating_day_bucket)
     metric_df = (
         metric_df.groupby(["date", "age_bucket"], as_index=False)["quantity_mtonnes"]
         .sum()
@@ -2329,7 +2143,7 @@ def _add_detail_floating_days_matrix_cell(fig, weekly_df, zone_filter, row, col)
         for bucket in FLOATING_DAY_BUCKET_ORDER
         if bucket in set(metric_df["age_bucket"])
     ]
-    for idx, area_name in enumerate(area_order):
+    for area_name in area_order:
         area_df = metric_df[metric_df["age_bucket"] == area_name].sort_values("date")
         fig.add_trace(
             go.Bar(
@@ -2404,7 +2218,6 @@ def build_region_detail_matrix(weekly_df, floating_days_weekly_df, split_dimensi
             weekly_df,
             "loaded_vessels",
             zone_filter,
-            split_dimension,
             row_idx,
             1,
             color_maps.get(zone_filter, {}),
@@ -2414,7 +2227,6 @@ def build_region_detail_matrix(weekly_df, floating_days_weekly_df, split_dimensi
             weekly_df,
             "floating_storage",
             zone_filter,
-            split_dimension,
             row_idx,
             2,
             color_maps.get(zone_filter, {}),
@@ -2469,291 +2281,6 @@ def build_region_detail_matrix(weekly_df, floating_days_weekly_df, split_dimensi
     return fig
 
 
-def build_arrival_origin_chart(signals_df, zone_filter):
-    today = dt.date.today()
-    if signals_df.empty:
-        return _empty_figure("No Kpler flow signal data loaded", height=SIGNAL_CHART_HEIGHT)
-
-    df = signals_df[
-        (signals_df["zone_filter"] == zone_filter)
-        & (signals_df["endpoint"] == "flows")
-        & (signals_df["metric"] == "inbound_tonnes")
-    ].copy()
-    if df.empty:
-        return _empty_figure("No inbound flow signal data for this basin", height=SIGNAL_CHART_HEIGHT)
-
-    df["date"] = pd.to_datetime(df["date"])
-    df["value_mt"] = pd.to_numeric(df["value"], errors="coerce").fillna(0.0) / 1_000_000.0
-    df = df[
-        (df["date"].dt.date >= today - dt.timedelta(days=30))
-        & (df["date"].dt.date <= today + dt.timedelta(days=45))
-    ].copy()
-    if df.empty:
-        return _empty_figure("No recent or forward inbound flow signal data", height=SIGNAL_CHART_HEIGHT)
-
-    top_origins = (
-        df.groupby("area_name")["value_mt"]
-        .sum()
-        .sort_values(ascending=False)
-        .head(8)
-        .index
-        .tolist()
-    )
-    df["origin_group"] = df["area_name"].where(df["area_name"].isin(top_origins), "Others")
-    plot_df = (
-        df.groupby(["date", "origin_group"], as_index=False)["value_mt"]
-        .sum()
-        .sort_values(["date", "origin_group"])
-    )
-
-    fig = go.Figure()
-    for idx, area_name in enumerate(top_origins + (["Others"] if "Others" in set(plot_df["origin_group"]) else [])):
-        area_df = plot_df[plot_df["origin_group"] == area_name]
-        if area_df.empty or area_df["value_mt"].abs().sum() == 0:
-            continue
-        fig.add_trace(
-            go.Bar(
-                x=area_df["date"],
-                y=area_df["value_mt"],
-                name=_area_display_name(area_name),
-                marker_color=KPLER_FLEET_COLORS[idx % len(KPLER_FLEET_COLORS)],
-                hovertemplate="%{fullData.name}<br>%{x|%d %b %Y}<br>%{y:.2f} mt<extra></extra>",
-            )
-        )
-
-    fig.add_vline(x=today, line_width=1.5, line_dash="dash", line_color="#64748b")
-    fig.update_layout(
-        title=dict(
-            text=f"{_region_label(zone_filter)} LNG arrivals by origin",
-            x=0.01,
-            xanchor="left",
-            font=dict(size=15, color="#1f2937"),
-        ),
-        template="plotly_white",
-        barmode="stack",
-        height=SIGNAL_CHART_HEIGHT,
-        margin=dict(l=55, r=20, t=78, b=45),
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="top", y=0.98, xanchor="left", x=0, font=dict(size=10)),
-        yaxis=dict(title="mt", rangemode="tozero", gridcolor="rgba(148, 163, 184, 0.25)", domain=[0, 0.72]),
-        xaxis=dict(title=None, tickformat="%d %b", gridcolor="rgba(148, 163, 184, 0.18)"),
-    )
-    return fig
-
-
-def build_utilization_stack_chart(signals_df, zone_filter, start_date, end_date):
-    if signals_df.empty:
-        return _empty_figure("No fleet utilization signal data loaded", height=SIGNAL_CHART_HEIGHT)
-
-    df = signals_df[
-        (signals_df["zone_filter"] == zone_filter)
-        & (signals_df["endpoint"] == "fleet_utilization")
-        & (signals_df["metric"] == "vessel_count")
-    ].copy()
-    if df.empty:
-        return _empty_figure("No fleet utilization signal data for this basin", height=SIGNAL_CHART_HEIGHT)
-
-    df["date"] = pd.to_datetime(df["date"])
-    df["value"] = pd.to_numeric(df["value"], errors="coerce").fillna(0.0)
-    df = df[
-        (df["date"].dt.date >= start_date)
-        & (df["date"].dt.date <= end_date)
-    ].copy()
-    if df.empty:
-        return _empty_figure("No fleet utilization signal data in this date range", height=SIGNAL_CHART_HEIGHT)
-
-    state_order = ["Loaded", "Ballast", "Maintenance"]
-    state_colors = {
-        "Loaded": "#0b3558",
-        "Ballast": "#2f91d0",
-        "Maintenance": "#95a3b3",
-    }
-    plot_df = (
-        df.groupby(["date", "area_name"], as_index=False)["value"]
-        .sum()
-        .sort_values(["date", "area_name"])
-    )
-
-    fig = go.Figure()
-    for state in state_order:
-        state_df = plot_df[plot_df["area_name"] == state]
-        if state_df.empty:
-            continue
-        fig.add_trace(
-            go.Scatter(
-                x=state_df["date"],
-                y=state_df["value"],
-                name=state,
-                mode="lines",
-                stackgroup="one",
-                line=dict(width=1.2, color=state_colors.get(state)),
-                hovertemplate="%{fullData.name}<br>%{x|%d %b %Y}<br>%{y:.0f} vessels<extra></extra>",
-            )
-        )
-
-    fig.update_layout(
-        title=dict(
-            text=f"{_region_label(zone_filter)} LNG fleet utilization",
-            x=0.01,
-            xanchor="left",
-            font=dict(size=15, color="#1f2937"),
-        ),
-        template="plotly_white",
-        height=SIGNAL_CHART_HEIGHT,
-        margin=dict(l=55, r=20, t=72, b=45),
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="top", y=0.98, xanchor="left", x=0, font=dict(size=10)),
-        yaxis=dict(title="vessels", rangemode="tozero", gridcolor="rgba(148, 163, 184, 0.25)", domain=[0, 0.76]),
-        xaxis=dict(title=None, tickformat="%b %Y", gridcolor="rgba(148, 163, 184, 0.18)"),
-    )
-    return fig
-
-
-def build_congestion_signal_chart(signals_df, zone_filter, start_date, end_date):
-    if signals_df.empty:
-        return _empty_figure("No congestion signal data loaded", height=SIGNAL_CHART_HEIGHT)
-
-    df = signals_df[
-        (signals_df["zone_filter"] == zone_filter)
-        & (signals_df["endpoint"] == "congestion")
-        & (signals_df["metric"].isin(["waiting_count", "waiting_duration_days"]))
-    ].copy()
-    if df.empty:
-        return _empty_figure("No congestion signal data for this basin", height=SIGNAL_CHART_HEIGHT)
-
-    df["date"] = pd.to_datetime(df["date"])
-    df["value"] = pd.to_numeric(df["value"], errors="coerce").fillna(0.0)
-    df = df[
-        (df["date"].dt.date >= start_date)
-        & (df["date"].dt.date <= end_date)
-    ].copy()
-    if df.empty:
-        return _empty_figure("No congestion signal data in this date range", height=SIGNAL_CHART_HEIGHT)
-
-    total_df = (
-        df.groupby(["date", "metric"], as_index=False)["value"]
-        .sum()
-        .sort_values(["metric", "date"])
-    )
-    count_df = total_df[total_df["metric"] == "waiting_count"]
-    duration_df = total_df[total_df["metric"] == "waiting_duration_days"]
-
-    fig = go.Figure()
-    if not count_df.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=count_df["date"],
-                y=count_df["value"],
-                name="Waiting count",
-                mode="lines",
-                line=dict(color="#0b3558", width=2.2),
-                hovertemplate="Waiting count<br>%{x|%d %b %Y}<br>%{y:.0f} vessels<extra></extra>",
-            )
-        )
-    if not duration_df.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=duration_df["date"],
-                y=duration_df["value"],
-                name="Duration",
-                mode="lines",
-                yaxis="y2",
-                line=dict(color=KPLER_FLEET_MA_COLOR, width=2.2),
-                hovertemplate="Duration<br>%{x|%d %b %Y}<br>%{y:.2f} days<extra></extra>",
-            )
-        )
-
-    fig.update_layout(
-        title=dict(
-            text=f"{_region_label(zone_filter)} berth congestion and waiting",
-            x=0.01,
-            xanchor="left",
-            font=dict(size=15, color="#1f2937"),
-        ),
-        template="plotly_white",
-        height=SIGNAL_CHART_HEIGHT,
-        margin=dict(l=55, r=55, t=72, b=45),
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="top", y=0.98, xanchor="left", x=0, font=dict(size=10)),
-        yaxis=dict(title="vessels", rangemode="tozero", gridcolor="rgba(148, 163, 184, 0.25)"),
-        yaxis2=dict(title="days", overlaying="y", side="right", rangemode="tozero", showgrid=False),
-        xaxis=dict(title=None, tickformat="%b %Y", gridcolor="rgba(148, 163, 184, 0.18)"),
-    )
-    return fig
-
-
-def build_freight_signal_chart(signals_df, zone_filter, start_date, end_date):
-    freight_df = _filter_freight_for_region(signals_df, zone_filter)
-    if freight_df.empty:
-        return _empty_figure("No freight demand signal data loaded", height=SIGNAL_CHART_HEIGHT)
-
-    freight_df["date"] = pd.to_datetime(freight_df["date"])
-    freight_df["value"] = pd.to_numeric(freight_df["value"], errors="coerce").fillna(0.0)
-    freight_df = freight_df[
-        (freight_df["date"].dt.date >= start_date)
-        & (freight_df["date"].dt.date <= end_date)
-    ].copy()
-    if freight_df.empty:
-        return _empty_figure("No freight demand signal data in this date range", height=SIGNAL_CHART_HEIGHT)
-
-    ton_miles = (
-        freight_df[freight_df["metric"] == "loaded_ton_miles"]
-        .groupby("date", as_index=False)["value"]
-        .sum()
-        .sort_values("date")
-    )
-    ton_miles["value_bn"] = ton_miles["value"] / 1_000_000_000.0
-    avg_distance = freight_df[freight_df["metric"] == "avg_loaded_distance"].copy()
-    avg_distance = avg_distance[avg_distance["value"] > 0]
-    avg_distance = (
-        avg_distance.groupby("date", as_index=False)["value"]
-        .mean()
-        .sort_values("date")
-    )
-
-    fig = go.Figure()
-    if not ton_miles.empty:
-        fig.add_trace(
-            go.Bar(
-                x=ton_miles["date"],
-                y=ton_miles["value_bn"],
-                name="Loaded ton-miles",
-                marker_color="#1f5f8b",
-                hovertemplate="Loaded ton-miles<br>%{x|%b %Y}<br>%{y:.1f} bn t-nmi<extra></extra>",
-            )
-        )
-    if not avg_distance.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=avg_distance["date"],
-                y=avg_distance["value"],
-                name="Avg distance",
-                mode="lines+markers",
-                yaxis="y2",
-                line=dict(color=KPLER_FLEET_MA_COLOR, width=2.2),
-                hovertemplate="Avg distance<br>%{x|%b %Y}<br>%{y:.0f} nmi<extra></extra>",
-            )
-        )
-
-    fig.update_layout(
-        title=dict(
-            text=f"{_region_label(zone_filter)} loaded freight demand",
-            x=0.01,
-            xanchor="left",
-            font=dict(size=15, color="#1f2937"),
-        ),
-        template="plotly_white",
-        height=SIGNAL_CHART_HEIGHT,
-        margin=dict(l=55, r=60, t=72, b=45),
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="top", y=0.98, xanchor="left", x=0, font=dict(size=10)),
-        yaxis=dict(title="bn t-nmi", rangemode="tozero", gridcolor="rgba(148, 163, 184, 0.25)"),
-        yaxis2=dict(title="nmi", overlaying="y", side="right", rangemode="tozero", showgrid=False),
-        xaxis=dict(title=None, tickformat="%b %Y", gridcolor="rgba(148, 163, 184, 0.18)"),
-    )
-    return fig
-
-
 def _signal_region_row_titles():
     return [f"<b>{_region_label(zone_filter)}</b>" for zone_filter in KPLER_FLEET_DIVERSION_REGION_ORDER]
 
@@ -2805,7 +2332,12 @@ def _style_signal_region_row_figure(fig, *, barmode=None, legend_y=1.18, left_ti
     if left_title:
         fig.update_yaxes(title={"text": left_title, "font": dict(size=10, color="#475569")}, row=1, col=1)
     if right_title:
-        fig.update_yaxes(title={"text": right_title, "font": dict(size=10, color="#475569")}, row=1, col=len(KPLER_FLEET_DIVERSION_REGION_ORDER), secondary_y=True)
+        fig.update_yaxes(
+            title={"text": right_title, "font": dict(size=10, color="#475569")},
+            row=1,
+            col=len(KPLER_FLEET_DIVERSION_REGION_ORDER),
+            secondary_y=True,
+        )
     for annotation in fig.layout.annotations:
         annotation.font = dict(size=9, color="#334155")
     return fig
@@ -2975,7 +2507,7 @@ def build_utilization_region_row(signals_df, start_date, end_date):
 def build_congestion_region_row(signals_df, start_date, end_date):
     region_order = KPLER_FLEET_DIVERSION_REGION_ORDER
     if signals_df.empty:
-        return _empty_figure("No congestion signal data loaded", height=SIGNAL_REGION_ROW_CHART_HEIGHT)
+        return _empty_figure("No congestion signal data loaded", height=CONGESTION_SIGNAL_CHART_HEIGHT)
 
     df = signals_df[
         (signals_df["zone_filter"].isin(region_order))
@@ -2983,7 +2515,7 @@ def build_congestion_region_row(signals_df, start_date, end_date):
         & (signals_df["metric"].isin(["waiting_count", "waiting_duration_days"]))
     ].copy()
     if df.empty:
-        return _empty_figure("No congestion signal data for regional basins", height=SIGNAL_REGION_ROW_CHART_HEIGHT)
+        return _empty_figure("No congestion signal data for regional basins", height=CONGESTION_SIGNAL_CHART_HEIGHT)
 
     df["date"] = pd.to_datetime(df["date"])
     df["value"] = pd.to_numeric(df["value"], errors="coerce").fillna(0.0)
@@ -2992,67 +2524,402 @@ def build_congestion_region_row(signals_df, start_date, end_date):
         & (df["date"].dt.date <= end_date)
     ].copy()
     if df.empty:
-        return _empty_figure("No congestion signal data in this date range", height=SIGNAL_REGION_ROW_CHART_HEIGHT)
+        return _empty_figure("No congestion signal data in this date range", height=CONGESTION_SIGNAL_CHART_HEIGHT)
 
-    total_df = (
+    totals = (
         df.groupby(["zone_filter", "date", "metric"], as_index=False)["value"]
         .sum()
-        .sort_values(["zone_filter", "metric", "date"])
+        .pivot_table(
+            index=["zone_filter", "date"],
+            columns="metric",
+            values="value",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        .reset_index()
+        .sort_values(["zone_filter", "date"])
     )
-    fig = make_subplots(
-        rows=1,
-        cols=len(region_order),
-        subplot_titles=_signal_region_row_titles(),
-        horizontal_spacing=0.035,
-        specs=[[{"secondary_y": True} for _ in region_order]],
-    )
-    for col, zone_filter in enumerate(region_order, start=1):
-        zone_df = total_df[total_df["zone_filter"] == zone_filter]
-        count_df = zone_df[zone_df["metric"] == "waiting_count"].sort_values("date")
-        duration_df = zone_df[zone_df["metric"] == "waiting_duration_days"].sort_values("date")
-        if not count_df.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=count_df["date"],
-                    y=count_df["value"],
-                    name="Waiting count",
-                    legendgroup="Waiting count",
-                    showlegend=col == 1,
-                    mode="lines",
-                    line=dict(color="#0b3558", width=2.0),
-                    hovertemplate=(
-                        f"{_region_label(zone_filter)}<br>"
-                        "Waiting count<br>%{x|%d %b %Y}<br>%{y:.0f} vessels<extra></extra>"
-                    ),
-                ),
-                row=1,
-                col=col,
-                secondary_y=False,
-            )
-        if not duration_df.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=duration_df["date"],
-                    y=duration_df["value"],
-                    name="Duration",
-                    legendgroup="Duration",
-                    showlegend=col == 1,
-                    mode="lines",
-                    line=dict(color=KPLER_FLEET_MA_COLOR, width=2.0),
-                    hovertemplate=(
-                        f"{_region_label(zone_filter)}<br>"
-                        "Duration<br>%{x|%d %b %Y}<br>%{y:.2f} days<extra></extra>"
-                    ),
-                ),
-                row=1,
-                col=col,
-                secondary_y=True,
-            )
+    for metric in ("waiting_count", "waiting_duration_days"):
+        if metric not in totals:
+            totals[metric] = 0.0
 
-    _style_signal_region_row_figure(fig, left_title="vessels", right_title="days", legend_y=1.16)
-    fig.update_xaxes(tickformat="%b %Y", nticks=4)
-    for col in range(1, len(region_order)):
-        fig.update_yaxes(showticklabels=False, secondary_y=True, row=1, col=col)
+    def _percentile_series(series):
+        clean = pd.to_numeric(series, errors="coerce")
+        valid = clean.dropna()
+        if valid.empty:
+            return pd.Series(0.0, index=series.index)
+        if valid.nunique(dropna=True) <= 1:
+            value = 50.0 if float(valid.iloc[-1]) > 0 else 0.0
+            return pd.Series(value, index=series.index)
+        return clean.rank(pct=True, method="average").fillna(0.0) * 100.0
+
+    totals["waiting_count"] = pd.to_numeric(totals["waiting_count"], errors="coerce").fillna(0.0)
+    totals["waiting_duration_days"] = pd.to_numeric(
+        totals["waiting_duration_days"],
+        errors="coerce",
+    ).fillna(0.0)
+    totals["count_percentile"] = totals.groupby("zone_filter")["waiting_count"].transform(_percentile_series)
+    totals["duration_percentile"] = totals.groupby("zone_filter")["waiting_duration_days"].transform(_percentile_series)
+    totals["pressure_score"] = 0.6 * totals["count_percentile"] + 0.4 * totals["duration_percentile"]
+    totals["waiting_count_14d"] = totals.groupby("zone_filter")["waiting_count"].transform(
+        lambda series: series.rolling(14, min_periods=1).mean()
+    )
+    totals["pressure_score_14d"] = totals.groupby("zone_filter")["pressure_score"].transform(
+        lambda series: series.rolling(14, min_periods=1).mean()
+    )
+
+    display_start = max(start_date, end_date - dt.timedelta(days=540))
+    display_df = totals[totals["date"].dt.date >= display_start].copy()
+    if display_df.empty:
+        display_df = totals.copy()
+
+    latest_rows = []
+    for zone_filter in region_order:
+        zone_history = totals[totals["zone_filter"] == zone_filter].sort_values("date")
+        if zone_history.empty:
+            continue
+        latest = zone_history.iloc[-1]
+        latest_rows.append(
+            {
+                "zone_filter": zone_filter,
+                "region": _region_label(zone_filter),
+                "date": latest["date"],
+                "waiting_count": float(latest["waiting_count"]),
+                "waiting_duration_days": float(latest["waiting_duration_days"]),
+                "pressure_score": float(latest["pressure_score"]),
+                "count_percentile": float(latest["count_percentile"]),
+                "duration_percentile": float(latest["duration_percentile"]),
+            }
+        )
+    latest_df = pd.DataFrame(latest_rows)
+    if latest_df.empty:
+        return _empty_figure("No congestion signal data in this date range", height=CONGESTION_SIGNAL_CHART_HEIGHT)
+
+    def _pressure_color(score):
+        if score >= 85:
+            return "#dc2626"
+        if score >= 70:
+            return "#f59e0b"
+        if score >= 50:
+            return "#2563eb"
+        return "#64748b"
+
+    latest_df = latest_df.sort_values("pressure_score", ascending=False)
+    fig = make_subplots(
+        rows=3,
+        cols=len(region_order),
+        subplot_titles=(
+            ["<b>Current pressure ranking</b>"]
+            + [f"<b>{_region_label(zone_filter)}</b>" for zone_filter in region_order]
+            + ["" for _ in region_order]
+        ),
+        specs=[
+            [{"type": "bar", "colspan": len(region_order)}] + [None for _ in region_order[1:]],
+            [{"type": "xy"} for _ in region_order],
+            [{"type": "xy"} for _ in region_order],
+        ],
+        row_heights=[0.28, 0.34, 0.38],
+        vertical_spacing=0.09,
+        horizontal_spacing=0.035,
+    )
+
+    fig.add_vrect(
+        x0=70,
+        x1=85,
+        fillcolor="rgba(245, 158, 11, 0.08)",
+        line_width=0,
+        layer="below",
+        row=1,
+        col=1,
+    )
+    fig.add_vrect(
+        x0=85,
+        x1=100,
+        fillcolor="rgba(220, 38, 38, 0.08)",
+        line_width=0,
+        layer="below",
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=latest_df["pressure_score"],
+            y=latest_df["region"],
+            orientation="h",
+            marker_color=[_pressure_color(score) for score in latest_df["pressure_score"]],
+            text=[
+                f"{score:.0f}%  |  {count:.0f} waiting  |  {duration:.1f}d"
+                for score, count, duration in zip(
+                    latest_df["pressure_score"],
+                    latest_df["waiting_count"],
+                    latest_df["waiting_duration_days"],
+                )
+            ],
+            textposition="auto",
+            customdata=list(
+                zip(
+                    latest_df["waiting_count"],
+                    latest_df["waiting_duration_days"],
+                    latest_df["count_percentile"],
+                    latest_df["duration_percentile"],
+                    latest_df["date"],
+                )
+            ),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Pressure score: %{x:.0f}%<br>"
+                "Waiting vessels: %{customdata[0]:.0f}<br>"
+                "Wait-duration signal: %{customdata[1]:.2f} days<br>"
+                "Count percentile: %{customdata[2]:.0f}%<br>"
+                "Duration percentile: %{customdata[3]:.0f}%<br>"
+                "Latest date: %{customdata[4]|%d %b %Y}<extra></extra>"
+            ),
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+
+    count_axis_max = max(1.0, float(display_df["waiting_count"].max()) * 1.18)
+    for col, zone_filter in enumerate(region_order, start=1):
+        zone_display = display_df[display_df["zone_filter"] == zone_filter].sort_values("date")
+        if zone_display.empty:
+            continue
+        latest = zone_display.iloc[-1]
+        count_p90 = totals.loc[totals["zone_filter"] == zone_filter, "waiting_count"].quantile(0.90)
+        region_label = _region_label(zone_filter)
+        customdata = list(
+            zip(
+                zone_display["waiting_count"],
+                zone_display["waiting_duration_days"],
+                zone_display["pressure_score"],
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=zone_display["date"],
+                y=zone_display["waiting_count"],
+                name="Daily vessels",
+                legendgroup="Daily vessels",
+                showlegend=col == 1,
+                mode="lines",
+                line=dict(color="rgba(100, 116, 139, 0.30)", width=1.0),
+                customdata=customdata,
+                hovertemplate=(
+                    f"{region_label}<br>"
+                    "Daily waiting vessels<br>%{x|%d %b %Y}<br>"
+                    "%{y:.0f} vessels<br>"
+                    "Wait-duration signal: %{customdata[1]:.2f} days<br>"
+                    "Pressure score: %{customdata[2]:.0f}%<extra></extra>"
+                ),
+            ),
+            row=2,
+            col=col,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=zone_display["date"],
+                y=zone_display["waiting_count_14d"],
+                name="14D avg vessels",
+                legendgroup="14D avg vessels",
+                showlegend=col == 1,
+                mode="lines",
+                line=dict(color="#0b3558", width=2.4),
+                hovertemplate=(
+                    f"{region_label}<br>"
+                    "14D average waiting vessels<br>%{x|%d %b %Y}<br>"
+                    "%{y:.1f} vessels<extra></extra>"
+                ),
+            ),
+            row=2,
+            col=col,
+        )
+        if pd.notna(count_p90):
+            fig.add_trace(
+                go.Scatter(
+                    x=[zone_display["date"].min(), zone_display["date"].max()],
+                    y=[count_p90, count_p90],
+                    name="90th pct",
+                    legendgroup="90th pct",
+                    showlegend=col == 1,
+                    mode="lines",
+                    line=dict(color="rgba(220, 38, 38, 0.55)", width=1.2, dash="dot"),
+                    hovertemplate=f"{region_label}<br>90th pct waiting vessels<br>%{{y:.1f}} vessels<extra></extra>",
+                ),
+                row=2,
+                col=col,
+            )
+        fig.add_trace(
+            go.Scatter(
+                x=[latest["date"]],
+                y=[latest["waiting_count"]],
+                mode="markers+text",
+                marker=dict(color="#0b3558", size=7, line=dict(color="#ffffff", width=1.2)),
+                text=[f"{latest['waiting_count']:.0f}"],
+                textposition="top center",
+                textfont=dict(size=9, color="#0f172a"),
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            row=2,
+            col=col,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=zone_display["date"],
+                y=zone_display["pressure_score"],
+                name="Daily pressure",
+                legendgroup="Daily pressure",
+                showlegend=col == 1,
+                mode="lines",
+                line=dict(color="rgba(15, 118, 110, 0.28)", width=1.0),
+                customdata=customdata,
+                hovertemplate=(
+                    f"{region_label}<br>"
+                    "Daily pressure score<br>%{x|%d %b %Y}<br>"
+                    "%{y:.0f}%<br>"
+                    "Waiting vessels: %{customdata[0]:.0f}<br>"
+                    "Wait-duration signal: %{customdata[1]:.2f} days<extra></extra>"
+                ),
+            ),
+            row=3,
+            col=col,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=zone_display["date"],
+                y=zone_display["pressure_score_14d"],
+                name="14D avg pressure",
+                legendgroup="14D avg pressure",
+                showlegend=col == 1,
+                mode="lines",
+                line=dict(color="#0f766e", width=2.4),
+                hovertemplate=f"{region_label}<br>14D average pressure<br>%{{x|%d %b %Y}}<br>%{{y:.0f}}%<extra></extra>",
+            ),
+            row=3,
+            col=col,
+        )
+        fig.add_hrect(
+            y0=70,
+            y1=85,
+            fillcolor="rgba(245, 158, 11, 0.08)",
+            line_width=0,
+            row=3,
+            col=col,
+        )
+        fig.add_hrect(
+            y0=85,
+            y1=100,
+            fillcolor="rgba(220, 38, 38, 0.08)",
+            line_width=0,
+            row=3,
+            col=col,
+        )
+        fig.add_hline(
+            y=85,
+            line_width=1,
+            line_dash="dot",
+            line_color="rgba(220, 38, 38, 0.45)",
+            row=3,
+            col=col,
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        height=CONGESTION_SIGNAL_CHART_HEIGHT,
+        margin=dict(l=58, r=22, t=78, b=42),
+        plot_bgcolor="rgba(248, 250, 252, 0.9)",
+        paper_bgcolor="#ffffff",
+        hovermode="closest",
+        bargap=0.28,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.04,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=9, color="#334155"),
+            groupclick="togglegroup",
+            itemsizing="constant",
+            itemwidth=30,
+        ),
+        hoverlabel=dict(
+            bgcolor="rgba(255, 255, 255, 0.96)",
+            bordercolor="rgba(148, 163, 184, 0.65)",
+            font=dict(size=11, color="#0f172a"),
+        ),
+    )
+    fig.update_xaxes(
+        title=None,
+        range=[0, 104],
+        ticksuffix="%",
+        gridcolor="rgba(148, 163, 184, 0.18)",
+        tickfont=dict(size=9, color="#64748b"),
+        fixedrange=True,
+        row=1,
+        col=1,
+    )
+    fig.update_yaxes(
+        autorange="reversed",
+        tickfont=dict(size=10, color="#334155"),
+        fixedrange=True,
+        row=1,
+        col=1,
+    )
+    fig.update_xaxes(
+        title=None,
+        tickformat="%b %Y",
+        nticks=4,
+        gridcolor="rgba(148, 163, 184, 0.14)",
+        showline=True,
+        linecolor="rgba(148, 163, 184, 0.45)",
+        tickfont=dict(size=7, color="#64748b"),
+        fixedrange=True,
+        row=2,
+    )
+    fig.update_xaxes(
+        title=None,
+        tickformat="%b %Y",
+        nticks=4,
+        gridcolor="rgba(148, 163, 184, 0.14)",
+        showline=True,
+        linecolor="rgba(148, 163, 184, 0.45)",
+        tickfont=dict(size=7, color="#64748b"),
+        fixedrange=True,
+        row=3,
+    )
+    fig.update_yaxes(
+        title=None,
+        range=[0, count_axis_max],
+        rangemode="tozero",
+        gridcolor="rgba(148, 163, 184, 0.20)",
+        zerolinecolor="rgba(148, 163, 184, 0.34)",
+        showline=True,
+        linecolor="rgba(148, 163, 184, 0.45)",
+        tickfont=dict(size=8, color="#64748b"),
+        fixedrange=True,
+        row=2,
+    )
+    fig.update_yaxes(
+        title=None,
+        range=[0, 100],
+        ticksuffix="%",
+        dtick=25,
+        gridcolor="rgba(148, 163, 184, 0.20)",
+        zerolinecolor="rgba(148, 163, 184, 0.34)",
+        showline=True,
+        linecolor="rgba(148, 163, 184, 0.45)",
+        tickfont=dict(size=8, color="#64748b"),
+        fixedrange=True,
+        row=3,
+    )
+    for col in range(2, len(region_order) + 1):
+        fig.update_yaxes(showticklabels=False, row=2, col=col)
+        fig.update_yaxes(showticklabels=False, row=3, col=col)
+    fig.update_yaxes(title={"text": "vessels", "font": dict(size=10, color="#475569")}, row=2, col=1)
+    fig.update_yaxes(title={"text": "pressure", "font": dict(size=10, color="#475569")}, row=3, col=1)
+    for annotation in fig.layout.annotations:
+        annotation.font = dict(size=9, color="#334155")
     return fig
 
 
@@ -3358,63 +3225,6 @@ def build_global_signal_rows(signal_summaries, selected_region=None):
     return rows
 
 
-def build_diversion_rows(diversions_df, zone_filter):
-    if diversions_df.empty:
-        return []
-
-    rows = []
-    for _, row in diversions_df.iterrows():
-        into_region = _matches_region_values(
-            zone_filter,
-            subcontinent=row.get("new_destination_subcontinent_name"),
-            zone=row.get("new_destination_zone_name"),
-            country=row.get("new_destination_country_name"),
-        )
-        out_region = _matches_region_values(
-            zone_filter,
-            subcontinent=row.get("diverted_from_subcontinent_name"),
-            zone=row.get("diverted_from_zone_name"),
-            country=row.get("diverted_from_country_name"),
-        )
-        if not into_region and not out_region:
-            continue
-        if into_region and out_region:
-            direction = "Internal"
-        elif into_region:
-            direction = "Into"
-        else:
-            direction = "Out"
-
-        cargo_tons = pd.to_numeric(row.get("cargo_origin_tons"), errors="coerce")
-        cargo_mt = float(cargo_tons) / 1_000_000.0 if pd.notna(cargo_tons) else None
-        new_date = pd.to_datetime(row.get("new_destination_date"), errors="coerce")
-        diversion_date = pd.to_datetime(row.get("diversion_date"), errors="coerce")
-        sort_date = new_date if pd.notna(new_date) else diversion_date
-        rows.append(
-            {
-                "direction": direction,
-                "vessel": _clean_text(row.get("vessel_name")) or "-",
-                "state": _clean_text(row.get("vessel_state")) or "-",
-                "from": _clean_text(row.get("diverted_from_country_name")) or _clean_text(row.get("diverted_from_location_name")) or "-",
-                "to": _clean_text(row.get("new_destination_country_name")) or _clean_text(row.get("new_destination_location_name")) or "-",
-                "new_eta": f"{new_date:%d %b %Y}" if pd.notna(new_date) else "-",
-                "diversion_date": f"{diversion_date:%d %b %Y}" if pd.notna(diversion_date) else "-",
-                "cargo_mt": _format_number(cargo_mt, 2),
-                "charterer": _clean_text(row.get("charterer_name")) or "-",
-                "_sort_date": sort_date,
-            }
-        )
-
-    rows = sorted(
-        rows,
-        key=lambda item: item["_sort_date"] if pd.notna(item["_sort_date"]) else pd.Timestamp.min,
-        reverse=True,
-    )[:16]
-    for row in rows:
-        row.pop("_sort_date", None)
-    return rows
-
-
 def build_movers_rows(weekly_df):
     if weekly_df.empty:
         return []
@@ -3502,21 +3312,6 @@ def _threshold_column(field, header_name, width=88, min_width=66, high=80, mediu
         ),
     }
     return column
-
-
-def _status_column(field="status", header_name="Status"):
-    return {
-        "field": field,
-        "headerName": header_name,
-        "width": 62,
-        "minWidth": 56,
-        "cellClass": "fleet-metrics-status-cell fleet-metrics-group-start",
-        "cellClassRules": {
-            "fleet-metrics-status-ok": "params.value === 'OK'",
-            "fleet-metrics-status-stale": "params.value === 'Stale'",
-            "fleet-metrics-status-empty": "params.value === 'No data'",
-        },
-    }
 
 
 def _metric_column_group(header_name, children):
@@ -3698,32 +3493,6 @@ FLEET_METRICS_MOVERS_COLUMN_DEFS = [
     _delta_column("floating_4w", "Floating 4w"),
 ]
 
-FLEET_METRICS_DIVERSIONS_COLUMN_DEFS = [
-    {
-        "field": "direction",
-        "headerName": "Dir",
-        "width": 68,
-        "minWidth": 58,
-        "cellClass": "fleet-metrics-status-cell",
-    },
-    {
-        "field": "vessel",
-        "headerName": "Vessel",
-        "pinned": "left",
-        "width": 142,
-        "minWidth": 116,
-        "cellClass": "fleet-metrics-left-cell fleet-metrics-strong-cell",
-    },
-    {"field": "state", "headerName": "State", "width": 92, "minWidth": 74},
-    {"field": "from", "headerName": "From", "width": 120, "minWidth": 88, "cellClass": "fleet-metrics-left-cell"},
-    {"field": "to", "headerName": "To", "width": 120, "minWidth": 88, "cellClass": "fleet-metrics-left-cell"},
-    {"field": "new_eta", "headerName": "New ETA", "width": 96, "minWidth": 78},
-    {"field": "diversion_date", "headerName": "Diverted", "width": 96, "minWidth": 78},
-    _number_column("cargo_mt", "Cargo mt", 78, 62),
-    {"field": "charterer", "headerName": "Charterer", "width": 132, "minWidth": 92, "cellClass": "fleet-metrics-left-cell"},
-]
-
-
 def _ag_grid_table(
     id_value,
     column_defs,
@@ -3826,7 +3595,7 @@ def _diversion_seasonality_section():
     )
 
 
-def _signal_chart_section(title, subtitle, graph_id):
+def _signal_chart_section(title, subtitle, graph_id, height=SIGNAL_REGION_ROW_CHART_HEIGHT):
     return html.Div(
         [
             html.Div(
@@ -3838,7 +3607,7 @@ def _signal_chart_section(title, subtitle, graph_id):
             ),
             dcc.Graph(
                 id=graph_id,
-                style={"height": f"{SIGNAL_REGION_ROW_CHART_HEIGHT}px"},
+                style={"height": f"{height}px"},
                 config={"displayModeBar": False, "responsive": True},
             ),
         ],
@@ -3860,8 +3629,9 @@ def _signal_chart_sections():
         ),
         _signal_chart_section(
             "Congestion and waiting",
-            "Waiting vessels and average waiting duration before berth by regional basin.",
+            "Current pressure, waiting-vessel trend, and abnormality versus recent history by regional basin.",
             "fleet-metrics-congestion-signal-chart",
+            height=CONGESTION_SIGNAL_CHART_HEIGHT,
         ),
         _signal_chart_section(
             "Freight demand",
@@ -4271,29 +4041,21 @@ def update_area_options(zone_filter, split_dimension):
     Output("fleet-metrics-region-detail-matrix-chart", "figure"),
     Input("fleet-metrics-region-tabs", "value"),
     Input("fleet-metrics-split-dropdown", "value"),
-    Input("fleet-metrics-area-dropdown", "value"),
     Input("fleet-metrics-date-range", "start_date"),
     Input("fleet-metrics-date-range", "end_date"),
     prevent_initial_call=False,
 )
-def update_fleet_metrics_page(zone_filter, split_dimension, selected_areas, start_date, end_date):
+def update_fleet_metrics_page(zone_filter, split_dimension, start_date, end_date):
     zone_filter = zone_filter or KPLER_FLEET_DEFAULT_ZONE_FILTER
     if zone_filter not in KPLER_FLEET_REGION_ORDER:
         zone_filter = KPLER_FLEET_DEFAULT_ZONE_FILTER
     if split_dimension not in {option["value"] for option in KPLER_FLEET_SPLIT_OPTIONS}:
         split_dimension = "current_subcontinents"
 
-    if isinstance(selected_areas, str):
-        selected_areas = [selected_areas]
-    selected_areas = [area for area in (selected_areas or []) if area]
-    if not selected_areas:
-        areas = fetch_area_options(split_dimension, zone_filter)
-        default_candidates = _default_area_candidates(zone_filter, split_dimension)
-        selected_areas = [area for area in default_candidates if area in areas] or areas[:9]
-
     try:
+        today = dt.date.today()
         start_date_val = pd.to_datetime(start_date).date() if start_date else KPLER_FLEET_DEFAULT_START_DATE
-        end_date_val = pd.to_datetime(end_date).date() if end_date else dt.date.today()
+        end_date_val = pd.to_datetime(end_date).date() if end_date else today
         if start_date_val > end_date_val:
             start_date_val, end_date_val = end_date_val, start_date_val
 
@@ -4305,7 +4067,8 @@ def update_fleet_metrics_page(zone_filter, split_dimension, selected_areas, star
             start_date=start_date_val,
             end_date=end_date_val,
         )
-        summaries = compute_region_summaries(summary_daily, end_date_val)
+        summary_weekly = derive_weekly_fleet_metrics(summary_daily)
+        summaries = compute_region_summaries(summary_weekly, end_date_val)
         selected_summary = summaries.get(zone_filter)
         status_strip = build_status_strip(upload_timestamp, signal_upload_timestamp, zone_filter, price_context)
         summary_cards = build_summary_cards(selected_summary)
@@ -4319,7 +4082,32 @@ def update_fleet_metrics_page(zone_filter, split_dimension, selected_areas, star
             start_date=start_date_val,
             end_date=end_date_val,
         )
-        diversions_df = fetch_recent_diversions()
+        signal_diversion_start = today - dt.timedelta(days=45)
+        signal_diversion_end = today + dt.timedelta(days=60)
+        if start_date_val <= signal_diversion_end and end_date_val >= signal_diversion_start:
+            all_diversions_df = fetch_recent_diversions(
+                start_date=min(start_date_val, signal_diversion_start),
+                end_date=max(end_date_val, signal_diversion_end),
+            )
+            diversions_df = _filter_diversions_by_event_window(
+                all_diversions_df,
+                signal_diversion_start,
+                signal_diversion_end,
+            )
+            diversion_history_df = _filter_diversions_by_event_window(
+                all_diversions_df,
+                start_date_val,
+                end_date_val,
+            )
+        else:
+            diversions_df = fetch_recent_diversions(
+                start_date=signal_diversion_start,
+                end_date=signal_diversion_end,
+            )
+            diversion_history_df = fetch_recent_diversions(
+                start_date=start_date_val,
+                end_date=end_date_val,
+            )
         signal_summaries = compute_global_signal_summaries(regional_signals, diversions_df, end_date_val)
         selected_signal_summary = signal_summaries.get(zone_filter)
         signal_cards = build_global_signal_cards(selected_signal_summary)
@@ -4328,37 +4116,41 @@ def update_fleet_metrics_page(zone_filter, split_dimension, selected_areas, star
             FLEET_METRICS_GLOBAL_SIGNALS_COLUMN_DEFS,
             signal_rows,
         )
-        loaded_seasonal_fig = build_region_seasonal_chart(summary_daily, "loaded_vessels")
-        floating_seasonal_fig = build_region_seasonal_chart(summary_daily, "floating_storage")
+        loaded_seasonal_fig = build_region_seasonal_chart(summary_weekly, "loaded_vessels")
+        floating_seasonal_fig = build_region_seasonal_chart(summary_weekly, "floating_storage")
         arrival_pipeline_fig = build_arrival_origin_region_row(regional_signals)
         utilization_fig = build_utilization_region_row(regional_signals, start_date_val, end_date_val)
         congestion_signal_fig = build_congestion_region_row(regional_signals, start_date_val, end_date_val)
         freight_signal_fig = build_freight_region_row(regional_signals, start_date_val, end_date_val)
-        diversion_history_df = fetch_recent_diversions(start_date=start_date_val, end_date=end_date_val)
         diversion_seasonal_fig = build_diversion_seasonal_chart(
             diversion_history_df,
             start_date=start_date_val,
             end_date=end_date_val,
         )
-        all_area_weekly = fetch_fleet_metrics_weekly(
-            split_dimension=split_dimension,
-            start_date=start_date_val,
-            end_date=end_date_val,
-            zone_filter=zone_filter,
-            metrics=("loaded_vessels", "floating_storage"),
-        )
         detail_matrix_weekly = fetch_fleet_metrics_weekly(
             split_dimension=split_dimension,
             start_date=start_date_val,
             end_date=end_date_val,
-            zone_filter=None,
+            zone_filters=KPLER_FLEET_DIVERSION_REGION_ORDER,
             metrics=("loaded_vessels", "floating_storage"),
         )
+        if zone_filter in KPLER_FLEET_DIVERSION_REGION_ORDER:
+            all_area_weekly = detail_matrix_weekly[
+                detail_matrix_weekly["zone_filter"] == zone_filter
+            ].copy()
+        else:
+            all_area_weekly = fetch_fleet_metrics_weekly(
+                split_dimension=split_dimension,
+                start_date=start_date_val,
+                end_date=end_date_val,
+                zone_filter=zone_filter,
+                metrics=("loaded_vessels", "floating_storage"),
+            )
         detail_matrix_floating_days = fetch_fleet_metrics_weekly(
             split_dimension="floating_days",
             start_date=start_date_val,
             end_date=end_date_val,
-            zone_filter=None,
+            zone_filters=KPLER_FLEET_DIVERSION_REGION_ORDER,
             metrics=("floating_storage",),
         )
         detail_matrix_fig = build_region_detail_matrix(
@@ -4393,8 +4185,7 @@ def update_fleet_metrics_page(zone_filter, split_dimension, selected_areas, star
             detail_matrix_fig,
         )
     except Exception as exc:
-        import traceback
-        traceback.print_exc()
+        logger.exception("Error loading Kpler fleet metrics page")
         error_fig = _empty_figure(f"Error loading Kpler fleet metrics: {exc}")
         return (
             html.Div(f"Error loading FleetMetrics page: {exc}", style={"color": "#b91c1c"}),

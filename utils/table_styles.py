@@ -4,36 +4,11 @@ Unified table styling system for standardized DataTable appearance across all pa
 Based on supply.py styling standards with McKinsey blue (#2E86C1) headers.
 """
 
+import pandas as pd
+
 # ========================================
 # STANDARD TABLE STYLES
 # ========================================
-
-# Standard McKinsey table header style - matching supply.py reference
-STANDARD_TABLE_HEADER = {
-    'backgroundColor': '#2E86C1',     # McKinsey blue - primary brand color
-    'color': 'white',                 # White text for contrast
-    'fontWeight': 'bold',             # Bold headers for prominence
-    'fontSize': '12px',               # Consistent font size
-    'fontFamily': 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',  # Updated to Inter per dash_style.md
-    'padding': '8px',                 # Standard padding
-    'whiteSpace': 'pre-wrap',
-    'lineHeight': '1.2',
-    'textAlign': 'center',
-    'border': '1px solid #1B4F72'    # Darker border for definition
-}
-
-# Standard cell style for consistency
-STANDARD_TABLE_CELL = {
-    'textAlign': 'center',
-    'padding': '8px',
-    'fontSize': '12px',
-    'fontFamily': 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',  # Updated to Inter per dash_style.md
-    'backgroundColor': 'white',
-    'minWidth': '60px',
-    'maxWidth': '180px',
-    'whiteSpace': 'normal',
-    'height': 'auto'
-}
 
 # Common conditional styling patterns
 STANDARD_CONDITIONAL_STYLES = {
@@ -70,51 +45,71 @@ class StandardTableStyleManager:
                 'overflowY': 'auto',
                 'margin': '0 auto'
             },
-            'style_header': STANDARD_TABLE_HEADER,
-            'style_cell': STANDARD_TABLE_CELL,
             'style_data_conditional': [
                 STANDARD_CONDITIONAL_STYLES['alternating_rows']
             ]
         }
     
-    @staticmethod
-    def get_mckinsey_delta_table_config():
-        """Configuration for McKinsey-style delta tables with heat map colors"""
-        base_config = StandardTableStyleManager.get_base_datatable_config()
-        
-        # Enhanced cell style for delta tables
-        base_config['style_cell'].update({
-            'fontSize': '12px',
-            'padding': '6px 4px',  # More compact for data-heavy tables
-            'textAlign': 'center',
-            'border': '1px solid #e5e7eb'
-        })
-        
-        return base_config
 
-# ========================================
-# LEGACY COMPATIBILITY FUNCTIONS
-# ========================================
+def format_numeric_table_cell(value, decimals: int = 2) -> str:
+    if pd.isna(value):
+        return ""
 
-def get_standard_table_style():
-    """
-    Returns a complete standard table style configuration.
-    Use this as the base for all DataTables for consistency.
-    """
-    return StandardTableStyleManager.get_base_datatable_config()
+    if isinstance(value, (int, float)):
+        return f"{float(value):.{decimals}f}"
 
-def get_compact_table_style():
-    """
-    Returns a compact version of the standard table style.
-    Use this for tables with many columns or limited space.
-    """
-    compact_style = get_standard_table_style()
-    compact_style['style_cell']['fontSize'] = '11px'
-    compact_style['style_cell']['padding'] = '6px'
-    compact_style['style_cell']['minWidth'] = '50px'
-    compact_style['style_header']['fontSize'] = '11px'
-    compact_style['style_header']['padding'] = '6px'
-    return compact_style
+    return str(value)
+
+
+def format_table_cell_value_1dp(value) -> str:
+    return format_numeric_table_cell(value, decimals=1)
+
+
+def format_table_cell_value_2dp(value) -> str:
+    return format_numeric_table_cell(value, decimals=2)
+
+
+def build_responsive_column_styles(
+    df: pd.DataFrame,
+    *,
+    value_formatter=format_table_cell_value_2dp,
+) -> list[dict]:
+    column_styles = []
+    column_weights = {}
+    column_min_widths = {}
+
+    for column_name in df.columns:
+        header_length = len(str(column_name))
+        value_lengths = df[column_name].map(value_formatter).map(len)
+        max_length = max([header_length] + value_lengths.tolist()) if not df.empty else header_length
+
+        if column_name == "Month":
+            column_weights[column_name] = max(8, min(max_length, 12))
+            column_min_widths[column_name] = 92
+        elif column_name == "Total MMTPA":
+            column_weights[column_name] = max(8, min(max_length, 14))
+            column_min_widths[column_name] = 96
+        else:
+            column_weights[column_name] = max(6, min(max_length, 18))
+            column_min_widths[column_name] = 72
+
+    total_weight = sum(column_weights.values()) or 1
+
+    for column_name in df.columns:
+        width_pct = column_weights[column_name] / total_weight * 100
+        style_entry = {
+            "if": {"column_id": column_name},
+            "minWidth": f"{column_min_widths[column_name]}px",
+            "width": f"{width_pct:.2f}%",
+        }
+
+        if column_name == "Month":
+            style_entry["textAlign"] = "left"
+
+        column_styles.append(style_entry)
+
+    return column_styles
+
 
 # ========================================
 # STANDARD COLOR PALETTE

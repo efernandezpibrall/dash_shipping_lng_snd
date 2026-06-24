@@ -1,13 +1,41 @@
-from io import BytesIO, StringIO
 import datetime as dt
-import json
 
 import pandas as pd
-from dash import dcc, html, dash_table, callback, Input, Output, State
+from dash import dcc, html, callback, Input, Output, State
+import dash_ag_grid as dag
 from dash.dash_table.Format import Format, Scheme
+from utils.ag_grid_tables import create_ag_grid_from_datatable
 from dash.exceptions import PreventUpdate
 from sqlalchemy import text
 
+from utils.balance_time import (
+    build_lng_season_periods as _build_lng_season_periods,
+    filter_by_month_date_range as _filter_by_date_range,
+    get_default_interval_window as _get_default_interval_window,
+    get_month_date_bounds as _get_date_bounds,
+    normalize_month_date as _normalize_month_date,
+)
+from utils.balance_matrix import (
+    align_matrix_to_reference_months as _align_matrix_to_reference_months,
+    build_delta_matrix as _build_delta_matrix,
+    export_matrix_to_excel_bytes as _export_matrix_to_excel_bytes,
+)
+from utils.balance_components import (
+    build_balance_section_summary as _build_section_summary,
+    create_balance_empty_state as _create_empty_state,
+)
+from utils.dataframe_store import (
+    deserialize_dataframe_store as _deserialize_dataframe,
+    serialize_dataframe_store as _serialize_dataframe,
+)
+from utils.snapshot_controls import (
+    build_ea_metadata_lines as _build_ea_metadata_lines,
+    build_woodmac_metadata_lines as _build_woodmac_metadata_lines,
+    deserialize_snapshot_value as _deserialize_snapshot_value,
+    ea_metadata_from_upload_options as _ea_metadata_from_upload_options,
+    resolve_snapshot_control_values as _resolve_snapshot_control_values,
+    woodmac_metadata_from_publication_options as _woodmac_metadata_from_publication_options,
+)
 from utils.export_flow_data import (
     DB_SCHEMA,
     build_export_flow_matrix,
@@ -23,7 +51,16 @@ from utils.export_flow_data import (
     fetch_woodmac_publication_options,
     get_available_countries,
 )
-from utils.table_styles import StandardTableStyleManager, TABLE_COLORS
+from utils.flow_country_selection import (
+    normalize_selected_flow_values as _normalize_selected_destination_columns,
+    resolve_flow_destination_selection,
+    sanitize_monthly_country_flow_data,
+)
+from utils.table_styles import (
+    StandardTableStyleManager,
+    TABLE_COLORS,
+    build_responsive_column_styles as _build_responsive_column_styles,
+)
 
 
 EXPORT_BUTTON_STYLE = {
@@ -61,11 +98,18 @@ TIME_VIEW_CONTROL_SHELL_STYLE = {
     "display": "inline-flex",
     "alignItems": "center",
     "gap": "10px",
-    "padding": "6px 8px 6px 12px",
+    "padding": "3px 8px 3px 12px",
     "backgroundColor": "#ffffff",
     "border": "1px solid #dbe4ee",
     "borderRadius": "999px",
     "boxShadow": "0 1px 2px rgba(15, 23, 42, 0.05)",
+}
+
+SUPPLY_STICKY_HEADER_STYLE = {
+    "display": "flex",
+    "gap": "12px",
+    "alignItems": "flex-end",
+    "flexWrap": "wrap",
 }
 
 UNKNOWN_DESTINATION_GROUP = "Unknown"
@@ -129,33 +173,9 @@ def _first_non_empty_value(series, fallback=""):
 
 
 def _sanitize_supply_raw_export_flow(raw_df: pd.DataFrame) -> pd.DataFrame:
-    if raw_df.empty:
-        return pd.DataFrame(columns=["month", "country_name", "total_mmtpa"])
-
-    cleaned_df = raw_df.copy()
-    cleaned_df["month"] = (
-        pd.to_datetime(cleaned_df["month"], errors="coerce")
-        .dt.to_period("M")
-        .dt.to_timestamp()
-    )
-    cleaned_df["country_name"] = (
-        cleaned_df["country_name"]
-        .fillna(UNKNOWN_DESTINATION_GROUP)
-        .astype(str)
-        .str.strip()
-        .replace("", UNKNOWN_DESTINATION_GROUP)
-    )
-    cleaned_df["total_mmtpa"] = pd.to_numeric(
-        cleaned_df["total_mmtpa"],
-        errors="coerce",
-    ).fillna(0.0)
-    cleaned_df = cleaned_df.dropna(subset=["month"])
-
-    return (
-        cleaned_df.groupby(["month", "country_name"], as_index=False)["total_mmtpa"]
-        .sum()
-        .sort_values(["month", "country_name"])
-        .reset_index(drop=True)
+    return sanitize_monthly_country_flow_data(
+        raw_df,
+        unknown_group=UNKNOWN_DESTINATION_GROUP,
     )
 
 
@@ -323,23 +343,6 @@ def _get_available_destination_group_values(
     return _sort_destination_group_values(group_values)
 
 
-def _normalize_selected_destination_columns(selected_values) -> list[str]:
-    if selected_values is None:
-        return []
-    if isinstance(selected_values, str):
-        raw_values = [selected_values]
-    else:
-        raw_values = list(selected_values)
-
-    normalized_values = []
-    for value in raw_values:
-        normalized_value = _normalize_mapping_value(value)
-        if normalized_value is not None and normalized_value not in normalized_values:
-            normalized_values.append(normalized_value)
-
-    return normalized_values
-
-
 def _build_supply_matrix(
     raw_df: pd.DataFrame,
     destination_aggregation: str,
@@ -411,140 +414,20 @@ def _build_supply_matrix(
     return result_df
 
 
-def _resolve_country_columns_selection(
-    selected_values,
-    available_countries: list[str],
-) -> list[str]:
-    available_country_set = set(available_countries or [])
-    normalized_selection = _normalize_selected_destination_columns(selected_values)
-    if normalized_selection:
-        resolved_selection = [
-            country
-            for country in normalized_selection
-            if country in available_country_set
-        ]
-        if resolved_selection:
-            return resolved_selection
-
-    return default_selected_countries(available_countries or [])
-
-
 def _resolve_destination_columns_selection(
     destination_aggregation: str,
     selected_values,
     available_countries: list[str],
     lookup_records,
 ) -> list[str]:
-    if destination_aggregation == "country":
-        return _resolve_country_columns_selection(
-            selected_values,
-            available_countries,
-        )
-
-    normalized_selection = _normalize_selected_destination_columns(selected_values)
-    if normalized_selection:
-        return normalized_selection
-
-    return _get_available_destination_group_values(
+    return resolve_flow_destination_selection(
         destination_aggregation,
+        selected_values,
         available_countries,
         lookup_records,
+        default_selected_countries_fn=default_selected_countries,
+        available_group_values_fn=_get_available_destination_group_values,
     )
-
-
-def _serialize_dataframe(df: pd.DataFrame | None) -> str | None:
-    if df is None or df.empty:
-        return None
-
-    return df.to_json(date_format="iso", orient="split")
-
-
-def _deserialize_dataframe(data: str | None) -> pd.DataFrame:
-    if not data:
-        return pd.DataFrame()
-
-    return pd.read_json(StringIO(data), orient="split")
-
-
-def _normalize_month_date(value) -> pd.Timestamp | None:
-    if not value:
-        return None
-
-    timestamp = pd.to_datetime(value, errors="coerce")
-    if pd.isna(timestamp):
-        return None
-
-    return timestamp.to_period("M").to_timestamp()
-
-
-def _get_date_bounds(dataframes: list[pd.DataFrame]) -> tuple[str | None, str | None]:
-    non_empty_frames = [df for df in dataframes if df is not None and not df.empty]
-    if not non_empty_frames:
-        return None, None
-
-    combined_df = pd.concat(non_empty_frames, ignore_index=True)
-    min_month = pd.to_datetime(combined_df["month"]).min()
-    max_month = pd.to_datetime(combined_df["month"]).max()
-
-    return min_month.strftime("%Y-%m-%d"), max_month.strftime("%Y-%m-%d")
-
-
-def _get_default_interval_window() -> tuple[pd.Timestamp, pd.Timestamp]:
-    current_year = pd.Timestamp.now().year
-    default_start = pd.Timestamp(year=current_year, month=1, day=1)
-    default_end = pd.Timestamp(year=current_year + 5, month=12, day=1)
-    return default_start, default_end
-
-
-def _filter_by_date_range(
-    raw_df: pd.DataFrame,
-    start_date: str | None,
-    end_date: str | None,
-) -> pd.DataFrame:
-    if raw_df.empty:
-        return raw_df
-
-    filtered_df = raw_df.copy()
-    filtered_df["month"] = pd.to_datetime(filtered_df["month"]).dt.to_period("M").dt.to_timestamp()
-
-    start_month = _normalize_month_date(start_date)
-    end_month = _normalize_month_date(end_date)
-
-    if start_month is not None:
-        filtered_df = filtered_df[filtered_df["month"] >= start_month]
-    if end_month is not None:
-        filtered_df = filtered_df[filtered_df["month"] <= end_month]
-
-    return filtered_df
-
-
-def _build_lng_season_periods(
-    dates: pd.Series,
-) -> tuple[pd.Series, pd.Series]:
-    normalized_dates = pd.to_datetime(dates, errors="coerce").dt.to_period("M").dt.to_timestamp()
-    is_summer = normalized_dates.dt.month.between(4, 9)
-    season_year = (
-        normalized_dates.dt.year - normalized_dates.dt.month.isin([1, 2, 3]).astype(int)
-    ).astype("Int64")
-
-    season_start_month = pd.Series(10, index=normalized_dates.index, dtype="int64")
-    season_start_month.loc[is_summer] = 4
-
-    season_code = pd.Series("W", index=normalized_dates.index, dtype="object")
-    season_code.loc[is_summer] = "S"
-
-    season_start = pd.to_datetime(
-        {
-            "year": season_year,
-            "month": season_start_month,
-            "day": 1,
-        },
-        errors="coerce",
-    )
-    season_label = season_year.astype(str)
-    season_label = season_label.where(normalized_dates.notna(), "")
-    season_label = season_label + "-" + season_code.where(normalized_dates.notna(), "")
-    return season_start, season_label
 
 
 def _apply_supply_time_view(matrix_df: pd.DataFrame, time_view: str) -> pd.DataFrame:
@@ -651,265 +534,11 @@ def _apply_supply_time_view(matrix_df: pd.DataFrame, time_view: str) -> pd.DataF
     return result_df.reset_index(drop=True)
 
 
-def _align_matrix_to_reference_months(
-    matrix_df: pd.DataFrame,
-    reference_month_labels: list[str],
-) -> pd.DataFrame:
-    reference_index = (
-        pd.Series(reference_month_labels, dtype="object")
-        .pipe(pd.to_datetime, errors="coerce")
-        .dt.to_period("M")
-        .dt.to_timestamp()
-    )
-    reference_index = pd.Index(reference_index.dropna().unique())
-
-    numeric_columns = [column for column in matrix_df.columns if column != "Month"]
-    if reference_index.empty:
-        return pd.DataFrame(columns=["Month"] + numeric_columns)
-
-    if matrix_df.empty:
-        aligned_df = pd.DataFrame(index=reference_index)
-    else:
-        aligned_df = matrix_df.copy()
-        aligned_df["Month"] = pd.to_datetime(
-            aligned_df["Month"].astype(str),
-            errors="coerce",
-        ).dt.to_period("M").dt.to_timestamp()
-        aligned_df = (
-            aligned_df.dropna(subset=["Month"])
-            .drop_duplicates(subset=["Month"], keep="last")
-            .set_index("Month")
-            .sort_index()
-            .reindex(reference_index)
-        )
-
-    for column_name in numeric_columns:
-        source_series = (
-            aligned_df[column_name]
-            if column_name in aligned_df.columns
-            else pd.Series(float("nan"), index=aligned_df.index, dtype="float64")
-        )
-        aligned_df[column_name] = pd.to_numeric(
-            source_series,
-            errors="coerce",
-        )
-
-    aligned_df.index.name = "Month"
-    result_df = aligned_df.reset_index()
-    result_df["Month"] = pd.to_datetime(result_df["Month"]).dt.strftime("%Y-%m")
-
-    return result_df[["Month"] + numeric_columns]
-
-
-def _create_empty_state(message: str) -> html.Div:
-    return html.Div(message, className="balance-empty-state")
-
-
-def _serialize_snapshot_value(payload: dict[str, str | None]) -> str:
-    return json.dumps(payload, sort_keys=True)
-
-
-def _deserialize_snapshot_value(value: str | dict | None) -> dict[str, str | None]:
-    if not value:
-        return {}
-
-    if isinstance(value, dict):
-        return value
-
-    try:
-        parsed_value = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        return {}
-
-    return parsed_value if isinstance(parsed_value, dict) else {}
-
-
-def _default_previous_option_value(options: list[dict]) -> str | None:
-    if len(options) > 1:
-        return options[1]["value"]
-    if options:
-        return options[0]["value"]
-    return None
-
-
-def _build_woodmac_snapshot_dropdown_options(
-    publication_options: list[dict[str, str | None]],
-) -> list[dict[str, str]]:
-    dropdown_options = []
-    for option in publication_options:
-        publication_label = option.get("market_outlook", "Unknown publication")
-        publication_timestamp = _format_metadata_timestamp(
-            option.get("publication_timestamp")
-        )
-        label = publication_label
-        if publication_timestamp:
-            label = f"{publication_label} | {publication_timestamp}"
-
-        dropdown_options.append(
-            {
-                "label": label,
-                "value": _serialize_snapshot_value(option),
-            }
-        )
-
-    return dropdown_options
-
-
-def _build_ea_upload_dropdown_options(
-    upload_timestamps: list[str],
-) -> list[dict[str, str]]:
-    dropdown_options = []
-    for upload_timestamp in upload_timestamps:
-        formatted_timestamp = _format_metadata_timestamp(upload_timestamp) or upload_timestamp
-        dropdown_options.append(
-            {
-                "label": formatted_timestamp,
-                "value": upload_timestamp,
-            }
-        )
-
-    return dropdown_options
-
-
-def _build_delta_matrix(
-    baseline_matrix: pd.DataFrame,
-    comparison_matrix: pd.DataFrame,
-) -> pd.DataFrame:
-    if baseline_matrix.empty:
-        return pd.DataFrame(columns=["Month", "Total MMTPA"])
-
-    numeric_columns = [column for column in baseline_matrix.columns if column != "Month"]
-    delta_df = baseline_matrix.copy()
-    delta_df[numeric_columns] = delta_df[numeric_columns].apply(
-        pd.to_numeric,
-        errors="coerce",
-    )
-
-    comparison_aligned = comparison_matrix.copy()
-    for column in numeric_columns:
-        if column not in comparison_aligned.columns:
-            comparison_aligned[column] = float("nan")
-
-    comparison_aligned = comparison_aligned[["Month"] + numeric_columns]
-    comparison_aligned[numeric_columns] = comparison_aligned[numeric_columns].apply(
-        pd.to_numeric,
-        errors="coerce",
-    )
-    comparison_aligned = comparison_aligned.set_index("Month").reindex(delta_df["Month"])
-
-    delta_index = delta_df.set_index("Month")
-    delta_index[numeric_columns] = (
-        delta_index[numeric_columns] - comparison_aligned[numeric_columns]
-    ).round(2)
-
-    return delta_index.reset_index()
-
-
-def _format_table_cell_value(value) -> str:
-    if pd.isna(value):
-        return ""
-
-    if isinstance(value, (int, float)):
-        return f"{float(value):.2f}"
-
-    return str(value)
-
-
-def _build_responsive_column_styles(df: pd.DataFrame) -> list[dict]:
-    column_styles = []
-    column_weights = {}
-    column_min_widths = {}
-
-    for column_name in df.columns:
-        header_length = len(str(column_name))
-        value_lengths = df[column_name].map(_format_table_cell_value).map(len)
-        max_length = max([header_length] + value_lengths.tolist()) if not df.empty else header_length
-
-        if column_name == "Month":
-            column_weights[column_name] = max(8, min(max_length, 12))
-            column_min_widths[column_name] = 92
-        elif column_name == "Total MMTPA":
-            column_weights[column_name] = max(8, min(max_length, 14))
-            column_min_widths[column_name] = 96
-        else:
-            column_weights[column_name] = max(6, min(max_length, 18))
-            column_min_widths[column_name] = 72
-
-    total_weight = sum(column_weights.values()) or 1
-
-    for column_name in df.columns:
-        width_pct = column_weights[column_name] / total_weight * 100
-        style_entry = {
-            "if": {"column_id": column_name},
-            "minWidth": f"{column_min_widths[column_name]}px",
-            "width": f"{width_pct:.2f}%",
-        }
-
-        if column_name == "Month":
-            style_entry["textAlign"] = "left"
-
-        column_styles.append(style_entry)
-
-    return column_styles
-
-
-def _format_metadata_timestamp(value) -> str | None:
-    if not value:
-        return None
-
-    timestamp = pd.to_datetime(value, errors="coerce")
-    if pd.isna(timestamp):
-        return str(value)
-
-    return timestamp.strftime("%Y-%m-%d %H:%M")
-
-
-def _build_woodmac_metadata_lines(metadata: dict | None) -> list[str]:
-    if not metadata:
-        return []
-
-    lines = []
-    short_term_line = metadata.get("short_term_market_outlook")
-    short_term_timestamp = _format_metadata_timestamp(
-        metadata.get("short_term_publication_timestamp")
-    )
-    if short_term_line:
-        if short_term_timestamp:
-            lines.append(
-                f"ST publication: {short_term_line} | publication_date: {short_term_timestamp}"
-            )
-        else:
-            lines.append(f"ST publication: {short_term_line}")
-
-    long_term_line = metadata.get("long_term_market_outlook")
-    long_term_timestamp = _format_metadata_timestamp(
-        metadata.get("long_term_publication_timestamp")
-    )
-    if long_term_line:
-        if long_term_timestamp:
-            lines.append(
-                f"LT publication: {long_term_line} | publication_date: {long_term_timestamp}"
-            )
-        else:
-            lines.append(f"LT publication: {long_term_line}")
-
-    return lines
-
-
-def _build_ea_metadata_lines(metadata: dict | None) -> list[str]:
-    if not metadata:
-        return []
-
-    upload_timestamp = _format_metadata_timestamp(metadata.get("upload_timestamp_utc"))
-    if not upload_timestamp:
-        return []
-
-    return [f"upload_timestamp_utc: {upload_timestamp}"]
 def _create_balance_table(
     table_id: str,
     df: pd.DataFrame,
     table_mode: str = "absolute",
-) -> dash_table.DataTable | html.Div:
+) -> dag.AgGrid | html.Div:
     if df.empty:
         return _create_empty_state("No data available for the current selection.")
 
@@ -986,14 +615,13 @@ def _create_balance_table(
             ]
         )
 
-    return dash_table.DataTable(
+    return create_ag_grid_from_datatable(
         id=table_id,
         columns=columns,
         data=df.where(pd.notna(df), None).to_dict("records"),
         sort_action="native",
         page_action="none",
         fill_width=True,
-        fixed_rows={"headers": True},
         fixed_columns={"headers": True, "data": 1},
         style_table={
             "overflowX": "auto",
@@ -1002,213 +630,8 @@ def _create_balance_table(
             "width": "100%",
             "minWidth": "100%",
         },
-        style_header=base_config["style_header"],
-        style_cell={
-            **base_config["style_cell"],
-            "minWidth": "72px",
-            "width": "72px",
-            "maxWidth": "none",
-            "border": f"1px solid {TABLE_COLORS['border_light']}",
-            "padding": "6px 8px",
-        },
         style_cell_conditional=_build_responsive_column_styles(df),
         style_data_conditional=style_data_conditional,
-    )
-
-
-def _build_section_summary(
-    raw_df: pd.DataFrame,
-    matrix_df: pd.DataFrame,
-    destination_aggregation: str,
-    other_countries_mode: str,
-    metadata_lines: list[str] | None = None,
-    time_view: str = "monthly",
-) -> html.Div:
-    summary_children = []
-
-    if raw_df.empty:
-        summary_children.append(
-            html.Div("No source data returned.", className="balance-summary-row")
-        )
-    else:
-        month_start = (
-            matrix_df["Month"].iloc[0]
-            if not matrix_df.empty
-            else raw_df["month"].min().strftime("%Y-%m")
-        )
-        month_end = (
-            matrix_df["Month"].iloc[-1]
-            if not matrix_df.empty
-            else raw_df["month"].max().strftime("%Y-%m")
-        )
-        visible_country_count = max(len(matrix_df.columns) - 2, 0)
-        standardized_country_count = raw_df["country_name"].nunique()
-        period_label = TIME_VIEW_PERIOD_LABELS.get(time_view, "month")
-        count_label = period_label if len(matrix_df) == 1 else f"{period_label}s"
-        aggregation_label = DESTINATION_AGGREGATION_LABELS.get(
-            destination_aggregation,
-            "Country",
-        )
-        visible_column_label = (
-            "visible country columns"
-            if destination_aggregation == "country"
-            else f"visible {aggregation_label.lower()} columns"
-        )
-        visibility_note = (
-            "Other countries grouped into Rest of the World."
-            if destination_aggregation == "country"
-            and other_countries_mode == "rest_of_world"
-            else (
-                "Only selected countries are included in the totals."
-                if destination_aggregation == "country"
-                else (
-                    f"Destination aggregation: {aggregation_label}. "
-                    f"All groups shown as explicit columns."
-                )
-            )
-        )
-
-        summary_children.append(
-            html.Div(
-                [
-                    html.Span(f"{len(matrix_df):,} {count_label}"),
-                    html.Span(f"{month_start} to {month_end}"),
-                    html.Span(f"{visible_country_count} {visible_column_label}"),
-                    html.Span(f"{standardized_country_count} standardized source countries"),
-                    html.Span(visibility_note),
-                ],
-                className="balance-summary-row",
-            )
-        )
-
-    if metadata_lines:
-        summary_children.append(
-            html.Div(
-                [html.Span(line) for line in metadata_lines],
-                className="balance-metadata-row",
-            )
-        )
-
-    return html.Div(
-        summary_children
-    )
-
-
-def _build_comparison_metadata_lines(
-    comparison_source: str,
-    short_term_value: str | None,
-    long_term_value: str | None,
-    ea_upload_value: str | None,
-) -> list[str]:
-    if comparison_source == "woodmac":
-        short_term_snapshot = _deserialize_snapshot_value(short_term_value)
-        long_term_snapshot = _deserialize_snapshot_value(long_term_value)
-        lines = ["Delta formula: left baseline table - selected snapshot"]
-
-        short_term_line = short_term_snapshot.get("market_outlook")
-        short_term_timestamp = _format_metadata_timestamp(
-            short_term_snapshot.get("publication_timestamp")
-        )
-        if short_term_line:
-            if short_term_timestamp:
-                lines.append(
-                    f"Comparison source: WoodMac | ST publication: {short_term_line} | publication_date: {short_term_timestamp}"
-                )
-            else:
-                lines.append(
-                    f"Comparison source: WoodMac | ST publication: {short_term_line}"
-                )
-
-        long_term_line = long_term_snapshot.get("market_outlook")
-        long_term_timestamp = _format_metadata_timestamp(
-            long_term_snapshot.get("publication_timestamp")
-        )
-        if long_term_line:
-            if long_term_timestamp:
-                lines.append(
-                    f"LT publication: {long_term_line} | publication_date: {long_term_timestamp}"
-                )
-            else:
-                lines.append(f"LT publication: {long_term_line}")
-
-        return lines
-    ea_upload_label = _format_metadata_timestamp(ea_upload_value) or ea_upload_value
-    if ea_upload_label:
-        return [
-            "Delta formula: left baseline table - selected snapshot",
-            f"Comparison source: Energy Aspects | upload_timestamp_utc: {ea_upload_label}",
-        ]
-
-    return ["Delta formula: left baseline table - selected snapshot"]
-
-
-def _build_comparison_summary(
-    delta_df: pd.DataFrame,
-    metadata_lines: list[str],
-) -> html.Div:
-    return html.Div()
-
-
-def _resolve_snapshot_control_values(
-    comparison_source,
-    comparison_options,
-    current_st_value,
-    current_lt_value,
-    current_ea_upload_value,
-):
-    comparison_options = comparison_options or {}
-    woodmac_options = comparison_options.get("woodmac", {})
-    short_term_options = _build_woodmac_snapshot_dropdown_options(
-        woodmac_options.get("short_term", [])
-    )
-    long_term_options = _build_woodmac_snapshot_dropdown_options(
-        woodmac_options.get("long_term", [])
-    )
-    ea_upload_options = _build_ea_upload_dropdown_options(
-        comparison_options.get("ea_uploads", [])
-    )
-
-    short_term_values = {option["value"] for option in short_term_options}
-    long_term_values = {option["value"] for option in long_term_options}
-    ea_upload_values = {option["value"] for option in ea_upload_options}
-
-    short_term_value = (
-        current_st_value
-        if current_st_value in short_term_values
-        else _default_previous_option_value(short_term_options)
-    )
-    long_term_value = (
-        current_lt_value
-        if current_lt_value in long_term_values
-        else _default_previous_option_value(long_term_options)
-    )
-    ea_upload_value = (
-        current_ea_upload_value
-        if current_ea_upload_value in ea_upload_values
-        else _default_previous_option_value(ea_upload_options)
-    )
-
-    if comparison_source == "ea":
-        return (
-            short_term_options,
-            short_term_value,
-            long_term_options,
-            long_term_value,
-            ea_upload_options,
-            ea_upload_value,
-            {"display": "none"},
-            {"display": "flex", "gap": "12px", "flexWrap": "wrap", "alignItems": "flex-end"},
-        )
-
-    return (
-        short_term_options,
-        short_term_value,
-        long_term_options,
-        long_term_value,
-        ea_upload_options,
-        ea_upload_value,
-        {"display": "flex", "gap": "12px", "flexWrap": "wrap", "alignItems": "flex-end"},
-        {"display": "none"},
     )
 
 
@@ -1253,7 +676,6 @@ def _build_delta_comparison_output(
     other_countries_mode: str,
     destination_aggregation_lookup,
     time_view: str,
-    metadata_lines: list[str],
     empty_baseline_message: str,
     comparison_table_id: str,
     comparison_error_message: str | None = None,
@@ -1269,7 +691,7 @@ def _build_delta_comparison_output(
 
     if baseline_matrix.empty:
         return (
-            _build_comparison_summary(pd.DataFrame(columns=["Month", "Total MMTPA"]), metadata_lines),
+            html.Div(),
             _create_empty_state(empty_baseline_message),
         )
 
@@ -1279,10 +701,7 @@ def _build_delta_comparison_output(
         and other_countries_mode == "exclude"
     ):
         return (
-            _build_comparison_summary(
-                pd.DataFrame(columns=baseline_matrix.columns),
-                metadata_lines,
-            ),
+            html.Div(),
             _create_empty_state(
                 "Select at least one country or switch to Rest of the World mode."
             ),
@@ -1290,10 +709,7 @@ def _build_delta_comparison_output(
 
     if comparison_error_message:
         return (
-            _build_comparison_summary(
-                pd.DataFrame(columns=baseline_matrix.columns),
-                metadata_lines + [comparison_error_message],
-            ),
+            html.Div(),
             _create_empty_state(
                 "Unable to load comparison snapshot."
                 if comparison_error_message.startswith("Comparison load failed:")
@@ -1316,56 +732,13 @@ def _build_delta_comparison_output(
     comparison_matrix = _apply_supply_time_view(comparison_matrix, time_view)
     delta_matrix = _build_delta_matrix(baseline_matrix, comparison_matrix)
 
-    comparison_summary = _build_comparison_summary(delta_matrix, metadata_lines)
     comparison_table = _create_balance_table(
         comparison_table_id,
         delta_matrix,
         table_mode="delta",
     )
 
-    return comparison_summary, comparison_table
-
-
-def _create_source_section(
-    title: str,
-    subtitle: str,
-    summary_id: str,
-    table_container_id: str,
-    export_button_id: str,
-) -> html.Div:
-    header_children = [
-        html.Div(
-            [
-                html.H3(title, className="balance-section-title"),
-                html.Button(
-                    "Export to Excel",
-                    id=export_button_id,
-                    n_clicks=0,
-                    style=EXPORT_BUTTON_STYLE,
-                ),
-            ],
-            className="inline-section-header",
-            style={"display": "flex", "alignItems": "center"},
-        )
-    ]
-
-    if subtitle:
-        header_children.append(
-            html.P(subtitle, className="balance-section-subtitle")
-        )
-
-    header_children.append(html.Div(id=summary_id))
-
-    return html.Div(
-        [
-            html.Div(
-                header_children,
-                className="balance-section-header",
-            ),
-            html.Div(id=table_container_id, className="balance-table-container"),
-        ],
-        className="balance-section-card",
-    )
+    return html.Div(), comparison_table
 
 
 def _create_comparison_section(
@@ -1584,7 +957,6 @@ layout = html.Div(
         dcc.Store(id="balance-country-options-store", storage_type="memory"),
         dcc.Store(id="balance-destination-aggregation-lookup-store", storage_type="memory"),
         dcc.Store(id="balance-country-columns-selection-store", storage_type="memory"),
-        dcc.Store(id="balance-refresh-timestamp-store", storage_type="memory"),
         dcc.Store(id="balance-load-error-store", storage_type="memory"),
         dcc.Store(id="balance-woodmac-metadata-store", storage_type="memory"),
         dcc.Store(id="balance-ea-metadata-store", storage_type="memory"),
@@ -1595,153 +967,139 @@ layout = html.Div(
             [
                 html.Div(
                     [
+                        html.Div("Date Range", className="filter-group-header"),
                         html.Div(
                             [
-                                html.Div("Date Range", className="filter-group-header"),
-                                html.Label("Month interval:", className="filter-label"),
-                                html.Div(
-                                    [
-                                        dcc.DatePickerRange(
-                                            id="balance-date-range",
-                                            start_date=None,
-                                            end_date=None,
-                                            min_date_allowed=None,
-                                            max_date_allowed=None,
-                                            minimum_nights=0,
-                                            display_format="YYYY-MM",
-                                            month_format="YYYY-MM",
-                                            start_date_placeholder_text="Start month",
-                                            end_date_placeholder_text="End month",
-                                            clearable=False,
-                                            number_of_months_shown=2,
-                                        )
-                                    ],
-                                    className="professional-date-picker",
-                                ),
-                            ],
-                            className="filter-section filter-section-destination",
-                        ),
-                        html.Div(
-                            [
-                                html.Div(
-                                    "Time View",
-                                    className="filter-group-header",
-                                    title=SEASONAL_TIME_VIEW_TOOLTIP,
-                                    style={"cursor": "help"},
-                                ),
-                                html.Div(
-                                    [
-                                        dcc.RadioItems(
-                                            id="balance-time-view",
-                                            options=[
-                                                {"label": "Monthly", "value": "monthly"},
-                                                {"label": "Quarterly", "value": "quarterly"},
-                                                {"label": "Seasonally", "value": "seasonally"},
-                                                {"label": "Yearly", "value": "yearly"},
-                                            ],
-                                            value="yearly",
-                                            inline=True,
-                                            labelStyle={
-                                                "display": "inline-flex",
-                                                "alignItems": "center",
-                                                "marginRight": "10px",
-                                                "fontSize": "12px",
-                                                "fontWeight": "600",
-                                                "color": "#334155",
-                                            },
-                                            inputStyle={"marginRight": "6px"},
-                                            style={"display": "flex", "alignItems": "center"},
-                                        )
-                                    ],
-                                    style=TIME_VIEW_CONTROL_SHELL_STYLE,
-                                ),
-                            ],
-                            className="filter-section filter-section-destination",
-                        ),
-                        html.Div(
-                            [
-                                html.Div("Destination Aggregation", className="filter-group-header"),
-                                html.Label("Group by:", className="filter-label"),
-                                dcc.Dropdown(
-                                    id="balance-destination-aggregation-dropdown",
-                                    options=DESTINATION_AGGREGATION_OPTIONS,
-                                    value="country",
+                                dcc.DatePickerRange(
+                                    id="balance-date-range",
+                                    start_date=None,
+                                    end_date=None,
+                                    min_date_allowed=None,
+                                    max_date_allowed=None,
+                                    minimum_nights=0,
+                                    display_format="YYYY-MM",
+                                    month_format="YYYY-MM",
+                                    start_date_placeholder_text="Start month",
+                                    end_date_placeholder_text="End month",
                                     clearable=False,
-                                    className="filter-dropdown",
-                                    style={"minWidth": "240px"},
-                                ),
+                                    number_of_months_shown=2,
+                                )
                             ],
-                            className="filter-section filter-section-destination",
-                        ),
-                        html.Div(
-                            [
-                                html.Div(
-                                    "Country Columns",
-                                    id="balance-country-columns-header",
-                                    className="filter-group-header",
-                                ),
-                                html.Label(
-                                    "Countries:",
-                                    id="balance-country-columns-label",
-                                    className="filter-label",
-                                ),
-                                dcc.Dropdown(
-                                    id="balance-country-dropdown",
-                                    options=[],
-                                    value=None,
-                                    multi=True,
-                                    placeholder="Select countries to keep as separate columns",
-                                    className="filter-dropdown",
-                                    style={"minWidth": "380px"},
-                                ),
-                            ],
-                            className="filter-section filter-section-origin-exp",
-                        ),
-                        html.Div(
-                            [
-                                html.Div("Other Countries", className="filter-group-header"),
-                                html.Label("Handling:", className="filter-label"),
-                                dcc.RadioItems(
-                                    id="balance-other-country-mode",
-                                    options=[
-                                        {
-                                            "label": "Include as Rest of the World",
-                                            "value": "rest_of_world",
-                                        },
-                                        {
-                                            "label": "Exclude from the table",
-                                            "value": "exclude",
-                                        },
-                                    ],
-                                    value="rest_of_world",
-                                    className="balance-radio-group",
-                                    labelStyle={"display": "inline-flex", "alignItems": "center"},
-                                    inputStyle={"marginRight": "6px"},
-                                ),
-                            ],
-                            className="filter-section filter-section-volume",
-                        ),
-                        html.Div(
-                            [
-                                html.Div("Status", className="filter-group-header"),
-                                html.Div(
-                                    id="balance-refresh-indicator",
-                                    className="text-tertiary",
-                                    style={"fontSize": "12px", "whiteSpace": "nowrap"},
-                                ),
-                                html.Div(
-                                    id="balance-meta-indicator",
-                                    className="text-tertiary",
-                                    style={"fontSize": "12px", "maxWidth": "260px"},
-                                ),
-                            ],
-                            className="filter-section filter-section-analysis",
+                            className="professional-date-picker",
                         ),
                     ],
-                    className="filter-bar-grouped",
-                )
+                    className="filter-group",
+                    style={"minWidth": "280px"},
+                ),
+                html.Div(
+                    [
+                        html.Div(
+                            "Time View",
+                            className="filter-group-header",
+                            title=SEASONAL_TIME_VIEW_TOOLTIP,
+                            style={"cursor": "help"},
+                        ),
+                        html.Div(
+                            [
+                                dcc.RadioItems(
+                                    id="balance-time-view",
+                                    options=[
+                                        {"label": "Monthly", "value": "monthly"},
+                                        {"label": "Quarterly", "value": "quarterly"},
+                                        {"label": "Seasonally", "value": "seasonally"},
+                                        {"label": "Yearly", "value": "yearly"},
+                                    ],
+                                    value="yearly",
+                                    inline=True,
+                                    labelStyle={
+                                        "display": "inline-flex",
+                                        "alignItems": "center",
+                                        "marginRight": "10px",
+                                        "fontSize": "12px",
+                                        "fontWeight": "600",
+                                        "color": "#334155",
+                                    },
+                                    inputStyle={"marginRight": "6px"},
+                                    style={
+                                        "display": "flex",
+                                        "alignItems": "center",
+                                        "flexWrap": "wrap",
+                                    },
+                                )
+                            ],
+                            style=TIME_VIEW_CONTROL_SHELL_STYLE,
+                        ),
+                    ],
+                    className="filter-group",
+                    style={"minWidth": "360px"},
+                ),
+                html.Div(
+                    [
+                        html.Div("Destination Aggregation", className="filter-group-header"),
+                        dcc.Dropdown(
+                            id="balance-destination-aggregation-dropdown",
+                            options=DESTINATION_AGGREGATION_OPTIONS,
+                            value="country",
+                            clearable=False,
+                            className="filter-dropdown",
+                            style={"minWidth": "220px"},
+                        ),
+                    ],
+                    className="filter-group",
+                    style={"minWidth": "220px"},
+                ),
+                html.Div(
+                    [
+                        html.Div(
+                            "Country Columns",
+                            id="balance-country-columns-header",
+                            className="filter-group-header",
+                        ),
+                        dcc.Dropdown(
+                            id="balance-country-dropdown",
+                            options=[],
+                            value=None,
+                            multi=True,
+                            placeholder="Select countries to keep as separate columns",
+                            className="filter-dropdown",
+                            style={"minWidth": "340px"},
+                        ),
+                    ],
+                    className="filter-group",
+                    style={"flex": "1", "minWidth": "340px"},
+                ),
+                html.Div(
+                    [
+                        html.Div("Other Countries", className="filter-group-header"),
+                        dcc.RadioItems(
+                            id="balance-other-country-mode",
+                            options=[
+                                {
+                                    "label": "Include as Rest of the World",
+                                    "value": "rest_of_world",
+                                },
+                                {
+                                    "label": "Exclude from the table",
+                                    "value": "exclude",
+                                },
+                            ],
+                            value="rest_of_world",
+                            className="balance-radio-group",
+                            labelStyle={
+                                "display": "inline-flex",
+                                "alignItems": "center",
+                                "marginRight": "10px",
+                            },
+                            inputStyle={"marginRight": "6px"},
+                            style={"display": "flex", "alignItems": "center", "flexWrap": "wrap"},
+                        ),
+                    ],
+                    className="filter-group",
+                    style={"minWidth": "300px"},
+                ),
             ],
             className="professional-section-header",
+            style=SUPPLY_STICKY_HEADER_STYLE,
         ),
         html.Div(
             [
@@ -1770,7 +1128,6 @@ layout = html.Div(
     Output("balance-ea-data-store", "data"),
     Output("balance-country-options-store", "data"),
     Output("balance-destination-aggregation-lookup-store", "data"),
-    Output("balance-refresh-timestamp-store", "data"),
     Output("balance-load-error-store", "data"),
     Output("balance-woodmac-metadata-store", "data"),
     Output("balance-ea-metadata-store", "data"),
@@ -1795,29 +1152,29 @@ def load_balance_source_data(_):
         errors.append(f"WoodMac load failed: {exc}")
 
     try:
-        woodmac_metadata = fetch_woodmac_export_flow_metadata()
-    except Exception as exc:
-        errors.append(f"WoodMac metadata load failed: {exc}")
-
-    try:
         ea_df = fetch_ea_export_flow_raw_data()
     except Exception as exc:
         errors.append(f"Energy Aspects load failed: {exc}")
 
     try:
-        ea_metadata = fetch_ea_export_flow_metadata()
-    except Exception as exc:
-        errors.append(f"Energy Aspects metadata load failed: {exc}")
-
-    try:
         comparison_options["woodmac"] = fetch_woodmac_publication_options()
+        woodmac_metadata = _woodmac_metadata_from_publication_options(comparison_options["woodmac"])
     except Exception as exc:
         errors.append(f"WoodMac comparison options load failed: {exc}")
+        try:
+            woodmac_metadata = fetch_woodmac_export_flow_metadata()
+        except Exception as metadata_exc:
+            errors.append(f"WoodMac metadata load failed: {metadata_exc}")
 
     try:
         comparison_options["ea_uploads"] = fetch_ea_upload_options()
+        ea_metadata = _ea_metadata_from_upload_options(comparison_options["ea_uploads"])
     except Exception as exc:
         errors.append(f"Energy Aspects comparison options load failed: {exc}")
+        try:
+            ea_metadata = fetch_ea_export_flow_metadata()
+        except Exception as metadata_exc:
+            errors.append(f"Energy Aspects metadata load failed: {metadata_exc}")
 
     try:
         destination_aggregation_lookup = _fetch_destination_aggregation_lookup_records()
@@ -1825,7 +1182,6 @@ def load_balance_source_data(_):
         errors.append(f"Destination aggregation lookup load failed: {exc}")
 
     available_countries = get_available_countries([woodmac_df, ea_df])
-    refresh_timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     error_message = " | ".join(errors) if errors else None
 
     return (
@@ -1833,7 +1189,6 @@ def load_balance_source_data(_):
         _serialize_dataframe(ea_df),
         available_countries,
         destination_aggregation_lookup,
-        refresh_timestamp,
         error_message,
         woodmac_metadata,
         ea_metadata,
@@ -1846,7 +1201,6 @@ def load_balance_source_data(_):
     Output("balance-country-dropdown", "value"),
     Output("balance-country-dropdown", "disabled"),
     Output("balance-country-columns-header", "children"),
-    Output("balance-country-columns-label", "children"),
     Output("balance-country-dropdown", "placeholder"),
     Output("balance-other-country-mode", "disabled"),
     Output("balance-country-columns-selection-store", "data"),
@@ -1915,7 +1269,6 @@ def update_balance_country_options(
             selected_values,
             False,
             "Country Columns",
-            "Countries:",
             "Select countries to keep as separate columns",
             False,
             selected_values,
@@ -1964,7 +1317,6 @@ def update_balance_country_options(
         aggregation_values,
         True,
         "Destination Columns",
-        f"{aggregation_label} groups:",
         f"All {aggregation_label.lower()} groups are shown as columns",
         True,
         preserved_country_selection,
@@ -2075,57 +1427,6 @@ def update_balance_date_range(woodmac_data, ea_data, current_start_date, current
 
 
 @callback(
-    Output("balance-refresh-indicator", "children"),
-    Output("balance-meta-indicator", "children"),
-    Input("balance-refresh-timestamp-store", "data"),
-    Input("balance-country-options-store", "data"),
-    Input("balance-date-range", "start_date"),
-    Input("balance-date-range", "end_date"),
-    Input("balance-time-view", "value"),
-    Input("balance-destination-aggregation-dropdown", "value"),
-)
-def update_balance_status(
-    refresh_timestamp,
-    available_countries,
-    start_date,
-    end_date,
-    time_view,
-    destination_aggregation,
-):
-    refresh_text = (
-        f"Last refreshed: {refresh_timestamp}"
-        if refresh_timestamp
-        else "Last refreshed: waiting for data"
-    )
-    time_view_label = TIME_VIEW_LABELS.get(time_view, "Monthly")
-    aggregation_label = DESTINATION_AGGREGATION_LABELS.get(
-        destination_aggregation,
-        "Country",
-    )
-    if start_date and end_date:
-        start_label = _normalize_month_date(start_date).strftime("%Y-%m")
-        end_label = _normalize_month_date(end_date).strftime("%Y-%m")
-        range_text = (
-            f"Showing {start_label} to {end_label} in {time_view_label} view. "
-            f"Destination aggregation: {aggregation_label}."
-        )
-    else:
-        range_text = (
-            f"EA dataset attributes are resolved from Energy Aspects metadata, "
-            f"and country names are standardized with at_lng.mappings_country. "
-            f"Time view: {time_view_label}. "
-            f"Destination aggregation: {aggregation_label}."
-        )
-
-    meta_text = (
-        f"{len(available_countries or []):,} countries available after standardization. {range_text}"
-        if available_countries
-        else range_text
-    )
-    return refresh_text, meta_text
-
-
-@callback(
     Output("balance-load-error-banner", "children"),
     Input("balance-load-error-store", "data"),
 )
@@ -2209,6 +1510,8 @@ def render_balance_tables(
         other_countries_mode,
         _build_woodmac_metadata_lines(woodmac_metadata),
         time_view=time_view,
+        time_view_period_labels=TIME_VIEW_PERIOD_LABELS,
+        destination_aggregation_labels=DESTINATION_AGGREGATION_LABELS,
     )
     ea_summary = _build_section_summary(
         ea_raw_df,
@@ -2217,6 +1520,8 @@ def render_balance_tables(
         other_countries_mode,
         _build_ea_metadata_lines(ea_metadata),
         time_view=time_view,
+        time_view_period_labels=TIME_VIEW_PERIOD_LABELS,
+        destination_aggregation_labels=DESTINATION_AGGREGATION_LABELS,
     )
 
     if (
@@ -2293,13 +1598,6 @@ def render_comparison_delta_table(
         ea_upload_value,
     )
 
-    metadata_lines = _build_comparison_metadata_lines(
-        comparison_source,
-        short_term_value,
-        long_term_value,
-        ea_upload_value,
-    )
-
     comparison_filtered_df = _filter_by_date_range(
         comparison_raw_df if comparison_raw_df is not None else pd.DataFrame(),
         start_date,
@@ -2313,7 +1611,6 @@ def render_comparison_delta_table(
         other_countries_mode,
         destination_aggregation_lookup,
         time_view,
-        metadata_lines,
         "No baseline WoodMac data available for the current selection.",
         "balance-comparison-delta-table",
         comparison_error_message=comparison_error_message,
@@ -2379,13 +1676,6 @@ def render_ea_comparison_delta_table(
         ea_upload_value,
     )
 
-    metadata_lines = _build_comparison_metadata_lines(
-        comparison_source,
-        short_term_value,
-        long_term_value,
-        ea_upload_value,
-    )
-
     comparison_filtered_df = _filter_by_date_range(
         comparison_raw_df if comparison_raw_df is not None else pd.DataFrame(),
         start_date,
@@ -2399,30 +1689,10 @@ def render_ea_comparison_delta_table(
         other_countries_mode,
         destination_aggregation_lookup,
         time_view,
-        metadata_lines,
         "No baseline Energy Aspects data available for the current selection.",
         "balance-ea-comparison-delta-table",
         comparison_error_message=comparison_error_message,
     )
-
-
-def _export_matrix_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name=sheet_name, index=False)
-
-        worksheet = writer.sheets[sheet_name]
-        for column_cells in worksheet.columns:
-            max_length = 0
-            column_letter = column_cells[0].column_letter
-            for cell in column_cells:
-                cell_value = "" if cell.value is None else str(cell.value)
-                if len(cell_value) > max_length:
-                    max_length = len(cell_value)
-            worksheet.column_dimensions[column_letter].width = min(max_length + 2, 24)
-
-    output.seek(0)
-    return output.getvalue()
 
 
 def _build_filtered_matrix_for_export(

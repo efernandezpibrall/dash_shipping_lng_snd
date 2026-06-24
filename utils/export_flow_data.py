@@ -5,6 +5,15 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 
 from utils.ea_balance_catalog import build_resolved_ea_lng_balance_ctes
+from utils.flow_country_selection import (
+    build_ea_upload_metadata,
+    build_ea_upload_options,
+    build_woodmac_flow_metadata,
+    build_woodmac_publication_options,
+    resolve_available_countries,
+    resolve_default_selected_countries,
+    sanitize_raw_flow_data,
+)
 
 
 try:
@@ -469,47 +478,7 @@ ORDER BY upload_timestamp_utc DESC
 
 
 def _sanitize_raw_export_flow(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["month", "country_name", "total_mmtpa"])
-
-    cleaned_df = df.copy()
-    cleaned_df["month"] = pd.to_datetime(cleaned_df["month"])
-    cleaned_df["country_name"] = (
-        cleaned_df["country_name"]
-        .fillna("Unknown")
-        .astype(str)
-        .str.strip()
-        .replace("", "Unknown")
-    )
-    cleaned_df["total_mmtpa"] = pd.to_numeric(
-        cleaned_df["total_mmtpa"], errors="coerce"
-    ).fillna(0.0)
-
-    cleaned_df = (
-        cleaned_df.groupby(["month", "country_name"], as_index=False)["total_mmtpa"]
-        .sum()
-        .sort_values(["month", "country_name"])
-    )
-
-    return cleaned_df
-
-
-def _serialize_timestamp(value) -> str | None:
-    if value is None or pd.isna(value):
-        return None
-
-    return pd.Timestamp(value).isoformat()
-
-
-def fetch_all_export_flow_raw_data() -> dict[str, pd.DataFrame]:
-    with engine.connect() as connection:
-        woodmac_df = pd.read_sql_query(WOODMAC_EXPORT_FLOW_QUERY, connection)
-        ea_df = pd.read_sql_query(_build_ea_export_flow_query(), connection)
-
-    return {
-        "woodmac": _sanitize_raw_export_flow(woodmac_df),
-        "ea": _sanitize_raw_export_flow(ea_df),
-    }
+    return sanitize_raw_flow_data(df)
 
 
 def fetch_woodmac_export_flow_raw_data() -> pd.DataFrame:
@@ -567,17 +536,7 @@ def fetch_woodmac_export_flow_metadata() -> dict[str, str | None]:
     if metadata_df.empty:
         return {}
 
-    row = metadata_df.iloc[0]
-    return {
-        "short_term_market_outlook": row.get("short_term_market_outlook"),
-        "short_term_publication_timestamp": _serialize_timestamp(
-            row.get("short_term_publication_timestamp")
-        ),
-        "long_term_market_outlook": row.get("long_term_market_outlook"),
-        "long_term_publication_timestamp": _serialize_timestamp(
-            row.get("long_term_publication_timestamp")
-        ),
-    }
+    return build_woodmac_flow_metadata(metadata_df)
 
 
 def fetch_ea_export_flow_metadata() -> dict[str, str | None]:
@@ -589,10 +548,7 @@ def fetch_ea_export_flow_metadata() -> dict[str, str | None]:
     if metadata_df.empty:
         return {}
 
-    row = metadata_df.iloc[0]
-    return {
-        "upload_timestamp_utc": _serialize_timestamp(row.get("upload_timestamp_utc"))
-    }
+    return build_ea_upload_metadata(metadata_df)
 
 
 def fetch_woodmac_publication_options() -> dict[str, list[dict[str, str | None]]]:
@@ -602,18 +558,7 @@ def fetch_woodmac_publication_options() -> dict[str, list[dict[str, str | None]]
     if options_df.empty:
         return {"short_term": [], "long_term": []}
 
-    result = {"short_term": [], "long_term": []}
-    for _, row in options_df.iterrows():
-        result[row["publication_kind"]].append(
-            {
-                "market_outlook": row["market_outlook"],
-                "publication_timestamp": _serialize_timestamp(
-                    row["publication_timestamp"]
-                ),
-            }
-        )
-
-    return result
+    return build_woodmac_publication_options(options_df)
 
 
 def fetch_ea_upload_options() -> list[str]:
@@ -623,37 +568,18 @@ def fetch_ea_upload_options() -> list[str]:
     if options_df.empty:
         return []
 
-    return [
-        serialized_timestamp
-        for serialized_timestamp in (
-            _serialize_timestamp(value)
-            for value in options_df["upload_timestamp_utc"].tolist()
-        )
-        if serialized_timestamp
-    ]
+    return build_ea_upload_options(options_df)
 
 
 def get_available_countries(dataframes: list[pd.DataFrame]) -> list[str]:
-    non_empty_frames = [df for df in dataframes if df is not None and not df.empty]
-    if not non_empty_frames:
-        return []
-
-    combined_df = pd.concat(non_empty_frames, ignore_index=True)
-    country_totals = (
-        combined_df.groupby("country_name", as_index=False)["total_mmtpa"]
-        .sum()
-        .sort_values(["total_mmtpa", "country_name"], ascending=[False, True])
-    )
-
-    return country_totals["country_name"].tolist()
+    return resolve_available_countries(dataframes)
 
 
 def default_selected_countries(available_countries: list[str]) -> list[str]:
-    defaults = [country for country in DEFAULT_SELECTED_COUNTRIES if country in available_countries]
-    if defaults:
-        return defaults
-
-    return available_countries[: min(7, len(available_countries))]
+    return resolve_default_selected_countries(
+        available_countries,
+        DEFAULT_SELECTED_COUNTRIES,
+    )
 
 
 def build_export_flow_matrix(

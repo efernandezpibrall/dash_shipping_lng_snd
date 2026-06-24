@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    from typing import Iterable
 
 
 SUPPORTED_TIME_GROUPS = {"monthly", "quarterly", "yearly", "season"}
@@ -24,6 +27,95 @@ def normalize_time_group(value: str | None) -> str:
     if normalized not in SUPPORTED_TIME_GROUPS:
         return "monthly"
     return normalized
+
+
+def normalize_month_date(value) -> pd.Timestamp | None:
+    if not value:
+        return None
+
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+
+    return timestamp.to_period("M").to_timestamp()
+
+
+def get_month_date_bounds(
+    dataframes: list[pd.DataFrame],
+    *,
+    month_column: str = "month",
+) -> tuple[str | None, str | None]:
+    non_empty_frames = [df for df in dataframes if df is not None and not df.empty]
+    if not non_empty_frames:
+        return None, None
+
+    combined_df = pd.concat(non_empty_frames, ignore_index=True)
+    min_month = pd.to_datetime(combined_df[month_column]).min()
+    max_month = pd.to_datetime(combined_df[month_column]).max()
+
+    return min_month.strftime("%Y-%m-%d"), max_month.strftime("%Y-%m-%d")
+
+
+def filter_by_month_date_range(
+    raw_df: pd.DataFrame,
+    start_date: str | None,
+    end_date: str | None,
+    *,
+    month_column: str = "month",
+) -> pd.DataFrame:
+    if raw_df.empty:
+        return raw_df
+
+    filtered_df = raw_df.copy()
+    filtered_df[month_column] = (
+        pd.to_datetime(filtered_df[month_column]).dt.to_period("M").dt.to_timestamp()
+    )
+
+    start_month = normalize_month_date(start_date)
+    end_month = normalize_month_date(end_date)
+
+    if start_month is not None:
+        filtered_df = filtered_df[filtered_df[month_column] >= start_month]
+    if end_month is not None:
+        filtered_df = filtered_df[filtered_df[month_column] <= end_month]
+
+    return filtered_df
+
+
+def build_lng_season_periods(
+    dates: pd.Series,
+) -> tuple[pd.Series, pd.Series]:
+    normalized_dates = pd.to_datetime(dates, errors="coerce").dt.to_period("M").dt.to_timestamp()
+    is_summer = normalized_dates.dt.month.between(4, 9)
+    season_year = (
+        normalized_dates.dt.year - normalized_dates.dt.month.isin([1, 2, 3]).astype(int)
+    ).astype("Int64")
+
+    season_start_month = pd.Series(10, index=normalized_dates.index, dtype="int64")
+    season_start_month.loc[is_summer] = 4
+
+    season_code = pd.Series("W", index=normalized_dates.index, dtype="object")
+    season_code.loc[is_summer] = "S"
+
+    season_start = pd.to_datetime(
+        {
+            "year": season_year,
+            "month": season_start_month,
+            "day": 1,
+        },
+        errors="coerce",
+    )
+    season_label = season_year.astype(str)
+    season_label = season_label.where(normalized_dates.notna(), "")
+    season_label = season_label + "-" + season_code.where(normalized_dates.notna(), "")
+    return season_start, season_label
+
+
+def get_default_interval_window() -> tuple[pd.Timestamp, pd.Timestamp]:
+    current_year = pd.Timestamp.now().year
+    default_start = pd.Timestamp(year=current_year, month=1, day=1)
+    default_end = pd.Timestamp(year=current_year + 5, month=12, day=1)
+    return default_start, default_end
 
 
 def infer_period_type(period: str | None, fallback: str | None = None) -> str:
@@ -271,40 +363,3 @@ def annualized_mmtpa_to_monthly_mt(values) -> pd.Series:
 
 def annualized_mmtpa_to_monthly_bcm(values) -> pd.Series:
     return annualized_mmtpa_to_monthly_mt(values) * 1.36
-
-
-def convert_periodized_bcm_frame(
-    df: pd.DataFrame,
-    to_unit: str,
-    period_type: str,
-    *,
-    period_col: str = "Period",
-) -> pd.DataFrame:
-    if df.empty:
-        return df.copy()
-
-    working_df = df.copy()
-    target_unit = str(to_unit or "bcm").strip().lower()
-    numeric_columns = [
-        column_name
-        for column_name in working_df.columns
-        if column_name != period_col
-        and pd.api.types.is_numeric_dtype(working_df[column_name])
-    ]
-
-    if target_unit == "bcm":
-        return working_df.round(2)
-
-    if target_unit in {"mt", "mmt"}:
-        working_df[numeric_columns] = working_df[numeric_columns] / 1.36
-        return working_df.round(2)
-
-    if target_unit != "mcm_d":
-        return working_df.round(2)
-
-    days = working_df[period_col].apply(lambda value: get_days_in_period(value, period_type))
-    working_df[numeric_columns] = working_df[numeric_columns].mul(1000.0, axis=0)
-    for column_name in numeric_columns:
-        working_df[column_name] = working_df[column_name] / days
-
-    return working_df.round(2)

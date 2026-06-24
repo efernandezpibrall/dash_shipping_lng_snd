@@ -1,75 +1,44 @@
-from dash import html, dcc, dash_table, callback, Output, Input, State, Dash, ALL, callback_context
-from dash.dash_table.Format import Format, Group, Scheme
+from dash import html, dcc, callback, Output, Input, State, ALL, MATCH
+import dash_ag_grid as dag
 import plotly.graph_objects as go
-import dash_bootstrap_components as dbc
 import plotly.express as px
-from plotly.subplots import make_subplots
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import json
-from io import StringIO
+from datetime import datetime
 from dash.exceptions import PreventUpdate
 import configparser
 import os
-from sqlalchemy import create_engine, text
-import calendar
-
-from utils.table_styles import StandardTableStyleManager, TABLE_COLORS
+from sqlalchemy import create_engine
 
 ############################################ Style Constants ###################################################
 
-# Enterprise Standard Styles following dash_style.md guidelines
-CONTRACTS_SECTION_STYLES = {
-    # Chart container styles - for content areas
-    'chart_container': {
-        'margin-bottom': '20px',
-        'padding': '10px',
-        'background-color': 'white',
-        'border-radius': '6px',
-        'border': '1px solid #e5e7eb',
-        'width': '100%'
-    },
-    
-    # Table container styles
-    'table_container': {
-        'margin-bottom': '20px',
-        'padding': '10px',
-        'background-color': 'white',
-        'border-radius': '6px',
-        'border': '1px solid #e5e7eb',
-        'overflow-x': 'auto',
-        'width': '100%'
-    },
-    
-    # Layout panels
-    'left_panel': {'width': '49%', 'display': 'inline-block', 'verticalAlign': 'top'},
-    'right_panel': {'width': '49%', 'display': 'inline-block', 'verticalAlign': 'top'},
-    'section_container': {
-        'width': '100%',
-        'marginBottom': '30px'
-    },
-    
-    # Content wrapper
-    'content_wrapper': {
-        'background-color': 'white',
-        'border-radius': '6px',
-        'padding': '20px',
-        'margin-top': '10px',
-        'margin-bottom': '20px',
-        'box-shadow': '0 1px 3px 0 rgba(0, 0, 0, 0.1)',
-        'width': '100%',
-        'maxWidth': '100%'
-    },
-    
-    # Footnote styles
-    'footnote_style': {
-        'font-size': '11px',
-        'color': '#6b7280',
-        'margin-top': '8px',
-        'font-style': 'italic',
-        'padding': '0 20px'
-    }
+CONTRACTS_SECTION_STYLE = {
+    "background": "#ffffff",
+    "border": "1px solid #e5e7eb",
+    "borderRadius": "8px",
+    "padding": "12px",
+    "boxShadow": "0 1px 2px rgba(15, 23, 42, 0.05)",
+}
+
+CONTRACTS_GRAPH_CONFIG = {"displayModeBar": False, "responsive": True}
+AG_GRID_THEME = "ag-theme-alpine"
+
+CONTRACTS_AG_GRID_DEFAULT_COL_DEF = {
+    "sortable": True,
+    "filter": False,
+    "resizable": True,
+    "wrapHeaderText": True,
+    "autoHeaderHeight": True,
+    "suppressHeaderMenuButton": True,
+    "suppressHeaderFilterButton": True,
+}
+
+CONTRACTS_AG_GRID_OPTIONS = {
+    "animateRows": False,
+    "ensureDomOrder": True,
+    "enableCellTextSelection": True,
+    "suppressDragLeaveHidesColumns": True,
+    "rowHeight": 30,
+    "headerHeight": 32,
 }
 
 ############################################ postgres sql connection ###################################################
@@ -77,21 +46,14 @@ try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))
     CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except:
+except Exception:
     CONFIG_FILE_PATH = 'config.ini'
 
 config_reader = configparser.ConfigParser(interpolation=None)
 config_reader.read(CONFIG_FILE_PATH)
 
 DB_CONNECTION_STRING = config_reader.get('DATABASE', 'CONNECTION_STRING', fallback=None)
-DB_SCHEMA = config_reader.get('DATABASE', 'SCHEMA', fallback=None)
-
 engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
-
-def setup_database_connection():
-    """Setup database connection using existing configuration"""
-    return engine, DB_SCHEMA
-
 ############################################ Data Loading Functions ###################################################
 
 def normalize_flex_flag(value):
@@ -119,6 +81,12 @@ CONTRACTS_DATA_COLUMNS = [
     'max_acq_volume', 'max_acq_volume_unit', 'contract_note', 'equity_third_party',
     'destination_flexible_vs_end_users', 'indexation_category', 'indexation_point'
 ]
+
+CONTRACT_DETAIL_DATE_COLUMNS = {
+    'contract_date_signed',
+    'contract_date_start',
+    'contract_date_end',
+}
 
 ANNUAL_DEMAND_DATA_COLUMNS = [
     'id_contract', 'contract_name', 'year', 'acq_volume__mmtpa', 'metric_name',
@@ -349,14 +317,13 @@ def extract_index_detail(structure, indexation_cat, type='oil', indexation_point
     
     return None
 
-def prepare_volume_table_for_display(demand_df, table_type, available_years, volume_view, expanded_entities=None):
-    """Prepare volume data for display in DataTable with expandable rows showing source-destination breakdown
+def prepare_volume_table_for_display(demand_df, table_type, available_years, expanded_entities=None):
+    """Prepare volume data for AG Grid display with expandable source-destination breakdown.
     
     Args:
         demand_df: DataFrame with volume data
         table_type: 'country', 'seller', or 'destination'
         available_years: List of years to display as columns
-        volume_view: View selection from dropdown
         expanded_entities: List of expanded entity names
     """
     if demand_df.empty:
@@ -463,7 +430,7 @@ def prepare_volume_table_for_display(demand_df, table_type, available_years, vol
         {'name': detail_name, 'id': detail_entity_col, 'type': 'text'}
     ]
     columns.extend([
-        {'name': str(year), 'id': str(year), 'type': 'numeric', 'format': Format(precision=2, scheme=Scheme.fixed)} 
+        {'name': str(year), 'id': str(year), 'type': 'numeric', 'precision': 2, 'width': 86, 'minWidth': 70}
         for year in available_years
     ])
     
@@ -473,211 +440,524 @@ def prepare_volume_table_for_display(demand_df, table_type, available_years, vol
 ############################################ Layout Components ###################################################
 
 
+def _contracts_number_formatter(precision=2):
+    return {
+        "function": (
+            "params.value == null || params.value === '' || params.value === 'N/A' "
+            "? (params.value || '') "
+            f": Number(params.value).toLocaleString(undefined, {{minimumFractionDigits: {precision}, maximumFractionDigits: {precision}}})"
+        )
+    }
+
+
+def _contracts_records(records):
+    if not records:
+        return []
+    return pd.DataFrame(records).where(pd.notna, None).to_dict("records")
+
+
+def _contracts_date_only(value):
+    if pd.isna(value):
+        return value
+
+    parsed_value = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed_value):
+        return value
+
+    return parsed_value.strftime("%Y-%m-%d")
+
+
+def _contracts_ag_column_defs(columns, filterable=False, pinned_fields=None, default_width=118):
+    pinned_fields = set(pinned_fields or [])
+    column_defs = []
+
+    for column in columns:
+        field = column.get("id")
+        if not field:
+            continue
+
+        column_type = column.get("type")
+        is_numeric = column_type == "numeric"
+        header_name = column.get("name", field)
+        precision = column.get("precision", 2)
+        width = column.get("width") or (98 if is_numeric else default_width)
+        min_width = column.get("minWidth") or (72 if is_numeric else 96)
+
+        ag_column = {
+            "headerName": header_name,
+            "field": field,
+            "sortable": True,
+            "filter": "agNumberColumnFilter" if filterable and is_numeric else "agTextColumnFilter" if filterable else False,
+            "resizable": True,
+            "width": width,
+            "minWidth": min_width,
+            "cellClass": "fleet-metrics-number-cell" if is_numeric else "fleet-metrics-left-cell",
+        }
+
+        if field in pinned_fields:
+            ag_column.update({"pinned": "left", "lockPinned": True, "suppressMovable": True})
+
+        if is_numeric:
+            ag_column["type"] = "rightAligned"
+            ag_column["valueFormatter"] = _contracts_number_formatter(precision)
+
+        column_defs.append(ag_column)
+
+    return column_defs
+
+
+def _contracts_ag_grid(
+    id_value,
+    row_data=None,
+    column_defs=None,
+    height=480,
+    filterable=False,
+    total_field=None,
+    total_color="#2E86C1",
+    total_border="#1B4F72",
+    extra_class="",
+    filename="contracts_table.csv",
+):
+    default_col_def = {
+        **CONTRACTS_AG_GRID_DEFAULT_COL_DEF,
+        "filter": filterable,
+        "suppressHeaderMenuButton": not filterable,
+        "suppressHeaderFilterButton": not filterable,
+    }
+    grid_options = {
+        **CONTRACTS_AG_GRID_OPTIONS,
+        "pagination": False,
+    }
+    grid_kwargs = {
+        "id": id_value,
+        "rowData": row_data or [],
+        "columnDefs": column_defs or [],
+        "defaultColDef": default_col_def,
+        "dashGridOptions": grid_options,
+        "csvExportParams": {"fileName": filename},
+        "className": f"{AG_GRID_THEME} fleet-metrics-grid contracts-ag-grid {extra_class}".strip(),
+        "style": {"width": "100%", "height": f"{height}px"},
+        "dangerously_allow_code": True,
+        "exportDataAsCsv": False,
+    }
+
+    if total_field:
+        grid_kwargs["getRowStyle"] = {
+            "styleConditions": [
+                {
+                    "condition": f"params.data && params.data['{total_field}'] === 'TOTAL'",
+                    "style": {
+                        "backgroundColor": total_color,
+                        "color": "white",
+                        "fontWeight": "800",
+                        "borderTop": f"2px solid {total_border}",
+                    },
+                },
+            ],
+            "defaultStyle": {},
+        }
+        grid_kwargs["rowClassRules"] = {
+            "contracts-total-row": f"params.data && params.data['{total_field}'] === 'TOTAL'",
+        }
+
+    return dag.AgGrid(**grid_kwargs)
+
+
+def _contracts_volume_grid(table_id, display_data, columns, entity_field, filename, total_color="#2E86C1", total_border="#1B4F72"):
+    return _contracts_ag_grid(
+        id_value=table_id,
+        row_data=_contracts_records(display_data),
+        column_defs=_contracts_ag_column_defs(columns, pinned_fields=[entity_field], default_width=112),
+        height=480,
+        filterable=False,
+        total_field=entity_field,
+        total_color=total_color,
+        total_border=total_border,
+        extra_class="contracts-ag-grid--volume",
+        filename=filename,
+    )
+
+
+def _contracts_export_button(button_id):
+    return html.Button(
+        "Export CSV",
+        id=button_id,
+        n_clicks=0,
+        className="contracts-export-button",
+        type="button",
+    )
+
+
+def _contracts_section_heading(title, subtitle=None, control=None):
+    title_block = [html.H3(title, className="contracts-section-title")]
+    if subtitle:
+        title_block.append(html.Div(subtitle, className="fleet-metrics-table-subtitle"))
+
+    children = [html.Div(title_block, className="contracts-section-title-block")]
+    if control:
+        children.append(control)
+
+    return html.Div(children, className="fleet-metrics-table-heading contracts-section-heading")
+
+
+def _contracts_inline_control(label, control):
+    return html.Div(
+        [
+            html.Div(label, className="filter-group-header"),
+            control,
+        ],
+        className="contracts-inline-control",
+    )
+
+
+def _year_slider_marks(min_year, max_year):
+    span = max_year - min_year
+    tick_step = 20 if span > 60 else 10 if span > 35 else 5
+    first_tick = ((min_year + tick_step - 1) // tick_step) * tick_step
+
+    marked_years = {min_year, max_year}
+    marked_years.update(range(first_tick, max_year + 1, tick_step))
+
+    return {year: str(year) for year in sorted(marked_years) if min_year <= year <= max_year}
+
+
+def _contracts_graph(figure=None, graph_id=None, height=450):
+    graph_kwargs = {
+        "style": {"height": f"{height}px"},
+        "config": CONTRACTS_GRAPH_CONFIG,
+    }
+    if figure is not None:
+        graph_kwargs["figure"] = figure
+    if graph_id is not None:
+        graph_kwargs["id"] = graph_id
+
+    return html.Div(
+        dcc.Graph(**graph_kwargs),
+        className="contracts-chart-panel",
+    )
+
+
+def _contracts_table_panel(title, table):
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.H5(title, className="contracts-table-title"),
+                    _contracts_export_button(
+                        {'type': f'{table.id["type"]}-export-button', 'index': table.id.get('index', 'volume')}
+                        if isinstance(table.id, dict)
+                        else f"{table.id}-export-button"
+                    ),
+                ],
+                className="contracts-table-panel-heading",
+            ),
+            table,
+        ],
+        className="contracts-table-panel",
+    )
+
+
+def style_contracts_figure(fig, height=None):
+    if fig is None:
+        return fig
+
+    title_text = fig.layout.title.text if fig.layout and fig.layout.title else None
+    layout_update = {
+        "paper_bgcolor": "#ffffff",
+        "plot_bgcolor": "#ffffff",
+        "font": {"family": "Inter, -apple-system, BlinkMacSystemFont, sans-serif", "size": 12, "color": "#1f2937"},
+        "title": {
+            "text": title_text,
+            "font": {"size": 14, "color": "#0f172a"},
+            "x": 0.01,
+            "xanchor": "left",
+        },
+        "hoverlabel": {
+            "bgcolor": "#0f172a",
+            "bordercolor": "#0f172a",
+            "font": {"color": "#ffffff", "size": 11},
+        },
+        "legend": {
+            "font": {"size": 10, "color": "#334155"},
+            "title_font": {"size": 10, "color": "#475569"},
+            "bgcolor": "rgba(255, 255, 255, 0.88)",
+            "borderwidth": 0,
+        },
+    }
+    if height is not None:
+        layout_update["height"] = height
+
+    fig.update_layout(**layout_update)
+    fig.update_xaxes(
+        gridcolor="#eef2f7",
+        zeroline=False,
+        linecolor="#cbd5e1",
+        tickfont={"size": 11, "color": "#475569"},
+        title_font={"size": 11, "color": "#475569"},
+    )
+    fig.update_yaxes(
+        gridcolor="#eef2f7",
+        zeroline=False,
+        linecolor="#cbd5e1",
+        tickfont={"size": 11, "color": "#475569"},
+        title_font={"size": 11, "color": "#475569"},
+    )
+    return fig
+
+
 def create_filter_controls(min_year=2000, max_year=2030, default_start=2015, default_end=2025):
     """Create filter controls panel"""
-    return html.Div([
-        dbc.Row([
-            dbc.Col([
-                html.Label("Destination Country", className="form-label"),
-                dcc.Dropdown(
-                    id='destination-country-dropdown',
-                    placeholder="Select destination countries...",
-                    multi=True
-                )
-            ], width=3),
-            dbc.Col([
-                html.Label("Contract Type", className="form-label"),
-                dcc.Dropdown(
-                    id='contract-type-dropdown',
-                    placeholder="Select contract types...",
-                    multi=True
-                )
-            ], width=3),
-            dbc.Col([
-                html.Label("Pricing Type", className="form-label"),
-                dcc.Dropdown(
-                    id='pricing-type-dropdown',
-                    placeholder="Select pricing types...",
-                    multi=True
-                )
-            ], width=3),
-            dbc.Col([
-                html.Label("Seller Company", className="form-label"),
-                dcc.Dropdown(
-                    id='seller-company-dropdown',
-                    placeholder="Select sellers...",
-                    multi=True
-                )
-            ], width=3)
-        ], className="mb-3"),
-        dbc.Row([
-            dbc.Col([
-                html.Label("Year Range", className="form-label"),
-                dcc.RangeSlider(
-                    id='year-range-slider',
-                    min=min_year,
-                    max=max_year,
-                    step=1,
-                    value=[default_start, default_end],
-                    marks={i: str(i) for i in range(min_year, max_year + 1, 5) if i % 5 == 0 or i in [min_year, max_year, default_start, default_end]},
-                    tooltip={"placement": "bottom", "always_visible": True}
-                )
-            ], width=4),
-            dbc.Col([
-                html.Label("Cargo Basis", className="form-label"),
-                dcc.Dropdown(
-                    id='cargo-basis-dropdown',
-                    placeholder="Select cargo basis...",
-                    multi=True
-                )
-            ], width=2),
-            dbc.Col([
-                html.Label("Source Flexible", className="form-label"),
-                dcc.Dropdown(
-                    id='source-flexible-dropdown',
-                    options=[
-                        {'label': 'Flexible', 'value': 'Y'},
-                        {'label': 'Not Flexible', 'value': 'N'},
-                        {'label': 'Unknown', 'value': 'Unknown'}
-                    ],
-                    placeholder="Select flexibility...",
-                    multi=True
-                )
-            ], width=3),
-            dbc.Col([
-                html.Label("Destination Flexible", className="form-label"),
-                dcc.Dropdown(
-                    id='dest-flexible-dropdown',
-                    options=[
-                        {'label': 'Flexible', 'value': 'Y'},
-                        {'label': 'Not Flexible', 'value': 'N'},
-                        {'label': 'Unknown', 'value': 'Unknown'}
-                    ],
-                    placeholder="Select flexibility...",
-                    multi=True
-                )
-            ], width=3)
-        ], className="mb-3"),
-        html.Hr(className="mb-4")
-    ], style={'padding': '20px', 'background-color': '#f8f9fa', 'border-radius': '8px', 'margin-bottom': '20px'})
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div("Contracts", className="filter-group-header"),
+                    html.Div("WoodMac LNG contract book", className="contracts-filter-title"),
+                ],
+                className="filter-group contracts-filter-title-group",
+                style={"flex": "0 0 200px", "maxWidth": "100%"},
+            ),
+            html.Div(
+                [
+                    html.Div("Destination Country", className="filter-group-header"),
+                    dcc.Dropdown(
+                        id='destination-country-dropdown',
+                        placeholder="Select destination countries...",
+                        multi=True,
+                        className="filter-dropdown",
+                    ),
+                ],
+                className="filter-group",
+                style={"flex": "1 1 220px", "maxWidth": "100%"},
+            ),
+            html.Div(
+                [
+                    html.Div("Contract Type", className="filter-group-header"),
+                    dcc.Dropdown(
+                        id='contract-type-dropdown',
+                        placeholder="Select contract types...",
+                        multi=True,
+                        className="filter-dropdown",
+                    ),
+                ],
+                className="filter-group",
+                style={"flex": "1 1 190px", "maxWidth": "100%"},
+            ),
+            html.Div(
+                [
+                    html.Div("Pricing Type", className="filter-group-header"),
+                    dcc.Dropdown(
+                        id='pricing-type-dropdown',
+                        placeholder="Select pricing types...",
+                        multi=True,
+                        className="filter-dropdown",
+                    ),
+                ],
+                className="filter-group",
+                style={"flex": "1 1 190px", "maxWidth": "100%"},
+            ),
+            html.Div(
+                [
+                    html.Div("Seller Company", className="filter-group-header"),
+                    dcc.Dropdown(
+                        id='seller-company-dropdown',
+                        placeholder="Select sellers...",
+                        multi=True,
+                        className="filter-dropdown",
+                    ),
+                ],
+                className="filter-group",
+                style={"flex": "1 1 220px", "maxWidth": "100%"},
+            ),
+            html.Div(
+                [
+                    html.Div("Year Range", className="filter-group-header"),
+                    dcc.RangeSlider(
+                        id='year-range-slider',
+                        min=min_year,
+                        max=max_year,
+                        step=1,
+                        value=[default_start, default_end],
+                        marks=_year_slider_marks(min_year, max_year),
+                        tooltip={"placement": "bottom", "always_visible": False},
+                        className="contracts-year-range-slider",
+                    ),
+                ],
+                className="filter-group",
+                style={"flex": "1.4 1 360px", "maxWidth": "100%", "padding": "0 8px"},
+            ),
+            html.Div(
+                [
+                    html.Div("Cargo Basis", className="filter-group-header"),
+                    dcc.Dropdown(
+                        id='cargo-basis-dropdown',
+                        placeholder="Select cargo basis...",
+                        multi=True,
+                        className="filter-dropdown",
+                    ),
+                ],
+                className="filter-group",
+                style={"flex": "1 1 170px", "maxWidth": "100%"},
+            ),
+            html.Div(
+                [
+                    html.Div("Source Flexible", className="filter-group-header"),
+                    dcc.Dropdown(
+                        id='source-flexible-dropdown',
+                        options=[
+                            {'label': 'Flexible', 'value': 'Y'},
+                            {'label': 'Not Flexible', 'value': 'N'},
+                            {'label': 'Unknown', 'value': 'Unknown'}
+                        ],
+                        placeholder="Select flexibility...",
+                        multi=True,
+                        className="filter-dropdown",
+                    ),
+                ],
+                className="filter-group",
+                style={"flex": "1 1 190px", "maxWidth": "100%"},
+            ),
+            html.Div(
+                [
+                    html.Div("Destination Flexible", className="filter-group-header"),
+                    dcc.Dropdown(
+                        id='dest-flexible-dropdown',
+                        options=[
+                            {'label': 'Flexible', 'value': 'Y'},
+                            {'label': 'Not Flexible', 'value': 'N'},
+                            {'label': 'Unknown', 'value': 'Unknown'}
+                        ],
+                        placeholder="Select flexibility...",
+                        multi=True,
+                        className="filter-dropdown",
+                    ),
+                ],
+                className="filter-group",
+                style={"flex": "1 1 210px", "maxWidth": "100%"},
+            ),
+        ],
+        className="professional-section-header",
+        style={
+            "display": "flex",
+            "gap": "12px",
+            "alignItems": "flex-end",
+            "flexWrap": "wrap",
+        },
+    )
 
 def create_contracts_sections_layout():
     """Create the main sections layout replacing tabs"""
-    return html.Div([
-        # Contract Signing Timeline Section at the top
-        create_timeline_section(),
-        
-        # Volume Analysis Section
-        create_volume_analysis_section()
-    ])
+    return html.Div(
+        [
+            create_timeline_section(),
+            create_volume_analysis_section(),
+        ],
+        className="contracts-section-stack",
+    )
 
 def create_timeline_section():
     """Create Contract Signing Timeline section at the top of the page"""
-    return html.Div([
-        # Enterprise Standard Inline Section Header
-        html.Div([
-            html.H3("Contract Signing Timeline", className="section-title-inline"),
-            html.Label("Y-Axis Metric:", className="inline-filter-label"),
-            dcc.Dropdown(
-                id='timeline-metric-dropdown',
-                options=[
-                    {'label': 'Number of Contracts', 'value': 'count'},
-                    {'label': 'Volume (MTPA)', 'value': 'volume'}
-                ],
-                value='count',
-                className="inline-dropdown",
-                placeholder='Select metric...',
-                style={'width': '200px'}
+    metric_control = _contracts_inline_control(
+        "Y-axis metric",
+        dcc.Dropdown(
+            id='timeline-metric-dropdown',
+            options=[
+                {'label': 'Number of Contracts', 'value': 'count'},
+                {'label': 'Volume (MTPA)', 'value': 'volume'}
+            ],
+            value='count',
+            className="inline-dropdown",
+            placeholder='Select metric...',
+            clearable=False,
+            style={'width': '210px'}
+        ),
+    )
+
+    return html.Div(
+        [
+            _contracts_section_heading(
+                "Contract signing timeline",
+                "Historical signing cadence and pricing mix across the filtered contract book.",
+                metric_control,
             ),
-        ], className="inline-section-header"),
-        
-        # Section content wrapper with two charts side by side
-        html.Div([
-            html.Div([
-                dcc.Graph(
-                    id='timeline-chart',
-                    style={'height': '400px'}
-                )
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'}),
-            html.Div([
-                dcc.Graph(
-                    id='pricing-timeline-chart',
-                    style={'height': '400px'}
-                )
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'})
-        ], style=CONTRACTS_SECTION_STYLES['content_wrapper']),
-        
-        html.Hr(className="section-divider")
-    ], className="mb-4")
+            html.Div(
+                [
+                    _contracts_graph(graph_id='timeline-chart', height=420),
+                    _contracts_graph(graph_id='pricing-timeline-chart', height=420),
+                ],
+                className="contracts-chart-grid",
+            ),
+        ],
+        className="contracts-section contracts-timeline-section",
+        style=CONTRACTS_SECTION_STYLE,
+    )
 
 def create_volume_analysis_section():
     """Create Volume Analysis section following Enterprise Standard"""
-    return html.Div([
-        # Enterprise Standard Inline Section Header
-        html.Div([
-            html.H3("Volume Analysis", className="section-title-inline"),
-            html.Label("View Mode:", className="inline-filter-label"),
-            dcc.Dropdown(
-                id='volume-view-section-dropdown',
-                options=[
-                    {'label': 'By Country', 'value': 'country'},
-                    {'label': 'By Company', 'value': 'company'}
-                ],
-                value='country',
-                className="inline-dropdown",
-                placeholder='Select view...'
+    view_control = _contracts_inline_control(
+        "View mode",
+        dcc.Dropdown(
+            id='volume-view-section-dropdown',
+            options=[
+                {'label': 'By Country', 'value': 'country'},
+                {'label': 'By Company', 'value': 'company'}
+            ],
+            value='country',
+            className="inline-dropdown",
+            placeholder='Select view...',
+            clearable=False,
+            style={'width': '180px'}
+        ),
+    )
+
+    return html.Div(
+        [
+            _contracts_section_heading(
+                "Volume analysis",
+                "Contracted quantity, cargo basis, pricing type, and entity breakdowns for the selected delivery years.",
+                view_control,
             ),
-        ], className="inline-section-header"),
-        
-        # Section Content
-        html.Div([
-            # Two-panel layout for charts and controls
-            html.Div([
-                # Charts and tables will be inserted directly here
-                html.Div(id="volume-analysis-charts"),
-                html.Div(id="volume-analysis-tables"),
-                html.Div(id="volume-analysis-trends"),
-                
-            ], style=CONTRACTS_SECTION_STYLES['section_container']),
-            
-            # Footnote
-            html.P([
-                html.I(className="fas fa-info-circle", style={'margin-right': '5px', 'color': '#2E86C1'}),
-                "Volume data represents annual contracted quantities. Click on country/seller names to expand destination breakdown."
-            ], style=CONTRACTS_SECTION_STYLES['footnote_style'])
-            
-        ], style=CONTRACTS_SECTION_STYLES['content_wrapper'])
-    ])
+            html.Div(
+                [
+                    html.Div(id="volume-analysis-charts"),
+                    html.Div(id="volume-analysis-trends"),
+                    html.Div(id="volume-analysis-tables"),
+                ],
+                className="contracts-volume-content",
+            ),
+            html.P(
+                "Volume data represents annual contracted quantities. Expand source, destination, seller, or buyer rows for route detail.",
+                className="contracts-footnote",
+            ),
+        ],
+        className="contracts-section contracts-volume-section",
+        style=CONTRACTS_SECTION_STYLE,
+    )
 
 
 
 def create_contracts_table():
     """Create interactive contracts data table"""
-    return dbc.Card([
-        dbc.CardHeader([
-            html.H5("Contracts Summary - All Details", className="mb-0"),
-            dbc.Button("Export Data", id="export-button", className="btn-sm", color="primary")
-        ]),
-        dbc.CardBody([
-            dash_table.DataTable(
-                id='contracts-table',
-                columns=[],
-                data=[],
-                fill_width=False,
-                style_table={'height': '480px', 'overflowY': 'auto', 'overflowX': 'auto'},
-                style_header=StandardTableStyleManager.get_base_datatable_config()['style_header'],
-                style_cell={**StandardTableStyleManager.get_base_datatable_config()['style_cell'], 
-                           'minWidth': '100px', 'maxWidth': '300px'},
-                style_data_conditional=StandardTableStyleManager.get_base_datatable_config()['style_data_conditional'],
-                sort_action="native",
-                filter_action="native",
-                page_action="none",
-                fixed_rows={'headers': True},
-                export_format="xlsx",
-                export_headers="display"
-            )
-        ])
-    ])
+    return html.Div(
+        [
+            _contracts_section_heading(
+                "Contract details",
+                "Filtered contract-level records with pricing, flexibility, counterparties, and source/delivery metadata.",
+                _contracts_export_button("contracts-table-export-button"),
+            ),
+            _contracts_ag_grid(
+                id_value='contracts-table',
+                row_data=[],
+                column_defs=[],
+                height=520,
+                filterable=True,
+                extra_class="contracts-ag-grid--details",
+                filename="contracts_detail.csv",
+            ),
+        ],
+        className="contracts-section contracts-detail-table-section",
+        style=CONTRACTS_SECTION_STYLE,
+    )
 
 ############################################ Tab Content Functions ###################################################
 
@@ -702,16 +982,6 @@ def create_volume_analysis_content(contracts_df, demand_df, volume_view='both', 
             demand_df.loc[demand_df[col] == '', col] = 'Unknown'
             demand_df.loc[demand_df[col].isna(), col] = 'Unknown'
     
-    # Debug output (can be commented out in production)
-    print(f"\n=== Volume Analysis Debug ===")
-    print(f"Total demand records: {len(demand_df)}")
-    print(f"Unique source countries: {sorted(demand_df['country_name_source'].unique())}")
-    print(f"Unique destination countries: {sorted(demand_df['country_name_delivery'].unique())}")
-    
-    # The total volume should be the same whether grouped by source or destination
-    total_volume = demand_df['acq_volume__mmtpa'].sum()
-    print(f"Total volume in dataset: {total_volume:.2f} MMTPA")
-    
     # Use year range filter if provided, otherwise use recent years
     if year_range and len(year_range) == 2:
         filter_years = list(range(year_range[0], year_range[1] + 1))
@@ -726,24 +996,17 @@ def create_volume_analysis_content(contracts_df, demand_df, volume_view='both', 
     demand_df['country_name_source'] = demand_df['country_name_source'].fillna('Unknown')
     country_volume = demand_df.groupby(['country_name_source', 'year'])['acq_volume__mmtpa'].sum().reset_index()
     
-    # Debug source totals
-    source_chart_total = country_volume['acq_volume__mmtpa'].sum()
-    print(f"Source chart will show total: {source_chart_total:.2f} MMTPA")
-    
     # Get source countries by total volume
     country_totals = country_volume.groupby('country_name_source')['acq_volume__mmtpa'].sum().sort_values(ascending=False)
     
     # Show more countries if needed for consistency with destination chart
     num_source_countries = len(country_totals)
-    print(f"Total unique source countries: {num_source_countries}")
     
     # Match the destination chart approach - show up to 20 countries
     if num_source_countries <= 20:
         top_countries = country_totals.index.tolist()
-        print(f"Showing all {num_source_countries} source countries")
     else:
         top_countries = country_totals.head(20).index.tolist()
-        print(f"Showing top 20 of {num_source_countries} source countries")
         
         # Always include 'Unknown' if it exists and not in top 20
         if 'Unknown' in country_totals.index and 'Unknown' not in top_countries:
@@ -788,9 +1051,6 @@ def create_volume_analysis_content(contracts_df, demand_df, volume_view='both', 
     # Volume by seller company - using filtered demand data
     seller_volume = demand_df.groupby(['company_name_seller', 'year'])['acq_volume__mmtpa'].sum().reset_index()
     
-    # Get all sellers sorted by total volume (no limit)
-    seller_totals = seller_volume.groupby('company_name_seller')['acq_volume__mmtpa'].sum().sort_values(ascending=False)
-    
     # Use all sellers
     seller_volume_filtered = seller_volume
     
@@ -831,9 +1091,6 @@ def create_volume_analysis_content(contracts_df, demand_df, volume_view='both', 
     # Volume by buyer company - using filtered demand data
     if 'company_name_buyer' in demand_df.columns:
         buyer_volume = demand_df.groupby(['company_name_buyer', 'year'])['acq_volume__mmtpa'].sum().reset_index()
-        
-        # Get all buyers sorted by total volume (no limit)
-        buyer_totals = buyer_volume.groupby('company_name_buyer')['acq_volume__mmtpa'].sum().sort_values(ascending=False)
         
         # Use all buyers
         buyer_volume_filtered = buyer_volume
@@ -881,33 +1138,17 @@ def create_volume_analysis_content(contracts_df, demand_df, volume_view='both', 
     demand_df['country_name_delivery'] = demand_df['country_name_delivery'].fillna('Unknown')
     dest_volume = demand_df.groupby(['country_name_delivery', 'year'])['acq_volume__mmtpa'].sum().reset_index()
     
-    # Debug destination totals
-    dest_chart_total = dest_volume['acq_volume__mmtpa'].sum()
-    print(f"Destination chart will show total: {dest_chart_total:.2f} MMTPA")
-    
-    # Check the difference
-    if abs(source_chart_total - dest_chart_total) > 0.01:
-        print(f"\nWARNING: Chart totals don't match!")
-        print(f"Difference: {source_chart_total - dest_chart_total:.2f} MMTPA")
-    else:
-        print(f"✓ Chart totals match: {source_chart_total:.2f} MMTPA")
-    
-    print("=== End Debug ===")
-    
     # Get destination countries by total volume
     dest_totals = dest_volume.groupby('country_name_delivery')['acq_volume__mmtpa'].sum().sort_values(ascending=False)
     
     # Show more countries in destination chart (top 20 or all if less than 20)
     num_destinations = len(dest_totals)
-    print(f"Total unique destination countries: {num_destinations}")
     
     # If there are 20 or fewer destinations, show all; otherwise show top 20
     if num_destinations <= 20:
         top_destinations = dest_totals.index.tolist()
-        print(f"Showing all {num_destinations} destination countries")
     else:
         top_destinations = dest_totals.head(20).index.tolist()
-        print(f"Showing top 20 of {num_destinations} destination countries")
         
         # Always include 'Unknown' if it exists and not in top 20
         if 'Unknown' in dest_totals.index and 'Unknown' not in top_destinations:
@@ -1012,272 +1253,131 @@ def create_volume_analysis_content(contracts_df, demand_df, volume_view='both', 
         
         # Prepare expandable country table
         country_display_data, country_columns = prepare_volume_table_for_display(
-            demand_df, 'country', available_years, volume_view, expanded_countries
+            demand_df, 'country', available_years, expanded_countries
         )
         
-        # Get base config and add special styling for TOTAL row
-        country_config = StandardTableStyleManager.get_base_datatable_config()
-        country_config['style_data_conditional'].extend([
-            {
-                'if': {'filter_query': '{country_name_source} = "TOTAL"'},
-                'backgroundColor': '#2E86C1',
-                'color': 'white',
-                'fontWeight': 'bold',
-                'border': '2px solid #1B4F72'
-            }
-        ])
-        # Update style_table with fixed height
-        country_config['style_table'].update({'height': '480px', 'overflowY': 'auto'})
-        
-        country_table = dash_table.DataTable(
-            id={'type': 'volume-country-expandable-table', 'index': 'volume'},
-            data=country_display_data,
-            columns=country_columns,
-            page_action="none",
-            sort_action="native",
-            fixed_rows={'headers': True},
-            export_format="xlsx",
-            export_headers="display",
-            **country_config
+        country_table = _contracts_volume_grid(
+            {'type': 'volume-country-expandable-table', 'index': 'volume'},
+            country_display_data,
+            country_columns,
+            'country_name_source',
+            "volume_by_source_country.csv",
         )
         
         # Prepare expandable seller table
         seller_display_data, seller_columns = prepare_volume_table_for_display(
-            demand_df, 'seller', available_years, volume_view, expanded_sellers
+            demand_df, 'seller', available_years, expanded_sellers
         )
         
-        # Get base config and add special styling for TOTAL row
-        seller_config = StandardTableStyleManager.get_base_datatable_config()
-        seller_config['style_data_conditional'].extend([
-            {
-                'if': {'filter_query': '{company_name_seller} = "TOTAL"'},
-                'backgroundColor': '#2E86C1',
-                'color': 'white',
-                'fontWeight': 'bold',
-                'border': '2px solid #1B4F72'
-            }
-        ])
-        # Update style_table with fixed height
-        seller_config['style_table'].update({'height': '480px', 'overflowY': 'auto'})
-        
-        seller_table = dash_table.DataTable(
-            id={'type': 'volume-seller-expandable-table', 'index': 'volume'},
-            data=seller_display_data,
-            columns=seller_columns,
-            page_action="none",
-            sort_action="native",
-            fixed_rows={'headers': True},
-            export_format="xlsx",
-            export_headers="display",
-            **seller_config
+        seller_table = _contracts_volume_grid(
+            {'type': 'volume-seller-expandable-table', 'index': 'volume'},
+            seller_display_data,
+            seller_columns,
+            'company_name_seller',
+            "volume_by_seller_company.csv",
         )
     else:
         country_table = html.Div("No country data available")
         seller_table = html.Div("No seller data available")
+
+    for fig, height in [
+        (country_fig, 550),
+        (seller_fig, 550),
+        (buyer_fig, 550),
+        (dest_fig, 550),
+        (fob_des_fig, 450),
+        (trend_fig, 450),
+    ]:
+        style_contracts_figure(fig, height=height)
     
     # Determine layout based on volume_view selection
     if volume_view == 'country':
         main_charts_row = html.Div([
-            html.Div([
-                dcc.Graph(figure=country_fig, style={'height': '550px'})
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'}),
-            html.Div([
-                dcc.Graph(figure=dest_fig, style={'height': '550px'})
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'})
-        ], style={'width': '100%', 'marginBottom': '20px'})
+            _contracts_graph(figure=country_fig, height=550),
+            _contracts_graph(figure=dest_fig, height=550),
+        ], className="contracts-chart-grid")
         
         # Prepare destination country table
         dest_display_data, dest_columns = prepare_volume_table_for_display(
-            demand_df, 'destination', available_years, volume_view, expanded_destinations
+            demand_df, 'destination', available_years, expanded_destinations
         )
         
-        # Get base config and add special styling for TOTAL row
-        dest_config = StandardTableStyleManager.get_base_datatable_config()
-        dest_config['style_data_conditional'].extend([
-            {
-                'if': {'filter_query': '{country_name_delivery} = "TOTAL"'},
-                'backgroundColor': '#2E86C1',
-                'color': 'white',
-                'fontWeight': 'bold',
-                'border': '2px solid #1B4F72'
-            }
-        ])
-        # Update style_table with fixed height
-        dest_config['style_table'].update({'height': '480px', 'overflowY': 'auto'})
-        
-        dest_table = dash_table.DataTable(
-            id={'type': 'volume-destination-expandable-table', 'index': 'volume'},
-            data=dest_display_data,
-            columns=dest_columns,
-            page_action="none",
-            sort_action="native",
-            fixed_rows={'headers': True},
-            export_format="xlsx",
-            export_headers="display",
-            **dest_config
+        dest_table = _contracts_volume_grid(
+            {'type': 'volume-destination-expandable-table', 'index': 'volume'},
+            dest_display_data,
+            dest_columns,
+            'country_name_delivery',
+            "volume_by_destination_country.csv",
         )
         
         tables_row = html.Div([
-            html.Div([
-                html.Div([
-                    html.H5("Volume by Source Country", style={'display': 'inline-block', 'marginBottom': '15px', 'fontSize': '16px', 'fontWeight': 'bold'}),
-                    html.Span(" (Click ⬇ to export)", style={'fontSize': '12px', 'color': '#6c757d', 'marginLeft': '10px'})
-                ]),
-                country_table
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'}),
-            html.Div([
-                html.Div([
-                    html.H5("Volume by Destination Country", style={'display': 'inline-block', 'marginBottom': '15px', 'fontSize': '16px', 'fontWeight': 'bold'}),
-                    html.Span(" (Click ⬇ to export)", style={'fontSize': '12px', 'color': '#6c757d', 'marginLeft': '10px'})
-                ]),
-                dest_table
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'})
-        ], style={'width': '100%', 'marginTop': '20px'})
+            _contracts_table_panel("Volume by source country", country_table),
+            _contracts_table_panel("Volume by destination country", dest_table),
+        ], className="contracts-table-grid")
         
     elif volume_view == 'company':
         main_charts_row = html.Div([
-            html.Div([
-                dcc.Graph(figure=seller_fig, style={'height': '550px'})
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'}),
-            html.Div([
-                dcc.Graph(figure=buyer_fig, style={'height': '550px'})
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'})
-        ], style={'width': '100%', 'marginBottom': '20px'})
+            _contracts_graph(figure=seller_fig, height=550),
+            _contracts_graph(figure=buyer_fig, height=550),
+        ], className="contracts-chart-grid")
         
         # Prepare destination table for seller view too
         dest_display_data, dest_columns = prepare_volume_table_for_display(
-            demand_df, 'destination', available_years, volume_view, expanded_destinations
+            demand_df, 'destination', available_years, expanded_destinations
         )
         
-        dest_config = StandardTableStyleManager.get_base_datatable_config()
-        dest_config['style_data_conditional'].extend([
-            {
-                'if': {'filter_query': '{country_name_delivery} = "TOTAL"'},
-                'backgroundColor': '#2E86C1',
-                'color': 'white',
-                'fontWeight': 'bold',
-                'border': '2px solid #1B4F72'
-            }
-        ])
-        # Update style_table with fixed height
-        dest_config['style_table'].update({'height': '480px', 'overflowY': 'auto'})
-        
-        dest_table = dash_table.DataTable(
-            id={'type': 'volume-destination-expandable-table', 'index': 'volume'},
-            data=dest_display_data,
-            columns=dest_columns,
-            page_action="none",
-            sort_action="native",
-            fixed_rows={'headers': True},
-            export_format="xlsx",
-            export_headers="display",
-            **dest_config
+        dest_table = _contracts_volume_grid(
+            {'type': 'volume-destination-expandable-table', 'index': 'volume'},
+            dest_display_data,
+            dest_columns,
+            'country_name_delivery',
+            "volume_by_destination_country.csv",
         )
         
         # For company view, show seller and buyer tables
         # Prepare buyer table similar to seller table
         buyer_display_data, buyer_columns = prepare_volume_table_for_display(
-            demand_df, 'buyer', available_years, volume_view, expanded_buyers
+            demand_df, 'buyer', available_years, expanded_buyers
         )
         
-        buyer_config = StandardTableStyleManager.get_base_datatable_config()
-        buyer_config['style_data_conditional'].extend([
-            {
-                'if': {'filter_query': '{company_name_buyer} = "TOTAL"'},
-                'backgroundColor': '#27AE60',
-                'color': 'white',
-                'fontWeight': 'bold',
-                'border': '2px solid #145A32'
-            }
-        ])
-        # Update style_table with fixed height
-        buyer_config['style_table'].update({'height': '480px', 'overflowY': 'auto'})
-        
-        buyer_table = dash_table.DataTable(
-            id={'type': 'volume-buyer-expandable-table', 'index': 'volume'},
-            data=buyer_display_data,
-            columns=buyer_columns,
-            page_action="none",
-            sort_action="native",
-            fixed_rows={'headers': True},
-            export_format="xlsx",
-            export_headers="display",
-            **buyer_config
+        buyer_table = _contracts_volume_grid(
+            {'type': 'volume-buyer-expandable-table', 'index': 'volume'},
+            buyer_display_data,
+            buyer_columns,
+            'company_name_buyer',
+            "volume_by_buyer_company.csv",
+            total_color="#27AE60",
+            total_border="#145A32",
         )
         
         tables_row = html.Div([
-            html.Div([
-                html.Div([
-                    html.H5("Volume by Seller Company", style={'display': 'inline-block', 'marginBottom': '15px', 'fontSize': '16px', 'fontWeight': 'bold'}),
-                    html.Span(" (Click ⬇ to export)", style={'fontSize': '12px', 'color': '#6c757d', 'marginLeft': '10px'})
-                ]),
-                seller_table
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'}),
-            html.Div([
-                html.Div([
-                    html.H5("Volume by Buyer Company", style={'display': 'inline-block', 'marginBottom': '15px', 'fontSize': '16px', 'fontWeight': 'bold'}),
-                    html.Span(" (Click ⬇ to export)", style={'fontSize': '12px', 'color': '#6c757d', 'marginLeft': '10px'})
-                ]),
-                buyer_table
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'})
-        ], style={'width': '100%', 'marginTop': '20px'})
+            _contracts_table_panel("Volume by seller company", seller_table),
+            _contracts_table_panel("Volume by buyer company", buyer_table),
+        ], className="contracts-table-grid")
         
     else:  # fallback to country view
         main_charts_row = html.Div([
-            html.Div([
-                dcc.Graph(figure=country_fig, style={'height': '550px'})
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'}),
-            html.Div([
-                dcc.Graph(figure=dest_fig, style={'height': '550px'})
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'})
-        ], style={'width': '100%', 'marginBottom': '20px'})
+            _contracts_graph(figure=country_fig, height=550),
+            _contracts_graph(figure=dest_fig, height=550),
+        ], className="contracts-chart-grid")
         
         # Prepare destination table
         dest_display_data, dest_columns = prepare_volume_table_for_display(
-            demand_df, 'destination', available_years, volume_view, expanded_destinations
+            demand_df, 'destination', available_years, expanded_destinations
         )
         
-        dest_config = StandardTableStyleManager.get_base_datatable_config()
-        dest_config['style_data_conditional'].extend([
-            {
-                'if': {'filter_query': '{country_name_delivery} = "TOTAL"'},
-                'backgroundColor': '#2E86C1',
-                'color': 'white',
-                'fontWeight': 'bold',
-                'border': '2px solid #1B4F72'
-            }
-        ])
-        # Update style_table with fixed height
-        dest_config['style_table'].update({'height': '480px', 'overflowY': 'auto'})
-        
-        dest_table = dash_table.DataTable(
-            id={'type': 'volume-destination-expandable-table', 'index': 'volume'},
-            data=dest_display_data,
-            columns=dest_columns,
-            page_action="none",
-            sort_action="native",
-            fixed_rows={'headers': True},
-            export_format="xlsx",
-            export_headers="display",
-            **dest_config
+        dest_table = _contracts_volume_grid(
+            {'type': 'volume-destination-expandable-table', 'index': 'volume'},
+            dest_display_data,
+            dest_columns,
+            'country_name_delivery',
+            "volume_by_destination_country.csv",
         )
         
         tables_row = html.Div([
-            html.Div([
-                html.Div([
-                    html.H5("Volume by Source Country", style={'display': 'inline-block', 'marginBottom': '15px', 'fontSize': '16px', 'fontWeight': 'bold'}),
-                    html.Span(" (Click ⬇ to export)", style={'fontSize': '12px', 'color': '#6c757d', 'marginLeft': '10px'})
-                ]),
-                country_table
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'}),
-            html.Div([
-                html.Div([
-                    html.H5("Volume by Destination Country", style={'display': 'inline-block', 'marginBottom': '15px', 'fontSize': '16px', 'fontWeight': 'bold'}),
-                    html.Span(" (Click ⬇ to export)", style={'fontSize': '12px', 'color': '#6c757d', 'marginLeft': '10px'})
-                ]),
-                dest_table
-            ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'})
-        ], style={'width': '100%', 'marginTop': '20px'})
+            _contracts_table_panel("Volume by source country", country_table),
+            _contracts_table_panel("Volume by destination country", dest_table),
+        ], className="contracts-table-grid")
     
     # Create Pricing Type and Contract Type Distribution charts by delivery year
     # Merge contracts with demand to get delivery years
@@ -1416,26 +1516,21 @@ def create_volume_analysis_content(contracts_df, demand_df, volume_view='both', 
         contract_type_fig = go.Figure()
         contract_type_fig.add_annotation(text="No contract type data available", x=0.5, y=0.5, showarrow=False)
         contract_type_fig.update_layout(height=450, title="Contract Type Distribution by Year")
+
+    style_contracts_figure(pricing_type_fig, height=450)
+    style_contracts_figure(contract_type_fig, height=450)
     
     # Create distribution charts row
     distribution_charts_row = html.Div([
-        html.Div([
-            dcc.Graph(figure=pricing_type_fig, style={'height': '450px'})
-        ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'}),
-        html.Div([
-            dcc.Graph(figure=contract_type_fig, style={'height': '450px'})
-        ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'})
-    ], style={'width': '100%', 'marginBottom': '20px'})
+        _contracts_graph(figure=pricing_type_fig, height=450),
+        _contracts_graph(figure=contract_type_fig, height=450),
+    ], className="contracts-chart-grid")
     
     # Create the overview charts row (FOB/DES and Trend)
     overview_charts_row = html.Div([
-        html.Div([
-            dcc.Graph(figure=fob_des_fig, style={'height': '450px'})
-        ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'}),
-        html.Div([
-            dcc.Graph(figure=trend_fig, style={'height': '450px'})
-        ], style={'width': '50%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': '0 10px'})
-    ], style={'width': '100%', 'marginBottom': '20px'})
+        _contracts_graph(figure=fob_des_fig, height=450),
+        _contracts_graph(figure=trend_fig, height=450),
+    ], className="contracts-chart-grid")
     
     return html.Div([
         # Distribution Charts Row (Pricing Type and Contract Type) - First Row
@@ -1449,156 +1544,6 @@ def create_volume_analysis_content(contracts_df, demand_df, volume_view='both', 
         
         # Summary Tables Row - Fourth Row
         tables_row
-    ])
-
-
-def create_contract_analytics_content(contracts_df, demand_df):
-    """Create contract analytics tab content"""
-    if contracts_df.empty:
-        return html.Div("No data available", className="text-center p-4")
-    
-    # Contract type distribution
-    contract_types = contracts_df['contract_type'].value_counts()
-    type_fig = px.pie(
-        values=contract_types.values,
-        names=contract_types.index,
-        title="Contract Type Distribution"
-    )
-    type_fig.update_layout(height=400)
-    
-    # Create merged pricing type chart with indexation categories
-    # For indexed contracts, show oil/gas/hybrid categorization
-    pricing_data = []
-    
-    # Debug: Check what indexation categories we have
-    index_contracts = contracts_df[contracts_df['contract_pricing_type'] == 'Index']
-    if not index_contracts.empty:
-        print(f"Found {len(index_contracts)} indexed contracts")
-        print(f"Unique indexation categories: {index_contracts['indexation_category'].unique()}")
-    
-    for _, row in contracts_df.iterrows():
-        pricing_type = row['contract_pricing_type']
-        indexation_cat = row.get('indexation_category', None)
-        
-        # Create detailed pricing label with oil/gas/hybrid categorization
-        if pricing_type == 'Index':
-            if indexation_cat and pd.notna(indexation_cat) and indexation_cat not in ['Unknown', '', None]:
-                # Categorize based on indexation category content
-                index_lower = str(indexation_cat).lower()
-                if 'oil' in index_lower or 'brent' in index_lower or 'crude' in index_lower or 'wti' in index_lower:
-                    pricing_label = "Index - Oil"
-                elif 'gas' in index_lower or 'henry hub' in index_lower or 'hhub' in index_lower or 'nbp' in index_lower or 'ttf' in index_lower or 'jkm' in index_lower:
-                    pricing_label = "Index - Gas"
-                elif 'hybrid' in index_lower or ('oil' in index_lower and 'gas' in index_lower):
-                    pricing_label = "Index - Hybrid"
-                else:
-                    pricing_label = "Unknown"  # Changed from f"Index - {indexation_cat}" to always use Unknown
-            else:
-                pricing_label = "Unknown"
-        else:
-            pricing_label = pricing_type
-        
-        # Extra safety check - never allow just "Index" or "Indexed"
-        if pricing_label in ['Index', 'Indexed']:
-            pricing_label = "Unknown"
-        
-        pricing_data.append(pricing_label)
-    
-    # Count the pricing types with categories
-    pricing_counts = pd.Series(pricing_data).value_counts()
-    
-    # Create the merged pricing chart
-    pricing_fig = px.pie(
-        values=pricing_counts.values,
-        names=pricing_counts.index,
-        title="Pricing Type & Indexation Distribution"
-    )
-    pricing_fig.update_layout(height=400)
-    
-    return dbc.Row([
-        dbc.Col([
-            dcc.Graph(figure=type_fig)
-        ], width=6),
-        dbc.Col([
-            dcc.Graph(figure=pricing_fig)
-        ], width=6)
-    ])
-
-def create_pricing_analysis_content(contracts_df, price_assumptions_df):
-    """Create pricing analysis tab content"""
-    if contracts_df.empty:
-        return html.Div("No data available", className="text-center p-4")
-    
-    # Create merged pricing type chart with indexation categories
-    pricing_data = []
-    
-    # Debug: Check what indexation categories we have
-    index_contracts = contracts_df[contracts_df['contract_pricing_type'] == 'Index']
-    if not index_contracts.empty:
-        print(f"Pricing Analysis - Found {len(index_contracts)} indexed contracts")
-        print(f"Pricing Analysis - Unique indexation categories: {index_contracts['indexation_category'].unique()}")
-    
-    for _, row in contracts_df.iterrows():
-        pricing_type = row['contract_pricing_type']
-        indexation_cat = row.get('indexation_category', None)
-        
-        # Create detailed pricing label with oil/gas/hybrid categorization
-        if pricing_type == 'Index':
-            if indexation_cat and pd.notna(indexation_cat) and indexation_cat not in ['Unknown', '', None]:
-                # Categorize based on indexation category content
-                index_lower = str(indexation_cat).lower()
-                if 'oil' in index_lower or 'brent' in index_lower or 'crude' in index_lower or 'wti' in index_lower:
-                    pricing_label = "Index - Oil"
-                elif 'gas' in index_lower or 'henry hub' in index_lower or 'hhub' in index_lower or 'nbp' in index_lower or 'ttf' in index_lower or 'jkm' in index_lower:
-                    pricing_label = "Index - Gas"
-                elif 'hybrid' in index_lower or ('oil' in index_lower and 'gas' in index_lower):
-                    pricing_label = "Index - Hybrid"
-                else:
-                    pricing_label = "Unknown"  # Changed from f"Index - {indexation_cat}" to always use Unknown
-            else:
-                pricing_label = "Unknown"
-        else:
-            pricing_label = pricing_type
-        
-        # Extra safety check - never allow just "Index" or "Indexed"
-        if pricing_label in ['Index', 'Indexed']:
-            pricing_label = "Unknown"
-        
-        pricing_data.append(pricing_label)
-    
-    # Count the pricing types with categories
-    pricing_counts = pd.Series(pricing_data).value_counts()
-    
-    # Create the merged pricing/indexation chart
-    merged_pricing_fig = px.pie(
-        values=pricing_counts.values,
-        names=pricing_counts.index,
-        title="Pricing Type & Indexation Distribution"
-    )
-    merged_pricing_fig.update_layout(height=400)
-    
-    # Flexibility analysis
-    flexibility_data = {
-        'Source Flexible': contracts_df['is_source_flexible'].value_counts().get('Y', 0),
-        'Source Not Flexible': contracts_df['is_source_flexible'].value_counts().get('N', 0),
-        'Destination Flexible': contracts_df['is_destination_flexible'].value_counts().get('Y', 0),
-        'Destination Not Flexible': contracts_df['is_destination_flexible'].value_counts().get('N', 0)
-    }
-    
-    flexibility_fig = px.bar(
-        x=list(flexibility_data.keys()),
-        y=list(flexibility_data.values()),
-        title="Contract Flexibility Analysis"
-    )
-    flexibility_fig.update_layout(height=400)
-    
-    return dbc.Row([
-        dbc.Col([
-            dcc.Graph(figure=merged_pricing_fig)
-        ], width=6),
-        dbc.Col([
-            dcc.Graph(figure=flexibility_fig)
-        ], width=6)
     ])
 
 
@@ -1731,7 +1676,7 @@ def _calculate_contract_year_settings(loaded_contracts_df):
                     year_match = re.search(r'20\d{2}|19\d{2}', date_str)
                     if year_match:
                         end_years.append(int(year_match.group()))
-            except:
+            except Exception:
                 continue
 
         if end_years:
@@ -1820,30 +1765,29 @@ def layout():
     _ensure_contracts_data_loaded()
     year_settings = _contracts_year_settings or _default_year_settings()
 
-    return html.Div([
-        # Filter Controls
-        create_filter_controls(
-            year_settings['min_year'],
-            year_settings['max_year'],
-            year_settings['default_start'],
-            year_settings['default_end'],
-        ),
-
-        # Main Sections (replace tabs)
-        create_contracts_sections_layout(),
-
-        # Interactive Data Table
-        create_contracts_table(),
-
-        # Hidden div to store data
-        html.Div(id='contracts-data-store', style={'display': 'none'}),
-
-        # Stores for expanded states in volume tables
-        dcc.Store(id='volume-country-expanded-store', data=[]),
-        dcc.Store(id='volume-seller-expanded-store', data=[]),
-        dcc.Store(id='volume-destination-expanded-store', data=[]),
-        dcc.Store(id='volume-buyer-expanded-store', data=[])
-    ])
+    return html.Div(
+        [
+            create_filter_controls(
+                year_settings['min_year'],
+                year_settings['max_year'],
+                year_settings['default_start'],
+                year_settings['default_end'],
+            ),
+            html.Div(
+                [
+                    create_contracts_sections_layout(),
+                    create_contracts_table(),
+                ],
+                className="contracts-content-stack",
+            ),
+            html.Div(id='contracts-data-store', style={'display': 'none'}),
+            dcc.Store(id='volume-country-expanded-store', data=[]),
+            dcc.Store(id='volume-seller-expanded-store', data=[]),
+            dcc.Store(id='volume-destination-expanded-store', data=[]),
+            dcc.Store(id='volume-buyer-expanded-store', data=[]),
+        ],
+        className="contracts-page-shell",
+    )
 
 ############################################ Callbacks ###################################################
 
@@ -1972,15 +1916,14 @@ def update_volume_analysis_section(dest_countries, contract_types,
      Input('contract-type-dropdown', 'value'),
      Input('pricing-type-dropdown', 'value'),
      Input('seller-company-dropdown', 'value'),
-     Input('year-range-slider', 'value'),
      Input('source-flexible-dropdown', 'value'),
      Input('dest-flexible-dropdown', 'value'),
      Input('timeline-metric-dropdown', 'value')]
 )
-def update_timeline_charts(dest_countries, contract_types, pricing_types, sellers, year_range, source_flexible, dest_flexible, timeline_metric):
+def update_timeline_charts(dest_countries, contract_types, pricing_types, sellers, source_flexible, dest_flexible, timeline_metric):
     """Update contract signing timeline charts"""
     
-    # Apply filters (except year_range - timeline shows all years)
+    # Timeline charts intentionally show the full historical range.
     filtered_contracts = contracts_df.copy()
     
     if dest_countries:
@@ -2076,6 +2019,7 @@ def update_timeline_charts(dest_countries, contract_types, pricing_types, seller
         empty_fig = go.Figure()
         empty_fig.add_annotation(text="No data available for selected filters", x=0.5, y=0.5, showarrow=False)
         empty_fig.update_layout(height=400, title="Contract Signing Timeline")
+        style_contracts_figure(empty_fig, height=420)
         return empty_fig, empty_fig
     
     # Create timeline chart (first chart)
@@ -2151,68 +2095,6 @@ def update_timeline_charts(dest_countries, contract_types, pricing_types, seller
     if timeline_metric == 'volume' and not demand_df.empty:
         # Get total volume per contract
         volume_by_contract = demand_df.groupby('id_contract')['acq_volume__mmtpa'].sum().to_dict()
-    
-    # Debug indexation categories - check both 'Index' and 'Indexed'
-    print(f"\n=== Timeline Pricing Debug ===")
-    print(f"Contract pricing types in data: {filtered_contracts['contract_pricing_type'].value_counts().to_dict()}")
-    
-    # Check for contracts with Unknown pricing but indexation data
-    unknown_pricing = filtered_contracts[filtered_contracts['contract_pricing_type'].isin(['Unknown', None, ''])]
-    if not unknown_pricing.empty:
-        has_index_cat = unknown_pricing['indexation_category'].notna().sum() if 'indexation_category' in unknown_pricing.columns else 0
-        has_index_point = unknown_pricing['indexation_point'].notna().sum() if 'indexation_point' in unknown_pricing.columns else 0
-        print(f"\nContracts with Unknown pricing type: {len(unknown_pricing)}")
-        print(f"  - With indexation_category: {has_index_cat}")
-        print(f"  - With indexation_point: {has_index_point}")
-        
-        if 'indexation_category_enhanced' in unknown_pricing.columns:
-            sample_cats = unknown_pricing[unknown_pricing['indexation_category_enhanced'].notna()]['indexation_category_enhanced'].head(5)
-            if not sample_cats.empty:
-                print(f"  Sample indexation categories in Unknown contracts:")
-                for cat in sample_cats:
-                    print(f"    - {cat}")
-    
-    index_contracts = filtered_contracts[filtered_contracts['contract_pricing_type'].isin(['Index', 'Indexed'])]
-    if not index_contracts.empty:
-        print(f"Total indexed contracts: {len(index_contracts)}")
-        
-        # Check original indexation category
-        if 'indexation_category' in index_contracts.columns:
-            orig_cats = index_contracts['indexation_category'].value_counts().head(10)
-            print(f"\nOriginal indexation categories (top 10):")
-            for cat, count in orig_cats.items():
-                print(f"  {cat}: {count}")
-        
-        # Check enhanced indexation category
-        if 'indexation_category_enhanced' in index_contracts.columns:
-            enh_cats = index_contracts['indexation_category_enhanced'].value_counts().head(10)
-            print(f"\nEnhanced indexation categories (top 10):")
-            for cat, count in enh_cats.items():
-                print(f"  {cat}: {count}")
-        
-        # Check pricing structures
-        if 'oil_pricing_structure' in index_contracts.columns:
-            oil_structs = index_contracts['oil_pricing_structure'].dropna()
-            if not oil_structs.empty:
-                print(f"\nOil pricing structures (sample):")
-                for struct in oil_structs.head(5):
-                    print(f"  {struct}")
-            oil_count = oil_structs.shape[0]
-            print(f"Total contracts with oil pricing structure: {oil_count}")
-        
-        if 'gas_pricing_structure' in index_contracts.columns:
-            gas_structs = index_contracts['gas_pricing_structure'].dropna()
-            if not gas_structs.empty:
-                print(f"\nGas pricing structures (sample):")
-                for struct in gas_structs.head(5):
-                    print(f"  {struct}")
-            gas_count = gas_structs.shape[0]
-            print(f"Total contracts with gas pricing structure: {gas_count}")
-        
-        # Check both oil and gas
-        if 'oil_pricing_structure' in index_contracts.columns and 'gas_pricing_structure' in index_contracts.columns:
-            both = index_contracts[(index_contracts['oil_pricing_structure'].notna()) & (index_contracts['gas_pricing_structure'].notna())]
-            print(f"\nContracts with BOTH oil and gas structures: {len(both)}")
     
     for _, row in filtered_contracts.iterrows():
         year = row['contract_year_signed']
@@ -2303,7 +2185,6 @@ def update_timeline_charts(dest_countries, contract_types, pricing_types, seller
             # Double-check it's not actually indexed
             if (indexation_cat and pd.notna(indexation_cat) and str(indexation_cat).strip() not in ['', 'None', 'Unknown', 'nan']):
                 # It has indexation data, so treat as indexed despite 'Fixed' label
-                print(f"WARNING: Contract {row.get('id_contract', 'unknown')} labeled as Fixed but has indexation: {indexation_cat}")
                 pricing_label = "Unknown"
             else:
                 pricing_label = 'Fixed'
@@ -2335,15 +2216,6 @@ def update_timeline_charts(dest_countries, contract_types, pricing_types, seller
     else:
         # Count contracts by year and pricing type
         pricing_counts = pricing_df.groupby(['Year', 'Pricing Type']).size().reset_index(name='Count')
-    
-    # Debug what pricing types we ended up with
-    print(f"\n=== Final Pricing Labels ===")
-    print(f"Unique pricing types in chart: {pricing_counts['Pricing Type'].unique()}")
-    label_counts = pricing_counts.groupby('Pricing Type')['Count'].sum().sort_values(ascending=False)
-    print(f"\nTotal contracts by pricing type:")
-    for label, count in label_counts.items():
-        print(f"  {label}: {count}")
-    print(f"=== End Debug ===\n")
     
     # Create comprehensive color map for all pricing types
     color_map = {
@@ -2390,7 +2262,6 @@ def update_timeline_charts(dest_countries, contract_types, pricing_types, seller
     
     # Create stacked bar chart
     y_title_pricing = "Total Volume (MTPA)" if timeline_metric == 'volume' else "Number of Contracts"
-    hover_name = "Volume" if timeline_metric == 'volume' else "Contracts"
     
     pricing_fig = px.bar(
         pricing_counts,
@@ -2430,24 +2301,26 @@ def update_timeline_charts(dest_countries, contract_types, pricing_types, seller
         hovermode='x unified'
     )
     
+    style_contracts_figure(timeline_fig, height=420)
+    style_contracts_figure(pricing_fig, height=420)
+
     return timeline_fig, pricing_fig
 
 
 @callback(
-    [Output('contracts-table', 'columns'),
-     Output('contracts-table', 'data')],
+    [Output('contracts-table', 'columnDefs'),
+     Output('contracts-table', 'rowData')],
     [Input('destination-country-dropdown', 'value'),
      Input('contract-type-dropdown', 'value'),
      Input('pricing-type-dropdown', 'value'),
      Input('seller-company-dropdown', 'value'),
      Input('year-range-slider', 'value'),
-     Input('cargo-basis-dropdown', 'value'),
      Input('source-flexible-dropdown', 'value'),
      Input('dest-flexible-dropdown', 'value')]
 )
 def update_contracts_table(dest_countries, contract_types, 
-                          pricing_types, sellers, year_range, cargo_basis,
-                          source_flexible, dest_flexible):
+                          pricing_types, sellers, year_range, source_flexible,
+                          dest_flexible):
     """Update contracts table based on filters"""
     
     # Apply same filters as tab content
@@ -2544,7 +2417,7 @@ def update_contracts_table(dest_countries, contract_types,
         {'name': 'Delivery Country', 'id': 'country_name_delivery', 'type': 'text'},
         {'name': 'Delivery Flexibility', 'id': 'flexibility_delivery', 'type': 'text'},
         {'name': 'Dest Flexible', 'id': 'is_destination_flexible', 'type': 'text'},
-        {'name': 'Volume (MMTPA)', 'id': 'max_acq_volume', 'type': 'numeric', 'format': Format(precision=2)},
+        {'name': 'Volume (MMTPA)', 'id': 'max_acq_volume', 'type': 'numeric', 'precision': 2},
         {'name': 'Volume Unit', 'id': 'max_acq_volume_unit', 'type': 'text'},
         {'name': 'Contract Note', 'id': 'contract_note', 'type': 'text'},
         {'name': 'Equity/Third Party', 'id': 'equity_third_party', 'type': 'text'},
@@ -2557,24 +2430,24 @@ def update_contracts_table(dest_countries, contract_types,
     pricing_columns = [
         {'name': 'Oil Pricing Structure', 'id': 'oil_pricing_structure', 'type': 'text'},
         {'name': 'Gas Pricing Structure', 'id': 'gas_pricing_structure', 'type': 'text'},
-        {'name': 'Slope', 'id': 'slope', 'type': 'numeric', 'format': Format(precision=4)},
-        {'name': 'Intercept', 'id': 'intercept', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Lower Inflection', 'id': 'lower_inflection', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Slope Lower', 'id': 'slope_lower', 'type': 'numeric', 'format': Format(precision=4)},
-        {'name': 'Intercept Lower', 'id': 'intercept_lower', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Upper Inflection', 'id': 'upper_inflection', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Slope Upper', 'id': 'slope_upper', 'type': 'numeric', 'format': Format(precision=4)},
-        {'name': 'Intercept Upper', 'id': 'intercept_upper', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Weighting', 'id': 'weighting', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Fixed Fee', 'id': 'fixed_fee', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Transport Tariff', 'id': 'transport_tariff', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Regas Tariff', 'id': 'regas_tariff', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Linkage %', 'id': 'linkage_percent', 'type': 'numeric', 'format': Format(precision=1)},
-        {'name': 'Oil Price at Signing', 'id': 'oil_price_in_signed_year', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Normalized Slope', 'id': 'normalized_slope', 'type': 'numeric', 'format': Format(precision=4)},
-        {'name': 'Oil Indexed Ship Cost', 'id': 'oil_indexed_shipping_cost', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Gas Indexed Ship Cost', 'id': 'gas_indexed_shipping_cost', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Other Costs', 'id': 'other_costs', 'type': 'numeric', 'format': Format(precision=2)}
+        {'name': 'Slope', 'id': 'slope', 'type': 'numeric', 'precision': 4},
+        {'name': 'Intercept', 'id': 'intercept', 'type': 'numeric', 'precision': 2},
+        {'name': 'Lower Inflection', 'id': 'lower_inflection', 'type': 'numeric', 'precision': 2},
+        {'name': 'Slope Lower', 'id': 'slope_lower', 'type': 'numeric', 'precision': 4},
+        {'name': 'Intercept Lower', 'id': 'intercept_lower', 'type': 'numeric', 'precision': 2},
+        {'name': 'Upper Inflection', 'id': 'upper_inflection', 'type': 'numeric', 'precision': 2},
+        {'name': 'Slope Upper', 'id': 'slope_upper', 'type': 'numeric', 'precision': 4},
+        {'name': 'Intercept Upper', 'id': 'intercept_upper', 'type': 'numeric', 'precision': 2},
+        {'name': 'Weighting', 'id': 'weighting', 'type': 'numeric', 'precision': 2},
+        {'name': 'Fixed Fee', 'id': 'fixed_fee', 'type': 'numeric', 'precision': 2},
+        {'name': 'Transport Tariff', 'id': 'transport_tariff', 'type': 'numeric', 'precision': 2},
+        {'name': 'Regas Tariff', 'id': 'regas_tariff', 'type': 'numeric', 'precision': 2},
+        {'name': 'Linkage %', 'id': 'linkage_percent', 'type': 'numeric', 'precision': 1},
+        {'name': 'Oil Price at Signing', 'id': 'oil_price_in_signed_year', 'type': 'numeric', 'precision': 2},
+        {'name': 'Normalized Slope', 'id': 'normalized_slope', 'type': 'numeric', 'precision': 4},
+        {'name': 'Oil Indexed Ship Cost', 'id': 'oil_indexed_shipping_cost', 'type': 'numeric', 'precision': 2},
+        {'name': 'Gas Indexed Ship Cost', 'id': 'gas_indexed_shipping_cost', 'type': 'numeric', 'precision': 2},
+        {'name': 'Other Costs', 'id': 'other_costs', 'type': 'numeric', 'precision': 2}
     ]
     
     # Add formula columns if they exist
@@ -2582,12 +2455,12 @@ def update_contracts_table(dest_countries, contract_types,
         {'name': 'Formula Structures', 'id': 'formula_structures', 'type': 'text'},
         {'name': 'Formula Index Points', 'id': 'formula_index_points', 'type': 'text'},
         {'name': 'Formula Coeff Types', 'id': 'formula_coeff_types', 'type': 'text'},
-        {'name': 'Avg Coefficient', 'id': 'avg_coefficient', 'type': 'numeric', 'format': Format(precision=4)},
-        {'name': 'Formula Lower Bound', 'id': 'formula_lower_bound', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Formula Upper Bound', 'id': 'formula_upper_bound', 'type': 'numeric', 'format': Format(precision=2)},
-        {'name': 'Avg Lag Months', 'id': 'avg_lag_months', 'type': 'numeric', 'format': Format(precision=1)},
-        {'name': 'Avg Average Months', 'id': 'avg_average_months', 'type': 'numeric', 'format': Format(precision=1)},
-        {'name': 'Formula Avg Weighting', 'id': 'formula_avg_weighting', 'type': 'numeric', 'format': Format(precision=2)}
+        {'name': 'Avg Coefficient', 'id': 'avg_coefficient', 'type': 'numeric', 'precision': 4},
+        {'name': 'Formula Lower Bound', 'id': 'formula_lower_bound', 'type': 'numeric', 'precision': 2},
+        {'name': 'Formula Upper Bound', 'id': 'formula_upper_bound', 'type': 'numeric', 'precision': 2},
+        {'name': 'Avg Lag Months', 'id': 'avg_lag_months', 'type': 'numeric', 'precision': 1},
+        {'name': 'Avg Average Months', 'id': 'avg_average_months', 'type': 'numeric', 'precision': 1},
+        {'name': 'Formula Avg Weighting', 'id': 'formula_avg_weighting', 'type': 'numeric', 'precision': 2}
     ]
     
     # Add enhanced indexation column if it exists
@@ -2602,174 +2475,162 @@ def update_contracts_table(dest_countries, contract_types,
     # Only select columns that exist in the dataframe
     available_columns = [col['id'] for col in table_columns if col['id'] in filtered_contracts.columns]
     available_table_columns = [col for col in table_columns if col['id'] in filtered_contracts.columns]
-    table_data = filtered_contracts[available_columns].fillna('N/A').to_dict('records')
+    table_df = filtered_contracts[available_columns].copy()
+    for date_column in CONTRACT_DETAIL_DATE_COLUMNS.intersection(table_df.columns):
+        table_df[date_column] = table_df[date_column].map(_contracts_date_only)
+
+    table_data = table_df.fillna('N/A').to_dict('records')
+    column_defs = _contracts_ag_column_defs(
+        available_table_columns,
+        filterable=True,
+        pinned_fields=['contract_name'],
+        default_width=150,
+    )
     
-    return available_table_columns, table_data
+    return column_defs, _contracts_records(table_data)
+
+
+def _ag_grid_clicked_row(clicked_events, table_data_list):
+    if not clicked_events:
+        raise PreventUpdate
+
+    event = next((candidate for candidate in clicked_events if candidate), None)
+    if not event:
+        raise PreventUpdate
+
+    clicked_row = event.get('data') if isinstance(event, dict) else None
+    if clicked_row:
+        return clicked_row
+
+    row_index = event.get('rowIndex') if isinstance(event, dict) else None
+    if row_index is None:
+        row_index = event.get('row') if isinstance(event, dict) else None
+
+    if row_index is None or not table_data_list:
+        raise PreventUpdate
+
+    table_data = next((data for data in table_data_list if data), None)
+    if table_data and row_index < len(table_data):
+        return table_data[row_index]
+
+    raise PreventUpdate
+
+
+def _toggle_expanded_entity(clicked_row, field, expanded_entities):
+    expanded_entities = list(expanded_entities or [])
+    entity_name = clicked_row.get(field, '')
+
+    if entity_name.startswith('▼ '):
+        clean_entity = entity_name[2:]
+        if clean_entity in expanded_entities:
+            expanded_entities.remove(clean_entity)
+    elif entity_name.startswith('▶ '):
+        clean_entity = entity_name[2:]
+        if clean_entity not in expanded_entities:
+            expanded_entities.append(clean_entity)
+
+    return expanded_entities
+
+
+@callback(
+    Output('contracts-table', 'exportDataAsCsv'),
+    Input('contracts-table-export-button', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def export_contracts_detail_table(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    return True
+
+
+@callback(
+    Output({'type': 'volume-country-expandable-table', 'index': MATCH}, 'exportDataAsCsv'),
+    Input({'type': 'volume-country-expandable-table-export-button', 'index': MATCH}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def export_volume_country_table(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    return True
+
+
+@callback(
+    Output({'type': 'volume-destination-expandable-table', 'index': MATCH}, 'exportDataAsCsv'),
+    Input({'type': 'volume-destination-expandable-table-export-button', 'index': MATCH}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def export_volume_destination_table(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    return True
+
+
+@callback(
+    Output({'type': 'volume-seller-expandable-table', 'index': MATCH}, 'exportDataAsCsv'),
+    Input({'type': 'volume-seller-expandable-table-export-button', 'index': MATCH}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def export_volume_seller_table(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    return True
+
+
+@callback(
+    Output({'type': 'volume-buyer-expandable-table', 'index': MATCH}, 'exportDataAsCsv'),
+    Input({'type': 'volume-buyer-expandable-table-export-button', 'index': MATCH}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def export_volume_buyer_table(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    return True
+
 
 # Callback to handle expanding/collapsing rows for volume country table
 @callback(
     Output('volume-country-expanded-store', 'data'),
-    [Input({'type': 'volume-country-expandable-table', 'index': ALL}, 'active_cell')],
+    [Input({'type': 'volume-country-expandable-table', 'index': ALL}, 'cellClicked')],
     [State('volume-country-expanded-store', 'data'),
-     State({'type': 'volume-country-expandable-table', 'index': ALL}, 'data')]
+     State({'type': 'volume-country-expandable-table', 'index': ALL}, 'rowData')]
 )
-def handle_volume_country_expansion(active_cells, expanded_countries, table_data_list):
+def handle_volume_country_expansion(clicked_events, expanded_countries, table_data_list):
     """Handle clicking on rows to expand/collapse in volume country table"""
-    if not active_cells or not table_data_list:
-        raise PreventUpdate
-    
-    ctx = callback_context
-    if not ctx.triggered:
-        raise PreventUpdate
-    
-    prop_id = ctx.triggered[0]['prop_id']
-    
-    if 'volume-country-expandable-table' in prop_id and '.active_cell' in prop_id:
-        active_cell = active_cells[0]
-        if active_cell and 'row' in active_cell:
-            table_data = table_data_list[0]
-            if active_cell['row'] < len(table_data):
-                clicked_row = table_data[active_cell['row']]
-                
-                # Extract country name from the clicked row
-                country_name = clicked_row.get('country_name_source', '')
-                
-                # Remove expand/collapse indicators to get clean name
-                if country_name.startswith('▼ '):
-                    clean_country = country_name[2:]
-                    # Collapse: remove from expanded list
-                    if clean_country in expanded_countries:
-                        expanded_countries.remove(clean_country)
-                elif country_name.startswith('▶ '):
-                    clean_country = country_name[2:]
-                    # Expand: add to expanded list
-                    if clean_country not in expanded_countries:
-                        expanded_countries.append(clean_country)
-    
-    return expanded_countries
+    clicked_row = _ag_grid_clicked_row(clicked_events, table_data_list)
+    return _toggle_expanded_entity(clicked_row, 'country_name_source', expanded_countries)
 
 # Callback to handle expanding/collapsing rows for volume seller table
 @callback(
     Output('volume-seller-expanded-store', 'data'),
-    [Input({'type': 'volume-seller-expandable-table', 'index': ALL}, 'active_cell')],
+    [Input({'type': 'volume-seller-expandable-table', 'index': ALL}, 'cellClicked')],
     [State('volume-seller-expanded-store', 'data'),
-     State({'type': 'volume-seller-expandable-table', 'index': ALL}, 'data')]
+     State({'type': 'volume-seller-expandable-table', 'index': ALL}, 'rowData')]
 )
-def handle_volume_seller_expansion(active_cells, expanded_sellers, table_data_list):
+def handle_volume_seller_expansion(clicked_events, expanded_sellers, table_data_list):
     """Handle clicking on rows to expand/collapse in volume seller table"""
-    if not active_cells or not table_data_list:
-        raise PreventUpdate
-    
-    ctx = callback_context
-    if not ctx.triggered:
-        raise PreventUpdate
-    
-    prop_id = ctx.triggered[0]['prop_id']
-    
-    if 'volume-seller-expandable-table' in prop_id and '.active_cell' in prop_id:
-        active_cell = active_cells[0]
-        if active_cell and 'row' in active_cell:
-            table_data = table_data_list[0]
-            if active_cell['row'] < len(table_data):
-                clicked_row = table_data[active_cell['row']]
-                
-                # Extract seller name from the clicked row
-                seller_name = clicked_row.get('company_name_seller', '')
-                
-                # Remove expand/collapse indicators to get clean name
-                if seller_name.startswith('▼ '):
-                    clean_seller = seller_name[2:]
-                    # Collapse: remove from expanded list
-                    if clean_seller in expanded_sellers:
-                        expanded_sellers.remove(clean_seller)
-                elif seller_name.startswith('▶ '):
-                    clean_seller = seller_name[2:]
-                    # Expand: add to expanded list
-                    if clean_seller not in expanded_sellers:
-                        expanded_sellers.append(clean_seller)
-    
-    return expanded_sellers
+    clicked_row = _ag_grid_clicked_row(clicked_events, table_data_list)
+    return _toggle_expanded_entity(clicked_row, 'company_name_seller', expanded_sellers)
 
 # Callback to handle expanding/collapsing rows for volume destination table
 @callback(
     Output('volume-destination-expanded-store', 'data'),
-    [Input({'type': 'volume-destination-expandable-table', 'index': ALL}, 'active_cell')],
+    [Input({'type': 'volume-destination-expandable-table', 'index': ALL}, 'cellClicked')],
     [State('volume-destination-expanded-store', 'data'),
-     State({'type': 'volume-destination-expandable-table', 'index': ALL}, 'data')]
+     State({'type': 'volume-destination-expandable-table', 'index': ALL}, 'rowData')]
 )
-def handle_volume_destination_expansion(active_cells, expanded_destinations, table_data_list):
+def handle_volume_destination_expansion(clicked_events, expanded_destinations, table_data_list):
     """Handle clicking on rows to expand/collapse in volume destination table"""
-    if not active_cells or not table_data_list:
-        raise PreventUpdate
-    
-    ctx = callback_context
-    if not ctx.triggered:
-        raise PreventUpdate
-    
-    prop_id = ctx.triggered[0]['prop_id']
-    
-    if 'volume-destination-expandable-table' in prop_id and '.active_cell' in prop_id:
-        active_cell = active_cells[0]
-        if active_cell and 'row' in active_cell:
-            table_data = table_data_list[0]
-            if active_cell['row'] < len(table_data):
-                clicked_row = table_data[active_cell['row']]
-                
-                # Extract destination name from the clicked row
-                dest_name = clicked_row.get('country_name_delivery', '')
-                
-                # Remove expand/collapse indicators to get clean name
-                if dest_name.startswith('▼ '):
-                    clean_dest = dest_name[2:]
-                    # Collapse: remove from expanded list
-                    if clean_dest in expanded_destinations:
-                        expanded_destinations.remove(clean_dest)
-                elif dest_name.startswith('▶ '):
-                    clean_dest = dest_name[2:]
-                    # Expand: add to expanded list
-                    if clean_dest not in expanded_destinations:
-                        expanded_destinations.append(clean_dest)
-    
-    return expanded_destinations
+    clicked_row = _ag_grid_clicked_row(clicked_events, table_data_list)
+    return _toggle_expanded_entity(clicked_row, 'country_name_delivery', expanded_destinations)
 
 # Callback to handle expanding/collapsing rows for volume buyer table
 @callback(
     Output('volume-buyer-expanded-store', 'data'),
-    [Input({'type': 'volume-buyer-expandable-table', 'index': ALL}, 'active_cell')],
+    [Input({'type': 'volume-buyer-expandable-table', 'index': ALL}, 'cellClicked')],
     [State('volume-buyer-expanded-store', 'data'),
-     State({'type': 'volume-buyer-expandable-table', 'index': ALL}, 'data')]
+     State({'type': 'volume-buyer-expandable-table', 'index': ALL}, 'rowData')]
 )
-def handle_volume_buyer_expansion(active_cells, expanded_buyers, table_data_list):
+def handle_volume_buyer_expansion(clicked_events, expanded_buyers, table_data_list):
     """Handle clicking on rows to expand/collapse in volume buyer table"""
-    if not active_cells or not table_data_list:
-        raise PreventUpdate
-    
-    ctx = callback_context
-    if not ctx.triggered:
-        raise PreventUpdate
-    
-    prop_id = ctx.triggered[0]['prop_id']
-    
-    if 'volume-buyer-expandable-table' in prop_id and '.active_cell' in prop_id:
-        active_cell = active_cells[0]
-        if active_cell and 'row' in active_cell:
-            table_data = table_data_list[0]
-            if active_cell['row'] < len(table_data):
-                clicked_row = table_data[active_cell['row']]
-                buyer_name = clicked_row.get('company_name_buyer', '')
-                
-                if expanded_buyers is None:
-                    expanded_buyers = []
-                
-                if buyer_name.startswith('▼ '):
-                    # Already expanded, collapse it
-                    clean_buyer = buyer_name[2:]
-                    if clean_buyer in expanded_buyers:
-                        expanded_buyers.remove(clean_buyer)
-                elif buyer_name.startswith('▶ '):
-                    clean_buyer = buyer_name[2:]
-                    # Expand: add to expanded list
-                    if clean_buyer not in expanded_buyers:
-                        expanded_buyers.append(clean_buyer)
-    
-    return expanded_buyers
+    clicked_row = _ag_grid_clicked_row(clicked_events, table_data_list)
+    return _toggle_expanded_entity(clicked_row, 'company_name_buyer', expanded_buyers)

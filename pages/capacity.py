@@ -1,5 +1,5 @@
 import base64
-from io import BytesIO, StringIO
+from io import BytesIO
 import datetime as dt
 import hashlib
 import math
@@ -8,8 +8,9 @@ import re
 import pandas as pd
 import plotly.graph_objects as go
 import dash_ag_grid as dag
-from dash import dcc, html, dash_table, callback, Input, Output, State, no_update, ctx
+from dash import dcc, html, callback, Input, Output, State, no_update, ctx
 from dash.dash_table.Format import Format, Scheme
+from utils.ag_grid_tables import create_ag_grid_from_datatable
 from dash.exceptions import PreventUpdate
 from openpyxl.styles import Border, Side
 from sqlalchemy import text
@@ -17,10 +18,25 @@ from sqlalchemy import text
 from fundamentals.terminals.capacity_scenario_utils import (
     create_capacity_scenario_from_source,
     delete_capacity_scenario,
-    duplicate_capacity_scenario,
     fetch_capacity_scenario_rows,
     get_available_capacity_scenarios,
     save_capacity_scenario_rows,
+)
+from fundamentals.terminals.ramp_forecast_utils import (
+    delete_managed_ramp_output_for_capacity_scenario,
+    generate_ramp_forecast_for_capacity_scenario,
+    get_latest_ramp_forecast_status,
+)
+from utils.balance_time import (
+    build_lng_season_periods as _build_lng_season_periods,
+    filter_by_month_date_range as _filter_by_date_range,
+    get_month_date_bounds as _get_date_bounds,
+    normalize_month_date as _normalize_month_date,
+)
+from utils.balance_components import create_balance_empty_state as _create_empty_state
+from utils.dataframe_store import (
+    deserialize_dataframe_store as _deserialize_dataframe,
+    serialize_dataframe_store as _serialize_dataframe,
 )
 from utils.export_flow_data import (
     COUNTRY_MAPPING_CTE,
@@ -30,7 +46,12 @@ from utils.export_flow_data import (
     engine,
     get_available_countries,
 )
-from utils.table_styles import StandardTableStyleManager, TABLE_COLORS
+from utils.flow_country_selection import serialize_timestamp
+from utils.table_styles import (
+    StandardTableStyleManager,
+    TABLE_COLORS,
+    format_table_cell_value_1dp as _format_table_cell_value,
+)
 
 
 EXPORT_BUTTON_STYLE = {
@@ -140,13 +161,6 @@ FALLBACK_COLORS = [
     "#005EB8",
     "#00B5E2",
 ]
-
-TRAIN_CHANGE_TIME_VIEW_LABELS = {
-    "monthly": "Monthly",
-    "quarterly": "Quarterly",
-    "seasonally": "Seasonally",
-    "yearly": "Yearly",
-}
 
 TRAIN_CHANGE_TIME_VIEW_PERIOD_LABELS = {
     "monthly": "monthly",
@@ -1968,48 +1982,8 @@ def _build_ea_capacity_schedule(
     return expanded_df
 
 
-def _serialize_dataframe(df: pd.DataFrame | None) -> str | None:
-    if df is None or df.empty:
-        return None
-
-    return df.to_json(date_format="iso", orient="split")
-
-
-def _deserialize_dataframe(data: str | None) -> pd.DataFrame:
-    if not data:
-        return pd.DataFrame()
-
-    return pd.read_json(StringIO(data), orient="split")
-
-
 def _serialize_timestamp(value) -> str | None:
-    if value is None or pd.isna(value):
-        return None
-
-    return pd.Timestamp(value).isoformat()
-
-
-def _normalize_month_date(value) -> pd.Timestamp | None:
-    if not value:
-        return None
-
-    timestamp = pd.to_datetime(value, errors="coerce")
-    if pd.isna(timestamp):
-        return None
-
-    return timestamp.to_period("M").to_timestamp()
-
-
-def _get_date_bounds(dataframes: list[pd.DataFrame]) -> tuple[str | None, str | None]:
-    non_empty_frames = [df for df in dataframes if df is not None and not df.empty]
-    if not non_empty_frames:
-        return None, None
-
-    combined_df = pd.concat(non_empty_frames, ignore_index=True)
-    min_month = pd.to_datetime(combined_df["month"]).min()
-    max_month = pd.to_datetime(combined_df["month"]).max()
-
-    return min_month.strftime("%Y-%m-%d"), max_month.strftime("%Y-%m-%d")
+    return serialize_timestamp(value)
 
 
 def _get_default_interval_window() -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -2017,57 +1991,6 @@ def _get_default_interval_window() -> tuple[pd.Timestamp, pd.Timestamp]:
     default_start = pd.Timestamp(year=current_year - 1, month=12, day=1)
     default_end = pd.Timestamp(year=current_year + 5, month=12, day=1)
     return default_start, default_end
-
-
-def _build_lng_season_periods(
-    dates: pd.Series,
-) -> tuple[pd.Series, pd.Series]:
-    normalized_dates = pd.to_datetime(dates, errors="coerce").dt.to_period("M").dt.to_timestamp()
-    is_summer = normalized_dates.dt.month.between(4, 9)
-    season_year = (
-        normalized_dates.dt.year - normalized_dates.dt.month.isin([1, 2, 3]).astype(int)
-    ).astype("Int64")
-
-    season_start_month = pd.Series(10, index=normalized_dates.index, dtype="int64")
-    season_start_month.loc[is_summer] = 4
-
-    season_code = pd.Series("W", index=normalized_dates.index, dtype="object")
-    season_code.loc[is_summer] = "S"
-
-    season_start = pd.to_datetime(
-        {
-            "year": season_year,
-            "month": season_start_month,
-            "day": 1,
-        },
-        errors="coerce",
-    )
-    season_label = season_year.astype(str)
-    season_label = season_label.where(normalized_dates.notna(), "")
-    season_label = season_label + "-" + season_code.where(normalized_dates.notna(), "")
-    return season_start, season_label
-
-
-def _filter_by_date_range(
-    raw_df: pd.DataFrame,
-    start_date: str | None,
-    end_date: str | None,
-) -> pd.DataFrame:
-    if raw_df.empty:
-        return raw_df
-
-    filtered_df = raw_df.copy()
-    filtered_df["month"] = pd.to_datetime(filtered_df["month"]).dt.to_period("M").dt.to_timestamp()
-
-    start_month = _normalize_month_date(start_date)
-    end_month = _normalize_month_date(end_date)
-
-    if start_month is not None:
-        filtered_df = filtered_df[filtered_df["month"] >= start_month]
-    if end_month is not None:
-        filtered_df = filtered_df[filtered_df["month"] <= end_month]
-
-    return filtered_df
 
 
 def _apply_capacity_time_view(matrix_df: pd.DataFrame, time_view: str) -> pd.DataFrame:
@@ -2097,10 +2020,6 @@ def _apply_capacity_time_view(matrix_df: pd.DataFrame, time_view: str) -> pd.Dat
         view_df["Month"] = view_df["__axis_date"].dt.year.astype(str)
 
     return view_df.reset_index(drop=True)
-
-
-def _create_empty_state(message: str) -> html.Div:
-    return html.Div(message, className="balance-empty-state")
 
 
 def _create_empty_capacity_figure(message: str) -> go.Figure:
@@ -2219,14 +2138,41 @@ def _resolve_selected_countries(
     ]
 
 
-def _format_table_cell_value(value) -> str:
-    if pd.isna(value):
-        return ""
+def _resolve_capacity_country_scope(
+    train_raw_df: pd.DataFrame,
+    ea_raw_df: pd.DataFrame,
+    selected_countries: list[str] | None,
+    *,
+    scenario_rows_df: pd.DataFrame | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[str]:
+    country_scope_frames = []
+    if not train_raw_df.empty:
+        country_scope_frames.append(
+            train_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
+                ["month", "country_name", "total_mmtpa"]
+            ]
+        )
+    if not ea_raw_df.empty:
+        country_scope_frames.append(
+            ea_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
+                ["month", "country_name", "total_mmtpa"]
+            ]
+        )
+    if scenario_rows_df is not None:
+        internal_scope_df = _build_internal_scenario_monthly_schedule(
+            scenario_rows_df,
+            start_date,
+            end_date,
+        )
+        if not internal_scope_df.empty:
+            country_scope_frames.append(internal_scope_df)
 
-    if isinstance(value, (int, float)):
-        return f"{float(value):.1f}"
-
-    return str(value)
+    return _resolve_selected_countries(
+        get_available_countries(country_scope_frames),
+        selected_countries,
+    )
 
 
 def _build_responsive_column_styles(df: pd.DataFrame) -> list[dict]:
@@ -2451,17 +2397,6 @@ def _build_yearly_missing_internal_column_styles(provider: str) -> list[dict]:
 YEARLY_PROVIDER_DISCREPANCY_TABLE_MAX_HEIGHT = "390px"
 
 
-def _format_metadata_timestamp(value) -> str | None:
-    if not value:
-        return None
-
-    timestamp = pd.to_datetime(value, errors="coerce")
-    if pd.isna(timestamp):
-        return str(value)
-
-    return timestamp.strftime("%Y-%m-%d %H:%M")
-
-
 def _rename_total_column(matrix_df: pd.DataFrame) -> pd.DataFrame:
     if matrix_df.empty:
         return pd.DataFrame(columns=["Month", "Total MTPA"])
@@ -2477,7 +2412,6 @@ def _build_capacity_metadata_lines(metadata: dict | None) -> list[str]:
     if not metadata:
         return []
 
-    metadata = metadata.get("woodmac", metadata)
     metadata_lines = []
 
     metadata_lines.append(WOODMAC_LEGACY_CAPACITY_NOTE)
@@ -2491,7 +2425,6 @@ def _build_ea_capacity_metadata_lines(
     if not metadata:
         return [EA_SCHEDULE_CAPACITY_NOTE]
 
-    metadata = metadata.get("ea", metadata)
     metadata_lines = []
 
     metadata_lines.append(EA_SCHEDULE_CAPACITY_NOTE)
@@ -2500,55 +2433,6 @@ def _build_ea_capacity_metadata_lines(
     )
 
     return metadata_lines
-
-
-def _build_capacity_status_children(metadata: dict | None) -> html.Div:
-    metadata = metadata or {}
-    woodmac_metadata = metadata.get("woodmac", {})
-    ea_metadata = metadata.get("ea", {})
-
-    status_rows = [
-        (
-            CAPACITY_SOURCE_TABLE,
-            _format_metadata_timestamp(woodmac_metadata.get("monthly_upload_timestamp_utc")),
-        ),
-        (
-            WOODMAC_ANNUAL_OUTPUT_SOURCE_TABLE,
-            _format_metadata_timestamp(woodmac_metadata.get("annual_upload_timestamp_utc")),
-        ),
-        (
-            EA_CAPACITY_SOURCE_TABLE,
-            _format_metadata_timestamp(ea_metadata.get("upload_timestamp_utc")),
-        ),
-    ]
-
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.Span(
-                        table_name,
-                        style={
-                            "fontFamily": "SFMono-Regular, Menlo, Consolas, monospace",
-                            "color": "#0f172a",
-                        },
-                    ),
-                    html.Span(
-                        upload_timestamp or "n/a",
-                        style={"color": "#475569"},
-                    ),
-                ],
-                style={
-                    "display": "grid",
-                    "gridTemplateColumns": "minmax(0, 1fr) auto",
-                    "gap": "8px",
-                    "alignItems": "start",
-                },
-            )
-            for table_name, upload_timestamp in status_rows
-        ],
-        style={"display": "grid", "gap": "6px"},
-    )
 
 
 def _build_section_summary(
@@ -2579,7 +2463,6 @@ def _build_train_change_summary(
     time_view: str = "monthly",
     detail_view: str = "country",
 ) -> html.Div:
-    time_view_label = TRAIN_CHANGE_TIME_VIEW_LABELS.get(time_view, "Monthly")
     time_view_period_label = TRAIN_CHANGE_TIME_VIEW_PERIOD_LABELS.get(time_view, "monthly")
     detail_view_label = TRAIN_CHANGE_DETAIL_VIEW_LABELS.get(detail_view, "Country")
 
@@ -3311,34 +3194,6 @@ def _prepare_capacity_scenario_rows_df(rows_df: pd.DataFrame | None) -> pd.DataF
     return prepared_df[columns]
 
 
-def _build_capacity_scenario_rows_from_snapshot(
-    snapshot_df: pd.DataFrame,
-    base_provider: str,
-) -> pd.DataFrame:
-    columns = _get_capacity_scenario_row_columns()
-    if snapshot_df.empty:
-        return pd.DataFrame(columns=columns)
-
-    scenario_rows_df = pd.DataFrame(
-        {
-            "scenario_row_key": snapshot_df["scenario_row_key"],
-            "country_name": snapshot_df["Country"],
-            "plant_name": snapshot_df["Plant"],
-            "train_label": snapshot_df["Train"],
-            "base_provider": base_provider,
-            "base_first_date": snapshot_df["First Date"],
-            "base_capacity_mtpa": snapshot_df["Capacity Change"],
-            "scenario_first_date": snapshot_df["First Date"],
-            "scenario_capacity_mtpa": snapshot_df["Capacity Change"],
-            "scenario_note": "",
-            "display_sort_country": snapshot_df["display_sort_country"],
-            "display_sort_plant": snapshot_df["display_sort_plant"],
-            "display_sort_train": snapshot_df["display_sort_train"],
-        }
-    )
-    return _prepare_capacity_scenario_rows_df(scenario_rows_df)
-
-
 def _build_capacity_scenario_rows_from_internal_rows(
     source_rows_df: pd.DataFrame,
 ) -> pd.DataFrame:
@@ -3550,201 +3405,6 @@ def _build_yearly_capacity_comparison_df(
     return comparison_df[columns]
 
 
-def _aggregate_capacity_discrepancy_rows(
-    source_df: pd.DataFrame,
-    entity_column_name: str,
-    date_source_column: str,
-    capacity_source_column: str,
-    date_output_column: str,
-    capacity_output_column: str,
-) -> pd.DataFrame:
-    columns = [
-        "Country",
-        entity_column_name,
-        "Train",
-        date_output_column,
-        capacity_output_column,
-    ]
-    if source_df.empty:
-        return pd.DataFrame(columns=columns)
-
-    aggregated_df = source_df.copy()
-    country_series = (
-        aggregated_df["Country"]
-        if "Country" in aggregated_df.columns
-        else pd.Series("", index=aggregated_df.index, dtype="object")
-    )
-    plant_series = (
-        aggregated_df["Plant"]
-        if "Plant" in aggregated_df.columns
-        else pd.Series("", index=aggregated_df.index, dtype="object")
-    )
-    train_series = (
-        aggregated_df["Train"]
-        if "Train" in aggregated_df.columns
-        else pd.Series("", index=aggregated_df.index, dtype="object")
-    )
-    date_series = (
-        aggregated_df[date_source_column]
-        if date_source_column in aggregated_df.columns
-        else pd.Series(pd.NaT, index=aggregated_df.index)
-    )
-    capacity_series = (
-        aggregated_df[capacity_source_column]
-        if capacity_source_column in aggregated_df.columns
-        else pd.Series(float("nan"), index=aggregated_df.index, dtype="float64")
-    )
-    aggregated_df["Country"] = (
-        country_series.fillna("").astype(str).str.strip()
-    )
-    aggregated_df[entity_column_name] = (
-        plant_series.fillna("").astype(str).str.strip()
-    )
-    aggregated_df["Train"] = train_series.map(_format_train_label)
-    aggregated_df[date_output_column] = pd.to_datetime(
-        date_series,
-        errors="coerce",
-    )
-    aggregated_df[capacity_output_column] = pd.to_numeric(
-        capacity_series,
-        errors="coerce",
-    ).round(6)
-
-    aggregated_df = (
-        aggregated_df.groupby(
-            ["Country", entity_column_name, "Train"],
-            as_index=False,
-            dropna=False,
-        )
-        .agg(
-            {
-                date_output_column: "min",
-                capacity_output_column: "sum",
-            }
-        )
-    )
-
-    aggregated_df[date_output_column] = aggregated_df[date_output_column].dt.strftime("%Y-%m-%d")
-    aggregated_df[date_output_column] = aggregated_df[date_output_column].where(
-        aggregated_df[date_output_column].notna(),
-        None,
-    )
-    aggregated_df[capacity_output_column] = pd.to_numeric(
-        aggregated_df[capacity_output_column],
-        errors="coerce",
-    ).round(2)
-    return aggregated_df[columns]
-
-
-def _build_provider_capacity_discrepancy_df(
-    provider: str,
-    provider_change_df: pd.DataFrame,
-    scenario_change_df: pd.DataFrame,
-    top_n: int = 10,
-) -> pd.DataFrame:
-    provider_key = str(provider or "").strip().casefold()
-    provider_config = {
-        "woodmac": {
-            "entity_column": "Plant",
-            "provider_capacity_source_column": "Delta MTPA",
-            "provider_date_column": "Woodmac First Date",
-            "provider_capacity_column": "Woodmac Capacity",
-            "columns": [
-                "Country",
-                "Plant",
-                "Train",
-                "Woodmac First Date",
-                "Woodmac Capacity",
-                "Scenario First Date",
-                "Scenario Capacity",
-                "Abs Capacity Delta",
-            ],
-        },
-        "energy_aspects": {
-            "entity_column": "Project",
-            "provider_capacity_source_column": "EA Net Delta (MTPA)",
-            "provider_date_column": "Energy Aspects First Date",
-            "provider_capacity_column": "Energy Aspects Capacity",
-            "columns": [
-                "Country",
-                "Project",
-                "Train",
-                "Energy Aspects First Date",
-                "Energy Aspects Capacity",
-                "Scenario First Date",
-                "Scenario Capacity",
-                "Abs Capacity Delta",
-            ],
-        },
-    }.get(provider_key)
-    if provider_config is None:
-        raise ValueError(f"Unsupported provider '{provider}'.")
-
-    provider_aggregate_df = _aggregate_capacity_discrepancy_rows(
-        provider_change_df,
-        provider_config["entity_column"],
-        "Effective Date",
-        provider_config["provider_capacity_source_column"],
-        provider_config["provider_date_column"],
-        provider_config["provider_capacity_column"],
-    )
-    scenario_aggregate_df = _aggregate_capacity_discrepancy_rows(
-        scenario_change_df,
-        provider_config["entity_column"],
-        "Effective Date",
-        INTERNAL_SCENARIO_NET_COLUMN,
-        "Scenario First Date",
-        "Scenario Capacity",
-    )
-
-    discrepancy_df = pd.merge(
-        provider_aggregate_df,
-        scenario_aggregate_df,
-        on=["Country", provider_config["entity_column"], "Train"],
-        how="outer",
-    )
-    if discrepancy_df.empty:
-        return pd.DataFrame(columns=provider_config["columns"])
-
-    provider_capacity_values = pd.to_numeric(
-        discrepancy_df[provider_config["provider_capacity_column"]],
-        errors="coerce",
-    )
-    scenario_capacity_values = pd.to_numeric(
-        discrepancy_df["Scenario Capacity"],
-        errors="coerce",
-    )
-    discrepancy_df["Abs Capacity Delta"] = (
-        scenario_capacity_values.fillna(0.0) - provider_capacity_values.fillna(0.0)
-    ).abs().round(2)
-    discrepancy_df = discrepancy_df[
-        discrepancy_df["Abs Capacity Delta"].fillna(0.0).round(6).gt(0)
-    ].copy()
-    if discrepancy_df.empty:
-        return pd.DataFrame(columns=provider_config["columns"])
-
-    discrepancy_df["__train_sort"] = pd.to_numeric(
-        discrepancy_df["Train"],
-        errors="coerce",
-    )
-    discrepancy_df = discrepancy_df.sort_values(
-        [
-            "Abs Capacity Delta",
-            "Country",
-            provider_config["entity_column"],
-            "__train_sort",
-            "Train",
-        ],
-        ascending=[False, True, True, True, True],
-        na_position="last",
-    ).head(top_n)
-    discrepancy_df = discrepancy_df.drop(
-        columns=["__train_sort"],
-        errors="ignore",
-    ).reset_index(drop=True)
-    return discrepancy_df[provider_config["columns"]]
-
-
 def _build_train_timeline_grid_df_for_scope(
     train_raw_df: pd.DataFrame,
     ea_raw_df: pd.DataFrame,
@@ -3757,31 +3417,13 @@ def _build_train_timeline_grid_df_for_scope(
 ) -> pd.DataFrame:
     scenario_rows_df = _prepare_capacity_scenario_rows_df(scenario_rows_df)
 
-    country_scope_frames = []
-    if not train_raw_df.empty:
-        country_scope_frames.append(
-            train_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
-                ["month", "country_name", "total_mmtpa"]
-            ]
-        )
-    if not ea_raw_df.empty:
-        country_scope_frames.append(
-            ea_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
-                ["month", "country_name", "total_mmtpa"]
-            ]
-        )
-    internal_scope_df = _build_internal_scenario_monthly_schedule(
-        scenario_rows_df,
-        start_date,
-        end_date,
-    )
-    if not internal_scope_df.empty:
-        country_scope_frames.append(internal_scope_df)
-
-    available_countries = get_available_countries(country_scope_frames)
-    resolved_countries = _resolve_selected_countries(
-        available_countries,
+    resolved_countries = _resolve_capacity_country_scope(
+        train_raw_df,
+        ea_raw_df,
         selected_countries,
+        scenario_rows_df=scenario_rows_df,
+        start_date=start_date,
+        end_date=end_date,
     )
 
     woodmac_change_df = _build_train_change_log(
@@ -4442,6 +4084,109 @@ def _build_capacity_scenario_message(
     )
 
 
+def _run_capacity_ramp_forecast(scenario_id: int | None) -> dict:
+    if scenario_id is None:
+        return {
+            "status": "failed",
+            "publish_status": "not_published",
+            "message": "No internal scenario selected for ramp generation.",
+        }
+    try:
+        return generate_ramp_forecast_for_capacity_scenario(int(scenario_id), engine)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "publish_status": "not_published",
+            "message": str(exc),
+            "managed_adjustment_scenario_name": f"capacity_ramp_{int(scenario_id)}",
+        }
+
+
+def _format_capacity_ramp_result_message(result: dict | None) -> tuple[str, str]:
+    result = result or {}
+    managed_name = result.get("managed_adjustment_scenario_name") or "capacity_ramp_<scenario_id>"
+    status = str(result.get("status") or "").casefold()
+    run_id = result.get("run_id")
+    run_suffix = f" Run {run_id}." if run_id is not None else ""
+
+    if status == "published":
+        records = pd.to_numeric(result.get("records_published"), errors="coerce")
+        records_text = f" with {int(records):,} row(s)" if pd.notna(records) else ""
+        return (
+            f"Ramp forecast published as {managed_name}{records_text}.{run_suffix}",
+            "success",
+        )
+
+    if status == "publish_blocked":
+        blocking_count = pd.to_numeric(result.get("blocking_qa_count"), errors="coerce")
+        count_text = int(blocking_count) if pd.notna(blocking_count) else "some"
+        return (
+            f"Ramp forecast blocked by {count_text} QA issue(s); {managed_name} was not updated.{run_suffix}",
+            "warning",
+        )
+
+    message = result.get("message") or result.get("error_message") or "Ramp forecast generation failed."
+    return (
+        f"Ramp forecast failed: {message}",
+        "warning",
+    )
+
+
+def _append_capacity_ramp_result_message(
+    prefix: str,
+    result: dict | None,
+    default_tone: str = "success",
+) -> html.Div:
+    ramp_text, ramp_tone = _format_capacity_ramp_result_message(result)
+    tone = ramp_tone if ramp_tone != "success" else default_tone
+    return _build_capacity_scenario_message(f"{prefix} {ramp_text}", tone)
+
+
+def _render_capacity_ramp_status_card(status: dict | None) -> html.Div:
+    if not status:
+        return html.Div(
+            "Ramp forecast: no generated run yet.",
+            className="balance-metadata-row",
+            style={"fontSize": "11px"},
+        )
+
+    publish_status = str(status.get("publish_status") or status.get("status") or "unknown")
+    run_id = status.get("run_id")
+    model_version_id = status.get("model_version_id")
+    generated_at = status.get("generated_at")
+    managed_name = status.get("managed_adjustment_scenario_name") or "capacity_ramp_<scenario_id>"
+    blocking_count = pd.to_numeric(status.get("blocking_qa_count"), errors="coerce")
+    blocking_text = int(blocking_count) if pd.notna(blocking_count) else 0
+    monthly_count = pd.to_numeric(status.get("monthly_row_count"), errors="coerce")
+    monthly_text = int(monthly_count) if pd.notna(monthly_count) else 0
+
+    status_color = {
+        "published": "#166534",
+        "blocked": "#9a3412",
+        "not_published": "#9a3412",
+    }.get(publish_status.casefold(), "#334155")
+
+    return html.Div(
+        [
+            html.Span("Ramp forecast", style={"fontWeight": "800", "color": "#334155"}),
+            html.Span(f"Run {run_id}" if run_id is not None else "No run"),
+            html.Span(f"Model {model_version_id}" if model_version_id is not None else "No model"),
+            html.Span(publish_status.replace("_", " ").title(), style={"color": status_color, "fontWeight": "800"}),
+            html.Span(f"{blocking_text} blocking QA"),
+            html.Span(f"{monthly_text:,} monthly rows"),
+            html.Span(managed_name),
+            html.Span(_serialize_timestamp(generated_at) or ""),
+        ],
+        className="balance-metadata-row",
+        style={
+            "display": "flex",
+            "gap": "8px",
+            "flexWrap": "wrap",
+            "fontSize": "11px",
+        },
+    )
+
+
 def _normalize_grid_event_value(value):
     if value is None:
         return None
@@ -4543,7 +4288,7 @@ def _coerce_timeline_row_capacity(value: object) -> float | None:
     return round(float(numeric_value), 6)
 
 
-def _coerce_timeline_row_note(value: object) -> str:
+def _normalize_timeline_text(value: object) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
@@ -4554,6 +4299,10 @@ def _coerce_timeline_row_note(value: object) -> str:
     except Exception:
         pass
     return str(value).strip()
+
+
+def _coerce_timeline_row_note(value: object) -> str:
+    return _normalize_timeline_text(value)
 
 
 def _resolve_grid_row_base_provider(row: dict) -> str:
@@ -5595,6 +5344,11 @@ def _create_train_timeline_section(
                                 className="balance-metadata-row",
                                 style={"fontSize": "11px"},
                             ),
+                            html.Div(
+                                id="capacity-page-ramp-forecast-status",
+                                className="balance-metadata-row",
+                                style={"fontSize": "11px"},
+                            ),
                         ],
                         style=selected_card_style,
                     ),
@@ -6277,7 +6031,6 @@ def _create_train_timeline_comparison_figure(
 
     chart_start_date = start_month - pd.DateOffset(days=15)
     chart_end_date = end_month + pd.offsets.MonthEnd(1) + pd.DateOffset(days=15)
-    title_date_range = f"{start_month.strftime('%B %Y')} - {end_month.strftime('%B %Y')}"
     compare_differs = str(source_key or "").strip().casefold() != str(compare_key or "").strip().casefold()
 
     monthly_df = (
@@ -7467,7 +7220,7 @@ def _build_unmapped_train_summary(alias_df: pd.DataFrame) -> html.Div:
 def _create_unmapped_plant_mapping_table(
     table_id: str,
     alias_df: pd.DataFrame | None = None,
-) -> dash_table.DataTable:
+) -> dag.AgGrid:
     alias_df = pd.DataFrame() if alias_df is None else alias_df.copy()
     columns = [
         {"name": "Country", "id": "country_name", "editable": False},
@@ -7487,7 +7240,7 @@ def _create_unmapped_plant_mapping_table(
         {"name": "Plant Name", "id": "plant_name", "editable": True},
     ]
 
-    return dash_table.DataTable(
+    return create_ag_grid_from_datatable(
         id=table_id,
         columns=columns,
         data=alias_df.to_dict("records"),
@@ -7500,26 +7253,6 @@ def _create_unmapped_plant_mapping_table(
             "borderRadius": "4px",
             "border": "1px solid #e2e8f0",
             "maxHeight": "420px",
-        },
-        style_header={
-            "backgroundColor": "#1e293b",
-            "color": "white",
-            "fontWeight": "700",
-            "fontSize": "11px",
-            "textAlign": "center",
-            "textTransform": "uppercase",
-            "letterSpacing": "0.05em",
-            "padding": "10px 8px",
-        },
-        style_cell={
-            "textAlign": "left",
-            "fontSize": "12px",
-            "padding": "7px 10px",
-            "minWidth": "90px",
-            "maxWidth": "260px",
-            "border": "1px solid #f1f5f9",
-            "whiteSpace": "normal",
-            "height": "auto",
         },
         style_cell_conditional=[
             {"if": {"column_id": "country_name"}, "minWidth": "130px", "maxWidth": "170px"},
@@ -7556,7 +7289,7 @@ def _create_unmapped_plant_mapping_table(
 def _create_unmapped_train_mapping_table(
     table_id: str,
     alias_df: pd.DataFrame | None = None,
-) -> dash_table.DataTable:
+) -> dag.AgGrid:
     alias_df = pd.DataFrame() if alias_df is None else alias_df.copy()
     columns = [
         {"name": "Country", "id": "country_name", "editable": False},
@@ -7593,7 +7326,7 @@ def _create_unmapped_train_mapping_table(
         {"name": "Notes", "id": "notes", "editable": True},
     ]
 
-    return dash_table.DataTable(
+    return create_ag_grid_from_datatable(
         id=table_id,
         columns=columns,
         data=alias_df.to_dict("records"),
@@ -7606,26 +7339,6 @@ def _create_unmapped_train_mapping_table(
             "borderRadius": "4px",
             "border": "1px solid #e2e8f0",
             "maxHeight": "420px",
-        },
-        style_header={
-            "backgroundColor": "#1e293b",
-            "color": "white",
-            "fontWeight": "700",
-            "fontSize": "11px",
-            "textAlign": "center",
-            "textTransform": "uppercase",
-            "letterSpacing": "0.05em",
-            "padding": "10px 8px",
-        },
-        style_cell={
-            "textAlign": "left",
-            "fontSize": "12px",
-            "padding": "7px 10px",
-            "minWidth": "90px",
-            "maxWidth": "260px",
-            "border": "1px solid #f1f5f9",
-            "whiteSpace": "normal",
-            "height": "auto",
         },
         style_cell_conditional=[
             {"if": {"column_id": "country_name"}, "minWidth": "120px", "maxWidth": "160px"},
@@ -7787,7 +7500,7 @@ def _create_capacity_table(
     table_id: str,
     df: pd.DataFrame,
     table_view: str = "absolute",
-) -> dash_table.DataTable | html.Div:
+) -> dag.AgGrid | html.Div:
     if df.empty:
         return _create_empty_state("No data available for the current selection.")
 
@@ -7865,14 +7578,13 @@ def _create_capacity_table(
                 ]
             )
 
-    return dash_table.DataTable(
+    return create_ag_grid_from_datatable(
         id=table_id,
         columns=columns,
         data=display_df.to_dict("records"),
         sort_action="native",
         page_action="none",
         fill_width=False,
-        fixed_rows={"headers": True},
         fixed_columns={"headers": True, "data": 1},
         style_table={
             "overflowX": "auto",
@@ -7880,15 +7592,6 @@ def _create_capacity_table(
             "maxHeight": "560px",
             "width": "100%",
             "minWidth": "100%",
-        },
-        style_header=base_config["style_header"],
-        style_cell={
-            **base_config["style_cell"],
-            "minWidth": "auto",
-            "width": "auto",
-            "maxWidth": "none",
-            "border": f"1px solid {TABLE_COLORS['border_light']}",
-            "padding": "6px 8px",
         },
         style_cell_conditional=_build_responsive_column_styles(display_df),
         style_data_conditional=style_data_conditional,
@@ -7898,7 +7601,7 @@ def _create_capacity_table(
 def _create_yearly_capacity_comparison_table(
     table_id: str,
     comparison_df: pd.DataFrame,
-) -> dash_table.DataTable | html.Div:
+) -> dag.AgGrid | html.Div:
     if comparison_df.empty:
         return _create_empty_state(
             "No overlapping yearly Woodmac and Energy Aspects values are available for the current selection."
@@ -7987,29 +7690,19 @@ def _create_yearly_capacity_comparison_table(
             ]
         )
 
-    return dash_table.DataTable(
+    return create_ag_grid_from_datatable(
         id=table_id,
         columns=columns,
         data=display_df.to_dict("records"),
         sort_action="native",
         page_action="none",
         fill_width=True,
-        fixed_rows={"headers": True},
         style_table={
             "overflowX": "auto",
             "overflowY": "auto",
             "maxHeight": "460px",
             "width": "100%",
             "minWidth": "100%",
-        },
-        style_header=base_config["style_header"],
-        style_cell={
-            **base_config["style_cell"],
-            "minWidth": "auto",
-            "width": "auto",
-            "maxWidth": "none",
-            "border": f"1px solid {TABLE_COLORS['border_light']}",
-            "padding": "6px 6px",
         },
         style_cell_conditional=_build_yearly_capacity_comparison_column_styles(),
         style_data_conditional=style_data_conditional,
@@ -8021,7 +7714,7 @@ def _create_provider_capacity_discrepancy_table(
     discrepancy_df: pd.DataFrame,
     provider: str,
     empty_message: str | None = None,
-) -> dash_table.DataTable | html.Div:
+) -> dag.AgGrid | html.Div:
     provider_config = _get_provider_discrepancy_config(provider)
     provider_key = str(provider_config["provider_key"])
     provider_capacity_column = str(provider_config["provider_capacity_display_column"])
@@ -8092,7 +7785,7 @@ def _create_provider_capacity_discrepancy_table(
         ]
     )
 
-    return dash_table.DataTable(
+    return create_ag_grid_from_datatable(
         id=table_id,
         columns=columns,
         data=display_df.to_dict("records"),
@@ -8100,22 +7793,12 @@ def _create_provider_capacity_discrepancy_table(
         sort_by=[{"column_id": "Abs Capacity Delta", "direction": "desc"}],
         page_action="none",
         fill_width=True,
-        fixed_rows={"headers": True},
         style_table={
             "overflowX": "auto",
             "overflowY": "auto",
             "maxHeight": YEARLY_PROVIDER_DISCREPANCY_TABLE_MAX_HEIGHT,
             "width": "100%",
             "minWidth": "100%",
-        },
-        style_header=base_config["style_header"],
-        style_cell={
-            **base_config["style_cell"],
-            "minWidth": "auto",
-            "width": "auto",
-            "maxWidth": "none",
-            "border": f"1px solid {TABLE_COLORS['border_light']}",
-            "padding": "5px 6px",
         },
         style_cell_conditional=_build_yearly_discrepancy_column_styles(provider),
         style_data_conditional=style_data_conditional,
@@ -8127,7 +7810,7 @@ def _create_provider_timeline_discrepancy_table(
     discrepancy_df: pd.DataFrame,
     provider: str,
     empty_message: str | None = None,
-) -> dash_table.DataTable | html.Div:
+) -> dag.AgGrid | html.Div:
     provider_config = _get_provider_discrepancy_config(provider)
     provider_key = str(provider_config["provider_key"])
     provider_date_column = str(provider_config["provider_date_column"])
@@ -8186,7 +7869,7 @@ def _create_provider_timeline_discrepancy_table(
         ]
     )
 
-    return dash_table.DataTable(
+    return create_ag_grid_from_datatable(
         id=table_id,
         columns=columns,
         data=display_df.to_dict("records"),
@@ -8194,22 +7877,12 @@ def _create_provider_timeline_discrepancy_table(
         sort_by=[{"column_id": "Abs Timeline Delta (Months)", "direction": "desc"}],
         page_action="none",
         fill_width=True,
-        fixed_rows={"headers": True},
         style_table={
             "overflowX": "auto",
             "overflowY": "auto",
             "maxHeight": YEARLY_PROVIDER_DISCREPANCY_TABLE_MAX_HEIGHT,
             "width": "100%",
             "minWidth": "100%",
-        },
-        style_header=base_config["style_header"],
-        style_cell={
-            **base_config["style_cell"],
-            "minWidth": "auto",
-            "width": "auto",
-            "maxWidth": "none",
-            "border": f"1px solid {TABLE_COLORS['border_light']}",
-            "padding": "5px 6px",
         },
         style_cell_conditional=_build_yearly_timeline_discrepancy_column_styles(provider),
         style_data_conditional=style_data_conditional,
@@ -8221,7 +7894,7 @@ def _create_provider_missing_internal_scenario_table(
     missing_df: pd.DataFrame,
     provider: str,
     empty_message: str | None = None,
-) -> dash_table.DataTable | html.Div:
+) -> dag.AgGrid | html.Div:
     provider_config = _get_provider_discrepancy_config(provider)
     provider_key = str(provider_config["provider_key"])
     provider_date_column = str(provider_config["provider_date_column"])
@@ -8276,29 +7949,19 @@ def _create_provider_missing_internal_scenario_table(
         ]
     )
 
-    return dash_table.DataTable(
+    return create_ag_grid_from_datatable(
         id=table_id,
         columns=columns,
         data=display_df.to_dict("records"),
         sort_action="native",
         page_action="none",
         fill_width=True,
-        fixed_rows={"headers": True},
         style_table={
             "overflowX": "auto",
             "overflowY": "auto",
             "maxHeight": YEARLY_PROVIDER_DISCREPANCY_TABLE_MAX_HEIGHT,
             "width": "100%",
             "minWidth": "100%",
-        },
-        style_header=base_config["style_header"],
-        style_cell={
-            **base_config["style_cell"],
-            "minWidth": "auto",
-            "width": "auto",
-            "maxWidth": "none",
-            "border": f"1px solid {TABLE_COLORS['border_light']}",
-            "padding": "5px 6px",
         },
         style_cell_conditional=_build_yearly_missing_internal_column_styles(provider),
         style_data_conditional=style_data_conditional,
@@ -9084,7 +8747,7 @@ def _build_train_change_hierarchical_rows(
 def _create_train_change_table(
     change_df: pd.DataFrame,
     internal_scenario_label: str | None = None,
-) -> dash_table.DataTable | html.Div:
+) -> dag.AgGrid | html.Div:
     if change_df.empty:
         return html.Div(
             [
@@ -9218,35 +8881,16 @@ def _create_train_change_table(
             ]
         )
 
-    table = dash_table.DataTable(
+    table = create_ag_grid_from_datatable(
         id="capacity-page-train-change-table",
         columns=columns,
         data=change_df.to_dict("records"),
-        fixed_rows={"headers": True},
         style_table={
             "overflowX": "auto",
             "overflowY": "auto",
             "borderRadius": "4px",
             "border": "1px solid #e2e8f0",
             "maxHeight": "620px",
-        },
-        style_header={
-            "backgroundColor": "#1e293b",
-            "color": "white",
-            "fontWeight": "700",
-            "fontSize": "11px",
-            "textAlign": "center",
-            "textTransform": "uppercase",
-            "letterSpacing": "0.05em",
-            "padding": "10px 8px",
-        },
-        style_cell={
-            "textAlign": "center",
-            "fontSize": "12px",
-            "padding": "7px 10px",
-            "minWidth": "72px",
-            "maxWidth": "160px",
-            "border": "1px solid #f1f5f9",
         },
         style_cell_conditional=[
             {"if": {"column_id": "Effective Date"}, "minWidth": "130px", "maxWidth": "140px"},
@@ -9262,7 +8906,6 @@ def _create_train_change_table(
             "month_group_key",
             "month_group_end",
         ],
-        merge_duplicate_headers=True,
         sort_action="none",
         page_action="none",
         fill_width=False,
@@ -9640,6 +9283,14 @@ def _blank_timeline_value_mask(series: pd.Series) -> pd.Series:
     return series.map(_is_blank_timeline_value)
 
 
+def _timeline_bool_mask(values: pd.Series | bool, index: pd.Index) -> pd.Series:
+    if isinstance(values, pd.Series):
+        series = values.reindex(index)
+    else:
+        series = pd.Series(values, index=index)
+    return series.astype("boolean").fillna(False).astype(bool)
+
+
 def _apply_train_timeline_provider_backfill(
     grid_df: pd.DataFrame,
     lookup_df: pd.DataFrame,
@@ -9650,7 +9301,7 @@ def _apply_train_timeline_provider_backfill(
     if grid_df.empty:
         return grid_df
 
-    grid_df[flag_column] = grid_df.get(flag_column, False).fillna(False).astype(bool)
+    grid_df[flag_column] = _timeline_bool_mask(grid_df.get(flag_column, False), grid_df.index)
     if lookup_df is None or lookup_df.empty:
         return grid_df
 
@@ -9715,7 +9366,10 @@ def _apply_train_timeline_provider_backfill(
             any_fill_mask |= mask
         merged_df[flag_column] = merged_df[flag_column] | (
             any_fill_mask
-            & merged_df[f"__lookup_{provider_prefix}_out_of_range"].fillna(False).astype(bool)
+            & _timeline_bool_mask(
+                merged_df[f"__lookup_{provider_prefix}_out_of_range"],
+                merged_df.index,
+            )
         )
 
     return merged_df.drop(
@@ -9737,7 +9391,10 @@ def _apply_train_timeline_scenario_backfill(
     if grid_df.empty:
         return grid_df
 
-    grid_df["__scenario_out_of_range"] = grid_df.get("__scenario_out_of_range", False).fillna(False).astype(bool)
+    grid_df["__scenario_out_of_range"] = _timeline_bool_mask(
+        grid_df.get("__scenario_out_of_range", False),
+        grid_df.index,
+    )
     if lookup_df is None or lookup_df.empty:
         return grid_df
 
@@ -9801,11 +9458,11 @@ def _apply_train_timeline_scenario_backfill(
             any_fill_mask |= mask
         merged_df["__scenario_overridden"] = merged_df["__scenario_overridden"].where(
             ~any_fill_mask,
-            merged_df["__lookup_scenario_overridden"].fillna(False),
+            _timeline_bool_mask(merged_df["__lookup_scenario_overridden"], merged_df.index),
         )
         merged_df["__scenario_out_of_range"] = merged_df["__scenario_out_of_range"] | (
             any_fill_mask
-            & merged_df["__lookup_scenario_out_of_range"].fillna(False).astype(bool)
+            & _timeline_bool_mask(merged_df["__lookup_scenario_out_of_range"], merged_df.index)
         )
 
     return merged_df.drop(
@@ -10017,8 +9674,9 @@ def _build_train_timeline_grid_rows(
             "display_sort_effective_date",
             "display_sort_direction",
         ]:
-            scenario_with_reference_df[column_name] = scenario_with_reference_df[column_name].combine_first(
-                scenario_with_reference_df[f"reference_{column_name}"]
+            scenario_with_reference_df[column_name] = scenario_with_reference_df[column_name].where(
+                scenario_with_reference_df[column_name].notna(),
+                scenario_with_reference_df[f"reference_{column_name}"],
             )
         scenario_with_reference_df["scenario_row_key"] = scenario_with_reference_df["scenario_row_key"].fillna(
             scenario_with_reference_df["reference_row_key"]
@@ -10085,7 +9743,10 @@ def _build_train_timeline_grid_rows(
             ignore_index=True,
             sort=False,
         )
-        grid_df["__scenario_overridden"] = grid_df["__scenario_overridden"].fillna(False)
+        grid_df["__scenario_overridden"] = _timeline_bool_mask(
+            grid_df["__scenario_overridden"],
+            grid_df.index,
+        )
 
     grid_df["__woodmac_out_of_range"] = False
     grid_df["__ea_out_of_range"] = False
@@ -10340,7 +10001,13 @@ def _create_train_timeline_table(
         },
         dashGridOptions={
             "animateRows": False,
-            "rowSelection": "multiple",
+            "rowSelection": {
+                "mode": "multiRow",
+                "checkboxes": False,
+                "headerCheckbox": False,
+                "enableClickSelection": True,
+                "enableSelectionWithoutKeys": True,
+            },
             "undoRedoCellEditing": True,
             "undoRedoCellEditingLimit": 30,
             "stopEditingWhenCellsLoseFocus": True,
@@ -10501,16 +10168,7 @@ def _export_train_timeline_workbook_bytes(
 
 
 def _normalize_train_timeline_import_text(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    return str(value).strip()
+    return _normalize_timeline_text(value)
 
 
 def _normalize_train_timeline_import_value(
@@ -10864,8 +10522,6 @@ layout = html.Div(
         ),
         html.Div(
             [
-                html.Div(
-                    [
                         html.Div(
                             [
                                 html.Div("Date Range", className="filter-group-header"),
@@ -10886,10 +10542,10 @@ layout = html.Div(
                                             number_of_months_shown=2,
                                         )
                                     ],
-                                    className="professional-date-picker capacity-page-date-range-picker",
+                                    className="professional-date-picker",
                                 ),
                             ],
-                            className="filter-section filter-section-destination",
+                            className="filter-group",
                         ),
                         html.Div(
                             [
@@ -10923,10 +10579,10 @@ layout = html.Div(
                                             style={"display": "flex", "alignItems": "center"},
                                         )
                                     ],
-                                    style=TRAIN_CHANGE_CONTROL_SHELL_STYLE,
+                                    style={**TRAIN_CHANGE_CONTROL_SHELL_STYLE, "padding": "3px 8px 3px 12px"},
                                 ),
                             ],
-                            className="filter-section filter-section-destination",
+                            className="filter-group",
                         ),
                         html.Div(
                             [
@@ -10947,24 +10603,16 @@ layout = html.Div(
                                     style={"width": "100%"},
                                 ),
                             ],
-                            className="filter-section filter-section-scenario",
+                            className="filter-group",
                         ),
-                        html.Div(
-                            [
-                                html.Div("Status", className="filter-group-header"),
-                                html.Div(
-                                    id="capacity-page-meta-indicator",
-                                    className="text-tertiary",
-                                    style={"fontSize": "11px", "maxWidth": "640px", "width": "100%"},
-                                ),
-                            ],
-                            className="filter-section filter-section-analysis",
-                        ),
-                    ],
-                    className="filter-bar-grouped",
-                )
             ],
             className="professional-section-header",
+            style={
+                "display": "flex",
+                "gap": "12px",
+                "alignItems": "flex-end",
+                "flexWrap": "wrap",
+            },
         ),
         html.Div(
             [
@@ -11264,14 +10912,6 @@ def update_capacity_date_range(woodmac_data, ea_capacity_data, current_start_dat
 
 
 @callback(
-    Output("capacity-page-meta-indicator", "children"),
-    Input("capacity-page-metadata-store", "data"),
-)
-def update_capacity_status(metadata):
-    return _build_capacity_status_children(metadata)
-
-
-@callback(
     Output("capacity-page-load-error-banner", "children"),
     Input("capacity-page-load-error-store", "data"),
 )
@@ -11322,7 +10962,6 @@ def sync_capacity_scenario_controls(options_data, selected_scenario_id, dirty_da
         for option in (options_data or [])
         if pd.notna(pd.to_numeric(option.get("scenario_id"), errors="coerce"))
     ]
-    valid_ids = [option["value"] for option in options]
     normalized_selected = pd.to_numeric(selected_scenario_id, errors="coerce")
     selected_value = int(normalized_selected) if pd.notna(normalized_selected) else None
 
@@ -11351,6 +10990,26 @@ def sync_capacity_scenario_controls(options_data, selected_scenario_id, dirty_da
         scenario_disabled,
         upload_button_style,
     )
+
+
+@callback(
+    Output("capacity-page-ramp-forecast-status", "children"),
+    Input("capacity-page-capacity-scenario-selected-store", "data"),
+    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+)
+def render_capacity_ramp_forecast_status(selected_scenario_id, _scenario_refresh_timestamp):
+    selected_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    if pd.isna(selected_value):
+        return _render_capacity_ramp_status_card(None)
+    try:
+        status = get_latest_ramp_forecast_status(int(selected_value), engine)
+    except Exception as exc:
+        return html.Div(
+            f"Ramp forecast status unavailable: {exc}",
+            className="balance-metadata-row",
+            style={"fontSize": "11px", "color": "#9a3412", "fontWeight": "700"},
+        )
+    return _render_capacity_ramp_status_card(status)
 
 
 @callback(
@@ -11410,7 +11069,6 @@ def toggle_capacity_scenario_source_dropdown(base_type, current_source_value):
     Output("capacity-page-capacity-scenario-switch-confirm", "displayed", allow_duplicate=True),
     Input("capacity-page-internal-scenario-dropdown", "value"),
     State("capacity-page-capacity-scenario-selected-store", "data"),
-    State("capacity-page-capacity-scenario-working-store", "data"),
     State("capacity-page-capacity-scenario-dirty-store", "data"),
     State("capacity-page-capacity-scenario-options-store", "data"),
     State("capacity-page-train-capacity-data-store", "data"),
@@ -11420,7 +11078,6 @@ def toggle_capacity_scenario_source_dropdown(base_type, current_source_value):
 def handle_capacity_scenario_selection(
     dropdown_value,
     current_selected_scenario_id,
-    current_working_store,
     current_dirty_store,
     scenario_options_data,
     train_capacity_data,
@@ -11594,14 +11251,14 @@ def refresh_selected_capacity_scenario_working_copy(
     State("capacity-page-train-timeline-table", "rowData"),
 )
 def manage_capacity_scenario_state(
-    create_clicks,
-    save_clicks,
-    revert_clicks,
-    delete_clicks,
-    switch_submit_clicks,
-    switch_cancel_clicks,
-    delete_submit_clicks,
-    delete_cancel_clicks,
+    _create_clicks,
+    _save_clicks,
+    _revert_clicks,
+    _delete_clicks,
+    _switch_submit_clicks,
+    _switch_cancel_clicks,
+    _delete_submit_clicks,
+    _delete_cancel_clicks,
     current_selected_scenario_id,
     current_working_store,
     current_dirty_store,
@@ -11708,6 +11365,7 @@ def manage_capacity_scenario_state(
                 source_rows_df=source_rows_df,
             )
             created_rows_df = fetch_capacity_scenario_rows(create_result["scenario_id"], engine)
+            ramp_result = _run_capacity_ramp_forecast(create_result["scenario_id"])
             refresh_value = dt.datetime.utcnow().isoformat()
             return (
                 create_result["scenario_id"],
@@ -11716,9 +11374,9 @@ def manage_capacity_scenario_state(
                 refresh_value,
                 None,
                 create_result["scenario_id"],
-                _build_capacity_scenario_message(
+                _append_capacity_ramp_result_message(
                     f"Created internal scenario '{create_result['scenario_name']}' with {create_result['row_count']:,} rows.",
-                    "success",
+                    ramp_result,
                 ),
                 False,
                 False,
@@ -11758,6 +11416,7 @@ def manage_capacity_scenario_state(
                 timeline_row_data,
             )
             save_capacity_scenario_rows(current_selected, updated_rows_df, engine)
+            ramp_result = _run_capacity_ramp_forecast(current_selected)
             refresh_value = dt.datetime.utcnow().isoformat()
             return (
                 current_selected,
@@ -11766,7 +11425,7 @@ def manage_capacity_scenario_state(
                 refresh_value,
                 None,
                 no_update,
-                _build_capacity_scenario_message("Scenario saved successfully.", "success"),
+                _append_capacity_ramp_result_message("Scenario saved successfully.", ramp_result),
                 False,
                 False,
             )
@@ -11848,6 +11507,23 @@ def manage_capacity_scenario_state(
             raise PreventUpdate
         try:
             delete_result = delete_capacity_scenario(current_selected, engine)
+            try:
+                ramp_delete_result = delete_managed_ramp_output_for_capacity_scenario(
+                    current_selected,
+                    engine,
+                )
+                delete_message = (
+                    f"Deleted internal scenario '{delete_result['scenario_name']}'. "
+                    f"Removed {ramp_delete_result['records_deleted']:,} managed ramp adjustment row(s) "
+                    f"from {ramp_delete_result['managed_adjustment_scenario_name']}."
+                )
+                delete_tone = "success"
+            except Exception as cleanup_exc:
+                delete_message = (
+                    f"Deleted internal scenario '{delete_result['scenario_name']}', "
+                    f"but managed ramp output cleanup failed: {cleanup_exc}"
+                )
+                delete_tone = "warning"
             refresh_value = dt.datetime.utcnow().isoformat()
             return (
                 None,
@@ -11857,8 +11533,8 @@ def manage_capacity_scenario_state(
                 None,
                 None,
                 _build_capacity_scenario_message(
-                    f"Deleted internal scenario '{delete_result['scenario_name']}'.",
-                    "success",
+                    delete_message,
+                    delete_tone,
                 ),
                 False,
                 False,
@@ -12588,30 +12264,13 @@ def render_train_capacity_change_table(
             _create_train_change_table(empty_df),
         )
 
-    country_scope_frames = []
-    if not train_raw_df.empty:
-        country_scope_frames.append(
-            train_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
-                ["month", "country_name", "total_mmtpa"]
-            ]
-        )
-    if not ea_raw_df.empty:
-        country_scope_frames.append(
-            ea_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
-                ["month", "country_name", "total_mmtpa"]
-            ]
-        )
-    internal_scope_df = _build_internal_scenario_monthly_schedule(
-        working_rows_df,
-        start_date,
-        end_date,
-    )
-    if not internal_scope_df.empty:
-        country_scope_frames.append(internal_scope_df)
-    available_countries = get_available_countries(country_scope_frames)
-    resolved_countries = _resolve_selected_countries(
-        available_countries,
+    resolved_countries = _resolve_capacity_country_scope(
+        train_raw_df,
+        ea_raw_df,
         selected_countries,
+        scenario_rows_df=working_rows_df,
+        start_date=start_date,
+        end_date=end_date,
     )
 
     woodmac_change_df = _build_train_change_log(
@@ -12701,30 +12360,13 @@ def render_train_timeline_table(
         current_timeline_row_data,
     )
 
-    country_scope_frames = []
-    if not train_raw_df.empty:
-        country_scope_frames.append(
-            train_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
-                ["month", "country_name", "total_mmtpa"]
-            ]
-        )
-    if not ea_raw_df.empty:
-        country_scope_frames.append(
-            ea_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
-                ["month", "country_name", "total_mmtpa"]
-            ]
-        )
-    internal_scope_df = _build_internal_scenario_monthly_schedule(
-        scenario_rows_df,
-        start_date,
-        end_date,
-    )
-    if not internal_scope_df.empty:
-        country_scope_frames.append(internal_scope_df)
-    available_countries = get_available_countries(country_scope_frames)
-    resolved_countries = _resolve_selected_countries(
-        available_countries,
+    resolved_countries = _resolve_capacity_country_scope(
+        train_raw_df,
+        ea_raw_df,
         selected_countries,
+        scenario_rows_df=scenario_rows_df,
+        start_date=start_date,
+        end_date=end_date,
     )
 
     woodmac_change_df = _build_train_change_log(
@@ -12886,9 +12528,9 @@ def render_train_timeline_comparison_chart(
 
 @callback(
     Output("capacity-page-unmapped-plant-summary", "children"),
-    Output("capacity-page-unmapped-plant-table", "data"),
+    Output("capacity-page-unmapped-plant-table", "rowData"),
     Output("capacity-page-unmapped-train-summary", "children"),
-    Output("capacity-page-unmapped-train-table", "data"),
+    Output("capacity-page-unmapped-train-table", "rowData"),
     Input("capacity-page-train-capacity-data-store", "data"),
     Input("capacity-page-ea-capacity-data-store", "data"),
     Input("capacity-page-country-dropdown", "value"),
@@ -13002,7 +12644,7 @@ def _clean_allocation_share_value(value: object, default: float = 1.0) -> float 
     Output("capacity-page-plant-mapping-save-trigger", "data"),
     Output("capacity-page-unmapped-plant-message", "children"),
     Input("capacity-page-save-plant-mappings-button", "n_clicks"),
-    State("capacity-page-unmapped-plant-table", "data"),
+    State("capacity-page-unmapped-plant-table", "rowData"),
     prevent_initial_call=True,
 )
 def save_unmapped_plant_mappings(n_clicks, table_data):
@@ -13125,7 +12767,7 @@ def save_unmapped_plant_mappings(n_clicks, table_data):
     Output("capacity-page-train-mapping-save-trigger", "data"),
     Output("capacity-page-unmapped-train-message", "children"),
     Input("capacity-page-save-train-mappings-button", "n_clicks"),
-    State("capacity-page-unmapped-train-table", "data"),
+    State("capacity-page-unmapped-train-table", "rowData"),
     prevent_initial_call=True,
 )
 def save_unmapped_train_mappings(n_clicks, table_data):
@@ -13577,29 +13219,16 @@ def export_train_change_excel(
 
     train_raw_df = _deserialize_dataframe(train_capacity_data)
     ea_raw_df = _deserialize_dataframe(ea_capacity_data)
+    working_rows_df = _deserialize_dataframe(working_scenario_data)
 
-    country_scope_frames = []
-    if not train_raw_df.empty:
-        country_scope_frames.append(
-            train_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
-                ["month", "country_name", "total_mmtpa"]
-            ]
-        )
-    if not ea_raw_df.empty:
-        country_scope_frames.append(
-            ea_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
-                ["month", "country_name", "total_mmtpa"]
-            ]
-        )
-    internal_scope_df = _build_internal_scenario_monthly_schedule(
-        _deserialize_dataframe(working_scenario_data),
-        start_date,
-        end_date,
+    resolved_countries = _resolve_capacity_country_scope(
+        train_raw_df,
+        ea_raw_df,
+        selected_countries,
+        scenario_rows_df=working_rows_df,
+        start_date=start_date,
+        end_date=end_date,
     )
-    if not internal_scope_df.empty:
-        country_scope_frames.append(internal_scope_df)
-    available_countries = get_available_countries(country_scope_frames)
-    resolved_countries = _resolve_selected_countries(available_countries, selected_countries)
 
     woodmac_change_df = _build_train_change_log(
         train_raw_df, resolved_countries, other_countries_mode, start_date, end_date
@@ -13608,7 +13237,7 @@ def export_train_change_excel(
         ea_raw_df, resolved_countries, other_countries_mode, start_date, end_date
     )
     internal_change_df = _build_internal_scenario_change_log(
-        _deserialize_dataframe(working_scenario_data),
+        working_rows_df,
         resolved_countries,
         other_countries_mode,
         start_date,
@@ -13707,28 +13336,14 @@ def export_train_timeline_excel(
         timeline_row_data,
     )
 
-    country_scope_frames = []
-    if not train_raw_df.empty:
-        country_scope_frames.append(
-            train_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
-                ["month", "country_name", "total_mmtpa"]
-            ]
-        )
-    if not ea_raw_df.empty:
-        country_scope_frames.append(
-            ea_raw_df.rename(columns={"capacity_mtpa": "total_mmtpa"})[
-                ["month", "country_name", "total_mmtpa"]
-            ]
-        )
-    internal_scope_df = _build_internal_scenario_monthly_schedule(
-        active_rows_df,
-        start_date,
-        end_date,
+    resolved_countries = _resolve_capacity_country_scope(
+        train_raw_df,
+        ea_raw_df,
+        selected_countries,
+        scenario_rows_df=active_rows_df,
+        start_date=start_date,
+        end_date=end_date,
     )
-    if not internal_scope_df.empty:
-        country_scope_frames.append(internal_scope_df)
-    available_countries = get_available_countries(country_scope_frames)
-    resolved_countries = _resolve_selected_countries(available_countries, selected_countries)
 
     woodmac_change_df = _build_train_change_log(
         train_raw_df,

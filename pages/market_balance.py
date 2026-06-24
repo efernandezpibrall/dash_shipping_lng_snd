@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
 from io import BytesIO
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from dash import Input, Output, State, callback, dash_table, dcc, html, no_update
+from dash import Input, Output, State, callback, dcc, html, no_update
 from dash.dash_table.Format import Format, Scheme
+from utils.ag_grid_tables import create_ag_grid_from_datatable
 from plotly.subplots import make_subplots
 
 from utils.balance_time import TIME_GROUP_LABELS, normalize_time_group
+from utils.balance_components import create_balance_empty_state as _create_empty_state
+from utils.snapshot_controls import (
+    deserialize_snapshot_value as _deserialize_snapshot_value,
+    format_metadata_timestamp as _format_metadata_timestamp,
+    resolve_snapshot_control_values as _resolve_snapshot_control_values,
+)
 from utils.market_balance_data import (
     COUNTRY_GROUP_LABELS,
     build_period_delta_table,
+    deserialize_frame as _deserialize_frame,
     fetch_country_balance_meta_payload,
     fetch_country_balance_payload,
     fetch_net_balance_for_ea_upload,
@@ -23,7 +31,13 @@ from utils.market_balance_data import (
     fetch_trade_balance_payload,
     serialize_frame,
 )
-from utils.table_styles import StandardTableStyleManager
+
+if TYPE_CHECKING:
+    import dash_ag_grid as dag
+from utils.table_styles import (
+    StandardTableStyleManager,
+    format_table_cell_value_1dp as _format_table_cell_value,
+)
 
 
 EXPORT_BUTTON_STYLE = {
@@ -42,11 +56,18 @@ STICKY_CONTROL_SHELL_STYLE = {
     "display": "inline-flex",
     "alignItems": "center",
     "gap": "10px",
-    "padding": "6px 8px 6px 12px",
+    "padding": "3px 8px 3px 12px",
     "backgroundColor": "#ffffff",
     "border": "1px solid #dbe4ee",
     "borderRadius": "999px",
     "boxShadow": "0 1px 2px rgba(15, 23, 42, 0.05)",
+}
+
+MARKET_BALANCE_STICKY_HEADER_STYLE = {
+    "display": "flex",
+    "gap": "12px",
+    "alignItems": "flex-end",
+    "flexWrap": "wrap",
 }
 
 STICKY_RADIO_LABEL_STYLE = {
@@ -115,62 +136,6 @@ def _default_market_balance_end_date() -> str:
     return dt.date(today.year + 5, 12, 31).isoformat()
 
 
-def _deserialize_frame(payload: dict | None) -> pd.DataFrame:
-    if not payload:
-        return pd.DataFrame()
-
-    records = payload.get("records") or []
-    columns = payload.get("columns") or []
-    if not records:
-        return pd.DataFrame(columns=columns)
-
-    df = pd.DataFrame(records)
-    if columns:
-        for column_name in columns:
-            if column_name not in df.columns:
-                df[column_name] = None
-        df = df[columns]
-
-    for column_name in payload.get("numeric_columns") or []:
-        if column_name in df.columns:
-            df[column_name] = pd.to_numeric(df[column_name], errors="coerce")
-
-    return df
-
-
-def _format_metadata_timestamp(value) -> str | None:
-    if not value:
-        return None
-
-    timestamp = pd.to_datetime(value, errors="coerce")
-    if pd.isna(timestamp):
-        return str(value)
-    return timestamp.strftime("%Y-%m-%d %H:%M")
-
-
-def _format_month_label(value) -> str | None:
-    if not value:
-        return None
-
-    timestamp = pd.to_datetime(value, errors="coerce")
-    if pd.isna(timestamp):
-        return str(value)
-    return timestamp.strftime("%Y-%m")
-
-
-def _format_date_range_label(start_date, end_date) -> str:
-    start_label = _format_month_label(start_date)
-    end_label = _format_month_label(end_date)
-
-    if start_label and end_label:
-        return f"{start_label} to {end_label}"
-    if start_label:
-        return f"From {start_label}"
-    if end_label:
-        return f"Through {end_label}"
-    return "Full history"
-
-
 def _empty_figure(message: str) -> go.Figure:
     figure = go.Figure()
     figure.update_layout(
@@ -225,16 +190,6 @@ def _choose_country_snapshot_value(
     if current_snapshot in snapshots:
         return current_snapshot
     return snapshots[1] if len(snapshots) > 1 else None
-
-
-def _format_table_cell_value(value) -> str:
-    if pd.isna(value):
-        return ""
-
-    if isinstance(value, (int, float)):
-        return f"{float(value):.1f}"
-
-    return str(value)
 
 
 def _split_wrapped_header_name(column_name: str) -> list[str]:
@@ -341,7 +296,7 @@ def _build_market_table(
     page_size: int = 18,
     compact: bool = False,
     wrap_multi_word_headers: bool = False,
-) -> html.Div | dash_table.DataTable:
+) -> html.Div | dag.AgGrid:
     df = _deserialize_frame(payload)
     if df.empty:
         return html.Div(empty_message, className="text-tertiary", style={"padding": "16px"})
@@ -419,62 +374,16 @@ def _build_market_table(
                 ]
             )
 
-    return dash_table.DataTable(
+    return create_ag_grid_from_datatable(
         id=table_id,
         columns=columns,
         data=df.to_dict("records"),
-        style_table={"overflowX": "auto", "marginTop": "12px"},
-        style_header={
-            **base_config["style_header"],
-            **(
-                {
-                    "padding": "5px 4px",
-                    "lineHeight": "1.05",
-                    "whiteSpace": "pre-wrap",
-                }
-                if compact
-                else {}
-            ),
-        },
-        style_cell={
-            **base_config["style_cell"],
-            "width": "auto",
-            "minWidth": "58px" if compact else "64px",
-            "maxWidth": "none",
-            **(
-                {
-                    "padding": "5px 4px",
-                    "lineHeight": "1.15",
-                    "fontSize": "11px",
-                }
-                if compact
-                else {}
-            ),
-        },
         style_cell_conditional=_build_responsive_column_styles(
             df,
             compact=compact,
             wrap_multi_word_headers=wrap_multi_word_headers,
         ),
         style_data_conditional=style_data_conditional,
-        css=(
-            [
-                {
-                    "selector": ".dash-header div",
-                    "rule": "white-space: normal; overflow: visible; text-overflow: clip;",
-                },
-                {
-                    "selector": ".dash-spreadsheet th",
-                    "rule": "height: auto;",
-                },
-                {
-                    "selector": ".dash-cell div",
-                    "rule": "white-space: normal;",
-                },
-            ]
-            if wrap_multi_word_headers
-            else []
-        ),
         fill_width=False,
         page_size=page_size,
     )
@@ -619,139 +528,6 @@ def _build_maintenance_kpi_cards(comparison_df: pd.DataFrame) -> html.Div:
     )
 
 
-def _create_empty_state(message: str) -> html.Div:
-    return html.Div(message, className="balance-empty-state")
-
-
-def _serialize_snapshot_value(payload: dict[str, str | None]) -> str:
-    return json.dumps(payload, sort_keys=True)
-
-
-def _deserialize_snapshot_value(value: str | dict | None) -> dict[str, str | None]:
-    if not value:
-        return {}
-
-    if isinstance(value, dict):
-        return value
-
-    try:
-        parsed_value = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        return {}
-
-    return parsed_value if isinstance(parsed_value, dict) else {}
-
-
-def _default_previous_option_value(options: list[dict]) -> str | None:
-    if len(options) > 1:
-        return options[1]["value"]
-    if options:
-        return options[0]["value"]
-    return None
-
-
-def _build_woodmac_snapshot_dropdown_options(
-    publication_options: list[dict[str, str | None]],
-) -> list[dict[str, str]]:
-    dropdown_options = []
-    for option in publication_options:
-        publication_label = option.get("market_outlook", "Unknown publication")
-        publication_timestamp = _format_metadata_timestamp(
-            option.get("publication_timestamp")
-        )
-        label = publication_label
-        if publication_timestamp:
-            label = f"{publication_label} | {publication_timestamp}"
-
-        dropdown_options.append(
-            {
-                "label": label,
-                "value": _serialize_snapshot_value(option),
-            }
-        )
-
-    return dropdown_options
-
-
-def _build_ea_upload_dropdown_options(
-    upload_timestamps: list[str],
-) -> list[dict[str, str]]:
-    dropdown_options = []
-    for upload_timestamp in upload_timestamps:
-        formatted_timestamp = _format_metadata_timestamp(upload_timestamp) or upload_timestamp
-        dropdown_options.append(
-            {
-                "label": formatted_timestamp,
-                "value": upload_timestamp,
-            }
-        )
-
-    return dropdown_options
-
-
-def _resolve_snapshot_control_values(
-    comparison_source,
-    comparison_options,
-    current_st_value,
-    current_lt_value,
-    current_ea_upload_value,
-):
-    comparison_options = comparison_options or {}
-    woodmac_options = comparison_options.get("woodmac", {})
-    short_term_options = _build_woodmac_snapshot_dropdown_options(
-        woodmac_options.get("short_term", [])
-    )
-    long_term_options = _build_woodmac_snapshot_dropdown_options(
-        woodmac_options.get("long_term", [])
-    )
-    ea_upload_options = _build_ea_upload_dropdown_options(
-        comparison_options.get("ea_uploads", [])
-    )
-
-    short_term_values = {option["value"] for option in short_term_options}
-    long_term_values = {option["value"] for option in long_term_options}
-    ea_upload_values = {option["value"] for option in ea_upload_options}
-
-    short_term_value = (
-        current_st_value
-        if current_st_value in short_term_values
-        else _default_previous_option_value(short_term_options)
-    )
-    long_term_value = (
-        current_lt_value
-        if current_lt_value in long_term_values
-        else _default_previous_option_value(long_term_options)
-    )
-    ea_upload_value = (
-        current_ea_upload_value
-        if current_ea_upload_value in ea_upload_values
-        else _default_previous_option_value(ea_upload_options)
-    )
-
-    if comparison_source == "ea":
-        return (
-            short_term_options,
-            short_term_value,
-            long_term_options,
-            long_term_value,
-            ea_upload_options,
-            ea_upload_value,
-            {"display": "none"},
-            {"display": "flex", "gap": "12px", "flexWrap": "wrap", "alignItems": "flex-end"},
-        )
-
-    return (
-        short_term_options,
-        short_term_value,
-        long_term_options,
-        long_term_value,
-        ea_upload_options,
-        ea_upload_value,
-        {"display": "flex", "gap": "12px", "flexWrap": "wrap", "alignItems": "flex-end"},
-        {"display": "none"},
-    )
-
-
 def _period_coverage_line(df: pd.DataFrame) -> str | None:
     if df.empty:
         return None
@@ -804,64 +580,6 @@ def _build_overview_net_summary(
         f"{overview_net_metadata.get('country_group_label', 'Classification')} | "
         f"{overview_net_metadata.get('unit', 'bcm')}"
     )
-    return _build_status_block(lines)
-
-
-def _build_net_balance_comparison_metadata_lines(
-    comparison_source: str,
-    short_term_value: str | None,
-    long_term_value: str | None,
-    ea_upload_value: str | None,
-) -> list[str]:
-    if comparison_source == "woodmac":
-        short_term_snapshot = _deserialize_snapshot_value(short_term_value)
-        long_term_snapshot = _deserialize_snapshot_value(long_term_value)
-        lines = ["Delta formula: left baseline table - selected snapshot"]
-
-        short_term_line = short_term_snapshot.get("market_outlook")
-        short_term_timestamp = _format_metadata_timestamp(
-            short_term_snapshot.get("publication_timestamp")
-        )
-        if short_term_line:
-            if short_term_timestamp:
-                lines.append(
-                    f"Comparison source: WoodMac | ST publication: {short_term_line} | publication_date: {short_term_timestamp}"
-                )
-            else:
-                lines.append(
-                    f"Comparison source: WoodMac | ST publication: {short_term_line}"
-                )
-
-        long_term_line = long_term_snapshot.get("market_outlook")
-        long_term_timestamp = _format_metadata_timestamp(
-            long_term_snapshot.get("publication_timestamp")
-        )
-        if long_term_line:
-            if long_term_timestamp:
-                lines.append(
-                    f"LT publication: {long_term_line} | publication_date: {long_term_timestamp}"
-                )
-            else:
-                lines.append(f"LT publication: {long_term_line}")
-
-        return lines
-
-    ea_upload_label = _format_metadata_timestamp(ea_upload_value) or ea_upload_value
-    if ea_upload_label:
-        return [
-            "Delta formula: left baseline table - selected snapshot",
-            f"Comparison source: Energy Aspects | upload_timestamp_utc: {ea_upload_label}",
-        ]
-
-    return ["Delta formula: left baseline table - selected snapshot"]
-
-
-def _build_delta_summary(delta_df: pd.DataFrame, metadata_lines: list[str]) -> html.Div:
-    lines = []
-    coverage_line = _period_coverage_line(delta_df)
-    if coverage_line:
-        lines.append(coverage_line)
-    lines.extend(metadata_lines)
     return _build_status_block(lines)
 
 
@@ -1166,7 +884,7 @@ def _render_overview_net_delta(
     unit: str,
     country_group: str,
     table_id: str,
-) -> tuple[html.Div, html.Div | dash_table.DataTable]:
+) -> tuple[html.Div, html.Div | dag.AgGrid]:
     if active_tab != "overview":
         return html.Div(), html.Div()
 
@@ -1527,107 +1245,95 @@ layout = html.Div(
             [
                 html.Div(
                     [
+                        html.Div("Date Range", className="filter-group-header"),
                         html.Div(
                             [
-                                html.Div("Date Range", className="filter-group-header"),
-                                html.Div(
-                                    [
-                                        dcc.DatePickerRange(
-                                            id="market-balance-date-range",
-                                            start_date=_default_market_balance_start_date(),
-                                            end_date=_default_market_balance_end_date(),
-                                            minimum_nights=0,
-                                            display_format="YYYY-MM",
-                                            month_format="YYYY-MM",
-                                            start_date_placeholder_text="Start month",
-                                            end_date_placeholder_text="End month",
-                                            clearable=False,
-                                            number_of_months_shown=2,
-                                        )
-                                    ],
-                                    className="professional-date-picker capacity-page-date-range-picker",
-                                ),
+                                dcc.DatePickerRange(
+                                    id="market-balance-date-range",
+                                    start_date=_default_market_balance_start_date(),
+                                    end_date=_default_market_balance_end_date(),
+                                    minimum_nights=0,
+                                    display_format="YYYY-MM",
+                                    month_format="YYYY-MM",
+                                    start_date_placeholder_text="Start month",
+                                    end_date_placeholder_text="End month",
+                                    clearable=False,
+                                    number_of_months_shown=2,
+                                )
                             ],
-                            className="filter-section filter-section-destination",
-                        ),
-                        html.Div(
-                            [
-                                html.Div("Time View", className="filter-group-header"),
-                                html.Div(
-                                    [
-                                        dcc.RadioItems(
-                                            id="market-balance-trade-time-group",
-                                            options=TIME_GROUP_OPTIONS,
-                                            value="yearly",
-                                            inline=True,
-                                            labelStyle=STICKY_RADIO_LABEL_STYLE,
-                                            inputStyle={"marginRight": "6px"},
-                                            style={"display": "flex", "alignItems": "center", "flexWrap": "wrap"},
-                                        )
-                                    ],
-                                    style=STICKY_CONTROL_SHELL_STYLE,
-                                ),
-                            ],
-                            className="filter-section filter-section-destination",
-                        ),
-                        html.Div(
-                            [
-                                html.Div("Unit", className="filter-group-header"),
-                                html.Div(
-                                    [
-                                        dcc.Dropdown(
-                                            id="market-balance-trade-unit",
-                                            options=TRADE_UNIT_OPTIONS,
-                                            value="bcm",
-                                            clearable=False,
-                                            className="capacity-scenario-sticky-dropdown",
-                                            style={"minWidth": "120px", "width": "100%"},
-                                        )
-                                    ],
-                                    className="capacity-scenario-sticky-shell",
-                                    style={"width": "100%"},
-                                ),
-                            ],
-                            className="filter-section filter-section-origin",
-                        ),
-                        html.Div(
-                            [
-                                html.Div("Country Grouping", className="filter-group-header"),
-                                html.Div(
-                                    [
-                                        dcc.Dropdown(
-                                            id="market-balance-trade-country-group",
-                                            options=COUNTRY_GROUP_OPTIONS,
-                                            value="country_classification_level1",
-                                            clearable=False,
-                                            className="capacity-scenario-sticky-dropdown",
-                                            style={"minWidth": "220px", "width": "100%"},
-                                        )
-                                    ],
-                                    className="capacity-scenario-sticky-shell",
-                                    style={"width": "100%"},
-                                ),
-                            ],
-                            className="filter-section filter-section-origin",
-                        ),
-                        html.Div(
-                            [
-                                html.Div("Status", className="filter-group-header"),
-                                html.Div(
-                                    id="market-balance-sticky-status",
-                                    className="text-tertiary",
-                                    style={"fontSize": "11px", "maxWidth": "640px", "width": "100%"},
-                                ),
-                            ],
-                            className="filter-section filter-section-analysis",
+                            className="professional-date-picker",
                         ),
                     ],
-                    className="filter-bar-grouped",
-                )
+                    className="filter-group",
+                    style={"minWidth": "280px"},
+                ),
+                html.Div(
+                    [
+                        html.Div("Time View", className="filter-group-header"),
+                        html.Div(
+                            [
+                                dcc.RadioItems(
+                                    id="market-balance-trade-time-group",
+                                    options=TIME_GROUP_OPTIONS,
+                                    value="yearly",
+                                    inline=True,
+                                    labelStyle=STICKY_RADIO_LABEL_STYLE,
+                                    inputStyle={"marginRight": "6px"},
+                                    style={"display": "flex", "alignItems": "center", "flexWrap": "wrap"},
+                                )
+                            ],
+                            style=STICKY_CONTROL_SHELL_STYLE,
+                        ),
+                    ],
+                    className="filter-group",
+                    style={"minWidth": "360px"},
+                ),
+                html.Div(
+                    [
+                        html.Div("Unit", className="filter-group-header"),
+                        html.Div(
+                            [
+                                dcc.Dropdown(
+                                    id="market-balance-trade-unit",
+                                    options=TRADE_UNIT_OPTIONS,
+                                    value="bcm",
+                                    clearable=False,
+                                    className="capacity-scenario-sticky-dropdown",
+                                    style={"minWidth": "120px", "width": "100%"},
+                                )
+                            ],
+                            className="capacity-scenario-sticky-shell",
+                            style={"width": "100%"},
+                        ),
+                    ],
+                    className="filter-group",
+                    style={"minWidth": "120px"},
+                ),
+                html.Div(
+                    [
+                        html.Div("Country Grouping", className="filter-group-header"),
+                        html.Div(
+                            [
+                                dcc.Dropdown(
+                                    id="market-balance-trade-country-group",
+                                    options=COUNTRY_GROUP_OPTIONS,
+                                    value="country_classification_level1",
+                                    clearable=False,
+                                    className="capacity-scenario-sticky-dropdown",
+                                    style={"minWidth": "220px", "width": "100%"},
+                                )
+                            ],
+                            className="capacity-scenario-sticky-shell",
+                            style={"width": "100%"},
+                        ),
+                    ],
+                    className="filter-group",
+                    style={"minWidth": "220px"},
+                ),
             ],
             className="professional-section-header",
+            style=MARKET_BALANCE_STICKY_HEADER_STYLE,
         ),
-
         html.Div(
             [
                 _build_overview_net_balance_section(
@@ -1993,67 +1699,6 @@ def initialize_market_balance_date_range(_, initialized):
         _default_market_balance_end_date(),
         True,
     )
-
-
-@callback(
-    Output("market-balance-sticky-status", "children"),
-    Input("market-balance-tabs", "value"),
-    Input("market-balance-date-range", "start_date"),
-    Input("market-balance-date-range", "end_date"),
-    Input("market-balance-trade-time-group", "value"),
-    Input("market-balance-trade-unit", "value"),
-    Input("market-balance-trade-country-group", "value"),
-    Input("market-balance-overview-store", "data"),
-    Input("market-balance-trade-store", "data"),
-    Input("market-balance-country-store", "data"),
-)
-def render_sticky_status(
-    active_tab,
-    start_date,
-    end_date,
-    time_group,
-    unit,
-    country_group,
-    overview_store,
-    trade_store,
-    country_store,
-):
-    active_tab_label = {
-        "overview": "Overview",
-        "trade_balance": "Trade Balance",
-        "country_drilldown": "Country Drilldown",
-    }.get(active_tab, "Market Balance")
-    lines = [
-        f"Active tab: {active_tab_label}",
-        f"Date Range: {_format_date_range_label(start_date, end_date)} | Time View: {TIME_GROUP_LABELS.get(normalize_time_group(time_group), 'Yearly')} | Unit: {unit if unit != 'mcm_d' else 'mcm/d'} | Country Grouping: {COUNTRY_GROUP_LABELS.get(country_group, 'Classification')}",
-    ]
-
-    if active_tab == "overview":
-        metadata = (overview_store or {}).get("metadata", {})
-        lines.append(
-            "Snapshots: "
-            f"WoodMac export {_format_metadata_timestamp(metadata.get('woodmac_export', {}).get('short_term_publication_timestamp')) or 'N/A'} | "
-            f"EA export {_format_metadata_timestamp(metadata.get('ea_export', {}).get('upload_timestamp_utc')) or 'N/A'}"
-        )
-    elif active_tab == "trade_balance":
-        metadata = (trade_store or {}).get("metadata", {})
-        lines.append(
-            "Trade source: "
-            f"{metadata.get('source', 'Energy Aspects')} | "
-            f"Export {_format_metadata_timestamp(metadata.get('export_metadata', {}).get('upload_timestamp_utc')) or 'N/A'} | "
-            f"Import {_format_metadata_timestamp(metadata.get('import_metadata', {}).get('upload_timestamp_utc')) or 'N/A'}"
-        )
-    elif active_tab == "country_drilldown":
-        metadata = (country_store or {}).get("metadata", {})
-        lines.append(
-            "Country status: "
-            f"{metadata.get('country') or 'N/A'} | "
-            f"Current {metadata.get('current_snapshot') or 'N/A'} | "
-            f"Compare {metadata.get('comparison_snapshot') or 'Latest baseline only'}"
-        )
-        lines.append("Unit and Country Grouping drive Overview + Trade Balance; Date Range and Time View also apply to Country Drilldown.")
-
-    return _build_status_block(lines)
 
 
 @callback(

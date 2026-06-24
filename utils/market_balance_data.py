@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import Iterable
+from typing import TYPE_CHECKING
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
+
+if TYPE_CHECKING:
+    from typing import Iterable
 
 from utils.balance_time import (
     align_frames_on_period,
@@ -25,7 +28,6 @@ from utils.export_flow_data import (
     fetch_ea_export_flow_raw_data,
     fetch_ea_export_flow_raw_data_for_upload,
     fetch_ea_upload_options as fetch_ea_export_upload_options,
-    fetch_woodmac_export_flow_metadata,
     fetch_woodmac_export_flow_raw_data,
     fetch_woodmac_export_flow_raw_data_for_publications,
     fetch_woodmac_publication_options as fetch_woodmac_export_publication_options,
@@ -37,6 +39,10 @@ from utils.import_flow_data import (
     fetch_woodmac_import_flow_metadata,
     fetch_woodmac_import_flow_raw_data,
     fetch_woodmac_import_flow_raw_data_for_publications,
+)
+from utils.snapshot_controls import (
+    ea_metadata_from_upload_options as _ea_metadata_from_upload_options,
+    woodmac_metadata_from_publication_options as _woodmac_metadata_from_publication_options,
 )
 
 
@@ -196,6 +202,29 @@ def serialize_frame(df: pd.DataFrame | None) -> dict:
         "columns": working_df.columns.tolist(),
         "numeric_columns": numeric_columns,
     }
+
+
+def deserialize_frame(payload: dict | None) -> pd.DataFrame:
+    if not payload:
+        return pd.DataFrame()
+
+    records = payload.get("records") or []
+    columns = payload.get("columns") or []
+    if not records:
+        return pd.DataFrame(columns=columns)
+
+    df = pd.DataFrame(records)
+    if columns:
+        for column_name in columns:
+            if column_name not in df.columns:
+                df[column_name] = None
+        df = df[columns]
+
+    for column_name in payload.get("numeric_columns") or []:
+        if column_name in df.columns:
+            df[column_name] = pd.to_numeric(df[column_name], errors="coerce")
+
+    return df
 
 
 def _sanitize_flow_raw_df(raw_df: pd.DataFrame) -> pd.DataFrame:
@@ -436,6 +465,22 @@ def _prepare_trade_flow_table(
     return pivot_df
 
 
+def _aligned_numeric_series(
+    frame: pd.DataFrame,
+    column_name: str,
+    periods: list[str],
+) -> pd.Series:
+    if column_name not in frame.columns:
+        return pd.Series(0.0, index=periods, dtype=float)
+
+    series = frame[column_name]
+    if isinstance(series, pd.DataFrame):
+        series = series.sum(axis=1)
+
+    series = pd.to_numeric(series, errors="coerce").fillna(0.0)
+    return series.reindex(periods, fill_value=0.0).astype(float)
+
+
 def _build_net_balance_table(
     exports_df: pd.DataFrame,
     imports_df: pd.DataFrame,
@@ -467,20 +512,9 @@ def _build_net_balance_table(
     exports_index = exports_df.set_index("Period") if not exports_df.empty else pd.DataFrame()
     imports_index = imports_df.set_index("Period") if not imports_df.empty else pd.DataFrame()
 
-    def _aligned_numeric_series(frame: pd.DataFrame, column_name: str) -> pd.Series:
-        if column_name not in frame.columns:
-            return pd.Series(0.0, index=all_periods, dtype=float)
-
-        series = frame[column_name]
-        if isinstance(series, pd.DataFrame):
-            series = series.sum(axis=1)
-
-        series = pd.to_numeric(series, errors="coerce").fillna(0.0)
-        return series.reindex(all_periods, fill_value=0.0).astype(float)
-
     for column_name in value_columns:
-        export_series = _aligned_numeric_series(exports_index, column_name)
-        import_series = _aligned_numeric_series(imports_index, column_name)
+        export_series = _aligned_numeric_series(exports_index, column_name, all_periods)
+        import_series = _aligned_numeric_series(imports_index, column_name, all_periods)
         result_df[column_name] = (export_series - import_series).round(2).values
 
     ordered_columns = ["Period"]
@@ -648,20 +682,9 @@ def calculate_flex_volumes(actual_df: pd.DataFrame, contract_df: pd.DataFrame) -
     actual_index = actual.set_index("Period")
     contract_index = contracts.set_index("Period")
 
-    def _aligned_numeric_series(frame: pd.DataFrame, column_name: str) -> pd.Series:
-        if column_name not in frame.columns:
-            return pd.Series(0.0, index=all_periods, dtype=float)
-
-        series = frame[column_name]
-        if isinstance(series, pd.DataFrame):
-            series = series.sum(axis=1)
-
-        series = pd.to_numeric(series, errors="coerce").fillna(0.0)
-        return series.reindex(all_periods, fill_value=0.0).astype(float)
-
     for column_name in group_columns:
-        actual_series = _aligned_numeric_series(actual_index, column_name)
-        contract_series = _aligned_numeric_series(contract_index, column_name)
+        actual_series = _aligned_numeric_series(actual_index, column_name, all_periods)
+        contract_series = _aligned_numeric_series(contract_index, column_name, all_periods)
         result_df[column_name] = (actual_series - contract_series).round(2).values
 
     ordered_columns = ["Period"]
@@ -683,6 +706,17 @@ def fetch_contract_volume_tables(
     mapping_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     mapping_df = mapping_df.copy() if mapping_df is not None else fetch_country_mapping_df()
+    selected_years = {
+        int(year)
+        for year in (selected_years or [])
+        if str(year).strip()
+    }
+    year_filter = ""
+    params = {}
+    if selected_years:
+        year_filter = "AND CAST(demand_table.year AS INTEGER) IN :selected_years"
+        params["selected_years"] = tuple(sorted(selected_years))
+
     query = text(
         f"""
         SELECT
@@ -695,22 +729,19 @@ def fetch_contract_volume_tables(
             ON demand_table.id_contract = contract_table.id_contract
         WHERE demand_table.id_contract IS NOT NULL
           AND demand_table.year IS NOT NULL
+          {year_filter}
         """
     )
+    if selected_years:
+        query = query.bindparams(bindparam("selected_years", expanding=True))
+
     with engine.connect() as connection:
-        contracts_df = pd.read_sql_query(query, connection)
+        contracts_df = pd.read_sql_query(query, connection, params=params)
 
     if contracts_df.empty:
         empty_df = pd.DataFrame(columns=["Period", "Total"])
         return empty_df, empty_df
 
-    selected_years = {
-        int(year)
-        for year in (selected_years or [])
-        if str(year).strip()
-    }
-    if selected_years:
-        contracts_df = contracts_df[contracts_df["contract_year"].isin(selected_years)].copy()
     if contracts_df.empty:
         empty_df = pd.DataFrame(columns=["Period", "Total"])
         return empty_df, empty_df
@@ -1106,6 +1137,72 @@ def convert_wm_maintenance_to_monthly_mt(raw_df: pd.DataFrame) -> pd.DataFrame:
     return working_df
 
 
+def _fetch_woodmac_maintenance_grouped_raw() -> pd.DataFrame:
+    query = text(
+        f"""
+        WITH maintenance_union AS (
+            SELECT
+                make_date(year::int, month::int, 1) AS month,
+                COALESCE(country_name, 'Unknown') AS country_name,
+                'Unplanned' AS metric,
+                SUM(metric_value) AS value
+            FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_unplanned_downtime_mta
+            WHERE metric_value > 0
+            GROUP BY 1, 2
+
+            UNION ALL
+
+            SELECT
+                make_date(year::int, month::int, 1) AS month,
+                COALESCE(country_name, 'Unknown') AS country_name,
+                'Planned' AS metric,
+                SUM(metric_value) AS value
+            FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_planned_maintenance_mta
+            WHERE metric_value > 0
+            GROUP BY 1, 2
+        )
+        SELECT month, country_name, metric, value
+        FROM maintenance_union
+        ORDER BY month, country_name, metric
+        """
+    )
+    with engine.connect() as connection:
+        return pd.read_sql_query(query, connection)
+
+
+def _build_woodmac_maintenance_total_frame(
+    raw_df: pd.DataFrame,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=["Month", "Provider", "Metric", "Value"])
+
+    working_df = raw_df.copy()
+    working_df = (
+        working_df.groupby(["month", "metric"], as_index=False)["value"]
+        .sum()
+        .sort_values(["month", "metric"])
+        .reset_index(drop=True)
+    )
+    working_df = _filter_frame_by_date_range(
+        working_df,
+        date_col="month",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if working_df.empty:
+        return pd.DataFrame(columns=["Month", "Provider", "Metric", "Value"])
+
+    working_df = convert_wm_maintenance_to_monthly_mt(working_df)
+    working_df["Provider"] = "WoodMac"
+    working_df["Month"] = pd.to_datetime(working_df["month"])
+    working_df["Metric"] = working_df["metric"]
+    working_df["Value"] = pd.to_numeric(working_df["value"], errors="coerce").fillna(0.0)
+    return working_df[["Month", "Provider", "Metric", "Value"]]
+
+
 def _build_maintenance_grouped_table(
     raw_df: pd.DataFrame,
     *,
@@ -1475,33 +1572,8 @@ def fetch_global_maintenance_overview(
     start_date: str | None = None,
     end_date: str | None = None,
     time_group: str = "monthly",
+    woodmac_raw_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    wm_query = text(
-        f"""
-        WITH maintenance_union AS (
-            SELECT
-                make_date(year::int, month::int, 1) AS month,
-                'Unplanned' AS metric,
-                SUM(metric_value) AS value
-            FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_unplanned_downtime_mta
-            WHERE metric_value > 0
-            GROUP BY 1
-
-            UNION ALL
-
-            SELECT
-                make_date(year::int, month::int, 1) AS month,
-                'Planned' AS metric,
-                SUM(metric_value) AS value
-            FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_planned_maintenance_mta
-            WHERE metric_value > 0
-            GROUP BY 1
-        )
-        SELECT month, metric, value
-        FROM maintenance_union
-        ORDER BY month, metric
-        """
-    )
     ea_query = text(
         f"""
         WITH latest_snapshot AS (
@@ -1523,15 +1595,49 @@ def fetch_global_maintenance_overview(
     )
 
     with engine.connect() as connection:
-        wm_df = pd.read_sql_query(wm_query, connection)
+        if woodmac_raw_df is None:
+            wm_query = text(
+                f"""
+                WITH maintenance_union AS (
+                    SELECT
+                        make_date(year::int, month::int, 1) AS month,
+                        'Unplanned' AS metric,
+                        SUM(metric_value) AS value
+                    FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_unplanned_downtime_mta
+                    WHERE metric_value > 0
+                    GROUP BY 1
+
+                    UNION ALL
+
+                    SELECT
+                        make_date(year::int, month::int, 1) AS month,
+                        'Planned' AS metric,
+                        SUM(metric_value) AS value
+                    FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_planned_maintenance_mta
+                    WHERE metric_value > 0
+                    GROUP BY 1
+                )
+                SELECT month, metric, value
+                FROM maintenance_union
+                ORDER BY month, metric
+                """
+            )
+            wm_df = pd.read_sql_query(wm_query, connection)
+        else:
+            wm_df = _build_woodmac_maintenance_total_frame(
+                woodmac_raw_df,
+                start_date=start_date,
+                end_date=end_date,
+            )
         ea_df = pd.read_sql_query(ea_query, connection)
 
-    wm_df = _filter_frame_by_date_range(
-        wm_df,
-        date_col="month",
-        start_date=start_date,
-        end_date=end_date,
-    )
+    if woodmac_raw_df is None:
+        wm_df = _filter_frame_by_date_range(
+            wm_df,
+            date_col="month",
+            start_date=start_date,
+            end_date=end_date,
+        )
     ea_df = _filter_frame_by_date_range(
         ea_df,
         date_col="month",
@@ -1539,14 +1645,14 @@ def fetch_global_maintenance_overview(
         end_date=end_date,
     )
 
-    if not wm_df.empty:
+    if woodmac_raw_df is None and not wm_df.empty:
         wm_df = convert_wm_maintenance_to_monthly_mt(wm_df)
         wm_df["Provider"] = "WoodMac"
         wm_df["Month"] = pd.to_datetime(wm_df["month"])
         wm_df["Metric"] = wm_df["metric"]
         wm_df["Value"] = pd.to_numeric(wm_df["value"], errors="coerce").fillna(0.0)
         wm_df = wm_df[["Month", "Provider", "Metric", "Value"]]
-    else:
+    elif wm_df.empty:
         wm_df = pd.DataFrame(columns=["Month", "Provider", "Metric", "Value"])
 
     ea_upload_timestamp = None
@@ -1583,55 +1689,6 @@ def fetch_global_maintenance_overview(
         ],
     }
     return combined_df, metadata
-
-
-def fetch_woodmac_maintenance_grouped_table(
-    *,
-    mapping_df: pd.DataFrame,
-    country_group: str,
-    time_group: str,
-    start_date: str | None = None,
-    end_date: str | None = None,
-) -> pd.DataFrame:
-    query = text(
-        f"""
-        WITH maintenance_union AS (
-            SELECT
-                make_date(year::int, month::int, 1) AS month,
-                COALESCE(country_name, 'Unknown') AS country_name,
-                'Unplanned' AS metric,
-                SUM(metric_value) AS value
-            FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_unplanned_downtime_mta
-            WHERE metric_value > 0
-            GROUP BY 1, 2
-
-            UNION ALL
-
-            SELECT
-                make_date(year::int, month::int, 1) AS month,
-                COALESCE(country_name, 'Unknown') AS country_name,
-                'Planned' AS metric,
-                SUM(metric_value) AS value
-            FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_planned_maintenance_mta
-            WHERE metric_value > 0
-            GROUP BY 1, 2
-        )
-        SELECT month, country_name, metric, value
-        FROM maintenance_union
-        ORDER BY month, country_name, metric
-        """
-    )
-    with engine.connect() as connection:
-        raw_df = pd.read_sql_query(query, connection)
-
-    return _build_maintenance_grouped_table(
-        raw_df,
-        mapping_df=mapping_df,
-        country_group=country_group,
-        time_group=time_group,
-        start_date=start_date,
-        end_date=end_date,
-    )
 
 
 def fetch_provider_overview_payload(
@@ -1689,12 +1746,15 @@ def fetch_provider_overview_payload(
             end_date=end_date,
             **overview_net_config,
         )
+        maintenance_raw_df = _fetch_woodmac_maintenance_grouped_raw()
         maintenance_df, maintenance_metadata = fetch_global_maintenance_overview(
             start_date=start_date,
             end_date=end_date,
             time_group=time_group,
+            woodmac_raw_df=maintenance_raw_df,
         )
-        maintenance_grouped_df = fetch_woodmac_maintenance_grouped_table(
+        maintenance_grouped_df = _build_maintenance_grouped_table(
+            maintenance_raw_df,
             mapping_df=mapping_df,
             country_group=country_group,
             time_group=time_group,
@@ -1731,14 +1791,19 @@ def fetch_provider_overview_payload(
             time_group=time_group,
         )
 
+        comparison_options = fetch_net_balance_comparison_options()
         metadata = {
-            "woodmac_export": fetch_woodmac_export_flow_metadata(),
+            "woodmac_export": _woodmac_metadata_from_publication_options(
+                comparison_options.get("woodmac")
+            ),
             "woodmac_import": fetch_woodmac_import_flow_metadata(),
-            "ea_export": fetch_ea_export_flow_metadata(),
+            "ea_export": _ea_metadata_from_upload_options(
+                comparison_options.get("ea_uploads")
+            ),
             "ea_import": fetch_ea_import_flow_metadata(),
             "maintenance": maintenance_metadata,
             "pacific_countries": PACIFIC_LOCKED_COUNTRIES,
-            "comparison_options": fetch_net_balance_comparison_options(),
+            "comparison_options": comparison_options,
             "overview_net": {
                 "country_group": overview_net_config["country_group"],
                 "country_group_label": COUNTRY_GROUP_LABELS.get(
@@ -2158,8 +2223,22 @@ def _fetch_country_balance_raw_data(
     country: str,
     *,
     snapshot_timestamp: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     conversion_factors_cte, warnings = build_country_conversion_factors_cte()
+    date_filters = []
+    params = {"country": country, "snapshot_timestamp": snapshot_timestamp}
+    start_bound = _normalize_range_start(start_date)
+    end_bound = _normalize_range_end(end_date)
+    if start_bound is not None:
+        date_filters.append("values_table.date::date >= :start_date")
+        params["start_date"] = start_bound
+    if end_bound is not None:
+        date_filters.append("values_table.date::date <= :end_date")
+        params["end_date"] = end_bound
+    date_filter_clause = "\n          AND " + "\n          AND ".join(date_filters) if date_filters else ""
+
     query = text(
         f"""
         WITH selected_datasets AS (
@@ -2200,6 +2279,7 @@ def _fetch_country_balance_raw_data(
             CAST(:snapshot_timestamp AS timestamp),
             (SELECT upload_timestamp_utc FROM latest_snapshot)
         )
+          {date_filter_clause}
         ORDER BY values_table.date
         """
     )
@@ -2207,7 +2287,7 @@ def _fetch_country_balance_raw_data(
         raw_df = pd.read_sql_query(
             query,
             connection,
-            params={"country": country, "snapshot_timestamp": snapshot_timestamp},
+            params=params,
         )
 
     if raw_df.empty:
@@ -2296,10 +2376,8 @@ def fetch_country_balance_payload(
         return _payload(error="Select a country to load the drilldown.")
 
     try:
-        current_raw_df, current_warnings = _fetch_country_balance_raw_data(country)
-        current_raw_df = _filter_frame_by_date_range(
-            current_raw_df,
-            date_col="Date",
+        current_raw_df, current_warnings = _fetch_country_balance_raw_data(
+            country,
             start_date=start_date,
             end_date=end_date,
         )
@@ -2308,15 +2386,14 @@ def fetch_country_balance_payload(
 
         comparison_requested = bool(comparison_timestamp)
         previous_raw_df, previous_warnings = (
-            _fetch_country_balance_raw_data(country, snapshot_timestamp=comparison_timestamp)
+            _fetch_country_balance_raw_data(
+                country,
+                snapshot_timestamp=comparison_timestamp,
+                start_date=start_date,
+                end_date=end_date,
+            )
             if comparison_requested
             else (pd.DataFrame(), [])
-        )
-        previous_raw_df = _filter_frame_by_date_range(
-            previous_raw_df,
-            date_col="Date",
-            start_date=start_date,
-            end_date=end_date,
         )
 
         current_table_df, formatted_columns = format_country_balance_table(current_raw_df, level)

@@ -1,3 +1,4 @@
+from utils.ag_grid_tables import create_ag_grid_from_datatable
 """
 Terminal Output Adjustments Editor
 
@@ -15,11 +16,10 @@ import datetime
 import base64
 import io
 import pandas as pd
-import numpy as np
 import dash
-from dash import html, dash_table, dcc, callback, Input, Output, State, MATCH, ALL
+from dash import html, dcc, callback, Input, Output, State
 import dash_bootstrap_components as dbc
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 import configparser
 import os
 import sys
@@ -32,7 +32,6 @@ sys.path.insert(0, project_root)
 from fundamentals.terminals.scenario_utils import (
     get_available_scenarios,
     duplicate_scenario,
-    get_latest_adjustments,
     save_adjustments_bulk,
     get_scenario_summary,
     delete_scenario
@@ -46,7 +45,7 @@ from fundamentals.terminals.scenario_utils import (
 try:
     config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))
     CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except:
+except Exception:
     CONFIG_FILE_PATH = 'config.ini'
 
 config_reader = configparser.ConfigParser(interpolation=None)
@@ -196,263 +195,245 @@ def get_trains_list():
 # Layout
 ###############################################################################
 
-# Fetch initial data
-scenarios = get_available_scenarios(engine)
-plants_df = get_plants_list()
-trains_df = get_trains_list()
+def layout():
+    scenarios = get_available_scenarios(engine)
+    plants_df = get_plants_list()
+    trains_df = get_trains_list()
 
-layout = dbc.Container([
-    dbc.Row([
-        dbc.Col([
-            html.H2("Terminal Output Adjustments Editor", className="mb-4"),
-            html.P([
-                "Manage scenario-based adjustments for LNG terminal production forecasts. ",
-                "Adjustments override Woodmac baseline data for selected trains and time periods."
-            ], className="text-muted mb-4"),
-        ])
-    ]),
-
-    # Return to terminals dashboard link
-    dbc.Row([
-        dbc.Col([
-            dcc.Link("← Return to Production", href="/production",
-                    className="btn btn-link mb-3")
-        ])
-    ]),
-
-    # Scenario management section
-    dbc.Card([
-        dbc.CardHeader(html.H5("Scenario Management")),
-        dbc.CardBody([
-            dbc.Row([
-                dbc.Col([
-                    html.Label("Select Scenario:", className="fw-bold"),
-                    dcc.Dropdown(
-                        id='scenario-selector',
-                        options=[{'label': s, 'value': s} for s in scenarios],
-                        value='best_view',
-                        clearable=False,
-                        className="mb-2"
-                    ),
-                    html.Small("base_view = Woodmac only (read-only), other scenarios = with adjustments",
-                              className="text-muted")
-                ], width=4),
-
-                dbc.Col([
-                    html.Label("Scenario Actions:", className="fw-bold"),
-                    html.Div([
-                        dbc.Button("Duplicate Scenario", id="duplicate-scenario-btn",
-                                  color="primary", size="sm", className="me-2"),
-                        dbc.Button("Delete Scenario", id="delete-scenario-btn",
-                                  color="danger", size="sm", className="me-2"),
-                        dbc.Button("Refresh Scenarios", id="refresh-scenarios-btn",
-                                  color="secondary", size="sm"),
-                    ])
-                ], width=5),
-
-                dbc.Col([
-                    html.Label("Scenario Info:", className="fw-bold"),
-                    html.Div(id="scenario-info", className="text-muted")
-                ], width=3),
+    return dbc.Container([
+        dbc.Row([
+            dbc.Col([
+                html.H2("Terminal Output Adjustments Editor", className="mb-4"),
+                html.P([
+                    "Manage scenario-based adjustments for LNG terminal production forecasts. ",
+                    "Adjustments override Woodmac baseline data for selected trains and time periods."
+                ], className="text-muted mb-4"),
             ])
-        ])
-    ], className="mb-4"),
+        ]),
 
-    # Copy trains from base_view section
-    dbc.Card([
-        dbc.CardHeader(html.H5("Copy Trains from Base View")),
-        dbc.CardBody([
-            dbc.Row([
-                dbc.Col([
-                    html.Label("Select Trains to Copy:", className="fw-bold"),
-                    dcc.Dropdown(
-                        id='trains-to-copy',
-                        options=[{'label': f"{row['plant_name']} - {row['lng_train_name_short']}",
-                                 'value': f"{row['plant_name']}|{row['lng_train_name_short']}"}
-                                for _, row in trains_df.iterrows()],
-                        placeholder="Select trains from base_view",
-                        multi=True
-                    ),
-                    html.Small("Select one or more trains to copy their baseline data as adjustments",
-                              className="text-muted")
-                ], width=6),
+        # Return to terminals dashboard link
+        dbc.Row([
+            dbc.Col([
+                dcc.Link("← Return to Production", href="/production",
+                        className="btn btn-link mb-3")
+            ])
+        ]),
 
-                dbc.Col([
-                    html.Label("Destination Scenario:", className="fw-bold"),
-                    dbc.Input(
-                        id='copy-destination-scenario',
-                        type='text',
-                        placeholder="Type scenario name or select from list",
-                        value='best_view',
-                        list='scenario-list',
-                        className="form-control"
-                    ),
-                    html.Datalist(
-                        id='scenario-list',
-                        children=[html.Option(value=s) for s in scenarios if s != 'base_view']
-                    ),
-                    html.Small("Type new scenario name or choose from existing",
-                              className="text-muted")
-                ], width=4),
+        # Scenario management section
+        dbc.Card([
+            dbc.CardHeader(html.H5("Scenario Management")),
+            dbc.CardBody([
+                dbc.Row([
+                    dbc.Col([
+                        html.Label("Select Scenario:", className="fw-bold"),
+                        dcc.Dropdown(
+                            id='scenario-selector',
+                            options=[{'label': s, 'value': s} for s in scenarios],
+                            value='best_view',
+                            clearable=False,
+                            className="mb-2"
+                        ),
+                        html.Small("base_view = Woodmac only (read-only), other scenarios = with adjustments",
+                                  className="text-muted")
+                    ], width=4),
 
-                dbc.Col([
-                    html.Label("Action:", className="fw-bold"),
-                    html.Div([
-                        dbc.Button("Copy Trains", id="copy-trains-btn",
-                                  color="primary", size="md", className="w-100"),
-                    ])
-                ], width=2),
+                    dbc.Col([
+                        html.Label("Scenario Actions:", className="fw-bold"),
+                        html.Div([
+                            dbc.Button("Duplicate Scenario", id="duplicate-scenario-btn",
+                                      color="primary", size="sm", className="me-2"),
+                            dbc.Button("Delete Scenario", id="delete-scenario-btn",
+                                      color="danger", size="sm", className="me-2"),
+                            dbc.Button("Refresh Scenarios", id="refresh-scenarios-btn",
+                                      color="secondary", size="sm"),
+                        ])
+                    ], width=5),
+
+                    dbc.Col([
+                        html.Label("Scenario Info:", className="fw-bold"),
+                        html.Div(id="scenario-info", className="text-muted")
+                    ], width=3),
+                ])
+            ])
+        ], className="mb-4"),
+
+        # Copy trains from base_view section
+        dbc.Card([
+            dbc.CardHeader(html.H5("Copy Trains from Base View")),
+            dbc.CardBody([
+                dbc.Row([
+                    dbc.Col([
+                        html.Label("Select Trains to Copy:", className="fw-bold"),
+                        dcc.Dropdown(
+                            id='trains-to-copy',
+                            options=[{'label': f"{row['plant_name']} - {row['lng_train_name_short']}",
+                                     'value': f"{row['plant_name']}|{row['lng_train_name_short']}"}
+                                    for _, row in trains_df.iterrows()],
+                            placeholder="Select trains from base_view",
+                            multi=True
+                        ),
+                        html.Small("Select one or more trains to copy their baseline data as adjustments",
+                                  className="text-muted")
+                    ], width=6),
+
+                    dbc.Col([
+                        html.Label("Destination Scenario:", className="fw-bold"),
+                        dbc.Input(
+                            id='copy-destination-scenario',
+                            type='text',
+                            placeholder="Type scenario name or select from list",
+                            value='best_view',
+                            list='scenario-list',
+                            className="form-control"
+                        ),
+                        html.Datalist(
+                            id='scenario-list',
+                            children=[html.Option(value=s) for s in scenarios if s != 'base_view']
+                        ),
+                        html.Small("Type new scenario name or choose from existing",
+                                  className="text-muted")
+                    ], width=4),
+
+                    dbc.Col([
+                        html.Label("Action:", className="fw-bold"),
+                        html.Div([
+                            dbc.Button("Copy Trains", id="copy-trains-btn",
+                                      color="primary", size="md", className="w-100"),
+                        ])
+                    ], width=2),
+                ]),
+                html.Div(id="copy-message", className="alert alert-info d-none mt-3", role="alert"),
+            ])
+        ], className="mb-4"),
+
+        # Filters section
+        dbc.Card([
+            dbc.CardHeader(html.H5("Data Filters")),
+            dbc.CardBody([
+                dbc.Row([
+                    dbc.Col([
+                        html.Label("Plant:", className="fw-bold"),
+                        dcc.Dropdown(
+                            id='plant-filter',
+                            options=[{'label': f"{row['plant_name']} ({row['country_name']})",
+                                     'value': row['plant_name']}
+                                    for _, row in plants_df.iterrows()],
+                            placeholder="All plants",
+                            multi=True
+                        )
+                    ], width=3),
+
+                    dbc.Col([
+                        html.Label("Train:", className="fw-bold"),
+                        dcc.Dropdown(
+                            id='train-filter',
+                            options=[{'label': f"{row['plant_name']} - {row['lng_train_name_short']}",
+                                     'value': f"{row['plant_name']}|{row['lng_train_name_short']}"}
+                                    for _, row in trains_df.iterrows()],
+                            placeholder="All trains",
+                            multi=True
+                        )
+                    ], width=3),
+
+                    dbc.Col([
+                        html.Label("Year Range:", className="fw-bold"),
+                        dcc.RangeSlider(
+                            id='year-range-slider',
+                            min=2020,
+                            max=2035,
+                            step=1,
+                            value=[2024, 2030],
+                            marks={year: str(year) for year in range(2020, 2036, 2)},
+                            tooltip={"placement": "bottom", "always_visible": True}
+                        )
+                    ], width=6),
+                ])
+            ])
+        ], className="mb-4"),
+
+        # Data table section
+        dbc.Card([
+            dbc.CardHeader([
+                html.H5("Adjustments Data", className="d-inline"),
+                html.Span(id="row-count-badge", className="badge bg-secondary ms-2")
             ]),
-            html.Div(id="copy-message", className="alert alert-info d-none mt-3", role="alert"),
-        ])
-    ], className="mb-4"),
+            dbc.CardBody([
+                # Action buttons
+                html.Div([
+                    dbc.Button("Add Row", id="add-row-btn", color="success", size="sm", className="me-2"),
+                    dbc.Button("Save Changes", id="save-changes-btn", color="primary", size="sm", className="me-2"),
+                    dbc.Button("Download CSV", id="download-csv-btn", color="info", size="sm", className="me-2"),
+                    dcc.Upload(
+                        id='upload-data',
+                        children=dbc.Button("Upload CSV/Excel", color="warning", size="sm"),
+                        multiple=False
+                    ),
+                ], className="mb-3"),
 
-    # Filters section
-    dbc.Card([
-        dbc.CardHeader(html.H5("Data Filters")),
-        dbc.CardBody([
-            dbc.Row([
-                dbc.Col([
-                    html.Label("Plant:", className="fw-bold"),
-                    dcc.Dropdown(
-                        id='plant-filter',
-                        options=[{'label': f"{row['plant_name']} ({row['country_name']})",
-                                 'value': row['plant_name']}
-                                for _, row in plants_df.iterrows()],
-                        placeholder="All plants",
-                        multi=True
-                    )
-                ], width=3),
+                # Message area
+                html.Div(id="message", className="alert alert-info d-none", role="alert"),
 
-                dbc.Col([
-                    html.Label("Train:", className="fw-bold"),
-                    dcc.Dropdown(
-                        id='train-filter',
-                        options=[{'label': f"{row['plant_name']} - {row['lng_train_name_short']}",
-                                 'value': f"{row['plant_name']}|{row['lng_train_name_short']}"}
-                                for _, row in trains_df.iterrows()],
-                        placeholder="All trains",
-                        multi=True
-                    )
-                ], width=3),
-
-                dbc.Col([
-                    html.Label("Year Range:", className="fw-bold"),
-                    dcc.RangeSlider(
-                        id='year-range-slider',
-                        min=2020,
-                        max=2035,
-                        step=1,
-                        value=[2024, 2030],
-                        marks={year: str(year) for year in range(2020, 2036, 2)},
-                        tooltip={"placement": "bottom", "always_visible": True}
-                    )
-                ], width=6),
-            ])
-        ])
-    ], className="mb-4"),
-
-    # Data table section
-    dbc.Card([
-        dbc.CardHeader([
-            html.H5("Adjustments Data", className="d-inline"),
-            html.Span(id="row-count-badge", className="badge bg-secondary ms-2")
-        ]),
-        dbc.CardBody([
-            # Action buttons
-            html.Div([
-                dbc.Button("Add Row", id="add-row-btn", color="success", size="sm", className="me-2"),
-                dbc.Button("Save Changes", id="save-changes-btn", color="primary", size="sm", className="me-2"),
-                dbc.Button("Download CSV", id="download-csv-btn", color="info", size="sm", className="me-2"),
-                dcc.Upload(
-                    id='upload-data',
-                    children=dbc.Button("Upload CSV/Excel", color="warning", size="sm"),
-                    multiple=False
-                ),
-            ], className="mb-3"),
-
-            # Message area
-            html.Div(id="message", className="alert alert-info d-none", role="alert"),
-
-            # Data table
-            dash_table.DataTable(
-                id='adjustments-table',
-                columns=[
-                    {"name": "Plant", "id": "plant_name", "editable": False},
-                    {"name": "Train", "id": "lng_train_name_short", "editable": False},
-                    {"name": "Country", "id": "country_name", "editable": False},
-                    {"name": "Year", "id": "year", "editable": True, "type": "numeric"},
-                    {"name": "Month", "id": "month", "editable": True, "type": "numeric"},
-                    {"name": "Baseline (MTPA)", "id": "baseline_output", "editable": False, "type": "numeric",
-                     "format": {"specifier": ".3f"}},
-                    {"name": "Adjusted (MTPA)", "id": "adjusted_output", "editable": True, "type": "numeric",
-                     "format": {"specifier": ".3f"}},
-                    {"name": "Final (MTPA)", "id": "final_output", "editable": False, "type": "numeric",
-                     "format": {"specifier": ".3f"}},
-                    {"name": "Source", "id": "data_source", "editable": False},
-                    {"name": "Comments", "id": "comments", "editable": True},
-                ],
-                data=[],
-                editable=True,
-                row_deletable=False,
-                row_selectable='multi',
-                selected_rows=[],
-                filter_action="native",
-                sort_action="native",
-                page_action="native",
-                page_size=50,
-                style_table={"overflowX": "auto"},
-                style_cell={
-                    "minWidth": "100px",
-                    "width": "120px",
-                    "maxWidth": "200px",
-                    "textAlign": "left",
-                    "padding": "8px"
-                },
-                style_data_conditional=[
-                    {
-                        'if': {'row_index': 'odd'},
-                        'backgroundColor': 'rgb(248, 248, 248)'
-                    },
-                    {
-                        'if': {
-                            'filter_query': '{data_source} = "adjusted"',
-                            'column_id': 'adjusted_output'
+                # Data table
+                create_ag_grid_from_datatable(
+                    id='adjustments-table',
+                    columns=[
+                        {"name": "Plant", "id": "plant_name", "editable": False},
+                        {"name": "Train", "id": "lng_train_name_short", "editable": False},
+                        {"name": "Country", "id": "country_name", "editable": False},
+                        {"name": "Year", "id": "year", "editable": True, "type": "numeric"},
+                        {"name": "Month", "id": "month", "editable": True, "type": "numeric"},
+                        {"name": "Baseline (MTPA)", "id": "baseline_output", "editable": False, "type": "numeric",
+                         "format": {"specifier": ".3f"}},
+                        {"name": "Adjusted (MTPA)", "id": "adjusted_output", "editable": True, "type": "numeric",
+                         "format": {"specifier": ".3f"}},
+                        {"name": "Final (MTPA)", "id": "final_output", "editable": False, "type": "numeric",
+                         "format": {"specifier": ".3f"}},
+                        {"name": "Source", "id": "data_source", "editable": False},
+                        {"name": "Comments", "id": "comments", "editable": True},
+                    ],
+                    data=[],
+                    editable=True,
+                    row_selectable='multi',
+                    filter_action="native",
+                    sort_action="native",
+                    page_action="native",
+                    page_size=50,
+                    style_data_conditional=[
+                        {
+                            'if': {'row_index': 'odd'},
+                            'backgroundColor': 'rgb(248, 248, 248)'
                         },
-                        'backgroundColor': '#ffffcc',
-                        'fontWeight': 'bold'
-                    },
-                ],
-                style_header={
-                    'backgroundColor': 'rgb(230, 230, 230)',
-                    'fontWeight': 'bold'
-                }
-            ),
+                        {
+                            'if': {
+                                'filter_query': '{data_source} = "adjusted"',
+                                'column_id': 'adjusted_output'
+                            },
+                            'backgroundColor': '#ffffcc',
+                            'fontWeight': 'bold'
+                        },
+                    ],
+                ),
 
-            # Download component
-            dcc.Download(id="download-dataframe-csv"),
-        ])
-    ], className="mb-4"),
+                # Download component
+                dcc.Download(id="download-dataframe-csv"),
+            ])
+        ], className="mb-4"),
 
-    # Modals
-    dbc.Modal([
-        dbc.ModalHeader(dbc.ModalTitle("Duplicate Scenario")),
-        dbc.ModalBody([
-            html.Label("New Scenario Name:", className="fw-bold"),
-            dbc.Input(id="new-scenario-name", type="text", placeholder="e.g., test_1"),
-            html.Small("Current scenario will be copied to new name", className="text-muted mt-2")
-        ]),
-        dbc.ModalFooter([
-            dbc.Button("Cancel", id="duplicate-cancel-btn", className="me-2"),
-            dbc.Button("Create", id="duplicate-confirm-btn", color="primary"),
-        ]),
-    ], id="duplicate-modal", is_open=False),
+        # Modals
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle("Duplicate Scenario")),
+            dbc.ModalBody([
+                html.Label("New Scenario Name:", className="fw-bold"),
+                dbc.Input(id="new-scenario-name", type="text", placeholder="e.g., test_1"),
+                html.Small("Current scenario will be copied to new name", className="text-muted mt-2")
+            ]),
+            dbc.ModalFooter([
+                dbc.Button("Cancel", id="duplicate-cancel-btn", className="me-2"),
+                dbc.Button("Create", id="duplicate-confirm-btn", color="primary"),
+            ]),
+        ], id="duplicate-modal", is_open=False),
 
-    # Store components
-    dcc.Store(id='table-data-store'),
-    dcc.Store(id='scenario-list-store', data=scenarios),
-
-], fluid=True, className="p-4")
+    ], fluid=True, className="p-4")
 
 
 ###############################################################################
@@ -460,9 +441,8 @@ layout = dbc.Container([
 ###############################################################################
 
 @callback(
-    [Output('adjustments-table', 'data'),
-     Output('row-count-badge', 'children'),
-     Output('table-data-store', 'data')],
+    [Output('adjustments-table', 'rowData'),
+     Output('row-count-badge', 'children')],
     [Input('scenario-selector', 'value'),
      Input('plant-filter', 'value'),
      Input('train-filter', 'value'),
@@ -472,13 +452,13 @@ layout = dbc.Container([
 def update_table_data(scenario, plants, trains, year_range):
     """Load and filter data based on scenario and filters."""
     if not scenario:
-        return [], "0 rows", []
+        return [], "0 rows"
 
     # Fetch data
     df = fetch_adjustments_with_baseline(scenario)
 
     if df.empty:
-        return [], "0 rows", []
+        return [], "0 rows"
 
     # Apply filters
     if plants:
@@ -509,7 +489,7 @@ def update_table_data(scenario, plants, trains, year_range):
     data = df.to_dict('records')
     row_count = f"{len(data)} rows"
 
-    return data, row_count, data
+    return data, row_count
 
 
 @callback(
@@ -520,14 +500,13 @@ def update_table_data(scenario, plants, trains, year_range):
     [State('duplicate-modal', 'is_open')],
     prevent_initial_call=True
 )
-def toggle_duplicate_modal(open_click, cancel_click, confirm_click, is_open):
+def toggle_duplicate_modal(_open_click, _cancel_click, _confirm_click, is_open):
     """Toggle the duplicate scenario modal."""
     return not is_open
 
 
 @callback(
     [Output('scenario-selector', 'options'),
-     Output('scenario-list-store', 'data'),
      Output('message', 'children'),
      Output('message', 'className')],
     [Input('duplicate-confirm-btn', 'n_clicks'),
@@ -537,44 +516,44 @@ def toggle_duplicate_modal(open_click, cancel_click, confirm_click, is_open):
      State('new-scenario-name', 'value')],
     prevent_initial_call=True
 )
-def manage_scenarios(duplicate_click, delete_click, refresh_click, current_scenario, new_name):
+def manage_scenarios(_duplicate_click, _delete_click, _refresh_click, current_scenario, new_name):
     """Handle scenario duplication, deletion, and refresh."""
     ctx = dash.callback_context
     if not ctx.triggered:
-        return dash.no_update, dash.no_update, "", "alert alert-info d-none"
+        return dash.no_update, "", "alert alert-info d-none"
 
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
     try:
         if trigger_id == 'duplicate-confirm-btn':
             if not new_name or not new_name.strip():
-                return dash.no_update, dash.no_update, "Please enter a scenario name", "alert alert-warning"
+                return dash.no_update, "Please enter a scenario name", "alert alert-warning"
 
             result = duplicate_scenario(current_scenario, new_name.strip(), engine)
             scenarios = get_available_scenarios(engine)
             options = [{'label': s, 'value': s} for s in scenarios]
             message = f"Successfully created '{new_name}' with {result['records_copied']} adjustments from '{current_scenario}'"
-            return options, scenarios, message, "alert alert-success"
+            return options, message, "alert alert-success"
 
         elif trigger_id == 'delete-scenario-btn':
             if current_scenario in ['base_view', 'best_view']:
-                return dash.no_update, dash.no_update, f"Cannot delete reserved scenario '{current_scenario}'", "alert alert-danger"
+                return dash.no_update, f"Cannot delete reserved scenario '{current_scenario}'", "alert alert-danger"
 
             result = delete_scenario(current_scenario, engine)
             scenarios = get_available_scenarios(engine)
             options = [{'label': s, 'value': s} for s in scenarios]
             message = f"Deleted scenario '{current_scenario}' ({result['records_deleted']} records removed)"
-            return options, scenarios, message, "alert alert-warning"
+            return options, message, "alert alert-warning"
 
         elif trigger_id == 'refresh-scenarios-btn':
             scenarios = get_available_scenarios(engine)
             options = [{'label': s, 'value': s} for s in scenarios]
-            return options, scenarios, "Scenarios refreshed", "alert alert-info"
+            return options, "Scenarios refreshed", "alert alert-info"
 
     except Exception as e:
-        return dash.no_update, dash.no_update, f"Error: {str(e)}", "alert alert-danger"
+        return dash.no_update, f"Error: {str(e)}", "alert alert-danger"
 
-    return dash.no_update, dash.no_update, "", "alert alert-info d-none"
+    return dash.no_update, "", "alert alert-info d-none"
 
 
 @callback(
@@ -613,23 +592,23 @@ def update_scenario_info(scenario):
             html.Br(),
             html.Small(f"Years: {row['earliest_year']}-{row['latest_year']}")
         ])
-    except:
+    except Exception:
         return html.Div([html.Strong(scenario)])
 
 
 @callback(
-    [Output('adjustments-table', 'data', allow_duplicate=True),
+    [Output('adjustments-table', 'rowData', allow_duplicate=True),
      Output('message', 'children', allow_duplicate=True),
      Output('message', 'className', allow_duplicate=True)],
     [Input('add-row-btn', 'n_clicks'),
      Input('save-changes-btn', 'n_clicks'),
      Input('upload-data', 'contents')],
-    [State('adjustments-table', 'data'),
+    [State('adjustments-table', 'rowData'),
      State('scenario-selector', 'value'),
      State('upload-data', 'filename')],
     prevent_initial_call=True
 )
-def handle_table_actions(add_clicks, save_clicks, upload_contents, current_data, scenario, filename):
+def handle_table_actions(_add_clicks, _save_clicks, upload_contents, current_data, scenario, filename):
     """Handle add row, save, and upload actions."""
     ctx = dash.callback_context
     if not ctx.triggered:
@@ -672,10 +651,6 @@ def handle_table_actions(add_clicks, save_clicks, upload_contents, current_data,
 
             if df_to_save.empty:
                 return dash.no_update, "No adjustments to save", "alert alert-warning"
-
-            # Ensure required columns exist
-            required_cols = ['id_plant', 'id_lng_train', 'plant_name', 'lng_train_name_short',
-                           'year', 'month', 'adjusted_output']
 
             # Only keep columns that exist in the database table
             # The table has: id_plant, id_lng_train, plant_name, lng_train_name_short,
@@ -726,11 +701,11 @@ def handle_table_actions(add_clicks, save_clicks, upload_contents, current_data,
 @callback(
     Output("download-dataframe-csv", "data"),
     Input("download-csv-btn", "n_clicks"),
-    State('adjustments-table', 'data'),
+    State('adjustments-table', 'rowData'),
     State('scenario-selector', 'value'),
     prevent_initial_call=True
 )
-def download_csv(n_clicks, data, scenario):
+def download_csv(_n_clicks, data, scenario):
     """Download current table data as CSV."""
     if not data:
         return dash.no_update
@@ -750,7 +725,7 @@ def download_csv(n_clicks, data, scenario):
      State('copy-destination-scenario', 'value')],
     prevent_initial_call=True
 )
-def copy_trains_to_scenario(n_clicks, trains_to_copy, destination_scenario):
+def copy_trains_to_scenario(_n_clicks, trains_to_copy, destination_scenario):
     """Copy selected trains from base_view to a scenario."""
     if not trains_to_copy or not destination_scenario:
         return "Please select trains and destination scenario", "alert alert-warning"
@@ -806,7 +781,7 @@ def copy_trains_to_scenario(n_clicks, trains_to_copy, destination_scenario):
             df_baseline = pd.read_sql(query, conn)
 
         if df_baseline.empty:
-            return f"No baseline data found for selected trains", "alert alert-warning"
+            return "No baseline data found for selected trains", "alert alert-warning"
 
         # Prepare data for insertion
         # Only keep columns that exist in the database table
