@@ -15,10 +15,20 @@ from plotly.subplots import make_subplots
 from utils.balance_time import TIME_GROUP_LABELS, normalize_time_group
 from utils.balance_components import create_balance_empty_state as _create_empty_state
 from utils.snapshot_controls import (
+    build_ea_upload_dropdown_options as _build_ea_run_dropdown_options,
     deserialize_snapshot_value as _deserialize_snapshot_value,
     format_metadata_timestamp as _format_metadata_timestamp,
     resolve_snapshot_control_values as _resolve_snapshot_control_values,
 )
+from utils.dashboard_snapshot_cache import (
+    build_source_key as _build_source_key,
+    get_or_build_snapshot as _get_or_build_snapshot,
+    resolve_snapshot as _resolve_snapshot,
+    snapshot_is_shared as _snapshot_is_shared,
+    was_global_refresh_triggered as _was_global_refresh_triggered,
+)
+from utils.provider_flow_snapshot import fetch_provider_flow_source_state as _fetch_provider_flow_source_state
+from utils.ea_run_interface import normalize_ea_run_id
 from utils.market_balance_data import (
     COUNTRY_GROUP_LABELS,
     build_period_delta_table,
@@ -30,6 +40,7 @@ from utils.market_balance_data import (
     fetch_provider_overview_payload,
     fetch_trade_balance_payload,
     serialize_frame,
+    engine,
 )
 
 if TYPE_CHECKING:
@@ -69,6 +80,32 @@ MARKET_BALANCE_STICKY_HEADER_STYLE = {
     "alignItems": "flex-end",
     "flexWrap": "wrap",
 }
+
+
+def _resolve_market_store(store_payload, namespace):
+    return _resolve_snapshot(
+        store_payload,
+        engine,
+        expected_namespace=namespace,
+    )
+
+
+def _load_cached_market_store(namespace, key_parts, builder, source_state=None):
+    if source_state is None or _was_global_refresh_triggered():
+        try:
+            source_state = _fetch_provider_flow_source_state()
+        except Exception:
+            source_state = {"request_token": dt.datetime.now(dt.timezone.utc).isoformat()}
+    source_key = _build_source_key(namespace, source_state, key_parts)
+    reference, payload = _get_or_build_snapshot(
+        engine,
+        namespace=namespace,
+        source_key=source_key,
+        builder=builder,
+        force=_was_global_refresh_triggered(),
+        manifest={"source_state": source_state, "filters": key_parts},
+    )
+    return reference if _snapshot_is_shared(reference) else payload
 
 STICKY_RADIO_LABEL_STYLE = {
     "display": "inline-flex",
@@ -176,7 +213,7 @@ def _build_error_banner(error_message: str | None) -> html.Div:
     )
 
 
-def _get_country_snapshot_values(meta_data: dict, country: str | None) -> list[str]:
+def _get_country_snapshot_values(meta_data: dict, country: str | None) -> list[dict]:
     country_snapshots = meta_data.get("country_snapshots") or {}
     if country and country in country_snapshots:
         return country_snapshots.get(country) or []
@@ -184,12 +221,17 @@ def _get_country_snapshot_values(meta_data: dict, country: str | None) -> list[s
 
 
 def _choose_country_snapshot_value(
-    snapshots: list[str],
-    current_snapshot: str | None,
-) -> str | None:
-    if current_snapshot in snapshots:
-        return current_snapshot
-    return snapshots[1] if len(snapshots) > 1 else None
+    snapshots: list[dict],
+    current_snapshot: int | None,
+) -> int | None:
+    run_ids = [run.get("run_id") for run in snapshots]
+    try:
+        normalized_current = normalize_ea_run_id(current_snapshot)
+    except (TypeError, ValueError):
+        normalized_current = None
+    if normalized_current in run_ids:
+        return normalized_current
+    return run_ids[1] if len(run_ids) > 1 else None
 
 
 def _split_wrapped_header_name(column_name: str) -> list[str]:
@@ -823,7 +865,7 @@ def _fetch_net_balance_comparison_frame(
     comparison_source: str,
     short_term_value: str | None,
     long_term_value: str | None,
-    ea_upload_value: str | None,
+    ea_upload_value: int | None,
     country_group: str,
     time_group: str,
     unit: str,
@@ -833,10 +875,10 @@ def _fetch_net_balance_comparison_frame(
     try:
         if comparison_source == "ea":
             if not ea_upload_value:
-                return None, "No Energy Aspects upload_timestamp_utc available."
+                return None, "No Energy Aspects comparison run available."
             return (
                 fetch_net_balance_for_ea_upload(
-                    upload_timestamp_utc=ea_upload_value,
+                    ea_as_of_run_id=ea_upload_value,
                     country_group=country_group,
                     time_group=time_group,
                     unit=unit,
@@ -877,7 +919,7 @@ def _render_overview_net_delta(
     comparison_source: str,
     short_term_value: str | None,
     long_term_value: str | None,
-    ea_upload_value: str | None,
+    ea_upload_value: int | None,
     start_date: str | None,
     end_date: str | None,
     time_group: str,
@@ -887,6 +929,11 @@ def _render_overview_net_delta(
 ) -> tuple[html.Div, html.Div | dag.AgGrid]:
     if active_tab != "overview":
         return html.Div(), html.Div()
+
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-overview-v2",
+    )
 
     error_message = (store_payload or {}).get("error")
     if error_message:
@@ -1230,6 +1277,7 @@ def _build_country_category_figure(df: pd.DataFrame, *, title: str, chart_type: 
 
 layout = html.Div(
     [
+        dcc.Store(id="market-balance-source-state-store", storage_type="memory"),
         dcc.Store(id="market-balance-overview-store", storage_type="memory"),
         dcc.Store(id="market-balance-trade-store", storage_type="memory"),
         dcc.Store(id="market-balance-country-meta-store", storage_type="memory"),
@@ -1665,6 +1713,17 @@ layout = html.Div(
 
 
 @callback(
+    Output("market-balance-source-state-store", "data"),
+    Input("global-refresh-button", "n_clicks"),
+)
+def load_market_balance_source_state(_):
+    try:
+        return _fetch_provider_flow_source_state()
+    except Exception:
+        return {"request_token": dt.datetime.now(dt.timezone.utc).isoformat()}
+
+
+@callback(
     Output("market-balance-overview-store", "data"),
     Input("global-refresh-button", "n_clicks"),
     Input("market-balance-date-range", "start_date"),
@@ -1672,14 +1731,29 @@ layout = html.Div(
     Input("market-balance-trade-time-group", "value"),
     Input("market-balance-trade-unit", "value"),
     Input("market-balance-trade-country-group", "value"),
+    State("market-balance-source-state-store", "data"),
 )
-def load_overview_store(_, start_date, end_date, time_group, unit, country_group):
-    return fetch_provider_overview_payload(
-        start_date=start_date,
-        end_date=end_date,
-        time_group=time_group,
-        unit=unit,
-        country_group=country_group,
+def load_overview_store(_, start_date, end_date, time_group, unit, country_group, source_state=None):
+    key_parts = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "time_group": time_group,
+        "unit": unit,
+        "country_group": country_group,
+    }
+    return _load_cached_market_store(
+        "market-balance-overview-v2",
+        key_parts,
+        lambda: fetch_provider_overview_payload(
+            start_date=start_date,
+            end_date=end_date,
+            time_group=time_group,
+            unit=unit,
+            country_group=country_group,
+            force_source_refresh=_was_global_refresh_triggered(),
+            source_state=source_state,
+        ),
+        source_state=source_state,
     )
 
 
@@ -1749,6 +1823,11 @@ def render_overview(active_tab, store_payload, maintenance_metric="Unplanned"):
             empty,
             empty,
         )
+
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-overview-v2",
+    )
 
     error_message = (store_payload or {}).get("error")
     if error_message:
@@ -1885,6 +1964,10 @@ def sync_woodmac_overview_comparison_controls(
     current_lt_value,
     current_ea_upload_value,
 ):
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-overview-v2",
+    )
     comparison_options = ((store_payload or {}).get("metadata", {}) or {}).get(
         "comparison_options", {}
     )
@@ -1919,6 +2002,10 @@ def sync_ea_overview_comparison_controls(
     current_lt_value,
     current_ea_upload_value,
 ):
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-overview-v2",
+    )
     comparison_options = ((store_payload or {}).get("metadata", {}) or {}).get(
         "comparison_options", {}
     )
@@ -2029,7 +2116,7 @@ def _export_overview_net_section(
     comparison_source: str,
     short_term_value: str | None,
     long_term_value: str | None,
-    ea_upload_value: str | None,
+    ea_upload_value: int | None,
     start_date: str | None,
     end_date: str | None,
     time_group: str,
@@ -2041,6 +2128,11 @@ def _export_overview_net_section(
 ):
     if not n_clicks:
         return no_update
+
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-overview-v2",
+    )
 
     if (store_payload or {}).get("error"):
         return no_update
@@ -2180,6 +2272,11 @@ def export_overview_workbook(n_clicks, store_payload):
     if not n_clicks:
         return no_update
 
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-overview-v2",
+    )
+
     data = (store_payload or {}).get("data", {})
     if not data:
         return no_update
@@ -2213,16 +2310,33 @@ def export_overview_workbook(n_clicks, store_payload):
     Input("market-balance-trade-country-group", "value"),
     Input("market-balance-trade-years", "value"),
     Input("market-balance-trade-unit", "value"),
+    State("market-balance-source-state-store", "data"),
 )
-def load_trade_store(_, start_date, end_date, time_group, diff_type, country_group, selected_years, unit):
-    return fetch_trade_balance_payload(
-        start_date=start_date,
-        end_date=end_date,
-        time_group=time_group,
-        diff_type=diff_type,
-        country_group=country_group,
-        selected_years=selected_years,
-        unit=unit,
+def load_trade_store(_, start_date, end_date, time_group, diff_type, country_group, selected_years, unit, source_state=None):
+    key_parts = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "time_group": time_group,
+        "diff_type": diff_type,
+        "country_group": country_group,
+        "selected_years": selected_years,
+        "unit": unit,
+    }
+    return _load_cached_market_store(
+        "market-balance-trade-v1",
+        key_parts,
+        lambda: fetch_trade_balance_payload(
+            start_date=start_date,
+            end_date=end_date,
+            time_group=time_group,
+            diff_type=diff_type,
+            country_group=country_group,
+            selected_years=selected_years,
+            unit=unit,
+            force_source_refresh=_was_global_refresh_triggered(),
+            source_state=source_state,
+        ),
+        source_state=source_state,
     )
 
 
@@ -2231,6 +2345,10 @@ def load_trade_store(_, start_date, end_date, time_group, diff_type, country_gro
     Input("market-balance-trade-store", "data"),
 )
 def sync_trade_years(store_payload):
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-trade-v1",
+    )
     metadata = (store_payload or {}).get("metadata", {})
     available_years = metadata.get("available_years") or []
     return [{"label": str(year), "value": year} for year in available_years]
@@ -2250,6 +2368,10 @@ def sync_trade_years(store_payload):
     Input("market-balance-trade-store", "data"),
 )
 def render_trade_balance(store_payload):
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-trade-v1",
+    )
     error_message = (store_payload or {}).get("error")
     if error_message:
         empty = _empty_figure("Trade balance unavailable")
@@ -2340,6 +2462,11 @@ def export_trade_workbook(n_clicks, store_payload):
     if not n_clicks:
         return no_update
 
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-trade-v1",
+    )
+
     data = (store_payload or {}).get("data", {})
     if not data:
         return no_update
@@ -2360,9 +2487,17 @@ def export_trade_workbook(n_clicks, store_payload):
 @callback(
     Output("market-balance-country-meta-store", "data"),
     Input("global-refresh-button", "n_clicks"),
+    State("market-balance-source-state-store", "data"),
 )
-def load_country_meta_store(_):
-    return fetch_country_balance_meta_payload()
+def load_country_meta_store(_, source_state=None):
+    return _load_cached_market_store(
+        "market-balance-country-meta-v2",
+        {},
+        lambda: fetch_country_balance_meta_payload(
+            current_ea=(source_state or {}).get("current_ea")
+        ),
+        source_state=source_state,
+    )
 
 
 @callback(
@@ -2372,6 +2507,10 @@ def load_country_meta_store(_):
     State("market-balance-country-dropdown", "value"),
 )
 def sync_country_controls(store_payload, current_country):
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-country-meta-v2",
+    )
     data = (store_payload or {}).get("data", {})
     metadata = (store_payload or {}).get("metadata", {})
     countries = data.get("countries") or []
@@ -2390,10 +2529,14 @@ def sync_country_controls(store_payload, current_country):
     State("market-balance-country-snapshot", "value"),
 )
 def sync_country_snapshot_control(store_payload, country, current_snapshot):
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-country-meta-v2",
+    )
     data = (store_payload or {}).get("data", {})
     snapshots = _get_country_snapshot_values(data, country)
 
-    snapshot_options = [{"label": snapshot, "value": snapshot} for snapshot in snapshots]
+    snapshot_options = _build_ea_run_dropdown_options(snapshots)
     next_snapshot = _choose_country_snapshot_value(
         snapshots,
         current_snapshot,
@@ -2410,15 +2553,30 @@ def sync_country_snapshot_control(store_payload, country, current_snapshot):
     Input("market-balance-date-range", "start_date"),
     Input("market-balance-date-range", "end_date"),
     Input("market-balance-country-snapshot", "value"),
+    State("market-balance-source-state-store", "data"),
 )
-def load_country_store(_, country, level, time_group, start_date, end_date, comparison_snapshot):
-    return fetch_country_balance_payload(
-        country=country,
-        level=level,
-        time_group=time_group,
-        start_date=start_date,
-        end_date=end_date,
-        comparison_timestamp=comparison_snapshot,
+def load_country_store(_, country, level, time_group, start_date, end_date, comparison_snapshot, source_state=None):
+    key_parts = {
+        "country": country,
+        "level": level,
+        "time_group": time_group,
+        "start_date": start_date,
+        "end_date": end_date,
+        "comparison_snapshot": comparison_snapshot,
+    }
+    return _load_cached_market_store(
+        "market-balance-country-v2",
+        key_parts,
+        lambda: fetch_country_balance_payload(
+            country=country,
+            level=level,
+            time_group=time_group,
+            start_date=start_date,
+            end_date=end_date,
+            comparison_timestamp=comparison_snapshot,
+            ea_as_of_run_id=((source_state or {}).get("current_ea") or {}).get("run_id"),
+        ),
+        source_state=source_state,
     )
 
 
@@ -2432,6 +2590,10 @@ def load_country_store(_, country, level, time_group, start_date, end_date, comp
     Input("market-balance-country-store", "data"),
 )
 def render_country_balance(store_payload):
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-country-v2",
+    )
     error_message = (store_payload or {}).get("error")
     if error_message:
         return (
@@ -2536,6 +2698,11 @@ def render_country_balance(store_payload):
 def export_country_workbook(n_clicks, store_payload, country):
     if not n_clicks:
         return no_update
+
+    store_payload = _resolve_market_store(
+        store_payload,
+        "market-balance-country-v2",
+    )
 
     data = (store_payload or {}).get("data", {})
     if not data:

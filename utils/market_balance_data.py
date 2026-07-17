@@ -39,10 +39,22 @@ from utils.import_flow_data import (
     fetch_woodmac_import_flow_metadata,
     fetch_woodmac_import_flow_raw_data,
     fetch_woodmac_import_flow_raw_data_for_publications,
+    fetch_woodmac_publication_options as fetch_woodmac_import_publication_options,
+    fetch_ea_upload_options as fetch_ea_import_upload_options,
 )
 from utils.snapshot_controls import (
     ea_metadata_from_upload_options as _ea_metadata_from_upload_options,
     woodmac_metadata_from_publication_options as _woodmac_metadata_from_publication_options,
+)
+from utils.ea_run_interface import (
+    fetch_current_ea_run,
+    fetch_ea_comparison_runs,
+    normalize_ea_run_id,
+)
+from utils.provider_flow_snapshot import (
+    build_provider_flow_payload,
+    get_provider_flow_snapshot,
+    get_provider_flow_snapshot_for_state,
 )
 
 
@@ -293,6 +305,17 @@ def _filter_frame_by_date_range(
     return working_df.copy()
 
 
+def _normalize_country_mapping_df(mapping_df: pd.DataFrame) -> pd.DataFrame:
+    if mapping_df.empty:
+        return pd.DataFrame(columns=["country_name", "country", *COUNTRY_GROUP_COLUMN_MAP.values()])
+
+    mapping_df = mapping_df.copy()
+    for column_name in mapping_df.columns:
+        mapping_df[column_name] = mapping_df[column_name].map(_normalize_text_value)
+
+    return mapping_df
+
+
 def fetch_country_mapping_df() -> pd.DataFrame:
     query = text(
         f"""
@@ -310,14 +333,40 @@ def fetch_country_mapping_df() -> pd.DataFrame:
     )
     with engine.connect() as connection:
         mapping_df = pd.read_sql_query(query, connection)
+    return _normalize_country_mapping_df(mapping_df)
 
-    if mapping_df.empty:
-        return pd.DataFrame(columns=["country_name", "country", *COUNTRY_GROUP_COLUMN_MAP.values()])
 
-    for column_name in mapping_df.columns:
-        mapping_df[column_name] = mapping_df[column_name].map(_normalize_text_value)
-
-    return mapping_df
+def _resolve_latest_provider_flow_payload(
+    *, force: bool = False, source_state: dict[str, object] | None = None
+) -> dict[str, object]:
+    try:
+        if source_state and isinstance(source_state.get("current_ea"), dict):
+            _, payload = get_provider_flow_snapshot_for_state(
+                source_state, force=force
+            )
+        else:
+            _, payload = get_provider_flow_snapshot(force=force)
+        errors = payload.get("errors") or {}
+        required = (
+            "woodmac_export",
+            "woodmac_import",
+            "ea_export",
+            "ea_import",
+            "mapping",
+            "woodmac_export_options",
+            "woodmac_import_options",
+            "ea_export_options",
+            "ea_import_options",
+        )
+        if any(name in errors or name not in payload for name in required):
+            raise RuntimeError("Shared provider payload is incomplete")
+        return payload
+    except Exception:
+        if source_state and isinstance(source_state.get("current_ea"), dict):
+            raise
+        # Use the same pinned builder when shared snapshot storage is unavailable.
+        _, payload = build_provider_flow_payload()
+        return payload
 
 
 def _build_country_group_lookup_maps(mapping_df: pd.DataFrame) -> dict[str, dict[str, str]]:
@@ -563,7 +612,7 @@ def _build_provider_net_balance_table(
 def fetch_net_balance_comparison_options() -> dict[str, object]:
     return {
         "woodmac": fetch_woodmac_export_publication_options(),
-        "ea_uploads": fetch_ea_export_upload_options(),
+        "ea_comparison_runs": fetch_ea_export_upload_options(),
     }
 
 
@@ -606,16 +655,28 @@ def fetch_net_balance_for_woodmac_publications(
 
 def fetch_net_balance_for_ea_upload(
     *,
-    upload_timestamp_utc: str,
+    ea_as_of_run_id: int | None = None,
+    upload_timestamp_utc: int | None = None,
     country_group: str,
     time_group: str,
     unit: str,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> pd.DataFrame:
+    run_id = normalize_ea_run_id(
+        ea_as_of_run_id if ea_as_of_run_id is not None else upload_timestamp_utc
+    )
     mapping_df = fetch_country_mapping_df()
-    export_raw_df = fetch_ea_export_flow_raw_data_for_upload(upload_timestamp_utc)
-    import_raw_df = fetch_ea_import_flow_raw_data_for_upload(upload_timestamp_utc)
+    export_raw_df = fetch_ea_export_flow_raw_data_for_upload(
+        run_id,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    import_raw_df = fetch_ea_import_flow_raw_data_for_upload(
+        run_id,
+        start_date=start_date,
+        end_date=end_date,
+    )
     return _build_provider_net_balance_table(
         export_raw_df,
         import_raw_df,
@@ -819,12 +880,18 @@ def fetch_trade_balance_payload(
     unit: str = "bcm",
     start_date: str | None = None,
     end_date: str | None = None,
+    force_source_refresh: bool = False,
+    source_state: dict[str, object] | None = None,
 ) -> dict:
     try:
         warnings: list[str] = []
-        mapping_df = fetch_country_mapping_df()
-        export_raw_df = fetch_ea_export_flow_raw_data()
-        import_raw_df = fetch_ea_import_flow_raw_data()
+        provider_payload = _resolve_latest_provider_flow_payload(
+            force=force_source_refresh,
+            source_state=source_state,
+        )
+        mapping_df = _normalize_country_mapping_df(provider_payload["mapping"])
+        export_raw_df = provider_payload["ea_export"]
+        import_raw_df = provider_payload["ea_import"]
 
         exports_df = _prepare_trade_flow_table(
             export_raw_df,
@@ -923,8 +990,12 @@ def fetch_trade_balance_payload(
                 "diff_type": diff_type,
                 "source": "Energy Aspects",
                 "warnings": warnings,
-                "export_metadata": fetch_ea_export_flow_metadata(),
-                "import_metadata": fetch_ea_import_flow_metadata(),
+                "export_metadata": _ea_metadata_from_upload_options(
+                    provider_payload.get("current_ea")
+                ),
+                "import_metadata": _ea_metadata_from_upload_options(
+                    provider_payload.get("current_ea")
+                ),
                 "start_date": _serialize_scalar(_normalize_range_start(start_date)),
                 "end_date": _serialize_scalar(_normalize_range_end(end_date)),
             },
@@ -1573,22 +1644,26 @@ def fetch_global_maintenance_overview(
     end_date: str | None = None,
     time_group: str = "monthly",
     woodmac_raw_df: pd.DataFrame | None = None,
+    ea_as_of_run_id: int | None = None,
 ) -> tuple[pd.DataFrame, dict]:
+    run_id = (
+        fetch_current_ea_run(engine, schema=DB_SCHEMA)["run_id"]
+        if ea_as_of_run_id is None
+        else normalize_ea_run_id(ea_as_of_run_id)
+    )
     ea_query = text(
         f"""
-        WITH latest_snapshot AS (
-            SELECT MAX(upload_timestamp_utc) AS upload_timestamp_utc
-            FROM {DB_SCHEMA}.ea_values
-            WHERE dataset_id = '15522'
-        )
         SELECT
             date::date AS month,
             ROUND(SUM(value)::numeric, 2) AS value,
             MAX(upload_timestamp_utc) AS upload_timestamp_utc,
             COUNT(*) AS n_assets
-        FROM {DB_SCHEMA}.ea_values
-        WHERE dataset_id = '15522'
-          AND upload_timestamp_utc = (SELECT upload_timestamp_utc FROM latest_snapshot)
+        FROM {DB_SCHEMA}.ea_values_at_run(
+            :ea_as_of_run_id,
+            ARRAY['15522']::text[],
+            CAST(:start_date AS timestamp),
+            CAST(:end_date AS timestamp)
+        )
         GROUP BY 1
         ORDER BY month
         """
@@ -1629,7 +1704,15 @@ def fetch_global_maintenance_overview(
                 start_date=start_date,
                 end_date=end_date,
             )
-        ea_df = pd.read_sql_query(ea_query, connection)
+        ea_df = pd.read_sql_query(
+            ea_query,
+            connection,
+            params={
+                "ea_as_of_run_id": run_id,
+                "start_date": _normalize_range_start(start_date),
+                "end_date": _normalize_range_end(end_date),
+            },
+        )
 
     if woodmac_raw_df is None:
         wm_df = _filter_frame_by_date_range(
@@ -1698,13 +1781,19 @@ def fetch_provider_overview_payload(
     time_group: str = "yearly",
     unit: str = "bcm",
     country_group: str = "country_classification_level1",
+    force_source_refresh: bool = False,
+    source_state: dict[str, object] | None = None,
 ) -> dict:
     try:
-        woodmac_export_df = fetch_woodmac_export_flow_raw_data()
-        woodmac_import_df = fetch_woodmac_import_flow_raw_data()
-        ea_export_df = fetch_ea_export_flow_raw_data()
-        ea_import_df = fetch_ea_import_flow_raw_data()
-        mapping_df = fetch_country_mapping_df()
+        provider_payload = _resolve_latest_provider_flow_payload(
+            force=force_source_refresh,
+            source_state=source_state,
+        )
+        woodmac_export_df = provider_payload["woodmac_export"]
+        woodmac_import_df = provider_payload["woodmac_import"]
+        ea_export_df = provider_payload["ea_export"]
+        ea_import_df = provider_payload["ea_import"]
+        mapping_df = _normalize_country_mapping_df(provider_payload["mapping"])
 
         woodmac_balance_df = _build_provider_balance_table(
             woodmac_export_df,
@@ -1752,6 +1841,7 @@ def fetch_provider_overview_payload(
             end_date=end_date,
             time_group=time_group,
             woodmac_raw_df=maintenance_raw_df,
+            ea_as_of_run_id=provider_payload["current_ea"]["run_id"],
         )
         maintenance_grouped_df = _build_maintenance_grouped_table(
             maintenance_raw_df,
@@ -1791,16 +1881,27 @@ def fetch_provider_overview_payload(
             time_group=time_group,
         )
 
-        comparison_options = fetch_net_balance_comparison_options()
+        comparison_options = {
+            "woodmac": provider_payload.get("woodmac_export_options") or {
+                "short_term": [], "long_term": []
+            },
+            "ea_comparison_runs": provider_payload.get("ea_comparison_runs") or [],
+        }
         metadata = {
             "woodmac_export": _woodmac_metadata_from_publication_options(
                 comparison_options.get("woodmac")
             ),
-            "woodmac_import": fetch_woodmac_import_flow_metadata(),
-            "ea_export": _ea_metadata_from_upload_options(
-                comparison_options.get("ea_uploads")
+            "woodmac_import": _woodmac_metadata_from_publication_options(
+                provider_payload.get("woodmac_import_options") or {
+                    "short_term": [], "long_term": []
+                }
             ),
-            "ea_import": fetch_ea_import_flow_metadata(),
+            "ea_export": _ea_metadata_from_upload_options(
+                provider_payload.get("current_ea")
+            ),
+            "ea_import": _ea_metadata_from_upload_options(
+                provider_payload.get("current_ea")
+            ),
             "maintenance": maintenance_metadata,
             "pacific_countries": PACIFIC_LOCKED_COUNTRIES,
             "comparison_options": comparison_options,
@@ -2106,7 +2207,9 @@ def _drop_country_display_metadata_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=["Timestamp UTC"], errors="ignore")
 
 
-def fetch_country_balance_meta_payload() -> dict:
+def fetch_country_balance_meta_payload(
+    *, current_ea: dict[str, object] | None = None
+) -> dict:
     try:
         countries_query = text(
             f"""
@@ -2117,57 +2220,25 @@ def fetch_country_balance_meta_payload() -> dict:
             ORDER BY country
             """
         )
-        snapshots_query = text(
-            f"""
-            WITH selected_datasets AS (
-                SELECT DISTINCT
-                    country,
-                    CAST(dataset_id AS TEXT) AS dataset_id
-                FROM {DB_SCHEMA}.fundamentals_global_balance_ea_datasets
-                WHERE used != 'N'
-                  AND balance = 'Gas'
-            )
-            SELECT
-                selected_datasets.country,
-                values_table.upload_timestamp_utc::timestamp AS upload_timestamp_utc
-            FROM {DB_SCHEMA}.ea_values values_table
-            JOIN selected_datasets
-                ON CAST(values_table.dataset_id AS TEXT) = selected_datasets.dataset_id
-            WHERE upload_timestamp_utc IS NOT NULL
-            GROUP BY selected_datasets.country, values_table.upload_timestamp_utc
-            ORDER BY selected_datasets.country, values_table.upload_timestamp_utc DESC
-            """
-        )
         with engine.connect() as connection:
             countries_df = pd.read_sql_query(countries_query, connection)
-            snapshots_df = pd.read_sql_query(snapshots_query, connection)
 
         countries = [
             _normalize_text_value(value)
             for value in countries_df.get("country", pd.Series(dtype=object)).tolist()
         ]
         countries = [value for value in countries if value]
-        country_snapshots: dict[str, list[str]] = {}
-        all_snapshot_values = []
-        for _, snapshot_row in snapshots_df.iterrows():
-            country = _normalize_text_value(snapshot_row.get("country"))
-            timestamp = pd.to_datetime(
-                snapshot_row.get("upload_timestamp_utc"), errors="coerce"
-            )
-            if not country or pd.isna(timestamp):
-                continue
-
-            snapshot = _serialize_scalar(timestamp)
-            if not snapshot:
-                continue
-            country_snapshots.setdefault(country, []).append(snapshot)
-            all_snapshot_values.append(timestamp)
-
-        snapshots = [
-            _serialize_scalar(value)
-            for value in sorted(set(all_snapshot_values), reverse=True)
-        ]
-        snapshots = [value for value in snapshots if value]
+        current_ea = dict(
+            current_ea or fetch_current_ea_run(engine, schema=DB_SCHEMA)
+        )
+        current_ea["run_id"] = normalize_ea_run_id(current_ea.get("run_id"))
+        snapshots = fetch_ea_comparison_runs(
+            engine,
+            max_run_id=current_ea["run_id"],
+            schema=DB_SCHEMA,
+            min_snapshot_at="2025-02-03",
+        )
+        country_snapshots = {country: snapshots for country in countries}
         default_country = countries[0] if countries else None
         default_country_snapshots = country_snapshots.get(default_country, snapshots)
         return _payload(
@@ -2179,11 +2250,11 @@ def fetch_country_balance_meta_payload() -> dict:
             metadata={
                 "default_country": default_country,
                 "default_snapshot": (
-                    default_country_snapshots[1]
+                    default_country_snapshots[1]["run_id"]
                     if len(default_country_snapshots) > 1
                     else None
                 ),
-                "latest_snapshot": snapshots[0] if snapshots else None,
+                "current_ea": current_ea,
             },
         )
     except Exception as exc:
@@ -2222,13 +2293,19 @@ def build_country_conversion_factors_cte() -> tuple[str, list[str]]:
 def _fetch_country_balance_raw_data(
     country: str,
     *,
-    snapshot_timestamp: str | None = None,
+    ea_as_of_run_id: int,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     conversion_factors_cte, warnings = build_country_conversion_factors_cte()
     date_filters = []
-    params = {"country": country, "snapshot_timestamp": snapshot_timestamp}
+    run_id = normalize_ea_run_id(ea_as_of_run_id)
+    params = {
+        "country": country,
+        "ea_as_of_run_id": run_id,
+        "start_date": None,
+        "end_date": None,
+    }
     start_bound = _normalize_range_start(start_date)
     end_bound = _normalize_range_end(end_date)
     if start_bound is not None:
@@ -2242,7 +2319,7 @@ def _fetch_country_balance_raw_data(
     query = text(
         f"""
         WITH selected_datasets AS (
-            SELECT
+            SELECT DISTINCT
                 CAST(dataset_id AS TEXT) AS dataset_id,
                 type,
                 subtype,
@@ -2253,34 +2330,38 @@ def _fetch_country_balance_raw_data(
               AND balance = 'Gas'
               AND used != 'N'
         ),
-        latest_snapshot AS (
-            SELECT MAX(values_table.upload_timestamp_utc) AS upload_timestamp_utc
-            FROM {DB_SCHEMA}.ea_values values_table
-            JOIN selected_datasets
-                ON CAST(values_table.dataset_id AS TEXT) = selected_datasets.dataset_id
+        selected_ids AS (
+            SELECT array_agg(dataset_id ORDER BY dataset_id)::text[] AS dataset_ids
+            FROM selected_datasets
+            HAVING count(*) > 0
         ),
         {conversion_factors_cte}
         SELECT
-            CAST(values_table.dataset_id AS TEXT) AS dataset_id,
             values_table.date::date AS date,
-            values_table.value,
-            values_table.upload_timestamp_utc::timestamp AS upload_timestamp_utc,
+            SUM(
+                values_table.value
+                * CASE WHEN selected_datasets.operation = '-' THEN -1 ELSE 1 END
+                * COALESCE(conversion_factors.conversion_factor_bcm_gas, 1)
+            ) AS value,
+            MAX(values_table.upload_timestamp_utc)::timestamp AS upload_timestamp_utc,
             selected_datasets.type,
             selected_datasets.subtype,
-            selected_datasets.subsubtype,
-            selected_datasets.operation,
-            COALESCE(conversion_factors.conversion_factor_bcm_gas, 1) AS conversion_factor_bcm_gas
-        FROM {DB_SCHEMA}.ea_values values_table
+            selected_datasets.subsubtype
+        FROM selected_ids
+        CROSS JOIN LATERAL {DB_SCHEMA}.ea_values_at_run(
+            :ea_as_of_run_id, selected_ids.dataset_ids,
+            CAST(:start_date AS timestamp), CAST(:end_date AS timestamp)
+        ) values_table
         JOIN selected_datasets
             ON CAST(values_table.dataset_id AS TEXT) = selected_datasets.dataset_id
         LEFT JOIN conversion_factors
             ON CAST(values_table.dataset_id AS TEXT) = conversion_factors.dataset_id
-        WHERE values_table.upload_timestamp_utc = COALESCE(
-            CAST(:snapshot_timestamp AS timestamp),
-            (SELECT upload_timestamp_utc FROM latest_snapshot)
-        )
+        WHERE TRUE
           {date_filter_clause}
-        ORDER BY values_table.date
+        GROUP BY values_table.date::date, selected_datasets.type,
+                 selected_datasets.subtype, selected_datasets.subsubtype
+        ORDER BY values_table.date::date, selected_datasets.type,
+                 selected_datasets.subtype, selected_datasets.subsubtype
         """
     )
     with engine.connect() as connection:
@@ -2294,11 +2375,6 @@ def _fetch_country_balance_raw_data(
         return raw_df, warnings
 
     raw_df["value"] = pd.to_numeric(raw_df["value"], errors="coerce").fillna(0.0)
-    raw_df["conversion_factor_bcm_gas"] = pd.to_numeric(
-        raw_df["conversion_factor_bcm_gas"], errors="coerce"
-    ).fillna(1.0)
-    raw_df.loc[raw_df["operation"] == "-", "value"] *= -1.0
-    raw_df["value"] = raw_df["value"] * raw_df["conversion_factor_bcm_gas"]
     raw_df["Date"] = pd.to_datetime(raw_df["date"]).dt.date
     raw_df["Timestamp UTC"] = pd.to_datetime(
         raw_df["upload_timestamp_utc"], errors="coerce"
@@ -2368,7 +2444,9 @@ def fetch_country_balance_payload(
     country: str | None,
     level: str = "subtype",
     time_group: str = "monthly",
-    comparison_timestamp: str | None = None,
+    comparison_run_id: int | None = None,
+    comparison_timestamp: int | None = None,
+    ea_as_of_run_id: int | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict:
@@ -2376,19 +2454,30 @@ def fetch_country_balance_payload(
         return _payload(error="Select a country to load the drilldown.")
 
     try:
+        current_run = (
+            fetch_current_ea_run(engine, schema=DB_SCHEMA)
+            if ea_as_of_run_id is None
+            else {"run_id": normalize_ea_run_id(ea_as_of_run_id)}
+        )
+        selected_comparison_run = (
+            comparison_run_id
+            if comparison_run_id is not None
+            else comparison_timestamp
+        )
         current_raw_df, current_warnings = _fetch_country_balance_raw_data(
             country,
+            ea_as_of_run_id=current_run["run_id"],
             start_date=start_date,
             end_date=end_date,
         )
         if current_raw_df.empty:
             return _payload(error=f"No country balance data is available for {country}.")
 
-        comparison_requested = bool(comparison_timestamp)
+        comparison_requested = selected_comparison_run is not None
         previous_raw_df, previous_warnings = (
             _fetch_country_balance_raw_data(
                 country,
-                snapshot_timestamp=comparison_timestamp,
+                ea_as_of_run_id=normalize_ea_run_id(selected_comparison_run),
                 start_date=start_date,
                 end_date=end_date,
             )
@@ -2422,7 +2511,7 @@ def fetch_country_balance_payload(
         delta_nonzero_cells = 0
         if comparison_requested and previous_raw_df.empty:
             warnings.append(
-                f"No comparison rows found for {country} at {comparison_timestamp}; "
+                f"No comparison rows found for {country} at run {selected_comparison_run}; "
                 "Delta vs Snapshot is unavailable for that selection."
             )
         elif comparison_requested and not delta_df.empty:
@@ -2457,7 +2546,8 @@ def fetch_country_balance_payload(
             if not current_raw_df.empty
             else None,
             "comparison_snapshot": comparison_snapshot_used,
-            "requested_comparison_snapshot": comparison_timestamp,
+            "current_ea_run_id": current_run["run_id"],
+            "requested_comparison_run_id": selected_comparison_run,
             "comparison_row_count": int(len(previous_raw_df)) if comparison_requested else 0,
             "delta_nonzero_cells": delta_nonzero_cells,
             "warnings": warnings,

@@ -6,6 +6,8 @@ import json
 
 import pandas as pd
 
+from utils.ea_run_interface import normalize_ea_run_id
+
 
 def format_metadata_timestamp(value) -> str | None:
     if not value:
@@ -69,15 +71,30 @@ def build_woodmac_snapshot_dropdown_options(
 
 
 def build_ea_upload_dropdown_options(
-    upload_timestamps: list[str],
-) -> list[dict[str, str]]:
+    runs: list[dict],
+) -> list[dict[str, object]]:
+    timestamp_counts: dict[str, int] = {}
+    for run in runs or []:
+        timestamp = format_metadata_timestamp(run.get("snapshot_at"))
+        if timestamp:
+            timestamp_counts[timestamp] = timestamp_counts.get(timestamp, 0) + 1
+
     dropdown_options = []
-    for upload_timestamp in upload_timestamps:
-        formatted_timestamp = format_metadata_timestamp(upload_timestamp) or upload_timestamp
+    for run in runs or []:
+        try:
+            run_id = normalize_ea_run_id(run.get("run_id"))
+        except ValueError:
+            continue
+        formatted_timestamp = format_metadata_timestamp(run.get("snapshot_at"))
+        if not formatted_timestamp:
+            continue
+        label = formatted_timestamp
+        if timestamp_counts.get(formatted_timestamp, 0) > 1:
+            label = f"{formatted_timestamp} | run {run_id}"
         dropdown_options.append(
             {
-                "label": formatted_timestamp,
-                "value": upload_timestamp,
+                "label": label,
+                "value": run_id,
             }
         )
 
@@ -104,11 +121,24 @@ def woodmac_metadata_from_publication_options(
 
 
 def ea_metadata_from_upload_options(
-    upload_options: list[str] | None,
-) -> dict[str, str | None]:
-    if not upload_options:
+    current_ea: dict | list | None,
+) -> dict[str, object]:
+    if not current_ea:
         return {}
-    return {"upload_timestamp_utc": upload_options[0]}
+    if isinstance(current_ea, list):
+        current_ea = current_ea[0] if current_ea else {}
+    if not isinstance(current_ea, dict):
+        return {}
+    try:
+        run_id = normalize_ea_run_id(current_ea.get("run_id"))
+    except ValueError:
+        return {}
+    snapshot_at = current_ea.get("snapshot_at")
+    return {
+        "run_id": run_id,
+        "snapshot_at": snapshot_at,
+        "upload_timestamp_utc": snapshot_at,
+    }
 
 
 def build_woodmac_metadata_lines(metadata: dict | None) -> list[str]:
@@ -170,7 +200,7 @@ def resolve_snapshot_control_values(
         woodmac_options.get("long_term", [])
     )
     ea_upload_options = build_ea_upload_dropdown_options(
-        comparison_options.get("ea_uploads", [])
+        comparison_options.get("ea_comparison_runs", comparison_options.get("ea_uploads", []))
     )
 
     short_term_values = {option["value"] for option in short_term_options}
@@ -187,9 +217,13 @@ def resolve_snapshot_control_values(
         if current_lt_value in long_term_values
         else default_previous_option_value(long_term_options)
     )
+    try:
+        validated_current_run = normalize_ea_run_id(current_ea_upload_value)
+    except ValueError:
+        validated_current_run = None
     ea_upload_value = (
-        current_ea_upload_value
-        if current_ea_upload_value in ea_upload_values
+        validated_current_run
+        if validated_current_run in ea_upload_values
         else default_previous_option_value(ea_upload_options)
     )
 

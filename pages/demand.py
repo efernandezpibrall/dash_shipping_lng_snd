@@ -25,8 +25,18 @@ from utils.balance_components import (
     create_balance_empty_state as _create_empty_state,
 )
 from utils.dataframe_store import (
-    deserialize_dataframe_store as _deserialize_dataframe,
+    deserialize_dataframe_store as _deserialize_dataframe_payload,
     serialize_dataframe_store as _serialize_dataframe,
+)
+from utils.dashboard_snapshot_cache import (
+    snapshot_is_shared as _snapshot_is_shared,
+    was_global_refresh_triggered as _was_global_refresh_triggered,
+    with_snapshot_slot as _with_snapshot_slot,
+)
+from utils.provider_flow_snapshot import (
+    build_provider_flow_payload as _build_provider_flow_payload,
+    get_provider_flow_snapshot as _get_provider_flow_snapshot,
+    resolve_provider_flow_snapshot as _resolve_provider_flow_snapshot,
 )
 from utils.snapshot_controls import (
     build_ea_metadata_lines as _build_ea_metadata_lines,
@@ -141,6 +151,13 @@ DESTINATION_AGGREGATION_LOOKUP_COLUMNS = [
 ]
 
 
+def _deserialize_dataframe(value):
+    resolved = _resolve_provider_flow_snapshot(value)
+    if isinstance(resolved, pd.DataFrame):
+        return resolved.copy()
+    return _deserialize_dataframe_payload(resolved)
+
+
 def _normalize_mapping_value(value):
     if pd.isna(value):
         return None
@@ -208,25 +225,7 @@ def _get_destination_aggregation_lookup_dataframe(
     return lookup_df.drop_duplicates(subset=["country_name"]).reset_index(drop=True)
 
 
-def _fetch_destination_aggregation_lookup_records() -> list[dict]:
-    query = text(
-        f"""
-        SELECT
-            country,
-            country_name,
-            continent,
-            subcontinent,
-            basin,
-            country_classification_level1,
-            country_classification,
-            shipping_region
-        FROM {DB_SCHEMA}.mappings_country
-        """
-    )
-
-    with engine.connect() as connection:
-        mapping_df = pd.read_sql_query(query, connection)
-
+def _build_destination_aggregation_lookup_records(mapping_df: pd.DataFrame) -> list[dict]:
     if mapping_df.empty:
         return []
 
@@ -259,6 +258,27 @@ def _fetch_destination_aggregation_lookup_records() -> list[dict]:
         deduped_df[column_name] = deduped_df[column_name].fillna(UNKNOWN_DESTINATION_GROUP)
 
     return deduped_df[DESTINATION_AGGREGATION_LOOKUP_COLUMNS].to_dict("records")
+
+
+def _fetch_destination_aggregation_lookup_records() -> list[dict]:
+    query = text(
+        f"""
+        SELECT
+            country,
+            country_name,
+            continent,
+            subcontinent,
+            basin,
+            country_classification_level1,
+            country_classification,
+            shipping_region
+        FROM {DB_SCHEMA}.mappings_country
+        """
+    )
+
+    with engine.connect() as connection:
+        mapping_df = pd.read_sql_query(query, connection)
+    return _build_destination_aggregation_lookup_records(mapping_df)
 
 
 def _sort_destination_group_values(values) -> list[str]:
@@ -639,14 +659,20 @@ def _fetch_comparison_raw_df(
     comparison_source: str,
     short_term_value: str | None,
     long_term_value: str | None,
-    ea_upload_value: str | None,
+    ea_upload_value: int | None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> tuple[pd.DataFrame | None, str | None]:
     try:
         if comparison_source == "ea":
             if not ea_upload_value:
-                return None, "No Energy Aspects upload_timestamp_utc available."
+                return None, "No Energy Aspects comparison run available."
             return (
-                fetch_ea_import_flow_raw_data_for_upload(ea_upload_value),
+                fetch_ea_import_flow_raw_data_for_upload(
+                    ea_upload_value,
+                    start_date=start_date,
+                    end_date=end_date,
+                ),
                 None,
             )
 
@@ -1142,22 +1168,36 @@ def load_balance_source_data(_):
     destination_aggregation_lookup = []
     comparison_options = {
         "woodmac": {"short_term": [], "long_term": []},
-        "ea_uploads": [],
+        "ea_comparison_runs": [],
     }
     errors = []
 
+    provider_reference = None
+    provider_payload = {}
+    provider_errors = {}
     try:
-        woodmac_df = fetch_woodmac_import_flow_raw_data()
-    except Exception as exc:
-        errors.append(f"WoodMac load failed: {exc}")
+        provider_reference, provider_payload = _get_provider_flow_snapshot(
+            force=_was_global_refresh_triggered(),
+        )
+        provider_errors = provider_payload.get("errors") or {}
+    except Exception:
+        try:
+            _, provider_payload = _build_provider_flow_payload()
+            provider_errors = provider_payload.get("errors") or {}
+        except Exception as fallback_exc:
+            provider_errors["provider_payload"] = str(fallback_exc)
+
+    woodmac_df = provider_payload.get("woodmac_import", pd.DataFrame())
+    ea_df = provider_payload.get("ea_import", pd.DataFrame())
+    if "woodmac_import" in provider_errors:
+        errors.append(f"WoodMac load failed: {provider_errors['woodmac_import']}")
+    if "ea_import" in provider_errors:
+        errors.append(f"Energy Aspects load failed: {provider_errors['ea_import']}")
 
     try:
-        ea_df = fetch_ea_import_flow_raw_data()
-    except Exception as exc:
-        errors.append(f"Energy Aspects load failed: {exc}")
-
-    try:
-        comparison_options["woodmac"] = fetch_woodmac_publication_options()
+        if "woodmac_import_options" in provider_errors:
+            raise RuntimeError(provider_errors["woodmac_import_options"])
+        comparison_options["woodmac"] = provider_payload.get("woodmac_import_options") or {}
         woodmac_metadata = _woodmac_metadata_from_publication_options(comparison_options["woodmac"])
     except Exception as exc:
         errors.append(f"WoodMac comparison options load failed: {exc}")
@@ -1167,8 +1207,16 @@ def load_balance_source_data(_):
             errors.append(f"WoodMac metadata load failed: {metadata_exc}")
 
     try:
-        comparison_options["ea_uploads"] = fetch_ea_upload_options()
-        ea_metadata = _ea_metadata_from_upload_options(comparison_options["ea_uploads"])
+        if "ea_import_options" in provider_errors:
+            raise RuntimeError(provider_errors["ea_import_options"])
+        comparison_options["ea_comparison_runs"] = (
+            provider_payload.get("ea_comparison_runs")
+            or provider_payload.get("ea_import_options")
+            or []
+        )
+        ea_metadata = _ea_metadata_from_upload_options(
+            provider_payload.get("current_ea")
+        )
     except Exception as exc:
         errors.append(f"Energy Aspects comparison options load failed: {exc}")
         try:
@@ -1177,16 +1225,26 @@ def load_balance_source_data(_):
             errors.append(f"Energy Aspects metadata load failed: {metadata_exc}")
 
     try:
-        destination_aggregation_lookup = _fetch_destination_aggregation_lookup_records()
+        if "mapping" in provider_errors:
+            raise RuntimeError(provider_errors["mapping"])
+        mapping_df = provider_payload.get("mapping", pd.DataFrame())
+        destination_aggregation_lookup = _build_destination_aggregation_lookup_records(mapping_df)
     except Exception as exc:
         errors.append(f"Destination aggregation lookup load failed: {exc}")
 
     available_countries = get_available_countries([woodmac_df, ea_df])
     error_message = " | ".join(errors) if errors else None
 
+    if provider_reference is not None and _snapshot_is_shared(provider_reference):
+        woodmac_store = _with_snapshot_slot(provider_reference, "woodmac_import")
+        ea_store = _with_snapshot_slot(provider_reference, "ea_import")
+    else:
+        woodmac_store = _serialize_dataframe(woodmac_df)
+        ea_store = _serialize_dataframe(ea_df)
+
     return (
-        _serialize_dataframe(woodmac_df),
-        _serialize_dataframe(ea_df),
+        woodmac_store,
+        ea_store,
         available_countries,
         destination_aggregation_lookup,
         error_message,
@@ -1596,6 +1654,8 @@ def render_comparison_delta_table(
         short_term_value,
         long_term_value,
         ea_upload_value,
+        start_date,
+        end_date,
     )
 
     comparison_filtered_df = _filter_by_date_range(
@@ -1674,6 +1734,8 @@ def render_ea_comparison_delta_table(
         short_term_value,
         long_term_value,
         ea_upload_value,
+        start_date,
+        end_date,
     )
 
     comparison_filtered_df = _filter_by_date_range(
