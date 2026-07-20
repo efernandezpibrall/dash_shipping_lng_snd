@@ -34,6 +34,15 @@ from dash.exceptions import PreventUpdate
 import configparser
 import os
 from sqlalchemy import create_engine
+from sqlalchemy import text
+
+from utils.dashboard_snapshot_cache import (
+    build_source_key as _build_source_key,
+    get_or_build_snapshot as _get_or_build_snapshot,
+    resolve_snapshot as _resolve_snapshot,
+    snapshot_is_shared as _snapshot_is_shared,
+    was_global_refresh_triggered as _was_global_refresh_triggered,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +69,21 @@ DB_SCHEMA = config_reader.get('DATABASE', 'SCHEMA', fallback=None)
 
 # create engine
 engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
+
+EXPORTER_DETAIL_BASE_NAMESPACE = 'exporter-detail-base-v1'
+
+
+def _fetch_exporter_detail_source_watermark():
+    with engine.connect() as connection:
+        return connection.execute(
+            text(f"""
+                SELECT snapshot_timestamp_utc
+                FROM {DB_SCHEMA}.kpler_trade_snapshots
+                WHERE run_kind = 'canonical' AND status = 'published'
+                ORDER BY snapshot_date_utc DESC
+                LIMIT 1
+            """)
+        ).scalar()
 
 
 BCM_PER_MMTPA = 1.36
@@ -1066,7 +1090,13 @@ def _fetch_normalized_destination_trades(engine, origin_country, min_start_date=
             COALESCE(NULLIF(BTRIM(continent_destination_name), ''), 'Unknown') AS destination_continent,
             COALESCE(NULLIF(BTRIM(continent_origin_name), ''), 'Unknown') AS origin_continent
         FROM {DB_SCHEMA}.kpler_trades
-        WHERE upload_timestamp_utc = (SELECT MAX(upload_timestamp_utc) FROM {DB_SCHEMA}.kpler_trades)
+        WHERE upload_timestamp_utc = (
+            SELECT snapshot_timestamp_utc
+            FROM {DB_SCHEMA}.kpler_trade_snapshots
+            WHERE run_kind = 'canonical' AND status = 'published'
+            ORDER BY snapshot_date_utc DESC
+            LIMIT 1
+        )
           AND origin_country_name = :origin_country
           AND "start" IS NOT NULL
           AND "start"::date >= :min_start_date
@@ -1194,7 +1224,13 @@ def _fetch_origin_plant_destination_trades(engine, origin_country, min_start_dat
             COALESCE(NULLIF(BTRIM(destination_country_name), ''), 'Unknown') AS destination_country,
             COALESCE(NULLIF(BTRIM(continent_destination_name), ''), 'Unknown') AS destination_continent
         FROM {DB_SCHEMA}.kpler_trades
-        WHERE upload_timestamp_utc = (SELECT MAX(upload_timestamp_utc) FROM {DB_SCHEMA}.kpler_trades)
+        WHERE upload_timestamp_utc = (
+            SELECT snapshot_timestamp_utc
+            FROM {DB_SCHEMA}.kpler_trade_snapshots
+            WHERE run_kind = 'canonical' AND status = 'published'
+            ORDER BY snapshot_date_utc DESC
+            LIMIT 1
+        )
           AND origin_country_name = :origin_country
           AND destination_country_name IS DISTINCT FROM :origin_country
           AND "start" IS NOT NULL
@@ -1575,7 +1611,13 @@ def process_trade_and_distance_data(engine,origin_country_name):
                                         WHERE kt.status='Delivered'
                                         and kt.origin_country_name = :origin_country_name
                                         and kt.zone_origin_name<>kt.zone_destination_name
-                                        and kt.upload_timestamp_utc = (select max(upload_timestamp_utc) from {DB_SCHEMA}.{trades_table_name})
+                                        and kt.upload_timestamp_utc = (
+                                            select snapshot_timestamp_utc
+                                            from {DB_SCHEMA}.kpler_trade_snapshots
+                                            where run_kind = 'canonical' and status = 'published'
+                                            order by snapshot_date_utc desc
+                                            limit 1
+                                        )
                                         ''')
             final_df = pd.read_sql(
                 route_query,
@@ -1659,6 +1701,11 @@ def process_trade_and_distance_data(engine,origin_country_name):
     return final_df
 
 def _resolve_exporter_detail_base_data(base_data):
+    base_data = _resolve_snapshot(
+        base_data,
+        engine,
+        expected_namespace=EXPORTER_DETAIL_BASE_NAMESPACE,
+    )
     if not base_data or base_data.get('error'):
         return pd.DataFrame(), {}, pd.DataFrame(), base_data.get('origin_country') if base_data else None
 
@@ -5769,7 +5816,13 @@ def initialize_country_dropdown(_n_clicks):
         SELECT DISTINCT origin_country_name
         FROM {DB_SCHEMA}.kpler_trades
         WHERE origin_country_name IS NOT NULL
-        AND upload_timestamp_utc = (SELECT MAX(upload_timestamp_utc) FROM {DB_SCHEMA}.kpler_trades)
+        AND upload_timestamp_utc = (
+            SELECT snapshot_timestamp_utc
+            FROM {DB_SCHEMA}.kpler_trade_snapshots
+            WHERE run_kind = 'canonical' AND status = 'published'
+            ORDER BY snapshot_date_utc DESC
+            LIMIT 1
+        )
         ORDER BY origin_country_name
         """
         countries_df = pd.read_sql(query, engine)
@@ -6763,13 +6816,35 @@ clientside_callback(
 )
 
 
+def _build_exporter_detail_base_payload(origin_country):
+    mapping_df = _load_destination_mapping_df(engine)
+    destination_df, origin_scope = _fetch_normalized_destination_trades(
+        engine,
+        origin_country,
+        mapping_df=mapping_df,
+    )
+    origin_plant_df = _fetch_origin_plant_destination_trades(
+        engine,
+        origin_country,
+        mapping_df=mapping_df,
+    )
+    return {
+        'origin_country': origin_country,
+        'normalized_destination_trades': _store_dataframe(destination_df),
+        'origin_plant_destination_trades': _store_dataframe(origin_plant_df),
+        'origin_scope': origin_scope,
+        'loaded_at': dt.datetime.now().isoformat(timespec='seconds'),
+    }
+
+
 # --- Callbacks for exporter detail base data ---
 @callback(
     Output('exporter-detail-base-data-store', 'data'),
     Input('origin-country-dropdown', 'value'),
+    Input('global-refresh-button', 'n_clicks'),
     prevent_initial_call=False
 )
-def refresh_exporter_detail_base_data(origin_country):
+def refresh_exporter_detail_base_data(origin_country, _global_refresh_clicks=None):
     """Fetch the reusable origin-scoped Kpler frames once for the detail page."""
     if not origin_country:
         return {
@@ -6781,24 +6856,24 @@ def refresh_exporter_detail_base_data(origin_country):
         }
 
     try:
-        mapping_df = _load_destination_mapping_df(engine)
-        destination_df, origin_scope = _fetch_normalized_destination_trades(
-            engine,
+        try:
+            source_watermark = _fetch_exporter_detail_source_watermark()
+        except Exception:
+            source_watermark = dt.datetime.now().isoformat(timespec='microseconds')
+        source_key = _build_source_key(
+            EXPORTER_DETAIL_BASE_NAMESPACE,
+            source_watermark,
             origin_country,
-            mapping_df=mapping_df
         )
-        origin_plant_df = _fetch_origin_plant_destination_trades(
+        reference, payload = _get_or_build_snapshot(
             engine,
-            origin_country,
-            mapping_df=mapping_df
+            namespace=EXPORTER_DETAIL_BASE_NAMESPACE,
+            source_key=source_key,
+            builder=lambda: _build_exporter_detail_base_payload(origin_country),
+            force=_was_global_refresh_triggered(),
+            manifest={'origin_country': origin_country},
         )
-        return {
-            'origin_country': origin_country,
-            'normalized_destination_trades': _store_dataframe(destination_df),
-            'origin_plant_destination_trades': _store_dataframe(origin_plant_df),
-            'origin_scope': origin_scope,
-            'loaded_at': dt.datetime.now().isoformat(timespec='seconds'),
-        }
+        return reference if _snapshot_is_shared(reference) else payload
     except Exception as exc:
         return {
             'origin_country': origin_country,

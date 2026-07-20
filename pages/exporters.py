@@ -16,6 +16,16 @@ from sqlalchemy import create_engine, text, bindparam
 import calendar
 
 from utils.table_styles import StandardTableStyleManager, TABLE_COLORS
+from utils.dashboard_snapshot_cache import (
+    build_source_key as _build_source_key,
+    get_or_build_snapshot as _get_or_build_snapshot,
+    pack_record_mapping as _pack_record_mapping,
+    resolve_snapshot as _resolve_snapshot,
+    snapshot_is_shared as _snapshot_is_shared,
+    unpack_record_mapping as _unpack_record_mapping,
+    was_global_refresh_triggered as _was_global_refresh_triggered,
+    with_snapshot_slot as _with_snapshot_slot,
+)
 
 # Month order constant for sorting (used in multiple functions)
 MONTH_ORDER = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
@@ -752,6 +762,30 @@ DB_SCHEMA = config_reader.get('DATABASE', 'SCHEMA', fallback=None)
 # create engine
 engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
+EXPORTERS_OVERVIEW_NAMESPACE = 'exporters-overview-v1'
+
+
+def _fetch_exporters_source_watermark():
+    with engine.connect() as connection:
+        return connection.execute(
+            text(f"""
+                SELECT snapshot_timestamp_utc
+                FROM {DB_SCHEMA}.kpler_trade_snapshots
+                WHERE run_kind = 'canonical' AND status = 'published'
+                ORDER BY snapshot_date_utc DESC
+                LIMIT 1
+            """)
+        ).scalar()
+
+
+def _resolve_exporters_store(value):
+    resolved = _resolve_snapshot(
+        value,
+        engine,
+        expected_namespace=EXPORTERS_OVERVIEW_NAMESPACE,
+    )
+    return _unpack_record_mapping(resolved)
+
 
 def setup_database_connection():
     """Setup database connection using existing configuration"""
@@ -767,8 +801,11 @@ def get_all_classification_groups(engine, schema):
         with engine.connect() as conn:
             query = text(f"""
             WITH latest_data AS (
-                SELECT MAX(upload_timestamp_utc) as max_timestamp
-                FROM {schema}.kpler_trades
+                SELECT snapshot_timestamp_utc as max_timestamp
+                FROM {schema}.kpler_trade_snapshots
+                WHERE run_kind = 'canonical' AND status = 'published'
+                ORDER BY snapshot_date_utc DESC
+                LIMIT 1
             ),
             classification_volumes AS (
                 SELECT
@@ -892,8 +929,11 @@ def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Count
             if classification_mode == 'Classification Level 1':
                 query = text(f"""
                 WITH latest_data AS (
-                    SELECT MAX(upload_timestamp_utc) as max_timestamp
-                    FROM {schema}.kpler_trades
+                    SELECT snapshot_timestamp_utc as max_timestamp
+                    FROM {schema}.kpler_trade_snapshots
+                    WHERE run_kind = 'canonical' AND status = 'published'
+                    ORDER BY snapshot_date_utc DESC
+                    LIMIT 1
                 )
                 SELECT
                     COALESCE(mc_origin.country_classification_level1, 'Unknown') as supply_classification,
@@ -921,8 +961,11 @@ def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Count
             else:
                 query = text(f"""
                 WITH latest_data AS (
-                    SELECT MAX(upload_timestamp_utc) as max_timestamp
-                    FROM {schema}.kpler_trades
+                    SELECT snapshot_timestamp_utc as max_timestamp
+                    FROM {schema}.kpler_trade_snapshots
+                    WHERE run_kind = 'canonical' AND status = 'published'
+                    ORDER BY snapshot_date_utc DESC
+                    LIMIT 1
                 )
                 SELECT
                     kt.origin_country_name as supply_country,
@@ -1276,8 +1319,11 @@ def fetch_global_supply_data(engine, schema, classification_mode='Country', roll
             # Get daily aggregated data with rolling average calculated in SQL
             query = text(f"""
             WITH latest_data AS (
-                SELECT MAX(upload_timestamp_utc) as max_timestamp
-                FROM {schema}.kpler_trades
+                SELECT snapshot_timestamp_utc as max_timestamp
+                FROM {schema}.kpler_trade_snapshots
+                WHERE run_kind = 'canonical' AND status = 'published'
+                ORDER BY snapshot_date_utc DESC
+                LIMIT 1
             ),
             -- Get all unique continents globally
             all_continents AS (
@@ -1404,8 +1450,11 @@ def fetch_country_supply_data(
             if classification_mode == 'Classification Level 1':
                 query = text(f"""
                 WITH latest_data AS (
-                    SELECT MAX(upload_timestamp_utc) as max_timestamp
-                    FROM {schema}.kpler_trades
+                    SELECT snapshot_timestamp_utc as max_timestamp
+                    FROM {schema}.kpler_trade_snapshots
+                    WHERE run_kind = 'canonical' AND status = 'published'
+                    ORDER BY snapshot_date_utc DESC
+                    LIMIT 1
                 ),
                 -- Get all unique continents for this classification
                 all_continents AS (
@@ -1504,8 +1553,11 @@ def fetch_country_supply_data(
             else:
                 query = text(f"""
                 WITH latest_data AS (
-                    SELECT MAX(upload_timestamp_utc) as max_timestamp
-                    FROM {schema}.kpler_trades
+                    SELECT snapshot_timestamp_utc as max_timestamp
+                    FROM {schema}.kpler_trade_snapshots
+                    WHERE run_kind = 'canonical' AND status = 'published'
+                    ORDER BY snapshot_date_utc DESC
+                    LIMIT 1
                 ),
                 -- Get all unique continents for this country
                 all_continents AS (
@@ -1680,8 +1732,11 @@ def _fetch_country_supply_chart_batch(engine, schema, rolling_avg_days=DEFAULT_S
 
     query = text(f"""
         WITH latest_data AS (
-            SELECT MAX(upload_timestamp_utc) as max_timestamp
-            FROM {schema}.kpler_trades
+            SELECT snapshot_timestamp_utc as max_timestamp
+            FROM {schema}.kpler_trade_snapshots
+            WHERE run_kind = 'canonical' AND status = 'published'
+            ORDER BY snapshot_date_utc DESC
+            LIMIT 1
         ),
         active_entities AS (
             SELECT DISTINCT
@@ -1811,8 +1866,11 @@ def _fetch_classification_supply_chart_batch(
 
     query = text(f"""
         WITH latest_data AS (
-            SELECT MAX(upload_timestamp_utc) as max_timestamp
-            FROM {schema}.kpler_trades
+            SELECT snapshot_timestamp_utc as max_timestamp
+            FROM {schema}.kpler_trade_snapshots
+            WHERE run_kind = 'canonical' AND status = 'published'
+            ORDER BY snapshot_date_utc DESC
+            LIMIT 1
         ),
         active_entities AS (
             SELECT DISTINCT
@@ -2032,8 +2090,11 @@ def fetch_supply_destination_base_data(engine, schema):
         with engine.connect() as conn:
             base_query = text(f"""
             WITH latest_data AS (
-                SELECT MAX(upload_timestamp_utc) as max_timestamp
-                FROM {schema}.kpler_trades
+                SELECT snapshot_timestamp_utc as max_timestamp
+                FROM {schema}.kpler_trade_snapshots
+                WHERE run_kind = 'canonical' AND status = 'published'
+                ORDER BY snapshot_date_utc DESC
+                LIMIT 1
             )
             SELECT
                 COALESCE(mc_origin.country_classification_level1, 'Unknown') as supply_classification,
@@ -2820,8 +2881,11 @@ def fetch_continent_chart_data_batch(
     daily_exports_sql = "\nUNION ALL\n".join(daily_export_selects)
     query = text(f"""
         WITH latest_data AS (
-            SELECT MAX(upload_timestamp_utc) as max_timestamp
-            FROM {db_schema}.kpler_trades
+            SELECT snapshot_timestamp_utc as max_timestamp
+            FROM {db_schema}.kpler_trade_snapshots
+            WHERE run_kind = 'canonical' AND status = 'published'
+            ORDER BY snapshot_date_utc DESC
+            LIMIT 1
         ),
         entity_continents AS (
             {entity_continents_sql}
@@ -5197,17 +5261,50 @@ def update_rolling_average_section_titles(rolling_avg_days):
     )
 
 
+def _build_exporters_overview_payload(
+    engine_inst,
+    schema,
+    classification_mode,
+    demand_aggregation_mode,
+    rolling_avg_days,
+):
+    chart_dfs = fetch_supply_chart_data(
+        engine_inst,
+        schema,
+        classification_mode,
+        rolling_avg_days,
+    )
+    charts_data = {
+        entity_name: entity_df.to_dict('records') if entity_df is not None and not entity_df.empty else []
+        for entity_name, entity_df in chart_dfs.items()
+    }
+    supply_dest_base_df = fetch_supply_destination_base_data(engine_inst, schema)
+    supply_dest_summary_payload = build_supply_dest_summary_store_payload(
+        engine_inst,
+        schema,
+        supply_dest_base_df,
+        classification_mode,
+        demand_aggregation_mode,
+    )
+    return {
+        'charts_cube': _pack_record_mapping(charts_data),
+        'continent_entities': list(charts_data.keys()),
+        'supply_dest': supply_dest_summary_payload,
+    }
+
+
 @callback(
     [Output('supply-charts-data', 'data'),
      Output('continent-charts-data', 'data'),
      Output('supply-dest-data-store', 'data')],
     [Input('initial-load-trigger', 'n_intervals'),
+     Input('global-refresh-button', 'n_clicks'),
      Input('country-classification-dropdown', 'value'),
      Input('aggregation-demand-dropdown', 'value'),
      Input('supply-rolling-window-days-input', 'value')],
     prevent_initial_call=False
 )
-def refresh_all_data(_n_intervals, classification_mode, demand_aggregation_mode, rolling_avg_days):
+def refresh_all_data(_n_intervals, _global_refresh_clicks, classification_mode, demand_aggregation_mode, rolling_avg_days):
     """Load all data from database"""
     try:
         # Fetch data
@@ -5219,33 +5316,49 @@ def refresh_all_data(_n_intervals, classification_mode, demand_aggregation_mode,
         demand_aggregation_mode = normalize_demand_aggregation_mode(demand_aggregation_mode)
         rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
 
-        chart_dfs = fetch_supply_chart_data(
-            engine_inst,
-            schema,
+        try:
+            source_watermark = _fetch_exporters_source_watermark()
+        except Exception:
+            source_watermark = datetime.now().isoformat(timespec='microseconds')
+        source_key = _build_source_key(
+            EXPORTERS_OVERVIEW_NAMESPACE,
+            source_watermark,
+            datetime.now().date(),
             classification_mode,
-            rolling_avg_days
+            demand_aggregation_mode,
+            rolling_avg_days,
         )
-        charts_data = {
-            entity_name: entity_df.to_dict('records') if entity_df is not None and not entity_df.empty else []
-            for entity_name, entity_df in chart_dfs.items()
-        }
-
-        supply_dest_base_df = fetch_supply_destination_base_data(engine_inst, schema)
-
-        supply_dest_summary_payload = build_supply_dest_summary_store_payload(
+        reference, payload = _get_or_build_snapshot(
             engine_inst,
-            schema,
-            supply_dest_base_df,
-            classification_mode,
-            demand_aggregation_mode
+            namespace=EXPORTERS_OVERVIEW_NAMESPACE,
+            source_key=source_key,
+            builder=lambda: _build_exporters_overview_payload(
+                engine_inst,
+                schema,
+                classification_mode,
+                demand_aggregation_mode,
+                rolling_avg_days,
+            ),
+            force=_was_global_refresh_triggered(),
+            manifest={
+                'classification_mode': classification_mode,
+                'demand_aggregation_mode': demand_aggregation_mode,
+                'rolling_avg_days': rolling_avg_days,
+            },
         )
 
-        # For continent charts, pass the same entity names
-        continent_charts_entities = list(charts_data.keys())
+        if _snapshot_is_shared(reference):
+            charts_store = _with_snapshot_slot(reference, 'charts_cube')
+            supply_dest_store = _with_snapshot_slot(reference, 'supply_dest')
+        else:
+            charts_store = _unpack_record_mapping(payload['charts_cube'])
+            supply_dest_store = payload['supply_dest']
 
-        return (charts_data,
-                continent_charts_entities,
-                supply_dest_summary_payload)
+        return (
+            charts_store,
+            payload['continent_entities'],
+            supply_dest_store,
+        )
 
     except Exception:
         return {}, [], _empty_supply_dest_summary_store_payload()
@@ -5609,6 +5722,7 @@ def _empty_supply_chart_figure(message, height=328):
 )
 def update_supply_year_selector_options(charts_data, selected_years):
     """Populate the inline year legend from the loaded rolling-average data."""
+    charts_data = _resolve_exporters_store(charts_data)
     available_years = _get_supply_chart_available_years(charts_data)
     if not available_years:
         return [], []
@@ -5868,6 +5982,7 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
                              country_grouping_mode, volume_metric, year_count,
                              quarter_count, month_count, week_count):
     """Update the supply-destination table with expandable rows"""
+    supply_dest_data = _resolve_exporters_store(supply_dest_data)
     vol_label = _get_volume_metric_info(volume_metric)['label']
     show_demand_aggregation = use_demand_classification_mode(classification_mode, demand_aggregation_mode)
     show_demand_country = use_demand_country_mode(demand_aggregation_mode)
@@ -6723,6 +6838,7 @@ def handle_supply_dest_row_expansion(_active_cells, table_data_list, expanded_cl
                                      supply_dest_data, classification_mode,
                                      demand_aggregation_mode, country_grouping_mode, view_type):
     """Handle clicking on rows to expand/collapse in the overview supply-destination table."""
+    supply_dest_data = _resolve_exporters_store(supply_dest_data)
     ctx = callback_context
     if not ctx.triggered:
         return expanded_classifications, expanded_countries, expanded_supply_countries
@@ -6967,6 +7083,7 @@ def update_supply_charts(
     rolling_avg_days
 ):
     """Dynamically generate supply charts based on classification mode"""
+    charts_data = _resolve_exporters_store(charts_data)
     if not charts_data:
         return html.Div("No data available", className='supply-rolling-empty-state')
 
@@ -7134,6 +7251,7 @@ def export_supply_dest_table_to_excel(n_clicks, derived_virtual_data_list, data_
 )
 def export_supply_charts_to_excel(n_clicks, charts_data, volume_metric, rolling_avg_days):
     """Export LNG Supply rolling-average data to Excel"""
+    charts_data = _resolve_exporters_store(charts_data)
     if n_clicks == 0 or not charts_data:
         return None
     rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
@@ -7273,8 +7391,11 @@ def export_continent_charts_to_excel(
                 # Query with percentage calculation for the active batched percentage chart.
                 query = f"""
                 WITH latest_data AS (
-                    SELECT MAX(upload_timestamp_utc) as max_timestamp
-                    FROM {schema}.kpler_trades
+                    SELECT snapshot_timestamp_utc as max_timestamp
+                    FROM {schema}.kpler_trade_snapshots
+                    WHERE run_kind = 'canonical' AND status = 'published'
+                    ORDER BY snapshot_date_utc DESC
+                    LIMIT 1
                 ),
                 all_continents AS (
                     SELECT DISTINCT
@@ -7371,8 +7492,11 @@ def export_continent_charts_to_excel(
                 # Query for absolute values (original query)
                 query = f"""
                 WITH latest_data AS (
-                    SELECT MAX(upload_timestamp_utc) as max_timestamp
-                    FROM {schema}.kpler_trades
+                    SELECT snapshot_timestamp_utc as max_timestamp
+                    FROM {schema}.kpler_trade_snapshots
+                    WHERE run_kind = 'canonical' AND status = 'published'
+                    ORDER BY snapshot_date_utc DESC
+                    LIMIT 1
                 ),
                 all_continents AS (
                     SELECT DISTINCT

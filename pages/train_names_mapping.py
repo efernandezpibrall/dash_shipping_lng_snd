@@ -1,22 +1,18 @@
-from dash import html, dcc, callback, Output, Input, State, no_update
-from dash.exceptions import PreventUpdate
+import configparser
+import os
+
+import dash_ag_grid as dag
 import dash_bootstrap_components as dbc
 import pandas as pd
-import configparser
-import math
-import os
-from sqlalchemy import create_engine, text
+from dash import Input, Output, State, callback, dcc, html, no_update
+from dash.exceptions import PreventUpdate
+from sqlalchemy import create_engine
 
-from utils.mappings_section import create_mappings_section_header
-from utils.mapping_page_figures import (
-    build_bar_figure as _build_bar_figure,
-    build_dropdown_options as _build_dropdown_options,
-    build_empty_figure as _build_empty_figure,
-    build_mapping_table as _build_mapping_table,
-    build_summary_card_row as _build_summary_card_row,
-    clean_text_value as _clean_text_value,
-    filter_mapping_dataframe as _filter_mapping_dataframe,
+from fundamentals.terminals.terminal_registry_utils import (
+    find_terminal_train_candidates,
+    replace_provider_source_allocations,
 )
+from utils.mappings_section import create_mappings_section_header
 
 
 try:
@@ -28,211 +24,107 @@ except Exception:
 
 config_reader = configparser.ConfigParser(interpolation=None)
 config_reader.read(CONFIG_FILE_PATH)
-
 DB_CONNECTION_STRING = config_reader.get("DATABASE", "CONNECTION_STRING", fallback=None)
 DB_SCHEMA = config_reader.get("DATABASE", "SCHEMA", fallback="at_lng")
-TABLE_NAME = "mapping_plant_train_name"
-
 engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
-DISPLAY_COLUMNS = [
+SOURCE_COLUMNS = ["provider_name", "provider_plant_id", "provider_train_id"]
+DISPLAY_COLUMNS = SOURCE_COLUMNS + [
     "country_name",
-    "plant_name",
-    "provider",
-    "parent_source_field",
-    "parent_source_name",
-    "source_field",
-    "source_name",
-    "scope_hint",
-    "component_hint",
-    "train",
+    "terminal_name",
+    "train_label",
     "allocation_share",
-    "notes",
-]
-
-EDITABLE_COLUMNS = {"scope_hint", "component_hint", "train", "allocation_share", "notes"}
-RAW_SOURCE_KEY_COLUMNS = [
-    "country_name",
-    "plant_name",
-    "provider",
-    "parent_source_field",
-    "parent_source_name",
-    "source_field",
-    "source_name",
 ]
 
 
-def _clean_train_value(value):
-    if pd.isna(value) or str(value).strip() == "":
+def fetch_provider_allocations(db_engine, schema=DB_SCHEMA):
+    query = f"""
+        SELECT links.provider_name,
+               links.provider_plant_id,
+               links.provider_train_id,
+               terminals.country_name,
+               terminals.terminal_name,
+               trains.train_label,
+               links.allocation_share::double precision AS allocation_share
+        FROM {schema}.fundamentals_terminal_train_provider_links links
+        JOIN {schema}.fundamentals_terminal_train_registry trains USING (train_key)
+        JOIN {schema}.fundamentals_terminal_registry terminals USING (terminal_key)
+        ORDER BY links.provider_name, links.provider_plant_id,
+                 links.provider_train_id, terminals.country_name,
+                 terminals.terminal_name, trains.train_label
+    """
+    return pd.read_sql_query(query, db_engine)
+
+
+def _clean_text(value):
+    if pd.isna(value):
         return ""
-    numeric_value = pd.to_numeric([value], errors="coerce")[0]
-    if pd.isna(numeric_value):
-        return ""
-    integer_value = int(numeric_value)
-    if integer_value <= 0:
-        return ""
-    return integer_value
+    return " ".join(str(value).split())
 
 
-def _clean_allocation_share(value):
-    if pd.isna(value) or str(value).strip() == "":
-        return ""
-    numeric_value = pd.to_numeric([value], errors="coerce")[0]
-    if pd.isna(numeric_value):
-        return ""
-    if float(numeric_value) <= 0:
-        return ""
-    return round(float(numeric_value), 8)
-
-
-def fetch_train_name_mappings_data(db_engine, schema=DB_SCHEMA):
-    try:
-        with db_engine.connect() as conn:
-            query = text(
-                f"""
-                SELECT
-                    country_name,
-                    plant_name,
-                    provider,
-                    parent_source_field,
-                    parent_source_name,
-                    source_field,
-                    source_name,
-                    scope_hint,
-                    component_hint,
-                    train,
-                    allocation_share,
-                    notes
-                FROM {schema}.{TABLE_NAME}
-                ORDER BY country_name, plant_name, provider, train, parent_source_name, source_name
-                """
-            )
-            df = pd.read_sql(query, conn)
-    except Exception as exc:
-        print(f"Error fetching train name mappings data: {exc}")
-        return pd.DataFrame(columns=DISPLAY_COLUMNS)
-
-    if df.empty:
-        return pd.DataFrame(columns=DISPLAY_COLUMNS)
-
-    for column_name in DISPLAY_COLUMNS:
-        if column_name == "train":
-            df[column_name] = df[column_name].map(_clean_train_value)
-        elif column_name == "allocation_share":
-            df[column_name] = df[column_name].map(_clean_allocation_share)
-        else:
-            df[column_name] = df[column_name].map(_clean_text_value)
-
-    df = df.drop_duplicates(
-        subset=RAW_SOURCE_KEY_COLUMNS + ["train"],
-        keep="last",
-    ).reset_index(drop=True)
-
-    return df
-
-
-def create_summary_cards(df):
-    if df.empty:
-        return html.Div("No train name mapping data available")
-
-    total_alias_rows = len(df)
-    canonical_trains = (
-        df[["country_name", "plant_name", "train"]]
-        .replace("", pd.NA)
-        .dropna()
-        .drop_duplicates()
-        .shape[0]
-    )
-    plants = df["plant_name"].replace("", pd.NA).dropna().nunique()
-    providers = df["provider"].replace("", pd.NA).dropna().nunique()
-
-    card_specs = [
-        ("Alias Rows", f"{total_alias_rows:,}"),
-        ("Canonical Trains", f"{canonical_trains:,}"),
-        ("Plants", f"{plants:,}"),
-        ("Providers", f"{providers:,}"),
+def _provider_allocation_grid():
+    column_defs = [
+        {
+            "field": "provider_name",
+            "headerName": "Provider",
+            "editable": True,
+            "minWidth": 145,
+        },
+        {
+            "field": "provider_plant_id",
+            "headerName": "Provider Plant ID",
+            "editable": True,
+            "minWidth": 190,
+        },
+        {
+            "field": "provider_train_id",
+            "headerName": "Provider Train ID",
+            "editable": True,
+            "minWidth": 190,
+        },
+        {
+            "field": "country_name",
+            "headerName": "Canonical Country",
+            "editable": True,
+            "minWidth": 160,
+        },
+        {
+            "field": "terminal_name",
+            "headerName": "Canonical Terminal",
+            "editable": True,
+            "minWidth": 230,
+        },
+        {
+            "field": "train_label",
+            "headerName": "Canonical Train",
+            "editable": True,
+            "minWidth": 180,
+        },
+        {
+            "field": "allocation_share",
+            "headerName": "Allocation",
+            "editable": True,
+            "type": "numericColumn",
+            "valueFormatter": {"function": "params.value == null ? '' : Number(params.value).toFixed(8)"},
+            "minWidth": 130,
+        },
     ]
-
-    return _build_summary_card_row(card_specs)
-
-
-def _filter_mapping_df(
-    df: pd.DataFrame,
-    countries,
-    plants,
-    providers,
-    parent_source_fields,
-    source_fields,
-    scope_hints,
-    search_text,
-) -> pd.DataFrame:
-    return _filter_mapping_dataframe(
-        df,
-        [
-            ("country_name", countries),
-            ("plant_name", plants),
-            ("provider", providers),
-            ("parent_source_field", parent_source_fields),
-            ("source_field", source_fields),
-            ("scope_hint", scope_hints),
-        ],
-        [
-            "country_name",
-            "plant_name",
-            "parent_source_name",
-            "source_name",
-            "component_hint",
-            "notes",
-        ],
-        search_text,
-    )
-
-
-def _create_mapping_table():
-    return _build_mapping_table(
-        table_id="train-name-mappings-table",
-        display_columns=DISPLAY_COLUMNS,
-        editable_columns=EDITABLE_COLUMNS,
-        numeric_columns={"train", "allocation_share"},
-        style_data_conditional=[
-            {
-                "if": {"column_id": "source_name"},
-                "backgroundColor": "#f8fafc",
-                "fontWeight": "600",
-                "color": "#1e3a5f",
-            },
-            {
-                "if": {"column_id": "scope_hint"},
-                "backgroundColor": "rgba(59, 130, 246, 0.06)",
-            },
-            {
-                "if": {"column_id": "component_hint"},
-                "backgroundColor": "rgba(59, 130, 246, 0.06)",
-            },
-            {
-                "if": {"column_id": "train"},
-                "backgroundColor": "rgba(34, 197, 94, 0.08)",
-                "fontWeight": "700",
-            },
-            {
-                "if": {"column_id": "allocation_share"},
-                "backgroundColor": "rgba(34, 197, 94, 0.08)",
-            },
-        ],
-        style_cell_conditional=[
-            {"if": {"column_id": "country_name"}, "minWidth": "140px", "textAlign": "left"},
-            {"if": {"column_id": "plant_name"}, "minWidth": "220px", "maxWidth": "280px", "textAlign": "left"},
-            {"if": {"column_id": "provider"}, "minWidth": "130px", "textAlign": "left"},
-            {"if": {"column_id": "parent_source_field"}, "minWidth": "130px", "textAlign": "left"},
-            {"if": {"column_id": "parent_source_name"}, "minWidth": "240px", "maxWidth": "320px", "textAlign": "left"},
-            {"if": {"column_id": "source_field"}, "minWidth": "150px", "textAlign": "left"},
-            {"if": {"column_id": "source_name"}, "minWidth": "220px", "maxWidth": "280px", "textAlign": "left"},
-            {"if": {"column_id": "scope_hint"}, "minWidth": "110px", "textAlign": "left"},
-            {"if": {"column_id": "component_hint"}, "minWidth": "150px", "maxWidth": "220px", "textAlign": "left"},
-            {"if": {"column_id": "train"}, "minWidth": "80px", "textAlign": "center"},
-            {"if": {"column_id": "allocation_share"}, "minWidth": "120px", "textAlign": "center"},
-            {"if": {"column_id": "notes"}, "minWidth": "220px", "maxWidth": "320px", "textAlign": "left"},
-        ],
+    return dag.AgGrid(
+        id="train-name-mappings-table",
+        columnDefs=column_defs,
+        rowData=[],
+        defaultColDef={
+            "sortable": True,
+            "filter": True,
+            "resizable": True,
+        },
+        dashGridOptions={
+            "rowSelection": {"mode": "multiRow"},
+            "animateRows": False,
+            "pagination": True,
+            "paginationPageSize": 50,
+        },
+        style={"height": "620px", "width": "100%"},
     )
 
 
@@ -246,204 +138,114 @@ layout = html.Div(
             max_intervals=1,
         ),
         create_mappings_section_header(
-            title="Train Mapping",
-            description="Canonical train mapping layer used to reconcile Woodmac lng_train_name_short and Energy Aspects train_name into plant-scoped numeric trains.",
+            title="Provider Train Allocations",
+            description=(
+                "Authoritative provider-source allocations to Capacity business trains. "
+                "Several sources may aggregate into one train, and one source may be split "
+                "across several trains when the allocation totals exactly 1.0."
+            ),
             active_href="/train_names_mapping",
         ),
-        html.Div(id="train-name-mappings-summary-cards-container", style={"padding": "0px 20px"}),
         html.Div(
             [
                 dbc.Card(
-                    [
-                        dbc.CardBody(
-                            [
-                                html.Div(
-                                    [
-                                        html.H5(
-                                            "Filters",
-                                            className="text-primary font-bold",
-                                            style={"marginBottom": "15px"},
+                    dbc.CardBody(
+                        [
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        dcc.Dropdown(
+                                            id="train-name-provider-filter",
+                                            multi=True,
+                                            placeholder="Filter provider",
                                         ),
-                                        dbc.Row(
-                                            [
-                                                dbc.Col(
-                                                    [
-                                                        html.Label("Country", className="text-secondary font-semibold", style={"fontSize": "13px", "marginBottom": "5px"}),
-                                                        dcc.Dropdown(id="train-name-country-filter", multi=True, placeholder="Select country(s)...", style={"fontSize": "13px"}),
-                                                    ],
-                                                    width=2,
-                                                ),
-                                                dbc.Col(
-                                                    [
-                                                        html.Label("Plant", className="text-secondary font-semibold", style={"fontSize": "13px", "marginBottom": "5px"}),
-                                                        dcc.Dropdown(id="train-name-plant-filter", multi=True, placeholder="Select plant(s)...", style={"fontSize": "13px"}),
-                                                    ],
-                                                    width=2,
-                                                ),
-                                                dbc.Col(
-                                                    [
-                                                        html.Label("Provider", className="text-secondary font-semibold", style={"fontSize": "13px", "marginBottom": "5px"}),
-                                                        dcc.Dropdown(id="train-name-provider-filter", multi=True, placeholder="Select provider(s)...", style={"fontSize": "13px"}),
-                                                    ],
-                                                    width=2,
-                                                ),
-                                                dbc.Col(
-                                                    [
-                                                        html.Label("Parent Source Field", className="text-secondary font-semibold", style={"fontSize": "13px", "marginBottom": "5px"}),
-                                                        dcc.Dropdown(id="train-name-parent-source-field-filter", multi=True, placeholder="Select parent field(s)...", style={"fontSize": "13px"}),
-                                                    ],
-                                                    width=2,
-                                                ),
-                                                dbc.Col(
-                                                    [
-                                                        html.Label("Source Field", className="text-secondary font-semibold", style={"fontSize": "13px", "marginBottom": "5px"}),
-                                                        dcc.Dropdown(id="train-name-source-field-filter", multi=True, placeholder="Select source field(s)...", style={"fontSize": "13px"}),
-                                                    ],
-                                                    width=2,
-                                                ),
-                                                dbc.Col(
-                                                    [
-                                                        html.Label("Scope Hint", className="text-secondary font-semibold", style={"fontSize": "13px", "marginBottom": "5px"}),
-                                                        dcc.Dropdown(id="train-name-scope-filter", multi=True, placeholder="Select scope hint(s)...", style={"fontSize": "13px"}),
-                                                    ],
-                                                    width=2,
-                                                ),
-                                            ],
-                                            className="g-3",
+                                        width=3,
+                                    ),
+                                    dbc.Col(
+                                        dcc.Dropdown(
+                                            id="train-name-country-filter",
+                                            multi=True,
+                                            placeholder="Filter canonical country",
                                         ),
-                                        dbc.Row(
-                                            [
-                                                dbc.Col(
-                                                    [
-                                                        html.Label("Search", className="text-secondary font-semibold", style={"fontSize": "13px", "marginBottom": "5px"}),
-                                                        dcc.Input(
-                                                            id="train-name-search-input",
-                                                            type="text",
-                                                            placeholder="Search source name, plant, parent source, component, notes...",
-                                                            style={
-                                                                "width": "100%",
-                                                                "fontSize": "13px",
-                                                                "padding": "8px 10px",
-                                                                "border": "1px solid #ced4da",
-                                                                "borderRadius": "4px",
-                                                            },
-                                                        ),
-                                                    ],
-                                                    width=9,
-                                                ),
-                                                dbc.Col(
-                                                    [
-                                                        html.Label(" ", style={"display": "block", "marginBottom": "5px"}),
-                                                        dbc.Button(
-                                                            "Clear Filters",
-                                                            id="train-name-clear-filters-btn",
-                                                            color="secondary",
-                                                            outline=True,
-                                                            size="sm",
-                                                            style={"width": "100%", "marginTop": "20px"},
-                                                        ),
-                                                    ],
-                                                    width=3,
-                                                ),
-                                            ],
-                                            className="g-3",
-                                            style={"marginTop": "4px"},
+                                        width=3,
+                                    ),
+                                    dbc.Col(
+                                        dcc.Input(
+                                            id="train-name-search-input",
+                                            type="text",
+                                            placeholder="Search source or canonical names",
+                                            style={"width": "100%", "padding": "7px 10px"},
                                         ),
-                                    ]
-                                )
-                            ]
-                        )
-                    ],
+                                        width=4,
+                                    ),
+                                    dbc.Col(
+                                        dbc.Button(
+                                            "Clear",
+                                            id="train-name-clear-filters-btn",
+                                            color="secondary",
+                                            outline=True,
+                                            size="sm",
+                                            style={"width": "100%"},
+                                        ),
+                                        width=2,
+                                    ),
+                                ],
+                                className="g-3",
+                            )
+                        ]
+                    ),
                     className="shadow-sm mb-4",
-                )
-            ],
-            style={"padding": "0px 20px"},
-        ),
-        html.Div(
-            [
+                ),
                 dbc.Card(
-                    [
-                        dbc.CardBody(
-                            [
-                                html.Div(
-                                    [
-                                        html.H5(
-                                            "Train Mapping Data",
-                                            className="text-primary font-bold",
-                                            style={"marginBottom": "10px"},
-                                        ),
-                                        html.P(
-                                            "This table stores train-mapping exceptions only. Simple raw Train N labels are inferred automatically in the Capacity page. Edit scope_hint, component_hint, train, allocation_share, and notes here for the cases that still need overrides, splits, or manual alignment.",
-                                            className="text-secondary",
-                                            style={"marginBottom": "12px"},
-                                        ),
-                                        html.Div(
-                                            [
-                                                html.Div(
-                                                    id="train-name-mappings-table-summary",
-                                                    className="text-secondary",
-                                                    style={"fontSize": "13px"},
-                                                ),
-                                                dbc.Button(
-                                                    "Save Train Mappings",
-                                                    id="train-name-save-btn",
-                                                    color="primary",
-                                                    size="sm",
-                                                ),
-                                            ],
-                                            style={
-                                                "display": "flex",
-                                                "justifyContent": "space-between",
-                                                "alignItems": "center",
-                                                "marginBottom": "12px",
-                                                "gap": "12px",
-                                            },
-                                        ),
-                                        html.Div(
-                                            id="train-name-save-message",
-                                            style={"marginBottom": "10px"},
-                                        ),
-                                        _create_mapping_table(),
-                                    ]
-                                )
-                            ]
-                        )
-                    ],
+                    dbc.CardBody(
+                        [
+                            html.Div(
+                                [
+                                    html.Div(
+                                        id="train-name-mappings-table-summary",
+                                        className="text-secondary",
+                                    ),
+                                    html.Div(
+                                        [
+                                            dbc.Button(
+                                                "Add allocation",
+                                                id="train-name-add-row-btn",
+                                                color="secondary",
+                                                outline=True,
+                                                size="sm",
+                                            ),
+                                            dbc.Button(
+                                                "Remove selected",
+                                                id="train-name-remove-row-btn",
+                                                color="danger",
+                                                outline=True,
+                                                size="sm",
+                                            ),
+                                            dbc.Button(
+                                                "Save allocations",
+                                                id="train-name-save-btn",
+                                                color="primary",
+                                                size="sm",
+                                            ),
+                                        ],
+                                        style={"display": "flex", "gap": "8px"},
+                                    ),
+                                ],
+                                style={
+                                    "display": "flex",
+                                    "justifyContent": "space-between",
+                                    "alignItems": "center",
+                                    "marginBottom": "12px",
+                                },
+                            ),
+                            html.Div(id="train-name-save-message", style={"marginBottom": "10px"}),
+                            _provider_allocation_grid(),
+                        ]
+                    ),
                     className="shadow-sm mb-4",
-                )
+                ),
             ],
-            style={"padding": "0px 20px"},
-        ),
-        html.Div(
-            [
-                dbc.Card(
-                    [
-                        dbc.CardBody(
-                            [
-                                html.Div(
-                                    [
-                                        html.H5(
-                                            "Mapping Overview",
-                                            className="text-primary font-bold",
-                                            style={"marginBottom": "15px"},
-                                        ),
-                                        dbc.Row(
-                                            [
-                                                dbc.Col(dcc.Graph(id="train-name-provider-chart"), width=4),
-                                                dbc.Col(dcc.Graph(id="train-name-plant-chart"), width=4),
-                                                dbc.Col(dcc.Graph(id="train-name-scope-chart"), width=4),
-                                            ],
-                                            className="g-3",
-                                        ),
-                                    ]
-                                )
-                            ]
-                        )
-                    ],
-                    className="shadow-sm mb-4",
-                )
-            ],
-            style={"padding": "0px 20px", "marginBottom": "30px"},
+            style={"padding": "0 20px 30px"},
         ),
     ]
 )
@@ -454,113 +256,90 @@ layout = html.Div(
     Input("train-name-mappings-load-trigger", "n_intervals"),
     Input("global-refresh-button", "n_clicks"),
 )
-def load_train_name_mapping_data(_, __):
-    df = fetch_train_name_mappings_data(engine)
-    return df.to_dict("records") if not df.empty else []
+def load_provider_allocations(_, __):
+    frame = fetch_provider_allocations(engine)
+    return frame.to_dict("records")
 
 
 @callback(
-    Output("train-name-country-filter", "options"),
-    Output("train-name-plant-filter", "options"),
     Output("train-name-provider-filter", "options"),
-    Output("train-name-parent-source-field-filter", "options"),
-    Output("train-name-source-field-filter", "options"),
-    Output("train-name-scope-filter", "options"),
-    Output("train-name-mappings-summary-cards-container", "children"),
+    Output("train-name-country-filter", "options"),
     Input("train-name-mappings-data-store", "data"),
 )
-def update_filter_options_and_summary(data):
-    if not data:
-        return [], [], [], [], [], [], html.Div("Loading...")
-
-    df = pd.DataFrame(data)
-    country_options = _build_dropdown_options(df["country_name"])
-    plant_options = _build_dropdown_options(df["plant_name"])
-    provider_options = _build_dropdown_options(df["provider"])
-    parent_source_field_options = _build_dropdown_options(df["parent_source_field"])
-    source_field_options = _build_dropdown_options(df["source_field"])
-    scope_options = _build_dropdown_options(df["scope_hint"])
-
+def update_filter_options(data):
+    frame = pd.DataFrame(data or [])
+    if frame.empty:
+        return [], []
     return (
-        country_options,
-        plant_options,
-        provider_options,
-        parent_source_field_options,
-        source_field_options,
-        scope_options,
-        create_summary_cards(df),
+        sorted(frame["provider_name"].dropna().unique()),
+        sorted(frame["country_name"].dropna().unique()),
     )
 
 
 @callback(
     Output("train-name-mappings-table-summary", "children"),
     Output("train-name-mappings-table", "rowData"),
-    Output("train-name-provider-chart", "figure"),
-    Output("train-name-plant-chart", "figure"),
-    Output("train-name-scope-chart", "figure"),
     Input("train-name-mappings-data-store", "data"),
-    Input("train-name-country-filter", "value"),
-    Input("train-name-plant-filter", "value"),
     Input("train-name-provider-filter", "value"),
-    Input("train-name-parent-source-field-filter", "value"),
-    Input("train-name-source-field-filter", "value"),
-    Input("train-name-scope-filter", "value"),
+    Input("train-name-country-filter", "value"),
     Input("train-name-search-input", "value"),
 )
-def update_mapping_views(data, countries, plants, providers, parent_source_fields, source_fields, scope_hints, search_text):
-    if not data:
-        empty_fig = _build_empty_figure("No train name mapping data available.")
-        return "No rows loaded.", [], empty_fig, empty_fig, empty_fig
-
-    df = pd.DataFrame(data)
-    filtered_df = _filter_mapping_df(
-        df,
-        countries,
-        plants,
-        providers,
-        parent_source_fields,
-        source_fields,
-        scope_hints,
-        search_text,
+def update_allocation_view(data, providers, countries, search_text):
+    frame = pd.DataFrame(data or [], columns=DISPLAY_COLUMNS)
+    if providers:
+        frame = frame[frame["provider_name"].isin(providers)]
+    if countries:
+        frame = frame[frame["country_name"].isin(countries)]
+    if search_text:
+        needle = str(search_text).strip().casefold()
+        haystack = frame[DISPLAY_COLUMNS[:-1]].fillna("").astype(str).agg(" ".join, axis=1)
+        frame = frame[haystack.str.casefold().str.contains(needle, regex=False)]
+    source_count = frame[SOURCE_COLUMNS].drop_duplicates().shape[0] if not frame.empty else 0
+    split_count = (
+        frame.groupby(SOURCE_COLUMNS).size().gt(1).sum()
+        if not frame.empty
+        else 0
     )
-
-    canonical_trains = (
-        filtered_df[["country_name", "plant_name", "train"]]
-        .replace("", pd.NA)
-        .dropna()
-        .drop_duplicates()
-        .shape[0]
+    summary = (
+        f"{len(frame):,} allocation rows | {source_count:,} provider sources | "
+        f"{split_count:,} split sources"
     )
-    summary_text = (
-        f"{len(filtered_df):,} rows shown | "
-        f"{canonical_trains:,} canonical trains | "
-        f"{filtered_df['plant_name'].replace('', pd.NA).dropna().nunique():,} plants"
-    )
-
-    provider_series = filtered_df["provider"].replace("", "Unspecified").value_counts().sort_values()
-    plant_series = filtered_df["plant_name"].replace("", "Unspecified").value_counts().head(15).sort_values()
-    scope_series = filtered_df["scope_hint"].replace("", "Unspecified").value_counts().sort_values()
-
-    provider_fig = _build_bar_figure(provider_series, "Mappings By Provider", "#1d4ed8")
-    plant_fig = _build_bar_figure(plant_series, "Top Plants By Mapping Rows", "#0f766e")
-    scope_fig = _build_bar_figure(scope_series, "Mappings By Scope Hint", "#7c3aed")
-
-    return summary_text, filtered_df.to_dict("records"), provider_fig, plant_fig, scope_fig
+    return summary, frame.to_dict("records")
 
 
 @callback(
-    Output("train-name-country-filter", "value"),
-    Output("train-name-plant-filter", "value"),
     Output("train-name-provider-filter", "value"),
-    Output("train-name-parent-source-field-filter", "value"),
-    Output("train-name-source-field-filter", "value"),
-    Output("train-name-scope-filter", "value"),
+    Output("train-name-country-filter", "value"),
     Output("train-name-search-input", "value"),
     Input("train-name-clear-filters-btn", "n_clicks"),
     prevent_initial_call=True,
 )
 def clear_filters(_):
-    return None, None, None, None, None, None, ""
+    return None, None, ""
+
+
+@callback(
+    Output("train-name-mappings-table", "rowData", allow_duplicate=True),
+    Input("train-name-add-row-btn", "n_clicks"),
+    Input("train-name-remove-row-btn", "n_clicks"),
+    State("train-name-mappings-table", "rowData"),
+    State("train-name-mappings-table", "selectedRows"),
+    prevent_initial_call=True,
+)
+def edit_allocation_rows(add_clicks, remove_clicks, rows, selected_rows):
+    from dash import ctx
+
+    rows = list(rows or [])
+    if ctx.triggered_id == "train-name-add-row-btn":
+        return rows + [{column: "" for column in DISPLAY_COLUMNS}]
+    if ctx.triggered_id == "train-name-remove-row-btn":
+        selected = {tuple(str(row.get(column, "")) for column in DISPLAY_COLUMNS) for row in selected_rows or []}
+        return [
+            row
+            for row in rows
+            if tuple(str(row.get(column, "")) for column in DISPLAY_COLUMNS) not in selected
+        ]
+    raise PreventUpdate
 
 
 @callback(
@@ -570,185 +349,78 @@ def clear_filters(_):
     State("train-name-mappings-table", "rowData"),
     prevent_initial_call=True,
 )
-def save_train_name_mappings(n_clicks, table_data):
+def save_provider_allocations(n_clicks, table_data):
     if not n_clicks:
         raise PreventUpdate
-
-    mapping_df = pd.DataFrame(table_data or [])
-    if mapping_df.empty:
-        return (
-            html.Div(
-                "No rows are currently loaded in the table.",
-                style={"color": "#9a3412", "fontSize": "12px", "fontWeight": "600"},
-            ),
-            no_update,
-        )
-
-    for column_name in DISPLAY_COLUMNS:
-        if column_name not in mapping_df.columns:
-            mapping_df[column_name] = ""
-
-    for column_name in DISPLAY_COLUMNS:
-        if column_name == "train":
-            mapping_df[column_name] = mapping_df[column_name].map(_clean_train_value)
-        elif column_name == "allocation_share":
-            mapping_df[column_name] = mapping_df[column_name].map(_clean_allocation_share)
-        else:
-            mapping_df[column_name] = mapping_df[column_name].map(_clean_text_value)
-
-    invalid_train_mask = mapping_df["train"].eq("")
-    if invalid_train_mask.any():
-        return (
-            html.Div(
-                "Every saved row must have a positive numeric train value.",
-                style={"color": "#991b1b", "fontSize": "12px", "fontWeight": "600"},
-            ),
-            no_update,
-        )
-
-    invalid_share_mask = mapping_df["allocation_share"].eq("")
-    if invalid_share_mask.any():
-        return (
-            html.Div(
-                "Every saved row must have a positive allocation_share value.",
-                style={"color": "#991b1b", "fontSize": "12px", "fontWeight": "600"},
-            ),
-            no_update,
-        )
-
-    save_df = mapping_df[DISPLAY_COLUMNS].copy()
-    for column_name in DISPLAY_COLUMNS:
-        if column_name not in {"train", "allocation_share"}:
-            save_df[column_name] = save_df[column_name].replace("", pd.NA)
-
-    save_df = save_df.dropna(
-        subset=RAW_SOURCE_KEY_COLUMNS + ["train", "allocation_share"]
-    ).copy()
-    save_df["train"] = save_df["train"].astype(int)
-    save_df["allocation_share"] = save_df["allocation_share"].astype(float)
-    save_df = save_df.drop_duplicates(
-        subset=RAW_SOURCE_KEY_COLUMNS + ["train"],
-        keep="last",
-    )
-
-    if save_df.empty:
-        return (
-            html.Div(
-                "Fill the required source fields, train, and allocation_share in the currently loaded rows before saving.",
-                style={"color": "#9a3412", "fontSize": "12px", "fontWeight": "600"},
-            ),
-            no_update,
-        )
-
-    share_check = (
-        save_df.groupby(RAW_SOURCE_KEY_COLUMNS, as_index=False)["allocation_share"]
-        .sum()
-    )
-    invalid_share_df = share_check[
-        ~share_check["allocation_share"].map(
-            lambda value: math.isclose(float(value), 1.0, rel_tol=0.0, abs_tol=1e-9)
-        )
+    frame = pd.DataFrame(table_data or [])
+    if frame.empty:
+        return html.Div("No allocation rows to save.", style={"color": "#9a3412"}), no_update
+    for column in DISPLAY_COLUMNS:
+        if column not in frame:
+            frame[column] = ""
+    for column in DISPLAY_COLUMNS[:-1]:
+        frame[column] = frame[column].map(_clean_text)
+    frame["allocation_share"] = pd.to_numeric(frame["allocation_share"], errors="coerce")
+    incomplete = frame[
+        frame[DISPLAY_COLUMNS[:-1]].eq("").any(axis=1)
+        | frame["allocation_share"].isna()
     ]
-    if not invalid_share_df.empty:
+    if not incomplete.empty:
         return (
             html.Div(
-                "allocation_share must sum to 1.0 for each raw source row before saving.",
-                style={"color": "#991b1b", "fontSize": "12px", "fontWeight": "600"},
+                "Every row requires provider IDs, canonical country, terminal, train, and allocation.",
+                style={"color": "#991b1b"},
             ),
             no_update,
         )
 
-    table_ref = f'"{DB_SCHEMA}"."{TABLE_NAME}"'
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS {table_ref} (
-                        country_name TEXT NOT NULL,
-                        plant_name TEXT NOT NULL,
-                        provider TEXT NOT NULL,
-                        parent_source_field TEXT NOT NULL,
-                        parent_source_name TEXT NOT NULL,
-                        source_field TEXT NOT NULL,
-                        source_name TEXT NOT NULL,
-                        scope_hint TEXT,
-                        component_hint TEXT,
-                        train INTEGER NOT NULL,
-                        allocation_share DOUBLE PRECISION NOT NULL DEFAULT 1.0,
-                        notes TEXT
-                    )
-                    """
-                )
+    resolved = []
+    ambiguous = []
+    for row in frame.to_dict("records"):
+        matches = find_terminal_train_candidates(
+            engine,
+            row["country_name"],
+            row["terminal_name"],
+            row["train_label"],
+        )
+        if len(matches) != 1:
+            ambiguous.append(
+                f"{row['country_name']} / {row['terminal_name']} / {row['train_label']}"
             )
-
-            key_df = save_df[RAW_SOURCE_KEY_COLUMNS].drop_duplicates().reset_index(drop=True)
-            for row in key_df.where(pd.notna(key_df), None).to_dict("records"):
-                connection.execute(
-                    text(
-                        f"""
-                        DELETE FROM {table_ref}
-                        WHERE country_name = :country_name
-                          AND plant_name = :plant_name
-                          AND provider = :provider
-                          AND parent_source_field = :parent_source_field
-                          AND parent_source_name = :parent_source_name
-                          AND source_field = :source_field
-                          AND source_name = :source_name
-                        """
-                    ),
-                    row,
-                )
-
-            for row in save_df.where(pd.notna(save_df), None).to_dict("records"):
-                connection.execute(
-                    text(
-                        f"""
-                        INSERT INTO {table_ref} (
-                            country_name,
-                            plant_name,
-                            provider,
-                            parent_source_field,
-                            parent_source_name,
-                            source_field,
-                            source_name,
-                            scope_hint,
-                            component_hint,
-                            train,
-                            allocation_share,
-                            notes
-                        ) VALUES (
-                            :country_name,
-                            :plant_name,
-                            :provider,
-                            :parent_source_field,
-                            :parent_source_name,
-                            :source_field,
-                            :source_name,
-                            :scope_hint,
-                            :component_hint,
-                            :train,
-                            :allocation_share,
-                            :notes
-                        )
-                        """
-                    ),
-                    row,
-                )
-
-        refreshed_df = fetch_train_name_mappings_data(engine)
+        else:
+            resolved.append({**row, "train_key": str(matches[0]["train_key"])})
+    if ambiguous:
         return (
             html.Div(
-                f"Saved {len(save_df):,} train mapping rows to at_lng.mapping_plant_train_name.",
-                style={"color": "#166534", "fontSize": "12px", "fontWeight": "600"},
+                "Canonical identities must resolve exactly once: " + "; ".join(ambiguous[:5]),
+                style={"color": "#991b1b"},
             ),
-            refreshed_df.to_dict("records"),
+            no_update,
+        )
+
+    resolved_frame = pd.DataFrame(resolved)
+    try:
+        changed = 0
+        for source_key, rows in resolved_frame.groupby(SOURCE_COLUMNS, sort=True):
+            result = replace_provider_source_allocations(
+                engine,
+                provider_name=source_key[0],
+                provider_plant_id=source_key[1],
+                provider_train_id=source_key[2],
+                allocations=rows[["train_key", "allocation_share"]].to_dict("records"),
+            )
+            changed += int(result["changed"])
+        refreshed = fetch_provider_allocations(engine)
+        return (
+            html.Div(
+                f"Validated {resolved_frame[SOURCE_COLUMNS].drop_duplicates().shape[0]:,} source groups; "
+                f"{changed:,} allocation set(s) changed.",
+                style={"color": "#166534", "fontWeight": "600"},
+            ),
+            refreshed.to_dict("records"),
         )
     except Exception as exc:
         return (
-            html.Div(
-                f"Train mapping save failed: {exc}",
-                style={"color": "#991b1b", "fontSize": "12px", "fontWeight": "600"},
-            ),
+            html.Div(f"Provider allocation save failed: {exc}", style={"color": "#991b1b"}),
             no_update,
         )

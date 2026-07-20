@@ -1,9 +1,10 @@
 from dash import html, dcc, callback, Input, Output, State, no_update
 import plotly.graph_objects as go
 import pandas as pd
-from datetime import datetime
+from datetime import date, datetime
 from functools import lru_cache
 from io import BytesIO
+import json
 import os
 import sys
 from dash.dash_table.Format import Format, Scheme
@@ -15,11 +16,21 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
 sys.path.insert(0, project_root)
 
-from fundamentals.terminals.scenario_utils import get_available_scenarios
+from fundamentals.terminals.terminal_output_utils import (
+    fetch_capacity_ramp_production_monthly,
+    get_capacity_ramp_production_catalog,
+)
 from utils.export_flow_data import (
     build_export_flow_matrix,
     default_selected_countries,
     get_available_countries,
+)
+from utils.global_supply_comparison import (
+    SUPPLY_SOURCE_ORDER,
+    TIME_VIEW_CONFIG,
+    aggregate_global_supply_comparison,
+    fetch_global_supply_comparison,
+    normalize_supply_time_view,
 )
 from utils.table_styles import (
     StandardTableStyleManager,
@@ -30,7 +41,6 @@ from pages.terminals import (
     PRIMARY_COLORS,
     convert_to_mcmd,
     engine,
-    fetch_volume_data,
     hex_to_rgb,
 )
 
@@ -56,6 +66,252 @@ def _create_empty_volume_figure(message):
         yaxis=dict(visible=False)
     )
     return fig
+
+
+def _create_empty_supply_comparison_figure(message):
+    fig = _create_empty_volume_figure(message)
+    fig.update_layout(height=460, margin=dict(l=72, r=36, t=72, b=58))
+    return fig
+
+
+@lru_cache(maxsize=32)
+def _fetch_global_supply_comparison_cached(run_id, _refresh_token=None):
+    comparison_df, metadata = fetch_global_supply_comparison(
+        engine,
+        int(run_id),
+    )
+    return comparison_df, metadata
+
+
+def create_global_supply_comparison_chart(comparison_df, metadata, time_view='monthly'):
+    """Compare the selected ramp run with the latest global provider supply views."""
+    if comparison_df is None or comparison_df.empty:
+        return _create_empty_supply_comparison_figure(
+            "No global supply comparison data is available"
+        )
+
+    time_view = normalize_supply_time_view(time_view)
+    view_config = TIME_VIEW_CONFIG[time_view]
+    if 'supply_mt' not in comparison_df.columns:
+        comparison_df = aggregate_global_supply_comparison(comparison_df, time_view)
+    source_styles = {
+        'Our ramp forecast': {'color': '#111827', 'width': 3.2, 'dash': 'solid'},
+        'Energy Aspects': {'color': '#D97706', 'width': 2.2, 'dash': 'solid'},
+        'Platts': {'color': '#2563EB', 'width': 2.2, 'dash': 'solid'},
+        'WoodMac': {'color': '#16803C', 'width': 2.2, 'dash': 'solid'},
+    }
+    fig = go.Figure()
+    for source_name in source_styles:
+        source_df = comparison_df[comparison_df['source'].eq(source_name)].sort_values('period_start')
+        if source_df.empty:
+            continue
+        style = source_styles[source_name]
+        fig.add_trace(
+            go.Scatter(
+                x=source_df['period_start'],
+                y=source_df['supply_mt'],
+                customdata=source_df['period_label'],
+                mode='lines',
+                name=source_name,
+                connectgaps=False,
+                line=style,
+                hovertemplate=(
+                    f'<b>{source_name}</b><br>'
+                    f"{view_config['label']}: %{{customdata}}<br>"
+                    f"Supply: %{{y:.2f}} {view_config['unit']}<extra></extra>"
+                ),
+            )
+        )
+
+    window_start = pd.to_datetime(metadata.get('window_start'), errors='coerce')
+    forecast_start = pd.to_datetime(metadata.get('forecast_start'), errors='coerce')
+    window_end = pd.to_datetime(metadata.get('window_end'), errors='coerce')
+    if pd.notna(forecast_start) and pd.notna(window_end):
+        fig.add_vrect(
+            x0=forecast_start,
+            x1=window_end,
+            fillcolor='rgba(148, 163, 184, 0.11)',
+            line_width=0,
+            layer='below',
+        )
+        fig.add_vline(
+            x=forecast_start,
+            line_width=1.2,
+            line_dash='dash',
+            line_color='#64748B',
+        )
+        fig.add_annotation(
+            x=forecast_start,
+            y=1.02,
+            xref='x',
+            yref='paper',
+            text='Forecast',
+            showarrow=False,
+            xanchor='left',
+            font={'size': 11, 'color': '#475569'},
+        )
+
+    fig.update_layout(
+        title={
+            'text': (
+                'Global LNG Supply: Ramp Scenario vs Providers'
+                '<br><sup>Five complete historical years and forecasts through 2031</sup>'
+            ),
+            'x': 0.5,
+            'xanchor': 'center',
+            'font': {'size': 18, 'family': 'Arial', 'color': '#1F2937'},
+        },
+        xaxis={
+            'title': '',
+            'type': 'date',
+            'range': [window_start, window_end],
+            'tickformat': '%Y' if time_view == 'yearly' else '%b\n%Y',
+            'dtick': 'M12' if time_view == 'yearly' else 'M6',
+            'showgrid': True,
+            'gridcolor': '#E5E7EB',
+            'linecolor': '#CBD5E1',
+        },
+        yaxis={
+            'title': f"{view_config['axis_label']} ({view_config['unit']})",
+            'rangemode': 'tozero',
+            'showgrid': True,
+            'gridcolor': '#E5E7EB',
+            'linecolor': '#CBD5E1',
+            'zeroline': False,
+        },
+        height=490,
+        margin={'l': 72, 'r': 36, 't': 82, 'b': 92},
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        hovermode='x unified',
+        legend={
+            'orientation': 'h',
+            'yanchor': 'top',
+            'y': -0.14,
+            'xanchor': 'center',
+            'x': 0.5,
+            'font': {'size': 11},
+        },
+    )
+    return fig
+
+
+def _create_global_supply_comparison_table(comparison_df, time_view='monthly'):
+    """Create the period-by-source table shown beneath the comparison chart."""
+    if comparison_df is None or comparison_df.empty:
+        return _create_empty_table_state("No comparison values are available.")
+
+    time_view = normalize_supply_time_view(time_view)
+    view_config = TIME_VIEW_CONFIG[time_view]
+    if 'supply_mt' not in comparison_df.columns:
+        comparison_df = aggregate_global_supply_comparison(comparison_df, time_view)
+    if comparison_df.empty:
+        return _create_empty_table_state("No complete periods are available for this time view.")
+
+    table_df = comparison_df.pivot_table(
+        index=['period_start', 'period_label'],
+        columns='source',
+        values='supply_mt',
+        aggfunc='sum',
+    ).reset_index()
+    table_df = table_df.sort_values('period_start').drop(columns='period_start')
+    table_df = table_df.rename(columns={'period_label': view_config['label']})
+    for source_name in SUPPLY_SOURCE_ORDER:
+        if source_name not in table_df.columns:
+            table_df[source_name] = None
+    table_df = table_df[[view_config['label'], *SUPPLY_SOURCE_ORDER]]
+    table_df[list(SUPPLY_SOURCE_ORDER)] = table_df[list(SUPPLY_SOURCE_ORDER)].round(2)
+
+    columns = [{"name": view_config['label'], "id": view_config['label']}]
+    columns.extend(
+        {
+            "name": f"{source_name} ({view_config['unit']})",
+            "id": source_name,
+            "type": "numeric",
+            "format": Format(precision=2, scheme=Scheme.fixed),
+        }
+        for source_name in SUPPLY_SOURCE_ORDER
+    )
+    base_config = StandardTableStyleManager.get_base_datatable_config()
+    style_data_conditional = list(base_config['style_data_conditional'])
+    style_data_conditional.append(
+        {
+            "if": {"column_id": view_config['label']},
+            "backgroundColor": "#f8fafc",
+            "fontWeight": "600",
+            "color": TABLE_COLORS['text_primary'],
+        }
+    )
+    column_styles = [
+        {
+            "if": {"column_id": view_config['label']},
+            "minWidth": "132px",
+            "width": "20%",
+            "textAlign": "left",
+        }
+    ]
+    column_styles.extend(
+        {
+            "if": {"column_id": source_name},
+            "minWidth": "150px",
+            "width": "20%",
+        }
+        for source_name in SUPPLY_SOURCE_ORDER
+    )
+    return html.Div(
+        [
+            html.Div(
+                f"Comparison Values | {view_config['unit']}",
+                style={
+                    'fontSize': '14px',
+                    'fontWeight': '700',
+                    'color': '#1F2937',
+                    'margin': '4px 0 8px',
+                },
+            ),
+            create_ag_grid_from_datatable(
+                id='production-global-supply-comparison-values-grid',
+                columns=columns,
+                data=table_df.to_dict('records'),
+                sort_action='native',
+                page_action='none',
+                fill_width=True,
+                fixed_columns={"headers": True, "data": 1},
+                style_table={
+                    "overflowX": "auto",
+                    "overflowY": "auto",
+                    "maxHeight": "430px",
+                    "width": "100%",
+                    "minWidth": "100%",
+                },
+                style_cell_conditional=column_styles,
+                style_data_conditional=style_data_conditional,
+            ),
+        ],
+        style={'margin': '0 10px 24px'},
+    )
+
+
+def _build_global_supply_source_note(metadata):
+    if not metadata:
+        return ""
+    parts = []
+    for source_name in ('Our ramp forecast', 'Energy Aspects', 'Platts', 'WoodMac'):
+        source = (metadata.get('sources') or {}).get(source_name)
+        if not source:
+            continue
+        coverage = f"{source.get('first_month')} to {source.get('last_month')}"
+        parts.append(f"{source_name}: {coverage}; {source.get('detail')}")
+    parts.extend(metadata.get('warnings') or [])
+    return html.Div(
+        " | ".join(parts),
+        style={
+            'fontSize': '11px',
+            'lineHeight': '1.45',
+            'color': '#64748B',
+            'margin': '2px 10px 20px',
+        },
+    )
 
 
 def _create_empty_table_state(message):
@@ -107,14 +363,39 @@ def _build_volume_table_column_styles(df):
     return column_styles
 
 
+def _json_safe_value(value):
+    """Convert catalog metadata into values accepted by dcc.Store."""
+    if isinstance(value, dict):
+        return {key: _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
 @lru_cache(maxsize=64)
-def _get_available_scenarios_cached(_refresh_token=None):
-    return tuple(get_available_scenarios(engine))
+def _get_capacity_ramp_catalog_cached(_refresh_token=None):
+    catalog_df = get_capacity_ramp_production_catalog(engine)
+    return tuple(
+        {
+            column_name: _json_safe_value(value)
+            for column_name, value in row.items()
+        }
+        for row in catalog_df.to_dict("records")
+    )
 
 
 @lru_cache(maxsize=64)
 def _fetch_volume_country_dataframe_cached(
-    scenario,
+    run_id,
     new_capacity_only,
     start_year,
     end_year,
@@ -122,27 +403,47 @@ def _fetch_volume_country_dataframe_cached(
     _refresh_token=None,
 ):
     """Fetch production data once per refresh-sensitive filter set."""
-    raw_df = fetch_volume_data(
+    raw_df = fetch_capacity_ramp_production_monthly(
+        run_id=int(run_id),
+        engine=engine,
         start_year=start_year,
         end_year=end_year,
-        breakdown=breakdown,
         new_capacity_only=new_capacity_only,
-        selected_countries=None,
-        scenario=scenario,
     )
 
     if raw_df.empty:
         return pd.DataFrame(columns=['month', 'country_name', 'total_output'])
 
-    country_df = raw_df[['year', 'month', 'group_name', 'total_output']].copy()
-    country_df = country_df.rename(columns={'group_name': 'country_name'})
+    breakdown = breakdown or 'country'
+    if breakdown == 'country':
+        country_df = raw_df.groupby(
+            ['year', 'month', 'country_name'], as_index=False
+        )['total_output'].sum()
+    elif breakdown == 'project':
+        country_df = raw_df.groupby(
+            ['year', 'month', 'plant_name', 'country_name'], as_index=False
+        )['total_output'].sum()
+        country_df = country_df.rename(columns={'plant_name': 'group_name'})
+        country_df = country_df[['year', 'month', 'group_name', 'total_output']]
+        country_df = country_df.rename(columns={'group_name': 'country_name'})
+    else:
+        country_df = raw_df[['year', 'month', 'plant_name', 'lng_train_name_short', 'total_output']].copy()
+        country_df['country_name'] = (
+            country_df['plant_name'].fillna('Unknown terminal')
+            + ' - '
+            + country_df['lng_train_name_short'].fillna('Train')
+        )
+        country_df = country_df.groupby(
+            ['year', 'month', 'country_name'], as_index=False
+        )['total_output'].sum()
+
     country_df['month'] = pd.to_datetime(country_df[['year', 'month']].assign(day=1))
 
     return country_df[['month', 'country_name', 'total_output']]
 
 
 def _prepare_volume_country_dataframe(
-    scenario='base_view',
+    run_id=None,
     selected_unit='mtpa',
     new_capacity_only=False,
     start_year=2025,
@@ -151,8 +452,11 @@ def _prepare_volume_country_dataframe(
     refresh_token=None,
 ):
     """Return the production-page data in the selected display unit."""
+    if run_id is None:
+        return pd.DataFrame(columns=['month', 'country_name', 'total_output'])
+
     country_df = _fetch_volume_country_dataframe_cached(
-        scenario,
+        int(run_id),
         bool(new_capacity_only),
         int(start_year),
         int(end_year),
@@ -164,6 +468,167 @@ def _prepare_volume_country_dataframe(
         country_df['total_output'] = convert_to_mcmd(country_df['total_output'])
 
     return country_df
+
+
+def _find_catalog_scenario(catalog, scenario_id):
+    if scenario_id is None:
+        return None
+    try:
+        resolved_id = int(scenario_id)
+    except (TypeError, ValueError):
+        return None
+    return next(
+        (row for row in catalog if row.get('scenario_id') == resolved_id),
+        None,
+    )
+
+
+def _format_catalog_option_label(row):
+    scenario_name = row.get('scenario_name') or f"Scenario {row.get('scenario_id')}"
+    run_id = row.get('display_run_id')
+    if run_id is None:
+        return f"{scenario_name} - No ramp run"
+    if int(row.get('display_blocking_qa_count') or 0) > 0:
+        return f"{scenario_name} - QA blocked (run {run_id})"
+    if row.get('fallback_reason'):
+        return f"{scenario_name} - Fallback run {run_id}"
+    return f"{scenario_name} - Run {run_id}"
+
+
+def _format_status_timestamp(value):
+    if not value:
+        return "Unknown"
+    timestamp = pd.to_datetime(value, errors='coerce', utc=True)
+    if pd.isna(timestamp):
+        return str(value)
+    return timestamp.strftime('%Y-%m-%d %H:%M UTC')
+
+
+def _format_status_month(value):
+    if not value:
+        return "Unknown"
+    timestamp = pd.to_datetime(value, errors='coerce')
+    if pd.isna(timestamp):
+        return str(value)
+    return timestamp.strftime('%b %Y')
+
+
+def _parse_blocker_summaries(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    return value if isinstance(value, list) else []
+
+
+def _build_ramp_run_status_banner(metadata):
+    """Show run provenance and make analytical QA limitations impossible to miss."""
+    base_style = {
+        'border': '1px solid',
+        'borderRadius': '4px',
+        'padding': '10px 14px',
+        'margin': '12px 0 18px',
+        'fontSize': '13px',
+        'lineHeight': '1.45',
+    }
+    if not metadata:
+        return html.Div(
+            "Select a Capacity scenario to view its ramp forecast.",
+            style={**base_style, 'backgroundColor': '#f8fafc', 'borderColor': '#cbd5e1'},
+        )
+
+    scenario_name = metadata.get('scenario_name') or 'Capacity scenario'
+    display_run_id = metadata.get('display_run_id')
+    if display_run_id is None:
+        latest_run_id = metadata.get('latest_attempt_run_id')
+        latest_status = metadata.get('latest_attempt_run_status')
+        attempt_text = (
+            f" Latest attempt: run {latest_run_id} ({latest_status})."
+            if latest_run_id is not None
+            else ""
+        )
+        return html.Div(
+            [
+                html.Strong(f"No ramp output is available for {scenario_name}."),
+                html.Span(attempt_text),
+                html.Span(" Generate the scenario forecast from "),
+                html.A("Capacity", href='/capacity', style={'fontWeight': '600'}),
+                html.Span(" before using Production."),
+            ],
+            style={
+                **base_style,
+                'backgroundColor': '#fff7ed',
+                'borderColor': '#f97316',
+                'color': '#9a3412',
+            },
+        )
+
+    is_blocked = int(metadata.get('display_blocking_qa_count') or 0) > 0
+    is_stale = bool(metadata.get('display_is_stale'))
+    is_current_published = bool(metadata.get('display_is_current_published'))
+    fallback_reason = metadata.get('fallback_reason')
+    blocking_count = int(metadata.get('display_blocking_qa_count') or 0)
+    generator_version = metadata.get('display_generator_version')
+    runtime_version = f"generator {generator_version or 'Unknown'}"
+    generated_at = _format_status_timestamp(metadata.get('display_generated_at'))
+    horizon_start = _format_status_month(metadata.get('display_horizon_start_month'))
+    horizon_end = _format_status_month(metadata.get('display_horizon_end_month'))
+    row_count = int(metadata.get('display_monthly_row_count') or 0)
+    train_count = int(metadata.get('display_train_count') or 0)
+
+    detail_parts = [
+        f"Run {display_run_id}",
+        runtime_version,
+        f"{train_count:,} trains",
+        f"generated {generated_at}",
+        f"horizon {horizon_start} to {horizon_end}",
+        f"{row_count:,} monthly rows",
+        "officially published" if is_current_published else "analytical only",
+    ]
+    children = [
+        html.Strong(
+            "QA-blocked ramp output shown for analysis. "
+            if is_blocked
+            else "Ramp output ready. "
+        ),
+        html.Span(" | ".join(detail_parts)),
+    ]
+    if is_blocked:
+        children.extend(
+            [html.Br(), html.Strong(f"{blocking_count} blocking QA issue(s).")]
+        )
+        for blocker in _parse_blocker_summaries(
+            metadata.get('display_blocking_qa_summaries')
+        )[:3]:
+            label = " / ".join(
+                str(blocker.get(key))
+                for key in ('country_name', 'plant_name', 'train_label')
+                if blocker.get(key)
+            )
+            message = blocker.get('message') or blocker.get('qa_type') or 'Blocking QA issue'
+            children.extend([html.Br(), html.Span(f"- {label + ': ' if label else ''}{message}")])
+    if fallback_reason:
+        children.extend([html.Br(), html.Strong("Fallback: "), html.Span(fallback_reason)])
+    if is_stale:
+        children.extend(
+            [
+                html.Br(),
+                html.Strong("Stale: "),
+                html.Span("scenario, SQL profile, baseline, or train registry inputs changed after this run."),
+            ]
+        )
+
+    has_warning = is_blocked or bool(fallback_reason) or is_stale
+    return html.Div(
+        children,
+        style={
+            **base_style,
+            'backgroundColor': '#fff7ed' if has_warning else '#f0fdf4',
+            'borderColor': '#f97316' if has_warning else '#22c55e',
+            'color': '#9a3412' if has_warning else '#166534',
+        },
+    )
 
 
 def _build_direct_pivot_matrix(raw_df, selected_unit='mtpa'):
@@ -417,28 +882,10 @@ def layout():
                                             dcc.Dropdown(
                                                 id='capacity-scenario-dropdown',
                                                 options=[],
-                                                value='base_view',
+                                                value=None,
                                                 clearable=False,
                                                 className='filter-dropdown',
-                                                style={'minWidth': '180px', 'width': '180px'}
-                                            ),
-                                            html.A(
-                                                html.Button(
-                                                    'Manage Adjustments',
-                                                    style={
-                                                        'padding': '8px 12px',
-                                                        'backgroundColor': '#2E86C1',
-                                                        'color': 'white',
-                                                        'border': 'none',
-                                                        'borderRadius': '4px',
-                                                        'cursor': 'pointer',
-                                                        'fontWeight': 'bold',
-                                                        'fontSize': '12px',
-                                                        'whiteSpace': 'nowrap'
-                                                    }
-                                                ),
-                                                href='/terminal_adjustments',
-                                                style={'textDecoration': 'none'}
+                                                style={'minWidth': '260px', 'width': '260px'}
                                             ),
                                         ],
                                         style={
@@ -450,7 +897,7 @@ def layout():
                                     ),
                                 ],
                                 className="filter-group",
-                                style={'minWidth': '330px'},
+                                style={'minWidth': '280px'},
                             ),
                             html.Div(
                                 [
@@ -571,6 +1018,40 @@ def layout():
                 'margin': '0',
             }
         ),
+        dcc.Store(id='production-ramp-run-store', storage_type='memory'),
+        html.Div(id='production-ramp-run-status'),
+        html.Div([
+            html.Div(
+                [
+                    html.Div("Time View", className="filter-group-header"),
+                    dcc.Dropdown(
+                        id='production-global-supply-time-view',
+                        options=[
+                            {'label': 'Month', 'value': 'monthly'},
+                            {'label': 'Quarter', 'value': 'quarterly'},
+                            {'label': 'Season', 'value': 'season'},
+                            {'label': 'Year', 'value': 'yearly'},
+                        ],
+                        value='monthly',
+                        clearable=False,
+                        searchable=False,
+                        style={'width': '180px'},
+                    ),
+                ],
+                className='filter-group',
+                style={'width': '200px', 'margin': '10px 10px 0'},
+            ),
+            dcc.Graph(
+                id='production-global-supply-comparison-chart',
+                figure=_create_empty_supply_comparison_figure(
+                    "Loading global supply comparison..."
+                ),
+                config={'displayModeBar': True, 'displaylogo': False},
+                style={'height': '100%'},
+            ),
+            html.Div(id='production-global-supply-comparison-note'),
+            html.Div(id='production-global-supply-comparison-table'),
+        ]),
         html.Div([
             html.Div([
                 html.Label("Year Range:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
@@ -604,14 +1085,101 @@ def layout():
 
 @callback(
     Output('capacity-scenario-dropdown', 'options'),
+    Output('capacity-scenario-dropdown', 'value'),
+    Input('global-refresh-button', 'n_clicks'),
+    State('capacity-scenario-dropdown', 'value'),
+)
+def populate_capacity_scenario_options(refresh_clicks, current_scenario_id):
+    """List every Capacity scenario and select Base Case by default."""
+    catalog = _get_capacity_ramp_catalog_cached(refresh_clicks)
+    options = [
+        {
+            'label': _format_catalog_option_label(row),
+            'value': row['scenario_id'],
+        }
+        for row in catalog
+    ]
+    scenario_ids = {row['scenario_id'] for row in catalog}
+    try:
+        resolved_current_id = int(current_scenario_id)
+    except (TypeError, ValueError):
+        resolved_current_id = None
+    if resolved_current_id in scenario_ids:
+        selected_scenario_id = resolved_current_id
+    else:
+        base_case = next(
+            (
+                row for row in catalog
+                if str(row.get('scenario_name') or '').casefold() == 'base case'
+            ),
+            None,
+        )
+        selected_scenario_id = (
+            base_case['scenario_id']
+            if base_case is not None
+            else (catalog[0]['scenario_id'] if catalog else None)
+        )
+    return options, selected_scenario_id
+
+
+@callback(
+    Output('production-ramp-run-store', 'data'),
+    Output('production-ramp-run-status', 'children'),
+    Input('capacity-scenario-dropdown', 'value'),
     Input('global-refresh-button', 'n_clicks'),
 )
-def populate_capacity_scenario_options(_):
-    """Load scenarios on page render instead of during app import."""
-    return [
-        {'label': scenario, 'value': scenario}
-        for scenario in _get_available_scenarios_cached(_)
-    ]
+def select_capacity_ramp_display_run(scenario_id, refresh_clicks):
+    """Freeze the selected scenario's display run for all downstream callbacks."""
+    catalog = _get_capacity_ramp_catalog_cached(refresh_clicks)
+    metadata = _find_catalog_scenario(catalog, scenario_id)
+    store_data = dict(metadata) if metadata else {}
+    store_data['refresh_token'] = refresh_clicks
+    return store_data, _build_ramp_run_status_banner(metadata)
+
+
+@callback(
+    Output('production-global-supply-comparison-chart', 'figure'),
+    Output('production-global-supply-comparison-note', 'children'),
+    Output('production-global-supply-comparison-table', 'children'),
+    Input('production-ramp-run-store', 'data'),
+    Input('production-global-supply-time-view', 'value'),
+)
+def update_global_supply_comparison(run_metadata, time_view):
+    """Render one fixed-window provider comparison for the selected scenario run."""
+    run_id = (run_metadata or {}).get('display_run_id')
+    if run_id is None:
+        return (
+            _create_empty_supply_comparison_figure(
+                "No ramp run is available for provider comparison"
+            ),
+            "",
+            _create_empty_table_state("No ramp run is available for provider comparison."),
+        )
+    comparison_df, metadata = _fetch_global_supply_comparison_cached(
+        int(run_id),
+        (run_metadata or {}).get('refresh_token'),
+    )
+    time_view = normalize_supply_time_view(time_view)
+    period_df = aggregate_global_supply_comparison(comparison_df.copy(), time_view)
+    source_note = _build_global_supply_source_note(metadata)
+    completeness_note = html.Div(
+        (
+            "Values are physical monthly supply."
+            if time_view == 'monthly'
+            else "Only complete periods are shown; blank cells mean the source does not cover every month in that period."
+        ),
+        style={
+            'fontSize': '11px',
+            'lineHeight': '1.4',
+            'color': '#64748B',
+            'margin': '-14px 10px 16px',
+        },
+    )
+    return (
+        create_global_supply_comparison_chart(period_df, metadata, time_view),
+        [source_note, completeness_note],
+        _create_global_supply_comparison_table(period_df, time_view),
+    )
 
 
 @callback(
@@ -619,42 +1187,41 @@ def populate_capacity_scenario_options(_):
     Output('capacity-country-columns-dropdown', 'value'),
     Output('capacity-country-columns-section', 'style'),
     Output('capacity-other-country-section', 'style'),
-    Input('capacity-scenario-dropdown', 'value'),
+    Input('production-ramp-run-store', 'data'),
     Input('capacity-new-capacity-checkbox', 'value'),
     Input('capacity-year-range-slider', 'value'),
     Input('capacity-breakdown-dropdown', 'value'),
-    Input('global-refresh-button', 'n_clicks'),
     State('capacity-country-columns-dropdown', 'value')
 )
 def populate_capacity_country_columns(
-    scenario,
+    run_metadata,
     new_capacity_checkbox,
     year_range,
     breakdown,
-    n_clicks,
     current_selection,
 ):
     """Populate the country-columns selector; hide country-only sections for plant/train."""
-    if not scenario:
-        raise PreventUpdate
-
     is_country = (breakdown or 'country') == 'country'
     hidden = {'display': 'none'}
     visible = None  # let CSS class control the style
     if not is_country:
         return no_update, no_update, hidden, hidden
 
+    run_id = (run_metadata or {}).get('display_run_id')
+    if run_id is None:
+        return [], [], visible, visible
+
     new_capacity_only = 'new_only' in (new_capacity_checkbox or [])
     start_year, end_year = year_range if year_range else [2025, 2040]
 
     raw_df = _prepare_volume_country_dataframe(
-        scenario=scenario,
+        run_id=run_id,
         selected_unit='mtpa',
         new_capacity_only=new_capacity_only,
         start_year=start_year,
         end_year=end_year,
         breakdown='country',
-        refresh_token=n_clicks,
+        refresh_token=(run_metadata or {}).get('refresh_token'),
     )
     available_countries = _get_available_volume_countries(raw_df)
     options = [{'label': country, 'value': country} for country in available_countries]
@@ -675,42 +1242,45 @@ def populate_capacity_country_columns(
 @callback(
     Output('capacity-volume-area-chart', 'figure'),
     Output('capacity-country-table-container', 'children'),
-    Input('capacity-scenario-dropdown', 'value'),
+    Input('production-ramp-run-store', 'data'),
     Input('capacity-unit-dropdown', 'value'),
     Input('capacity-new-capacity-checkbox', 'value'),
     Input('capacity-breakdown-dropdown', 'value'),
     Input('capacity-country-columns-dropdown', 'value'),
     Input('capacity-other-country-mode', 'value'),
     Input('capacity-year-range-slider', 'value'),
-    Input('global-refresh-button', 'n_clicks'),
     prevent_initial_call=True
 )
 def update_capacity_section(
-    scenario,
+    run_metadata,
     selected_unit,
     new_capacity_checkbox,
     breakdown,
     selected_countries,
     other_countries_mode,
     year_range,
-    refresh_clicks,
 ):
     """Update the production page chart and table from one shared dataset."""
-    if not scenario or not selected_unit:
+    if not selected_unit:
         raise PreventUpdate
+
+    run_id = (run_metadata or {}).get('display_run_id')
+    if run_id is None:
+        empty_message = "No ramp run is available. Generate one from Capacity."
+        return _create_empty_volume_figure(empty_message), _create_empty_table_state(empty_message)
 
     breakdown = breakdown or 'country'
     new_capacity_only = 'new_only' in (new_capacity_checkbox or [])
     start_year, end_year = year_range if year_range else [2025, 2040]
 
     raw_df = _prepare_volume_country_dataframe(
-        scenario=scenario,
+        run_id=run_id,
         selected_unit=selected_unit,
         new_capacity_only=new_capacity_only,
         start_year=start_year,
         end_year=end_year,
         breakdown=breakdown,
-        refresh_token=refresh_clicks,
+        refresh_token=(run_metadata or {}).get('refresh_token'),
     )
 
     if raw_df.empty:
@@ -756,29 +1326,31 @@ def update_capacity_section(
 @callback(
     Output('capacity-download-excel', 'data'),
     Input('capacity-export-excel-button', 'n_clicks'),
-    State('capacity-scenario-dropdown', 'value'),
+    State('production-ramp-run-store', 'data'),
     State('capacity-unit-dropdown', 'value'),
     State('capacity-new-capacity-checkbox', 'value'),
     State('capacity-breakdown-dropdown', 'value'),
     State('capacity-country-columns-dropdown', 'value'),
     State('capacity-other-country-mode', 'value'),
     State('capacity-year-range-slider', 'value'),
-    State('global-refresh-button', 'n_clicks'),
     prevent_initial_call=True
 )
 def export_capacity_to_excel(
     n_clicks,
-    scenario,
+    run_metadata,
     selected_unit,
     new_capacity_checkbox,
     breakdown,
     selected_countries,
     other_countries_mode,
     year_range,
-    refresh_clicks,
 ):
     """Export the visible month-by-group matrix to Excel."""
     if n_clicks == 0:
+        return None
+
+    run_id = (run_metadata or {}).get('display_run_id')
+    if run_id is None:
         return None
 
     breakdown = breakdown or 'country'
@@ -786,13 +1358,13 @@ def export_capacity_to_excel(
     start_year, end_year = year_range if year_range else [2025, 2040]
 
     raw_df = _prepare_volume_country_dataframe(
-        scenario=scenario,
+        run_id=run_id,
         selected_unit=selected_unit,
         new_capacity_only=new_capacity_only,
         start_year=start_year,
         end_year=end_year,
         breakdown=breakdown,
-        refresh_token=refresh_clicks,
+        refresh_token=(run_metadata or {}).get('refresh_token'),
     )
 
     if raw_df.empty:
@@ -846,6 +1418,9 @@ def export_capacity_to_excel(
     new_cap_label = '_NewCapacity' if new_capacity_only else ''
     breakdown_label = {'country': 'Country', 'project': 'Plant', 'train': 'Train'}[breakdown]
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f'LNG_Production_{breakdown_label}Matrix_{unit_label}{new_cap_label}_{timestamp}.xlsx'
+    filename = (
+        f'LNG_Production_Run{run_id}_{breakdown_label}Matrix_'
+        f'{unit_label}{new_cap_label}_{timestamp}.xlsx'
+    )
 
     return dcc.send_bytes(output.getvalue(), filename)

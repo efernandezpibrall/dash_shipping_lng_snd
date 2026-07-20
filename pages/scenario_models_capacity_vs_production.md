@@ -32,11 +32,14 @@ The Capacity page reads provider data from:
 - `at_lng.woodmac_lng_plant_train`
 - `at_lng.ea_lng_liquefaction_projects`
 
-Before the provider data is used, it is standardized with mapping tables:
+Before provider data is used, country names are standardized and each provider
+source is resolved directly to canonical train identity. Canonical terminal and
+train display names then come from the registries:
 
-- country mapping
-- `at_lng.mapping_plant_name`
-- `at_lng.mapping_plant_train_name`
+- `at_lng.mappings_country`
+- `at_lng.fundamentals_terminal_train_provider_links`
+- `at_lng.fundamentals_terminal_registry`
+- `at_lng.fundamentals_terminal_train_registry`
 
 ### Internal persistence tables
 

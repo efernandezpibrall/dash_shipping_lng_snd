@@ -3,6 +3,9 @@ import os
 import configparser
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+import threading
 
 import dash_ag_grid as dag
 import pandas as pd
@@ -11,6 +14,12 @@ from dash import callback, dcc, html
 from dash.dependencies import Input, Output
 from plotly.subplots import make_subplots
 from sqlalchemy import bindparam, create_engine, text
+
+from utils.dashboard_snapshot_cache import (
+    build_source_key as _build_source_key,
+    get_or_build_snapshot as _get_or_build_snapshot,
+    was_global_refresh_triggered as _was_global_refresh_triggered,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +75,25 @@ KPLER_FLEET_SEASONAL_REGION_ORDER = ["global"] + [
 KPLER_FLEET_DIVERSION_REGION_ORDER = [
     zone_filter for zone_filter in KPLER_FLEET_REGION_ORDER if zone_filter != "global"
 ]
+
+FLEET_METRICS_SNAPSHOT_NAMESPACE = "fleet-metrics-source-v1"
+_FLEET_RENDER_CACHE = OrderedDict()
+_FLEET_COMMON_RENDER_CACHE = OrderedDict()
+_FLEET_RENDER_CACHE_LOCK = threading.Lock()
+
+
+def _fetch_fleet_metrics_source_state():
+    query = text(f"""
+        SELECT
+            (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_FLEET_METRICS_TABLE)}) AS fleet_upload,
+            (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_REGIONAL_SIGNAL_TABLE)}) AS signal_upload,
+            (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_DIVERSIONS_TABLE)}) AS diversion_upload,
+            (SELECT MAX(cob) FROM {_table_ref(PRICE_CURVE_TABLE)}
+             WHERE code IN ('ICE_JKM_MO', 'ICE_TFU_MO')) AS price_cob
+    """)
+    with engine.connect() as connection:
+        row = connection.execute(query).mappings().first()
+    return dict(row or {})
 KPLER_FLEET_ZONE_SHORT_LABELS = {option["value"]: option["label"] for option in KPLER_FLEET_ZONE_OPTIONS}
 KPLER_REGION_DEFINITION_SUMMARIES = {
     "asia_pacific_oceans": "Asian LNG demand basin plus Pacific waiting and approach areas.",
@@ -4020,6 +4048,203 @@ def update_area_options(zone_filter, split_dimension):
     return options, default_values
 
 
+def _build_fleet_metrics_source_bundle(
+    *,
+    start_date_val,
+    end_date_val,
+    split_dimension,
+    today,
+    source_state,
+):
+    signal_diversion_start = today - dt.timedelta(days=45)
+    signal_diversion_end = today + dt.timedelta(days=60)
+    overlaps_signal_window = (
+        start_date_val <= signal_diversion_end
+        and end_date_val >= signal_diversion_start
+    )
+
+    if overlaps_signal_window:
+        diversion_tasks = {
+            "all_diversions": lambda: fetch_recent_diversions(
+                start_date=min(start_date_val, signal_diversion_start),
+                end_date=max(end_date_val, signal_diversion_end),
+            )
+        }
+    else:
+        diversion_tasks = {
+            "signal_diversions": lambda: fetch_recent_diversions(
+                start_date=signal_diversion_start,
+                end_date=signal_diversion_end,
+            ),
+            "diversion_history": lambda: fetch_recent_diversions(
+                start_date=start_date_val,
+                end_date=end_date_val,
+            ),
+        }
+
+    tasks = {
+        "detail_matrix_floating_days": lambda: fetch_fleet_metrics_weekly(
+            split_dimension="floating_days",
+            start_date=start_date_val,
+            end_date=end_date_val,
+            zone_filters=KPLER_FLEET_DIVERSION_REGION_ORDER,
+            metrics=("floating_storage",),
+        ),
+        "regional_signals": lambda: fetch_regional_signals(
+            start_date=start_date_val,
+            end_date=end_date_val,
+        ),
+        "detail_matrix_all_weekly": lambda: fetch_fleet_metrics_weekly(
+            split_dimension=split_dimension,
+            start_date=start_date_val,
+            end_date=end_date_val,
+            zone_filters=KPLER_FLEET_REGION_ORDER,
+            metrics=("loaded_vessels", "floating_storage"),
+        ),
+        "summary_daily": lambda: fetch_region_metric_totals_daily(
+            start_date=start_date_val,
+            end_date=end_date_val,
+        ),
+        "price_context": fetch_price_context,
+        **diversion_tasks,
+    }
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="fleet-metrics") as executor:
+        futures = {name: executor.submit(task) for name, task in tasks.items()}
+        for name in tasks:
+            results[name] = futures[name].result()
+
+    if overlaps_signal_window:
+        all_diversions_df = results["all_diversions"]
+        results["signal_diversions"] = _filter_diversions_by_event_window(
+            all_diversions_df,
+            signal_diversion_start,
+            signal_diversion_end,
+        )
+        results["diversion_history"] = _filter_diversions_by_event_window(
+            all_diversions_df,
+            start_date_val,
+            end_date_val,
+        )
+
+    detail_matrix_all = results.pop("detail_matrix_all_weekly")
+    results["detail_matrix_weekly"] = detail_matrix_all[
+        detail_matrix_all["zone_filter"].isin(KPLER_FLEET_DIVERSION_REGION_ORDER)
+    ].copy()
+    results["global_area_weekly"] = detail_matrix_all[
+        detail_matrix_all["zone_filter"] == "global"
+    ].copy()
+
+    results["upload_timestamp"] = source_state.get("fleet_upload")
+    results["signal_upload_timestamp"] = source_state.get("signal_upload")
+    return results
+
+
+def _build_fleet_metrics_common_render(
+    source_bundle,
+    *,
+    start_date_val,
+    end_date_val,
+    split_dimension,
+):
+    """Build zone-independent derived data and figures once per source bundle."""
+    summary_weekly = derive_weekly_fleet_metrics(source_bundle["summary_daily"])
+    summaries = compute_region_summaries(summary_weekly, end_date_val)
+    regional_signals = source_bundle["regional_signals"]
+    signal_summaries = compute_global_signal_summaries(
+        regional_signals,
+        source_bundle["signal_diversions"],
+        end_date_val,
+    )
+    detail_matrix_weekly = source_bundle["detail_matrix_weekly"]
+    detail_matrix_floating_days = source_bundle["detail_matrix_floating_days"]
+
+    figure_tasks = {
+        "detail_matrix_fig": lambda: build_region_detail_matrix(
+            detail_matrix_weekly,
+            detail_matrix_floating_days,
+            split_dimension,
+        ),
+        "arrival_pipeline_fig": lambda: build_arrival_origin_region_row(regional_signals),
+        "utilization_fig": lambda: build_utilization_region_row(
+            regional_signals,
+            start_date_val,
+            end_date_val,
+        ),
+        "congestion_signal_fig": lambda: build_congestion_region_row(
+            regional_signals,
+            start_date_val,
+            end_date_val,
+        ),
+        "freight_signal_fig": lambda: build_freight_region_row(
+            regional_signals,
+            start_date_val,
+            end_date_val,
+        ),
+        "diversion_seasonal_fig": lambda: build_diversion_seasonal_chart(
+            source_bundle["diversion_history"],
+            start_date=start_date_val,
+            end_date=end_date_val,
+        ),
+        "loaded_seasonal_fig": lambda: build_region_seasonal_chart(
+            summary_weekly,
+            "loaded_vessels",
+        ),
+        "floating_seasonal_fig": lambda: build_region_seasonal_chart(
+            summary_weekly,
+            "floating_storage",
+        ),
+        "detail_matrix_legend": lambda: build_region_detail_matrix_legend(
+            detail_matrix_weekly,
+            split_dimension,
+        ),
+    }
+    figures = {}
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="fleet-render") as executor:
+        futures = {name: executor.submit(task) for name, task in figure_tasks.items()}
+        for name in figure_tasks:
+            figures[name] = futures[name].result()
+
+    return {
+        "summary_weekly": summary_weekly,
+        "summaries": summaries,
+        "regional_signals": regional_signals,
+        "signal_summaries": signal_summaries,
+        "detail_matrix_weekly": detail_matrix_weekly,
+        "price_card": build_price_card(source_bundle["price_context"]),
+        **figures,
+    }
+
+
+def _get_fleet_metrics_common_render(
+    source_key,
+    source_bundle,
+    *,
+    start_date_val,
+    end_date_val,
+    split_dimension,
+):
+    with _FLEET_RENDER_CACHE_LOCK:
+        cached = _FLEET_COMMON_RENDER_CACHE.get(source_key)
+        if cached is not None:
+            _FLEET_COMMON_RENDER_CACHE.move_to_end(source_key)
+            return cached
+
+    prepared = _build_fleet_metrics_common_render(
+        source_bundle,
+        start_date_val=start_date_val,
+        end_date_val=end_date_val,
+        split_dimension=split_dimension,
+    )
+    with _FLEET_RENDER_CACHE_LOCK:
+        _FLEET_COMMON_RENDER_CACHE[source_key] = prepared
+        _FLEET_COMMON_RENDER_CACHE.move_to_end(source_key)
+        while len(_FLEET_COMMON_RENDER_CACHE) > 32:
+            _FLEET_COMMON_RENDER_CACHE.popitem(last=False)
+    return prepared
+
+
 @callback(
     Output("fleet-metrics-status-strip", "children"),
     Output("fleet-metrics-summary-cards", "children"),
@@ -4043,9 +4268,10 @@ def update_area_options(zone_filter, split_dimension):
     Input("fleet-metrics-split-dropdown", "value"),
     Input("fleet-metrics-date-range", "start_date"),
     Input("fleet-metrics-date-range", "end_date"),
+    Input("global-refresh-button", "n_clicks"),
     prevent_initial_call=False,
 )
-def update_fleet_metrics_page(zone_filter, split_dimension, start_date, end_date):
+def update_fleet_metrics_page(zone_filter, split_dimension, start_date, end_date, _global_refresh_clicks=None):
     zone_filter = zone_filter or KPLER_FLEET_DEFAULT_ZONE_FILTER
     if zone_filter not in KPLER_FLEET_REGION_ORDER:
         zone_filter = KPLER_FLEET_DEFAULT_ZONE_FILTER
@@ -4059,56 +4285,67 @@ def update_fleet_metrics_page(zone_filter, split_dimension, start_date, end_date
         if start_date_val > end_date_val:
             start_date_val, end_date_val = end_date_val, start_date_val
 
-        price_context = fetch_price_context()
-        upload_timestamp = fetch_latest_upload_timestamp()
-        signal_upload_timestamp = fetch_latest_signal_upload_timestamp()
-
-        summary_daily = fetch_region_metric_totals_daily(
-            start_date=start_date_val,
-            end_date=end_date_val,
+        try:
+            source_state = _fetch_fleet_metrics_source_state()
+        except Exception:
+            logger.warning("Fleet snapshot watermark lookup failed; using live-query fallback", exc_info=True)
+            source_state = {"request_token": dt.datetime.now(dt.timezone.utc).isoformat()}
+        source_key = _build_source_key(
+            FLEET_METRICS_SNAPSHOT_NAMESPACE,
+            source_state,
+            split_dimension,
+            start_date_val,
+            end_date_val,
+            today,
         )
-        summary_weekly = derive_weekly_fleet_metrics(summary_daily)
-        summaries = compute_region_summaries(summary_weekly, end_date_val)
+        source_reference, source_bundle = _get_or_build_snapshot(
+            engine,
+            namespace=FLEET_METRICS_SNAPSHOT_NAMESPACE,
+            source_key=source_key,
+            builder=lambda: _build_fleet_metrics_source_bundle(
+                start_date_val=start_date_val,
+                end_date_val=end_date_val,
+                split_dimension=split_dimension,
+                today=today,
+                source_state=source_state,
+            ),
+            force=_was_global_refresh_triggered(),
+            manifest={
+                "start_date": start_date_val.isoformat(),
+                "end_date": end_date_val.isoformat(),
+                "split_dimension": split_dimension,
+                "source_state": source_state,
+            },
+        )
+        render_source_key = (source_key, int(source_reference["revision"]))
+        render_cache_key = (render_source_key, zone_filter)
+        with _FLEET_RENDER_CACHE_LOCK:
+            cached_render = _FLEET_RENDER_CACHE.get(render_cache_key)
+            if cached_render is not None:
+                _FLEET_RENDER_CACHE.move_to_end(render_cache_key)
+                return cached_render
+
+        price_context = source_bundle["price_context"]
+        upload_timestamp = source_bundle["upload_timestamp"]
+        signal_upload_timestamp = source_bundle["signal_upload_timestamp"]
+        common_render = _get_fleet_metrics_common_render(
+            render_source_key,
+            source_bundle,
+            start_date_val=start_date_val,
+            end_date_val=end_date_val,
+            split_dimension=split_dimension,
+        )
+        summaries = common_render["summaries"]
         selected_summary = summaries.get(zone_filter)
         status_strip = build_status_strip(upload_timestamp, signal_upload_timestamp, zone_filter, price_context)
         summary_cards = build_summary_cards(selected_summary)
-        price_card = build_price_card(price_context)
+        price_card = common_render["price_card"]
         comparison_rows = build_comparison_rows(summaries, zone_filter)
         comparison_column_defs = build_compact_column_defs(
             FLEET_METRICS_REGION_COMPARISON_COLUMN_DEFS,
             comparison_rows,
         )
-        regional_signals = fetch_regional_signals(
-            start_date=start_date_val,
-            end_date=end_date_val,
-        )
-        signal_diversion_start = today - dt.timedelta(days=45)
-        signal_diversion_end = today + dt.timedelta(days=60)
-        if start_date_val <= signal_diversion_end and end_date_val >= signal_diversion_start:
-            all_diversions_df = fetch_recent_diversions(
-                start_date=min(start_date_val, signal_diversion_start),
-                end_date=max(end_date_val, signal_diversion_end),
-            )
-            diversions_df = _filter_diversions_by_event_window(
-                all_diversions_df,
-                signal_diversion_start,
-                signal_diversion_end,
-            )
-            diversion_history_df = _filter_diversions_by_event_window(
-                all_diversions_df,
-                start_date_val,
-                end_date_val,
-            )
-        else:
-            diversions_df = fetch_recent_diversions(
-                start_date=signal_diversion_start,
-                end_date=signal_diversion_end,
-            )
-            diversion_history_df = fetch_recent_diversions(
-                start_date=start_date_val,
-                end_date=end_date_val,
-            )
-        signal_summaries = compute_global_signal_summaries(regional_signals, diversions_df, end_date_val)
+        signal_summaries = common_render["signal_summaries"]
         selected_signal_summary = signal_summaries.get(zone_filter)
         signal_cards = build_global_signal_cards(selected_signal_summary)
         signal_rows = build_global_signal_rows(signal_summaries, zone_filter)
@@ -4116,55 +4353,25 @@ def update_fleet_metrics_page(zone_filter, split_dimension, start_date, end_date
             FLEET_METRICS_GLOBAL_SIGNALS_COLUMN_DEFS,
             signal_rows,
         )
-        loaded_seasonal_fig = build_region_seasonal_chart(summary_weekly, "loaded_vessels")
-        floating_seasonal_fig = build_region_seasonal_chart(summary_weekly, "floating_storage")
-        arrival_pipeline_fig = build_arrival_origin_region_row(regional_signals)
-        utilization_fig = build_utilization_region_row(regional_signals, start_date_val, end_date_val)
-        congestion_signal_fig = build_congestion_region_row(regional_signals, start_date_val, end_date_val)
-        freight_signal_fig = build_freight_region_row(regional_signals, start_date_val, end_date_val)
-        diversion_seasonal_fig = build_diversion_seasonal_chart(
-            diversion_history_df,
-            start_date=start_date_val,
-            end_date=end_date_val,
-        )
-        detail_matrix_weekly = fetch_fleet_metrics_weekly(
-            split_dimension=split_dimension,
-            start_date=start_date_val,
-            end_date=end_date_val,
-            zone_filters=KPLER_FLEET_DIVERSION_REGION_ORDER,
-            metrics=("loaded_vessels", "floating_storage"),
-        )
+        loaded_seasonal_fig = common_render["loaded_seasonal_fig"]
+        floating_seasonal_fig = common_render["floating_seasonal_fig"]
+        arrival_pipeline_fig = common_render["arrival_pipeline_fig"]
+        utilization_fig = common_render["utilization_fig"]
+        congestion_signal_fig = common_render["congestion_signal_fig"]
+        freight_signal_fig = common_render["freight_signal_fig"]
+        diversion_seasonal_fig = common_render["diversion_seasonal_fig"]
+        detail_matrix_weekly = common_render["detail_matrix_weekly"]
         if zone_filter in KPLER_FLEET_DIVERSION_REGION_ORDER:
             all_area_weekly = detail_matrix_weekly[
                 detail_matrix_weekly["zone_filter"] == zone_filter
             ].copy()
         else:
-            all_area_weekly = fetch_fleet_metrics_weekly(
-                split_dimension=split_dimension,
-                start_date=start_date_val,
-                end_date=end_date_val,
-                zone_filter=zone_filter,
-                metrics=("loaded_vessels", "floating_storage"),
-            )
-        detail_matrix_floating_days = fetch_fleet_metrics_weekly(
-            split_dimension="floating_days",
-            start_date=start_date_val,
-            end_date=end_date_val,
-            zone_filters=KPLER_FLEET_DIVERSION_REGION_ORDER,
-            metrics=("floating_storage",),
-        )
-        detail_matrix_fig = build_region_detail_matrix(
-            detail_matrix_weekly,
-            detail_matrix_floating_days,
-            split_dimension,
-        )
-        detail_matrix_legend = build_region_detail_matrix_legend(
-            detail_matrix_weekly,
-            split_dimension,
-        )
+            all_area_weekly = source_bundle["global_area_weekly"]
+        detail_matrix_fig = common_render["detail_matrix_fig"]
+        detail_matrix_legend = common_render["detail_matrix_legend"]
         movers_rows = build_movers_rows(all_area_weekly)
 
-        return (
+        result = (
             status_strip,
             summary_cards,
             price_card,
@@ -4184,6 +4391,12 @@ def update_fleet_metrics_page(zone_filter, split_dimension, start_date, end_date
             detail_matrix_legend,
             detail_matrix_fig,
         )
+        with _FLEET_RENDER_CACHE_LOCK:
+            _FLEET_RENDER_CACHE[render_cache_key] = result
+            _FLEET_RENDER_CACHE.move_to_end(render_cache_key)
+            while len(_FLEET_RENDER_CACHE) > 32:
+                _FLEET_RENDER_CACHE.popitem(last=False)
+        return result
     except Exception as exc:
         logger.exception("Error loading Kpler fleet metrics page")
         error_fig = _empty_figure(f"Error loading Kpler fleet metrics: {exc}")

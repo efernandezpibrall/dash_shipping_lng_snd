@@ -2,6 +2,10 @@ import pandas as pd
 import configparser
 import os
 from sqlalchemy import create_engine
+from fundamentals.terminals.terminal_output_utils import (
+    fetch_keyed_terminal_monthly_output,
+    fetch_keyed_terminal_train_summary,
+)
 
 ############################################ postgres sql connection ###################################################
 #------ code to be able to access config.ini, even having the path in the .virtualenvs is not working without it ------#
@@ -69,6 +73,9 @@ def fetch_train_data(scenario='base_view'):
     Returns:
         DataFrame with train information including derived start dates
     """
+    return fetch_keyed_terminal_train_summary(engine, scenario=scenario)
+
+    # Legacy provider-ID query retained temporarily for rollback comparison.
     if scenario == 'base_view':
         # Base view: Woodmac only, start dates from first volume > 0
         # Optimized query: reduced CTEs, combined operations
@@ -379,7 +386,7 @@ def get_new_capacity_filters(scenario='base_view'):
         scenario: Scenario name for adjustments ('base_view', 'best_view', etc.)
 
     Returns:
-        DataFrame with columns: plant_name, id_lng_train, lng_train_date_start_est
+        DataFrame with columns: plant_name, train_key, lng_train_date_start_est
     """
     df = fetch_train_data(scenario=scenario)
 
@@ -388,7 +395,9 @@ def get_new_capacity_filters(scenario='base_view'):
 
     # Filter for trains starting from current month onwards
     # lng_train_date_start_est is already a datetime from fetch_train_data()
-    new_trains_df = df[df['lng_train_date_start_est'] >= current_date][['plant_name', 'id_lng_train', 'lng_train_date_start_est', 'country_name']].copy()
+    new_trains_df = df[df['lng_train_date_start_est'] >= current_date][
+        ['plant_name', 'train_key', 'id_lng_train', 'lng_train_date_start_est', 'country_name']
+    ].copy()
 
     return new_trains_df
 
@@ -414,6 +423,36 @@ def fetch_volume_data(start_year=2025, end_year=2040, breakdown='country', new_c
     Returns:
         DataFrame with columns depending on breakdown level
     """
+    df = fetch_keyed_terminal_monthly_output(
+        engine,
+        start_year=start_year,
+        end_year=end_year,
+        scenario=scenario,
+    )
+    if selected_countries:
+        df = df[df['country_name'].isin(selected_countries)]
+    if new_capacity_only:
+        new_trains_df = get_new_capacity_filters(scenario=scenario)
+        if new_trains_df.empty:
+            return pd.DataFrame()
+        df = df[df['train_key'].isin(new_trains_df['train_key'])]
+        df = df[df['total_output'].notna() & (df['total_output'] > 0)]
+
+    if breakdown == 'country':
+        df = df.groupby(['year', 'month', 'country_name'], as_index=False)['total_output'].sum()
+        return df.rename(columns={'country_name': 'group_name'})
+    if breakdown == 'project':
+        df = df.groupby(
+            ['year', 'month', 'plant_name', 'country_name'], as_index=False
+        )['total_output'].sum()
+        return df.rename(columns={'plant_name': 'group_name'})
+
+    df['group_name'] = df['plant_name'] + ' - ' + df['lng_train_name_short']
+    return df[
+        ['year', 'month', 'group_name', 'plant_name', 'country_name', 'total_output']
+    ]
+
+    # Legacy provider-ID query retained temporarily for rollback comparison.
     # Fetch data with scenario-based adjustments
     if scenario == 'base_view':
         # Base view: Woodmac only, no adjustments

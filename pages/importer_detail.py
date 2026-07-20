@@ -34,6 +34,14 @@ import configparser
 import os
 from sqlalchemy import create_engine, text, bindparam
 
+from utils.dashboard_snapshot_cache import (
+    build_source_key as _build_source_key,
+    get_or_build_snapshot as _get_or_build_snapshot,
+    resolve_snapshot as _resolve_snapshot,
+    snapshot_is_shared as _snapshot_is_shared,
+    was_global_refresh_triggered as _was_global_refresh_triggered,
+)
+
 ############################################ postgres sql connection ###################################################
 #------ code to be able to access config.ini, even having the path in the .virtualenvs is not working without it ------#
 try:
@@ -57,6 +65,21 @@ DB_SCHEMA = config_reader.get('DATABASE', 'SCHEMA', fallback=None)
 
 # create engine
 engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
+
+IMPORTER_DETAIL_BASE_NAMESPACE = 'importer-detail-base-v1'
+
+
+def _fetch_importer_detail_source_watermark():
+    with engine.connect() as connection:
+        return connection.execute(
+            text(f"""
+                SELECT snapshot_timestamp_utc
+                FROM {DB_SCHEMA}.kpler_trade_snapshots
+                WHERE run_kind = 'canonical' AND status = 'published'
+                ORDER BY snapshot_date_utc DESC
+                LIMIT 1
+            """)
+        ).scalar()
 
 MCM_PER_CUBIC_METER = 0.6 / 1000
 BCM_PER_MMTPA = 1.36
@@ -2047,8 +2070,11 @@ def build_destination_catalog(engine):
     """Build a deduplicated destination catalog from Kpler destinations plus country mappings."""
     destination_query = text(f"""
         WITH latest_timestamp AS (
-            SELECT MAX(upload_timestamp_utc) AS max_ts
-            FROM {DB_SCHEMA}.kpler_trades
+            SELECT snapshot_timestamp_utc AS max_ts
+            FROM {DB_SCHEMA}.kpler_trade_snapshots
+            WHERE run_kind = 'canonical' AND status = 'published'
+            ORDER BY snapshot_date_utc DESC
+            LIMIT 1
         )
         SELECT DISTINCT destination_country_name
         FROM {DB_SCHEMA}.kpler_trades kt
@@ -2408,7 +2434,13 @@ def _fetch_importer_scoped_trades(engine, destination_countries, min_end_date=No
 
     min_end_date = pd.Timestamp(min_end_date or SUMMARY_LOOKBACK_START).normalize().date()
     where_clauses = [
-        "kt.upload_timestamp_utc = (SELECT MAX(upload_timestamp_utc) FROM {schema}.kpler_trades)".format(
+        """kt.upload_timestamp_utc = (
+            SELECT snapshot_timestamp_utc
+            FROM {schema}.kpler_trade_snapshots
+            WHERE run_kind = 'canonical' AND status = 'published'
+            ORDER BY snapshot_date_utc DESC
+            LIMIT 1
+        )""".format(
             schema=DB_SCHEMA
         ),
         "kt.destination_country_name IN :destination_countries",
@@ -2794,8 +2826,11 @@ def process_trade_and_distance_data(engine, destination_countries):
                     AND kt.destination_country_name IN :destination_countries
                     AND kt.zone_origin_name <> kt.zone_destination_name
                     AND kt.upload_timestamp_utc = (
-                        SELECT MAX(upload_timestamp_utc)
-                        FROM {DB_SCHEMA}.{trades_table_name}
+                        SELECT snapshot_timestamp_utc
+                        FROM {DB_SCHEMA}.kpler_trade_snapshots
+                        WHERE run_kind = 'canonical' AND status = 'published'
+                        ORDER BY snapshot_date_utc DESC
+                        LIMIT 1
                     )
             ''')
             final_df = pd.read_sql(
@@ -3092,6 +3127,11 @@ def _import_analysis_store_payload(selected_destination_aggregation, selected_de
 
 
 def _resolve_import_analysis_base_data(base_data):
+    base_data = _resolve_snapshot(
+        base_data,
+        engine,
+        expected_namespace=IMPORTER_DETAIL_BASE_NAMESPACE,
+    )
     if not base_data:
         return pd.DataFrame(), {
             'display_label': None,
@@ -3118,6 +3158,11 @@ def _resolve_import_analysis_base_data(base_data):
 
 def _import_analysis_base_data_matches(base_data, destination_context,
                                        selected_destination_aggregation, selected_destination):
+    base_data = _resolve_snapshot(
+        base_data,
+        engine,
+        expected_namespace=IMPORTER_DETAIL_BASE_NAMESPACE,
+    )
     if not base_data or base_data.get('error'):
         return False
 
@@ -5451,17 +5496,40 @@ def refresh_import_analysis_base_data(_n_clicks, selected_destination_aggregatio
         )
 
     try:
-        scoped_trades_df = _fetch_importer_scoped_trades(
-            engine,
-            destination_context['destination_countries'],
-            min_end_date=DETAIL_CHART_DATA_START_DATE
-        )
-        return _import_analysis_store_payload(
+        try:
+            source_watermark = _fetch_importer_detail_source_watermark()
+        except Exception:
+            source_watermark = dt.datetime.now().isoformat(timespec='microseconds')
+        source_key = _build_source_key(
+            IMPORTER_DETAIL_BASE_NAMESPACE,
+            source_watermark,
             selected_destination_aggregation,
             selected_destination,
-            destination_context,
-            scoped_trades_df
+            destination_context['destination_countries'],
+            DETAIL_CHART_DATA_START_DATE,
         )
+        reference, payload = _get_or_build_snapshot(
+            engine,
+            namespace=IMPORTER_DETAIL_BASE_NAMESPACE,
+            source_key=source_key,
+            builder=lambda: _import_analysis_store_payload(
+                selected_destination_aggregation,
+                selected_destination,
+                destination_context,
+                _fetch_importer_scoped_trades(
+                    engine,
+                    destination_context['destination_countries'],
+                    min_end_date=DETAIL_CHART_DATA_START_DATE,
+                ),
+            ),
+            force=_was_global_refresh_triggered(),
+            manifest={
+                'selected_destination_aggregation': selected_destination_aggregation,
+                'selected_destination_value': selected_destination,
+                'destination_countries': list(destination_context['destination_countries']),
+            },
+        )
+        return reference if _snapshot_is_shared(reference) else payload
     except Exception as exc:
         return _import_analysis_store_payload(
             selected_destination_aggregation,
@@ -5854,8 +5922,11 @@ def fetch_train_maintenance_data(engine, destination_countries=None):
         if normalized_destination_countries:
             supplier_ctes = f"""
             latest_timestamp AS (
-                SELECT MAX(upload_timestamp_utc) AS max_ts
-                FROM {DB_SCHEMA}.kpler_trades
+                SELECT snapshot_timestamp_utc AS max_ts
+                FROM {DB_SCHEMA}.kpler_trade_snapshots
+                WHERE run_kind = 'canonical' AND status = 'published'
+                ORDER BY snapshot_date_utc DESC
+                LIMIT 1
             ),
             supplier_countries AS (
                 SELECT DISTINCT origin_country_name

@@ -9,16 +9,10 @@ MAPPINGS_NAV_ITEMS = [
         "description": "Review country, basin, classification, and shipping-region mappings.",
     },
     {
-        "title": "Plant Mapping",
-        "href": "/plant_names_mapping",
-        "eyebrow": "Canonical Plants",
-        "description": "Reconcile source-specific plant labels into a shared plant name.",
-    },
-    {
-        "title": "Train Mapping",
+        "title": "Provider Train Links",
         "href": "/train_names_mapping",
-        "eyebrow": "Numeric Trains",
-        "description": "Standardize train naming and plant-scoped train allocations.",
+        "eyebrow": "Canonical Trains",
+        "description": "Allocate provider source records to Capacity business trains.",
     },
 ]
 

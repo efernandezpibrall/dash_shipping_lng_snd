@@ -5,9 +5,13 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 
 from utils.ea_balance_catalog import build_resolved_ea_lng_balance_ctes
+from utils.ea_run_interface import (
+    ea_values_at_run_source_sql,
+    fetch_current_ea_run,
+    fetch_ea_comparison_runs,
+    normalize_ea_run_id,
+)
 from utils.flow_country_selection import (
-    build_ea_upload_metadata,
-    build_ea_upload_options,
     build_woodmac_flow_metadata,
     build_woodmac_publication_options,
     resolve_available_countries,
@@ -196,10 +200,6 @@ def _build_ea_export_flow_query() -> str:
 WITH
 {COUNTRY_MAPPING_CTE},
 {balance_ctes},
-latest_snapshot AS (
-    SELECT MAX(upload_timestamp_utc) AS upload_timestamp_utc
-    FROM {DB_SCHEMA}.ea_values
-),
 export_mappings AS (
     SELECT
         dataset_id,
@@ -219,9 +219,7 @@ latest_values AS (
         values_table.dataset_id,
         values_table.date::date AS month,
         values_table.value
-    FROM {DB_SCHEMA}.ea_values values_table
-    JOIN latest_snapshot snapshot
-        ON values_table.upload_timestamp_utc = snapshot.upload_timestamp_utc
+    FROM {DB_SCHEMA}.ea_values_current values_table
     WHERE values_table.dataset_id IN (SELECT dataset_id FROM export_mappings)
 ),
 country_monthly AS (
@@ -337,9 +335,10 @@ latest_values AS (
         values_table.dataset_id,
         values_table.date::date AS month,
         values_table.value
-    FROM {DB_SCHEMA}.ea_values values_table
-    WHERE values_table.upload_timestamp_utc = CAST(:upload_timestamp_utc AS timestamp)
-      AND values_table.dataset_id IN (SELECT dataset_id FROM export_mappings)
+    FROM {ea_values_at_run_source_sql(
+        schema=DB_SCHEMA,
+        dataset_ids_sql="export_mappings",
+    )} values_table
 ),
 country_monthly AS (
     SELECT
@@ -406,28 +405,6 @@ FROM latest_short_term_market st
 CROSS JOIN latest_long_term_market lt
 """
 
-def _build_ea_export_flow_metadata_query() -> str:
-    balance_ctes, resolved_reference = build_resolved_ea_lng_balance_ctes(
-        engine, DB_SCHEMA
-    )
-    return f"""
-WITH
-{balance_ctes},
-export_mappings AS (
-    SELECT dataset_id
-    FROM {resolved_reference}
-    WHERE aspect = 'exports'
-      AND category_subtype = 'LNG'
-      AND frequency = 'monthly'
-      AND unit = 'Mt'
-      AND country IS NOT NULL
-      AND country <> ''
-)
-SELECT MAX(upload_timestamp_utc) AS upload_timestamp_utc
-FROM {DB_SCHEMA}.ea_values
-WHERE dataset_id IN (SELECT dataset_id FROM export_mappings)
-"""
-
 WOODMAC_PUBLICATION_OPTIONS_QUERY = f"""
 SELECT
     CASE
@@ -452,31 +429,6 @@ ORDER BY publication_kind,
     MAX(publication_date::timestamp) DESC
 """
 
-def _build_ea_upload_options_query() -> str:
-    balance_ctes, resolved_reference = build_resolved_ea_lng_balance_ctes(
-        engine, DB_SCHEMA
-    )
-    return f"""
-WITH
-{balance_ctes},
-export_mappings AS (
-    SELECT dataset_id
-    FROM {resolved_reference}
-    WHERE aspect = 'exports'
-      AND category_subtype = 'LNG'
-      AND frequency = 'monthly'
-      AND unit = 'Mt'
-      AND country IS NOT NULL
-      AND country <> ''
-)
-SELECT DISTINCT upload_timestamp_utc::timestamp AS upload_timestamp_utc
-FROM {DB_SCHEMA}.ea_values
-WHERE upload_timestamp_utc IS NOT NULL
-  AND dataset_id IN (SELECT dataset_id FROM export_mappings)
-ORDER BY upload_timestamp_utc DESC
-"""
-
-
 def _sanitize_raw_export_flow(df: pd.DataFrame) -> pd.DataFrame:
     return sanitize_raw_flow_data(df)
 
@@ -488,7 +440,18 @@ def fetch_woodmac_export_flow_raw_data() -> pd.DataFrame:
     return _sanitize_raw_export_flow(woodmac_df)
 
 
-def fetch_ea_export_flow_raw_data() -> pd.DataFrame:
+def fetch_ea_export_flow_raw_data(
+    *,
+    ea_as_of_run_id: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    if ea_as_of_run_id is not None:
+        return fetch_ea_export_flow_raw_data_at_run(
+            ea_as_of_run_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
     with engine.connect() as connection:
         ea_df = pd.read_sql_query(_build_ea_export_flow_query(), connection)
 
@@ -518,12 +481,22 @@ def fetch_woodmac_export_flow_raw_data_for_publications(
     return _sanitize_raw_export_flow(woodmac_df)
 
 
-def fetch_ea_export_flow_raw_data_for_upload(upload_timestamp_utc: str) -> pd.DataFrame:
+def fetch_ea_export_flow_raw_data_at_run(
+    ea_as_of_run_id: int,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    run_id = normalize_ea_run_id(ea_as_of_run_id)
     with engine.connect() as connection:
         ea_df = pd.read_sql_query(
             text(_build_ea_parameterized_export_flow_query()),
             connection,
-            params={"upload_timestamp_utc": upload_timestamp_utc},
+            params={
+                "ea_as_of_run_id": run_id,
+                "ea_start_date": start_date,
+                "ea_end_date": end_date,
+            },
         )
 
     return _sanitize_raw_export_flow(ea_df)
@@ -540,15 +513,12 @@ def fetch_woodmac_export_flow_metadata() -> dict[str, str | None]:
 
 
 def fetch_ea_export_flow_metadata() -> dict[str, str | None]:
-    with engine.connect() as connection:
-        metadata_df = pd.read_sql_query(
-            _build_ea_export_flow_metadata_query(), connection
-        )
-
-    if metadata_df.empty:
-        return {}
-
-    return build_ea_upload_metadata(metadata_df)
+    current_run = fetch_current_ea_run(engine, schema=DB_SCHEMA)
+    return {
+        "run_id": current_run["run_id"],
+        "snapshot_at": current_run["snapshot_at"],
+        "upload_timestamp_utc": current_run["snapshot_at"],
+    }
 
 
 def fetch_woodmac_publication_options() -> dict[str, list[dict[str, str | None]]]:
@@ -561,14 +531,21 @@ def fetch_woodmac_publication_options() -> dict[str, list[dict[str, str | None]]
     return build_woodmac_publication_options(options_df)
 
 
-def fetch_ea_upload_options() -> list[str]:
-    with engine.connect() as connection:
-        options_df = pd.read_sql_query(_build_ea_upload_options_query(), connection)
+def fetch_ea_upload_options(*, max_run_id: int | None = None) -> list[dict]:
+    current_run = (
+        fetch_current_ea_run(engine, schema=DB_SCHEMA)
+        if max_run_id is None
+        else {"run_id": normalize_ea_run_id(max_run_id)}
+    )
+    return fetch_ea_comparison_runs(
+        engine,
+        max_run_id=current_run["run_id"],
+        schema=DB_SCHEMA,
+    )
 
-    if options_df.empty:
-        return []
 
-    return build_ea_upload_options(options_df)
+# Temporary compatibility name for callers being migrated in the same release.
+fetch_ea_export_flow_raw_data_for_upload = fetch_ea_export_flow_raw_data_at_run
 
 
 def get_available_countries(dataframes: list[pd.DataFrame]) -> list[str]:

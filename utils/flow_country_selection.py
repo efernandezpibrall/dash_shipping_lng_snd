@@ -181,16 +181,6 @@ def build_woodmac_flow_metadata(metadata_df: pd.DataFrame) -> dict[str, str | No
     }
 
 
-def build_ea_upload_metadata(metadata_df: pd.DataFrame) -> dict[str, str | None]:
-    if metadata_df.empty:
-        return {}
-
-    row = metadata_df.iloc[0]
-    return {
-        "upload_timestamp_utc": serialize_timestamp(row.get("upload_timestamp_utc"))
-    }
-
-
 def build_woodmac_publication_options(
     options_df: pd.DataFrame,
 ) -> dict[str, list[dict[str, str | None]]]:
@@ -209,17 +199,3 @@ def build_woodmac_publication_options(
         )
 
     return result
-
-
-def build_ea_upload_options(options_df: pd.DataFrame) -> list[str]:
-    if options_df.empty:
-        return []
-
-    return [
-        serialized_timestamp
-        for serialized_timestamp in (
-            serialize_timestamp(value)
-            for value in options_df["upload_timestamp_utc"].tolist()
-        )
-        if serialized_timestamp
-    ]

@@ -7,6 +7,16 @@ import pandas as pd
 from io import BytesIO
 from datetime import datetime, timedelta
 from sqlalchemy import text
+from utils.dashboard_snapshot_cache import (
+    build_source_key as _build_source_key,
+    get_or_build_snapshot as _get_or_build_snapshot,
+    pack_record_mapping as _pack_record_mapping,
+    resolve_snapshot as _resolve_snapshot,
+    snapshot_is_shared as _snapshot_is_shared,
+    unpack_record_mapping as _unpack_record_mapping,
+    was_global_refresh_triggered as _was_global_refresh_triggered,
+    with_snapshot_slot as _with_snapshot_slot,
+)
 
 from pages.importer_detail import (
     engine,
@@ -90,6 +100,38 @@ ORIGIN_CONTINENT_CHART_TYPE_OPTIONS = [
     {'label': 'Volume', 'value': 'absolute'},
     {'label': 'Market Share (%)', 'value': 'percentage'},
 ]
+
+IMPORTERS_OVERVIEW_NAMESPACE = 'importers-overview-v1'
+IMPORTERS_PERIOD_NAMESPACE = 'importers-period-v1'
+
+
+def _fetch_importers_source_watermark():
+    query = text(f"""
+        SELECT snapshot_timestamp_utc
+        FROM {DB_SCHEMA}.kpler_trade_snapshots
+        WHERE run_kind = 'canonical' AND status = 'published'
+        ORDER BY snapshot_date_utc DESC
+        LIMIT 1
+    """)
+    with engine.connect() as connection:
+        return connection.execute(query).scalar()
+
+
+def _resolve_importers_chart_store(charts_data):
+    resolved = _resolve_snapshot(
+        charts_data,
+        engine,
+        expected_namespace=IMPORTERS_OVERVIEW_NAMESPACE,
+    )
+    return _unpack_record_mapping(resolved)
+
+
+def _resolve_importers_period_store(period_data):
+    return _resolve_snapshot(
+        period_data,
+        engine,
+        expected_namespace=IMPORTERS_PERIOD_NAMESPACE,
+    )
 
 IMPORTER_CLASSIFICATION_OPTIONS = [
     {'label': 'Country', 'value': 'Country'},
@@ -324,8 +366,11 @@ def _fetch_destination_ranking_df(catalog_df=None):
 
     query = text(f"""
         WITH latest_timestamp AS (
-            SELECT MAX(upload_timestamp_utc) AS max_ts
-            FROM {DB_SCHEMA}.kpler_trades
+            SELECT snapshot_timestamp_utc AS max_ts
+            FROM {DB_SCHEMA}.kpler_trade_snapshots
+            WHERE run_kind = 'canonical' AND status = 'published'
+            ORDER BY snapshot_date_utc DESC
+            LIMIT 1
         )
         SELECT
             kt.destination_country_name,
@@ -2977,6 +3022,7 @@ def _build_period_table_footnote(rolling_avg_days, vol_label, comparison_basis='
 
 
 layout = html.Div([
+    dcc.Store(id='imp-overview-source-state-store', storage_type='memory'),
     dcc.Store(id='imp-overview-chart-entities-store', storage_type='memory'),
     dcc.Store(id='imp-overview-table-entities-store', storage_type='memory'),
     dcc.Store(id='imp-overview-demand-data-store', storage_type='memory'),
@@ -3245,6 +3291,51 @@ def update_importer_rolling_section_titles(rolling_avg_days):
     )
 
 
+def _build_importers_overview_payload(classification_mode, rolling_avg_days):
+    rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
+    catalog_records = build_destination_catalog(engine)
+    catalog_df = get_destination_catalog_dataframe(catalog_records)
+    ranking_df = _fetch_destination_ranking_df(catalog_df)
+    table_entities = _build_destination_entities(
+        classification_mode,
+        limit=None,
+        catalog_df=catalog_df,
+        ranking_df=ranking_df
+    )
+    chart_limit = None if classification_mode == 'Classification Level 1' else TOP_IMPORTER_CHART_COUNT
+    chart_entities = _build_destination_entities(
+        classification_mode,
+        limit=chart_limit,
+        catalog_df=catalog_df,
+        ranking_df=ranking_df,
+        include_global=True,
+        include_rest=classification_mode != 'Classification Level 1'
+    )
+    demand_charts_data, origin_continent_charts_data = _build_chart_data_payload(
+        chart_entities,
+        classification_mode,
+        rolling_avg_days
+    )
+    return {
+        'chart_entities': chart_entities,
+        'table_entities': table_entities,
+        'demand_cube': _pack_record_mapping(demand_charts_data),
+        'origin_cube': _pack_record_mapping(origin_continent_charts_data),
+    }
+
+
+@callback(
+    Output('imp-overview-source-state-store', 'data'),
+    Input('global-refresh-button', 'n_clicks'),
+)
+def load_importers_overview_source_state(_n_clicks):
+    try:
+        watermark = _fetch_importers_source_watermark()
+        return {'watermark': watermark.isoformat() if hasattr(watermark, 'isoformat') else str(watermark)}
+    except Exception:
+        return {'request_token': datetime.now().isoformat(timespec='microseconds')}
+
+
 @callback(
     Output('imp-overview-chart-entities-store', 'data'),
     Output('imp-overview-table-entities-store', 'data'),
@@ -3253,41 +3344,59 @@ def update_importer_rolling_section_titles(rolling_avg_days):
     Input('global-refresh-button', 'n_clicks'),
     Input('imp-overview-classification-mode', 'value'),
     Input('imp-overview-rolling-window-days-input', 'value'),
+    State('imp-overview-source-state-store', 'data'),
     prevent_initial_call=False
 )
-def refresh_overview_data(_n_clicks, classification_mode, rolling_avg_days):
-    """Load the importer overview entities and chart datasets."""
+def refresh_overview_data(_n_clicks, classification_mode, rolling_avg_days, source_state=None):
+    """Load the importer overview entities and compact server-side chart datasets."""
     try:
         rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
-        catalog_records = build_destination_catalog(engine)
-        catalog_df = get_destination_catalog_dataframe(catalog_records)
-        ranking_df = _fetch_destination_ranking_df(catalog_df)
-        table_entities = _build_destination_entities(
+        if source_state and not _was_global_refresh_triggered():
+            source_watermark = source_state
+        else:
+            try:
+                watermark = _fetch_importers_source_watermark()
+                source_watermark = {
+                    'watermark': watermark.isoformat() if hasattr(watermark, 'isoformat') else str(watermark)
+                }
+            except Exception:
+                source_watermark = {
+                    'request_token': datetime.now().isoformat(timespec='microseconds')
+                }
+        source_key = _build_source_key(
+            IMPORTERS_OVERVIEW_NAMESPACE,
+            source_watermark,
+            datetime.now().date(),
             classification_mode,
-            limit=None,
-            catalog_df=catalog_df,
-            ranking_df=ranking_df
+            rolling_avg_days,
         )
-        chart_limit = None if classification_mode == 'Classification Level 1' else TOP_IMPORTER_CHART_COUNT
-        chart_entities = _build_destination_entities(
-            classification_mode,
-            limit=chart_limit,
-            catalog_df=catalog_df,
-            ranking_df=ranking_df,
-            include_global=True,
-            include_rest=classification_mode != 'Classification Level 1'
-        )
-        demand_charts_data, origin_continent_charts_data = _build_chart_data_payload(
-            chart_entities,
-            classification_mode,
-            rolling_avg_days
+        reference, payload = _get_or_build_snapshot(
+            engine,
+            namespace=IMPORTERS_OVERVIEW_NAMESPACE,
+            source_key=source_key,
+            builder=lambda: _build_importers_overview_payload(
+                classification_mode,
+                rolling_avg_days,
+            ),
+            force=_was_global_refresh_triggered(),
+            manifest={
+                'classification_mode': classification_mode,
+                'rolling_avg_days': rolling_avg_days,
+            },
         )
 
+        if _snapshot_is_shared(reference):
+            demand_store = _with_snapshot_slot(reference, 'demand_cube')
+            origin_store = _with_snapshot_slot(reference, 'origin_cube')
+        else:
+            demand_store = _unpack_record_mapping(payload['demand_cube'])
+            origin_store = _unpack_record_mapping(payload['origin_cube'])
+
         return (
-            chart_entities,
-            table_entities,
-            demand_charts_data,
-            origin_continent_charts_data
+            payload['chart_entities'],
+            payload['table_entities'],
+            demand_store,
+            origin_store,
         )
     except Exception:
         return [], [], {}, {}
@@ -3301,6 +3410,7 @@ def refresh_overview_data(_n_clicks, classification_mode, rolling_avg_days):
     prevent_initial_call=False
 )
 def update_demand_year_selector_options(charts_data, selected_years):
+    charts_data = _resolve_importers_chart_store(charts_data)
     available_years = _get_importer_chart_available_years(charts_data)
     if not available_years:
         return [], []
@@ -3337,6 +3447,7 @@ def update_demand_year_selector_options(charts_data, selected_years):
 )
 def update_demand_charts(charts_data, importer_entities, volume_metric, selected_years, rolling_avg_days):
     """Render the demand chart grid using the upgraded exporter-page pattern."""
+    charts_data = _resolve_importers_chart_store(charts_data)
     if not charts_data or not importer_entities:
         return html.Div('No data available', className='importer-rolling-empty-state')
 
@@ -3401,6 +3512,7 @@ def update_demand_charts(charts_data, importer_entities, volume_metric, selected
     prevent_initial_call=False
 )
 def update_origin_year_selector_options(charts_data, selected_years):
+    charts_data = _resolve_importers_chart_store(charts_data)
     available_years = _get_importer_chart_available_years(charts_data)
     if not available_years:
         return [], []
@@ -3432,6 +3544,7 @@ def update_origin_year_selector_options(charts_data, selected_years):
 def update_origin_continent_charts(charts_data, importer_entities, volume_metric, selected_years,
                                    chart_type, _rolling_avg_days):
     """Render the origin-continent chart grid using the upgraded exporter-page pattern."""
+    charts_data = _resolve_importers_chart_store(charts_data)
     if not charts_data or not importer_entities:
         return html.Div(
             'No data available',
@@ -3519,22 +3632,47 @@ def reset_period_expansion_state(_origin_level, _classification_mode, _importer_
     Input('imp-overview-origin-level-dropdown', 'value'),
     Input('imp-overview-rolling-window-days-input', 'value'),
     Input('imp-overview-origin-country-grouping-dropdown', 'value'),
+    Input('global-refresh-button', 'n_clicks'),
+    State('imp-overview-source-state-store', 'data'),
     prevent_initial_call=False
 )
 def refresh_period_data(importer_entities, classification_mode, origin_level, rolling_avg_days,
-                        origin_country_grouping_mode):
+                        origin_country_grouping_mode, global_refresh_clicks, source_state=None):
     """Load the raw period-analysis payload for the overview importers."""
     if not importer_entities:
         return _empty_importer_period_payload(origin_country_grouping_mode)
 
     try:
-        return _build_period_payload(
+        normalized_rolling_days = normalize_importer_rolling_avg_days(rolling_avg_days)
+        source_key = _build_source_key(
+            IMPORTERS_PERIOD_NAMESPACE,
+            source_state,
+            global_refresh_clicks or 0,
             importer_entities,
             classification_mode,
             origin_level,
             origin_country_grouping_mode,
-            normalize_importer_rolling_avg_days(rolling_avg_days)
+            normalized_rolling_days,
         )
+        reference, payload = _get_or_build_snapshot(
+            engine,
+            namespace=IMPORTERS_PERIOD_NAMESPACE,
+            source_key=source_key,
+            builder=lambda: _build_period_payload(
+                importer_entities,
+                classification_mode,
+                origin_level,
+                origin_country_grouping_mode,
+                normalized_rolling_days,
+            ),
+            manifest={
+                'classification_mode': classification_mode,
+                'origin_level': origin_level,
+                'origin_country_grouping_mode': origin_country_grouping_mode,
+                'rolling_avg_days': normalized_rolling_days,
+            },
+        )
+        return reference if _snapshot_is_shared(reference) else payload
     except Exception:
         return _empty_importer_period_payload(origin_country_grouping_mode)
 
@@ -3562,6 +3700,8 @@ def update_period_analysis_table(period_payload, expanded_importers, importer_en
     if not period_payload or not importer_entities:
         message = html.Div('No data available for the selected configuration.', style={'textAlign': 'center', 'padding': '20px'})
         return message, []
+
+    period_payload = _resolve_importers_period_store(period_payload)
 
     rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
     origin_country_grouping_mode = _normalize_importer_period_origin_grouping(origin_country_grouping_mode)
@@ -3684,6 +3824,8 @@ def export_demand_to_excel(n_clicks, charts_data, volume_metric, selected_years,
     if not n_clicks:
         raise PreventUpdate
 
+    charts_data = _resolve_importers_chart_store(charts_data)
+
     rolling_label = _format_importer_rolling_window_label(rolling_avg_days)
     export_df = _build_chart_export_df(charts_data, volume_metric, selected_years)
     if export_df.empty:
@@ -3711,6 +3853,8 @@ def export_origin_continent_to_excel(n_clicks, charts_data, volume_metric, selec
     """Export the currently rendered origin-continent chart data."""
     if not n_clicks:
         raise PreventUpdate
+
+    charts_data = _resolve_importers_chart_store(charts_data)
 
     rolling_label = _format_importer_rolling_window_label(rolling_avg_days)
     export_df = _build_chart_export_df(charts_data, volume_metric, selected_years, chart_type)

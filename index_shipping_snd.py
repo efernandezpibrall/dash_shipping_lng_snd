@@ -12,7 +12,6 @@ import pages.importer_detail
 import pages.exporters
 import pages.importers
 import pages.country_mappings
-import pages.plant_names_mapping
 import pages.train_names_mapping
 import pages.contracts
 import pages.capacity
@@ -106,8 +105,6 @@ def display_page(pathname):
         return pages.country_mappings.layout
     elif pathname == '/country_mappings':
         return pages.country_mappings.layout
-    elif pathname == '/plant_names_mapping':
-        return pages.plant_names_mapping.layout
     elif pathname == '/train_names_mapping':
         return pages.train_names_mapping.layout
     else:
@@ -150,8 +147,6 @@ app.clientside_callback(
             document.title = 'LNG Shipping - Country Mappings';
         } else if (pathname === '/country_mappings') {
             document.title = 'LNG Shipping - Country Mappings';
-        } else if (pathname === '/plant_names_mapping') {
-            document.title = 'LNG Shipping - Plant Mapping';
         } else if (pathname === '/train_names_mapping') {
             document.title = 'LNG Shipping - Train Mapping';
         } else {
@@ -195,7 +190,6 @@ app.clientside_callback(
         } else if (
             pathname === '/mappings' ||
             pathname === '/country_mappings' ||
-            pathname === '/plant_names_mapping' ||
             pathname === '/train_names_mapping'
         ) {
             activeNavId = 'nav-mappings';

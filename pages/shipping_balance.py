@@ -6,11 +6,22 @@ import pandas as pd
 import numpy as np
 import datetime as dt
 import logging
+import threading
 from io import StringIO, BytesIO
 from dash.exceptions import PreventUpdate
 import configparser
 import os
 from sqlalchemy import create_engine
+from concurrent.futures import ThreadPoolExecutor
+
+from utils.dashboard_snapshot_cache import (
+    build_source_key as _build_source_key,
+    get_or_build_snapshot as _get_or_build_snapshot,
+    resolve_snapshot as _resolve_snapshot,
+    snapshot_is_shared as _snapshot_is_shared,
+    was_global_refresh_triggered as _was_global_refresh_triggered,
+    with_snapshot_slot as _with_snapshot_slot,
+)
 
 from fundamentals.shipping_balance_calculator import global_shipping_balance as calc_global_shipping_balance, kpler_analysis
 
@@ -40,6 +51,71 @@ if not DB_CONNECTION_STRING:
 # create engine
 engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 logger = logging.getLogger(__name__)
+
+SHIPPING_BALANCE_NAMESPACE = "shipping-balance-v1"
+
+SHIPPING_BALANCE_SOURCE_STATE_QUERY = '''
+SELECT
+    (SELECT snapshot_timestamp_utc
+     FROM at_lng.kpler_trade_snapshots
+     WHERE run_kind = 'canonical' AND status = 'published'
+     ORDER BY snapshot_date_utc DESC
+     LIMIT 1) AS kpler_upload,
+    (SELECT MAX(publication_date::timestamp)
+     FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa) AS woodmac_publication,
+    (SELECT MAX(upload_timestamp_utc) FROM at_lng.syy_newbuilds) AS syy_upload,
+    (SELECT MAX(upload_timestamp_utc) FROM at_lng.kpler_vessels_info) AS vessel_upload,
+    (SELECT md5(COALESCE(string_agg(
+        concat_ws('|', COALESCE(country, ''), COALESCE(shipping_region, '')),
+        '||' ORDER BY COALESCE(country, '')
+    ), '')) FROM at_lng.mappings_country) AS mapping_hash
+'''
+
+SHIPPING_BALANCE_DATE_STATE_QUERY = '''
+WITH latest_kpler AS (
+    SELECT snapshot_timestamp_utc
+    FROM at_lng.kpler_trade_snapshots
+    WHERE run_kind = 'canonical' AND status = 'published'
+    ORDER BY snapshot_date_utc DESC
+    LIMIT 1
+)
+SELECT
+    MIN(s.min_delivered_end) FILTER (WHERE s.facts_retained) AS min_date,
+    MAX(s.max_delivered_end) FILTER (WHERE s.facts_retained) AS max_date,
+    MAX(s.max_delivered_end) FILTER (
+        WHERE s.snapshot_timestamp_utc = latest_kpler.snapshot_timestamp_utc
+    ) AS hist_date_max
+FROM at_lng.kpler_trade_snapshots s
+CROSS JOIN latest_kpler
+'''
+
+_SHIPPING_DATE_STATE_CACHE = {}
+_SHIPPING_DATE_STATE_LOCK = threading.Lock()
+
+
+def _fetch_shipping_balance_source_state():
+    return pd.read_sql(SHIPPING_BALANCE_SOURCE_STATE_QUERY, engine).iloc[0].to_dict()
+
+
+def _get_shipping_balance_date_state(kpler_upload):
+    cache_key = str(kpler_upload)
+    with _SHIPPING_DATE_STATE_LOCK:
+        cached = _SHIPPING_DATE_STATE_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    date_state = pd.read_sql(SHIPPING_BALANCE_DATE_STATE_QUERY, engine).iloc[0].to_dict()
+    with _SHIPPING_DATE_STATE_LOCK:
+        _SHIPPING_DATE_STATE_CACHE.clear()
+        _SHIPPING_DATE_STATE_CACHE[cache_key] = dict(date_state)
+    return date_state
+
+
+def _resolve_shipping_store(value):
+    return _resolve_snapshot(
+        value,
+        engine,
+        expected_namespace=SHIPPING_BALANCE_NAMESPACE,
+    )
 
 
 def _woodmac_validation_period_filter(aggregation_level, selected_year, selected_period):
@@ -1544,6 +1620,121 @@ layout = html.Div([
 ], style=SHIPPING_BALANCE_PAGE_STYLE)
 
 
+def _build_shipping_balance_payload(
+    *,
+    source_state,
+    aggregation_level,
+    vessel_age,
+    utilization_rate,
+    window_end_date,
+    use_kpler_historical,
+):
+    date_state = _get_shipping_balance_date_state(source_state.get('kpler_upload'))
+    if window_end_date is None:
+        yesterday = pd.Timestamp.now() - pd.Timedelta(days=1)
+        available_max = date_state.get('max_date')
+        window_end_date = (
+            min(yesterday, pd.to_datetime(available_max))
+            if pd.notna(available_max)
+            else yesterday
+        )
+        window_end_date = pd.Timestamp(window_end_date).normalize()
+    utilization_rate_decimal = utilization_rate / 100.0
+    historical_max_date = pd.to_datetime(date_state['hist_date_max'])
+    hist_date_max = historical_max_date + pd.offsets.MonthEnd(0)
+
+    def build_balance(lng_view):
+        return calc_global_shipping_balance(
+            engine=engine,
+            aggregation_level=aggregation_level,
+            life_expectancy=vessel_age,
+            lng_view=lng_view,
+            utilization_rate=utilization_rate_decimal,
+            window_end_date=window_end_date,
+            return_regional=True,
+            use_kpler_historical=use_kpler_historical,
+        )
+
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix='shipping-balance') as executor:
+        demand_future = executor.submit(build_balance, 'demand')
+        supply_future = executor.submit(build_balance, 'supply')
+        kpler_future = executor.submit(
+            kpler_analysis,
+            engine,
+            None,
+            hist_date_max,
+            aggregation_level,
+        )
+        # Resolve in the same logical order as the legacy callback.
+        df_regional_demand, df_global_shipping_balance = demand_future.result()
+        df_regional_supply, df_global_shipping_balance_supply = supply_future.result()
+        df_intracountry_trades, df_trades_shipping_region = kpler_future.result()
+
+    df_filtered = df_trades_shipping_region[df_trades_shipping_region['year'] >= 2019]
+    origin_regions = sorted(df_filtered['origin_shipping_region'].unique())
+    region_options = [{'label': 'All Regions', 'value': 'All Regions'}] + [
+        {'label': region, 'value': region} for region in origin_regions
+    ]
+
+    years = sorted(df_filtered['year'].unique())
+    latest_year = max(years)
+    year_options = [{'label': 'All Years', 'value': 'All Years'}] + [
+        {'label': str(year), 'value': str(year)} for year in years
+    ]
+
+    region_statuses = sorted(df_trades_shipping_region['status'].unique())
+    intracountry_statuses = sorted(df_intracountry_trades['status'].unique())
+    status_options_region = [{'label': 'All Statuses', 'value': 'All Statuses'}] + [
+        {'label': status.capitalize(), 'value': status} for status in region_statuses
+    ]
+    status_options_intracountry = [{'label': 'All Statuses', 'value': 'All Statuses'}] + [
+        {'label': status.capitalize(), 'value': status} for status in intracountry_statuses
+    ]
+    status_options_single = [
+        {'label': status['label'], 'value': status['value']}
+        for status in status_options_intracountry
+    ]
+
+    options_data = {
+        'region_options': region_options,
+        'year_options': year_options,
+        'latest_year': str(latest_year),
+        'status_options_region': status_options_region,
+        'status_options_intracountry': status_options_intracountry,
+        'status_options_single': status_options_single,
+        'aggregation_level': aggregation_level,
+        'vessel_age': vessel_age,
+        'utilization_rate': utilization_rate,
+        'hist_date_max': hist_date_max.isoformat(),
+    }
+
+    max_date = historical_max_date
+    min_date = date_state.get('min_date')
+    placeholder_text = (
+        f"YYYY-MM-DD (Max: {max_date.strftime('%Y-%m-%d')})"
+        if pd.notna(max_date)
+        else "YYYY-MM-DD"
+    )
+    min_date_str = min_date.strftime('%Y-%m-%d') if pd.notna(min_date) else ''
+    window_end_date_str = (
+        window_end_date.strftime('%Y-%m-%d')
+        if hasattr(window_end_date, 'strftime')
+        else str(window_end_date)[:10]
+    )
+
+    return {
+        'shipping_balance': df_global_shipping_balance.to_json(date_format='iso', orient='split'),
+        'shipping_balance_supply': df_global_shipping_balance_supply.to_json(date_format='iso', orient='split'),
+        'shipping_balance_regional': df_regional_demand.to_json(date_format='iso', orient='split'),
+        'shipping_balance_supply_regional': df_regional_supply.to_json(date_format='iso', orient='split'),
+        'options_data': options_data,
+        'intracountry_data': df_intracountry_trades.to_json(date_format='iso', orient='split'),
+        'placeholder_text': placeholder_text,
+        'min_date_str': min_date_str,
+        'window_end_date_str': window_end_date_str,
+    }
+
+
 # Callbacks
 # Update the refresh_data callback to include the aggregation dropdown and window date picker
 @callback(
@@ -1575,139 +1766,90 @@ def refresh_data(_n_clicks, aggregation_level='monthly', vessel_age=20, utilizat
     elif not window_end_date or (isinstance(window_end_date, str) and not window_end_date.strip()):
         window_end_date = None
 
-    # Get the date range from Kpler trades for date picker limits
-    query_date_range = '''
-        SELECT MIN("end") as min_date, MAX("end") as max_date
-        FROM at_lng.kpler_trades
-        WHERE status = 'Delivered' AND "end" IS NOT NULL
-    '''
-    date_range = pd.read_sql(query_date_range, engine)
-    min_date = date_range['min_date'].iloc[0]
-    max_date = date_range['max_date'].iloc[0]
+    try:
+        source_state = _fetch_shipping_balance_source_state()
+    except Exception:
+        logger.warning("Shipping snapshot watermark lookup failed; using live-query fallback", exc_info=True)
+        source_state = {"request_token": dt.datetime.now(dt.timezone.utc).isoformat()}
 
-    # Set default window_end_date to yesterday if not provided
+    # Canonicalize the default before keying the snapshot. The callback also
+    # writes this value back to the input, so None and the resolved date must
+    # address the same prepared revision rather than causing a second build.
     if window_end_date is None:
+        date_state = _get_shipping_balance_date_state(source_state.get('kpler_upload'))
         yesterday = pd.Timestamp.now() - pd.Timedelta(days=1)
-        # Use yesterday or max_date, whichever is earlier
-        window_end_date = min(yesterday, pd.to_datetime(max_date)) if max_date else yesterday
+        available_max = date_state.get('max_date')
+        window_end_date = (
+            min(yesterday, pd.to_datetime(available_max))
+            if pd.notna(available_max)
+            else yesterday
+        )
+        window_end_date = pd.Timestamp(window_end_date).normalize()
 
-    # Convert utilization rate from percentage to decimal
-    utilization_rate_decimal = utilization_rate / 100.0
-
-    # Determine if Kpler historical data should be used
     use_kpler_historical = 'kpler' in (use_kpler_checked or [])
-
-    # Fetch shipping balance data with selected parameters including window - with regional data
-    df_regional_demand, df_global_shipping_balance = calc_global_shipping_balance(
-        engine=engine,
-        aggregation_level=aggregation_level,
-        life_expectancy=vessel_age,
-        lng_view='demand',
-        utilization_rate=utilization_rate_decimal,
-        window_end_date=window_end_date,
-        return_regional=True,
-        use_kpler_historical=use_kpler_historical
+    source_key = _build_source_key(
+        SHIPPING_BALANCE_NAMESPACE,
+        source_state,
+        aggregation_level,
+        vessel_age,
+        utilization_rate,
+        window_end_date,
+        use_kpler_historical,
+    )
+    reference, payload = _get_or_build_snapshot(
+        engine,
+        namespace=SHIPPING_BALANCE_NAMESPACE,
+        source_key=source_key,
+        builder=lambda: _build_shipping_balance_payload(
+            source_state=source_state,
+            aggregation_level=aggregation_level,
+            vessel_age=vessel_age,
+            utilization_rate=utilization_rate,
+            window_end_date=window_end_date,
+            use_kpler_historical=use_kpler_historical,
+        ),
+        force=_was_global_refresh_triggered(),
+        manifest={
+            'aggregation_level': aggregation_level,
+            'vessel_age': vessel_age,
+            'utilization_rate': utilization_rate,
+            'window_end_date': (
+                window_end_date.strftime('%Y-%m-%d')
+                if hasattr(window_end_date, 'strftime')
+                else None
+            ),
+            'use_kpler_historical': use_kpler_historical,
+        },
     )
 
-    # Fetch shipping balance supply data with window - with regional data
-    df_regional_supply, df_global_shipping_balance_supply = calc_global_shipping_balance(
-        engine=engine,
-        aggregation_level=aggregation_level,
-        life_expectancy=vessel_age,
-        lng_view='supply',
-        utilization_rate=utilization_rate_decimal,
-        window_end_date=window_end_date,
-        return_regional=True,
-        use_kpler_historical=use_kpler_historical
-    )
-
-    # Rest of the function remains the same
-    # Get the maximum historical date to limit kpler_analysis to historical data only
-    query_max_hist_date = '''
-        SELECT MAX("end") as hist_date_max
-        FROM at_lng.kpler_trades
-        WHERE status='Delivered'
-        AND upload_timestamp_utc = (SELECT MAX(upload_timestamp_utc) FROM at_lng.kpler_trades)
-    '''
-    hist_date_max_df = pd.read_sql(query_max_hist_date, engine)
-    # Return the last day of the month containing the max date
-    max_date = pd.to_datetime(hist_date_max_df.hist_date_max.dt.date[0])
-    hist_date_max = max_date + pd.offsets.MonthEnd(0)
-
-    # Fetch trade shipping data - limit to historical data only
-    df_intracountry_trades, df_trades_shipping_region = kpler_analysis(engine, end_date=hist_date_max, aggregation_level=aggregation_level)
-
-    # Extract unique values for dropdown options
-    # Filter for relevant years (2019+)
-    df_filtered = df_trades_shipping_region[df_trades_shipping_region['year'] >= 2019]
-
-    # Get origin regions for dropdown
-    origin_regions = sorted(df_filtered['origin_shipping_region'].unique())
-    region_options = [{'label': 'All Regions', 'value': 'All Regions'}] + [
-        {'label': region, 'value': region} for region in origin_regions
-    ]
-
-    # Get years for dropdown
-    years = sorted(df_filtered['year'].unique())
-    latest_year = max(years)
-    year_options = [{'label': 'All Years', 'value': 'All Years'}] + [
-        {'label': str(year), 'value': str(year)} for year in years
-    ]
-
-    # Get status values for dropdowns
-    region_statuses = sorted(df_trades_shipping_region['status'].unique())
-    intracountry_statuses = sorted(df_intracountry_trades['status'].unique())
-
-    status_options_region = [{'label': 'All Statuses', 'value': 'All Statuses'}] + [
-        {'label': status.capitalize(), 'value': status} for status in region_statuses
-    ]
-
-    status_options_intracountry = [{'label': 'All Statuses', 'value': 'All Statuses'}] + [
-        {'label': status.capitalize(), 'value': status} for status in intracountry_statuses
-    ]
-
-    # Create single-select version of status options for metrics dropdown
-    status_options_single = [{'label': status['label'], 'value': status['value']}
-                             for status in status_options_intracountry]
-
-    # Store options data
-    options_data = {
-        'region_options': region_options,
-        'year_options': year_options,
-        'latest_year': str(latest_year),
-        'status_options_region': status_options_region,
-        'status_options_intracountry': status_options_intracountry,
-        'status_options_single': status_options_single,
-        'aggregation_level': aggregation_level,  # Store the current aggregation level
-        'vessel_age': vessel_age,  # Store the current vessel age
-        'utilization_rate': utilization_rate,  # Store the current utilization rate
-        'hist_date_max': hist_date_max.isoformat()  # Store the historical max date for current period marker
-    }
-
-    # Convert DataFrames to JSON for storage
-    shipping_balance = df_global_shipping_balance.to_json(date_format='iso', orient='split')
-    shipping_balance_supply = df_global_shipping_balance_supply.to_json(date_format='iso', orient='split')
-    shipping_balance_regional = df_regional_demand.to_json(date_format='iso', orient='split')
-    shipping_balance_supply_regional = df_regional_supply.to_json(date_format='iso', orient='split')
-    intracountry_data = df_intracountry_trades.to_json(date_format='iso', orient='split')
-
-    # Format dates for the text input
-    placeholder_text = f"YYYY-MM-DD (Max: {max_date.strftime('%Y-%m-%d')})" if max_date else "YYYY-MM-DD"
-    min_date_str = min_date.strftime('%Y-%m-%d') if min_date else ''
-
-    # Format window_end_date consistently
-    if window_end_date:
-        if hasattr(window_end_date, 'strftime'):
-            window_end_date_str = window_end_date.strftime('%Y-%m-%d')
-        else:
-            window_end_date_str = str(window_end_date)[:10]  # Take first 10 chars for YYYY-MM-DD
+    if _snapshot_is_shared(reference):
+        stores = [
+            _with_snapshot_slot(reference, slot)
+            for slot in (
+                'shipping_balance',
+                'shipping_balance_supply',
+                'shipping_balance_regional',
+                'shipping_balance_supply_regional',
+                'options_data',
+                'intracountry_data',
+            )
+        ]
     else:
-        # Default to yesterday if nothing set
-        window_end_date_str = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        stores = [
+            payload['shipping_balance'],
+            payload['shipping_balance_supply'],
+            payload['shipping_balance_regional'],
+            payload['shipping_balance_supply_regional'],
+            payload['options_data'],
+            payload['intracountry_data'],
+        ]
 
-    return (shipping_balance, shipping_balance_supply, shipping_balance_regional,
-            shipping_balance_supply_regional, options_data,
-            intracountry_data, placeholder_text, min_date_str, window_end_date_str)
+    return (
+        *stores,
+        payload['placeholder_text'],
+        payload['min_date_str'],
+        payload['window_end_date_str'],
+    )
 
 
 # Update the update_visualizations callback to handle aggregation levels in chart formatting
@@ -1720,6 +1862,9 @@ def refresh_data(_n_clicks, aggregation_level='monthly', vessel_age=20, utilizat
 )
 def update_visualizations(shipping_balance, shipping_balance_supply, dropdown_options):
     """Update visualizations and tables based on selected filters."""
+    shipping_balance = _resolve_shipping_store(shipping_balance)
+    shipping_balance_supply = _resolve_shipping_store(shipping_balance_supply)
+    dropdown_options = _resolve_shipping_store(dropdown_options)
     # Check if data is available
     if shipping_balance is None or shipping_balance_supply is None or dropdown_options is None:
         raise PreventUpdate
@@ -1770,6 +1915,9 @@ def export_demand_metrics_to_excel(n_clicks, shipping_balance, dropdown_options)
     """Export Demand View metrics to Excel."""
     if not n_clicks or shipping_balance is None or dropdown_options is None:
         raise PreventUpdate
+
+    shipping_balance = _resolve_shipping_store(shipping_balance)
+    dropdown_options = _resolve_shipping_store(dropdown_options)
 
     df = pd.read_json(StringIO(shipping_balance), orient='split')
     df['date'] = pd.to_datetime(df['date'])
@@ -1823,6 +1971,9 @@ def export_supply_metrics_to_excel(n_clicks, shipping_balance_supply, dropdown_o
     if not n_clicks or shipping_balance_supply is None or dropdown_options is None:
         raise PreventUpdate
 
+    shipping_balance_supply = _resolve_shipping_store(shipping_balance_supply)
+    dropdown_options = _resolve_shipping_store(dropdown_options)
+
     df = pd.read_json(StringIO(shipping_balance_supply), orient='split')
     df['date'] = pd.to_datetime(df['date'])
 
@@ -1875,6 +2026,9 @@ def export_fleet_stats_to_excel(n_clicks, shipping_balance, dropdown_options):
     """Export Fleet Statistics data to Excel."""
     if not n_clicks or shipping_balance is None or dropdown_options is None:
         raise PreventUpdate
+
+    shipping_balance = _resolve_shipping_store(shipping_balance)
+    dropdown_options = _resolve_shipping_store(dropdown_options)
 
     df_global = pd.read_json(StringIO(shipping_balance), orient='split')
     df_global['date'] = pd.to_datetime(df_global['date'])
@@ -1931,6 +2085,9 @@ def update_fleet_statistics_chart(shipping_balance, dropdown_options):
     if shipping_balance is None or dropdown_options is None:
         return {}
 
+    shipping_balance = _resolve_shipping_store(shipping_balance)
+    dropdown_options = _resolve_shipping_store(dropdown_options)
+
     try:
         # Convert stored JSON back to DataFrame
         df_global = pd.read_json(StringIO(shipping_balance), orient='split')
@@ -1973,6 +2130,9 @@ def update_intracountry_visualizations(intracountry_data, dropdown_options, sele
     # Check if data is available
     if intracountry_data is None or dropdown_options is None:
         raise PreventUpdate
+
+    intracountry_data = _resolve_shipping_store(intracountry_data)
+    dropdown_options = _resolve_shipping_store(dropdown_options)
 
     # Convert stored JSON back to DataFrame
     df_intracountry_trades = pd.read_json(StringIO(intracountry_data), orient='split')
@@ -2028,6 +2188,8 @@ def export_intracountry_count_to_excel(n_clicks, intracountry_data, selected_yea
     if not n_clicks or intracountry_data is None:
         raise PreventUpdate
 
+    intracountry_data = _resolve_shipping_store(intracountry_data)
+
     df = pd.read_json(StringIO(intracountry_data), orient='split')
     table_data = prepare_table_data(
         df, 'count_trades',
@@ -2061,6 +2223,8 @@ def export_intracountry_tonmiles_to_excel(n_clicks, intracountry_data, selected_
     if not n_clicks or intracountry_data is None:
         raise PreventUpdate
 
+    intracountry_data = _resolve_shipping_store(intracountry_data)
+
     df = pd.read_json(StringIO(intracountry_data), orient='split')
     table_data = prepare_table_data(
         df, 'sum_ton_miles',
@@ -2086,6 +2250,8 @@ def _build_regional_period_dropdown_options(regional_data, aggregation_level):
     """Build year and period dropdown options for regional demand/supply tables."""
     if regional_data is None:
         raise PreventUpdate
+
+    regional_data = _resolve_shipping_store(regional_data)
 
     df_regional = pd.read_json(StringIO(regional_data), orient='split')
 
@@ -2157,6 +2323,8 @@ def _build_regional_breakdown_table(
     """Build the regional demand/supply breakdown table for a selected period."""
     if regional_data is None or selected_year is None or selected_period is None:
         raise PreventUpdate
+
+    regional_data = _resolve_shipping_store(regional_data)
 
     try:
         df_regional = pd.read_json(StringIO(regional_data), orient='split')
@@ -2352,6 +2520,7 @@ def _regional_origin_destination_filter_options(regional_data):
     if regional_data is None:
         return [], []
     try:
+        regional_data = _resolve_shipping_store(regional_data)
         df_regional = pd.read_json(StringIO(regional_data), orient='split')
         origins = sorted(df_regional['origin_shipping_region'].unique())
         destinations = sorted(df_regional['destination_shipping_region'].unique())
@@ -2400,6 +2569,8 @@ def _render_regional_route_days_chart(
     log_label,
 ):
     try:
+        regional_data = _resolve_shipping_store(regional_data)
+        dropdown_options = _resolve_shipping_store(dropdown_options)
         return _build_route_days_chart(
             regional_data,
             origin_filter,

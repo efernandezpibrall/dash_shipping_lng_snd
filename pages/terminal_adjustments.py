@@ -1,4 +1,3 @@
-from utils.ag_grid_tables import create_ag_grid_from_datatable
 """
 Terminal Output Adjustments Editor
 
@@ -24,6 +23,8 @@ import configparser
 import os
 import sys
 
+from utils.ag_grid_tables import create_ag_grid_from_datatable
+
 # Add project root to path for imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
@@ -36,6 +37,11 @@ from fundamentals.terminals.scenario_utils import (
     get_scenario_summary,
     delete_scenario
 )
+from fundamentals.terminals.terminal_output_utils import (
+    fetch_keyed_terminal_adjustment_rows,
+    fetch_keyed_terminal_monthly_output,
+)
+from fundamentals.terminals.terminal_registry_utils import find_terminal_train_candidates
 
 ###############################################################################
 # Database Connection
@@ -68,6 +74,19 @@ def fetch_woodmac_baseline():
     Fetch Woodmac baseline data for all plants/trains.
     Returns monthly production data.
     """
+    df = fetch_keyed_terminal_monthly_output(
+        engine, start_year=2010, end_year=2050, scenario='base_view'
+    )
+    df['baseline_output'] = df['total_output']
+    return df[
+        [
+            'terminal_key', 'train_key', 'id_plant', 'id_lng_train',
+            'plant_name', 'lng_train_name_short', 'country_name',
+            'year', 'month', 'baseline_output',
+        ]
+    ]
+
+    # Legacy provider-ID query retained temporarily for rollback comparison.
     query = f"""
         SELECT
             id_plant,
@@ -104,6 +123,11 @@ def fetch_adjustments_with_baseline(scenario_name):
         df['comments'] = None
         return df
 
+    df = fetch_keyed_terminal_adjustment_rows(engine, scenario_name)
+    df['final_output'] = df['total_output']
+    return df
+
+    # Legacy provider-ID query retained temporarily for rollback comparison.
     query = f"""
         WITH woodmac_baseline AS (
             SELECT
@@ -161,11 +185,11 @@ def fetch_adjustments_with_baseline(scenario_name):
 
 
 def get_plants_list():
-    """Get unique list of plants for filter dropdown."""
+    """Get canonical terminals, including terminals without WoodMac records."""
     query = f"""
-        SELECT DISTINCT plant_name, country_name
-        FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_output_mta
-        ORDER BY country_name, plant_name
+        SELECT DISTINCT terminal_name AS plant_name, country_name
+        FROM {DB_SCHEMA}.fundamentals_terminal_registry
+        ORDER BY country_name, terminal_name
     """
 
     with engine.connect() as conn:
@@ -175,14 +199,41 @@ def get_plants_list():
 
 
 def get_trains_list():
-    """Get unique list of trains for filter dropdown."""
+    """Get canonical trains, including trains without WoodMac records."""
     query = f"""
         SELECT DISTINCT
-            plant_name,
-            lng_train_name_short,
-            country_name
-        FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_output_mta
-        ORDER BY country_name, plant_name, lng_train_name_short
+            terminal.terminal_name AS plant_name,
+            train.train_label AS lng_train_name_short,
+            terminal.country_name,
+            CASE WHEN provider.provider_count = 1
+                      AND provider.exclusive_provider_count = 1
+                      AND provider.provider_plant_id ~ '^[0-9]+$'
+                 THEN provider.provider_plant_id::bigint END AS id_plant,
+            CASE WHEN provider.provider_count = 1
+                      AND provider.exclusive_provider_count = 1
+                      AND provider.provider_train_id ~ '^[0-9]+$'
+                 THEN provider.provider_train_id::bigint END AS id_lng_train
+        FROM {DB_SCHEMA}.fundamentals_terminal_train_registry train
+        JOIN {DB_SCHEMA}.fundamentals_terminal_registry terminal USING (terminal_key)
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS provider_count,
+                   COUNT(*) FILTER (
+                       WHERE NOT EXISTS (
+                           SELECT 1
+                           FROM {DB_SCHEMA}.fundamentals_terminal_train_provider_links competing
+                           WHERE competing.provider_name = links.provider_name
+                             AND competing.provider_plant_id = links.provider_plant_id
+                             AND competing.provider_train_id = links.provider_train_id
+                             AND competing.train_key <> links.train_key
+                       )
+                   ) AS exclusive_provider_count,
+                   MIN(provider_plant_id) AS provider_plant_id,
+                   MIN(provider_train_id) AS provider_train_id
+            FROM {DB_SCHEMA}.fundamentals_terminal_train_provider_links links
+            WHERE links.train_key = train.train_key
+              AND links.provider_name = 'woodmac'
+        ) provider ON TRUE
+        ORDER BY terminal.country_name, terminal.terminal_name, train.train_label
     """
 
     with engine.connect() as conn:
@@ -268,7 +319,10 @@ def layout():
                             id='trains-to-copy',
                             options=[{'label': f"{row['plant_name']} - {row['lng_train_name_short']}",
                                      'value': f"{row['plant_name']}|{row['lng_train_name_short']}"}
-                                    for _, row in trains_df.iterrows()],
+                                    for _, row in trains_df[
+                                        trains_df['id_plant'].notna()
+                                        & trains_df['id_lng_train'].notna()
+                                    ].iterrows()],
                             placeholder="Select trains from base_view",
                             multi=True
                         ),
@@ -652,11 +706,31 @@ def handle_table_actions(_add_clicks, _save_clicks, upload_contents, current_dat
             if df_to_save.empty:
                 return dash.no_update, "No adjustments to save", "alert alert-warning"
 
+            if 'train_key' not in df_to_save.columns:
+                df_to_save['train_key'] = None
+            missing_keys = df_to_save['train_key'].isna() | df_to_save['train_key'].astype(str).str.strip().eq('')
+            for row_index, row in df_to_save.loc[missing_keys].iterrows():
+                matches = find_terminal_train_candidates(
+                    engine,
+                    row.get('country_name'),
+                    row.get('plant_name'),
+                    row.get('lng_train_name_short'),
+                )
+                if len(matches) != 1:
+                    raise ValueError(
+                        f"Unable to resolve one canonical train for "
+                        f"{row.get('plant_name')} - {row.get('lng_train_name_short')}."
+                    )
+                match = matches[0]
+                df_to_save.at[row_index, 'train_key'] = str(match['train_key'])
+                df_to_save.at[row_index, 'id_plant'] = match.get('id_plant')
+                df_to_save.at[row_index, 'id_lng_train'] = match.get('id_lng_train')
+
             # Only keep columns that exist in the database table
             # The table has: id_plant, id_lng_train, plant_name, lng_train_name_short,
             #                year, month, adjusted_output, scenario_name, source_name,
             #                comments, upload_timestamp_utc, created_by
-            table_columns = ['id_plant', 'id_lng_train', 'plant_name', 'lng_train_name_short',
+            table_columns = ['train_key', 'id_plant', 'id_lng_train', 'plant_name', 'lng_train_name_short',
                            'year', 'month', 'adjusted_output', 'comments']
 
             # Filter to only columns that exist in both the DataFrame and the table
