@@ -1,32 +1,15 @@
-import configparser
-import os
-
 import dash_ag_grid as dag
 import dash_bootstrap_components as dbc
 import pandas as pd
 from dash import Input, Output, State, callback, dcc, html, no_update
 from dash.exceptions import PreventUpdate
-from sqlalchemy import create_engine
 
 from fundamentals.terminals.terminal_registry_utils import (
     find_terminal_train_candidates,
     replace_provider_source_allocations,
 )
+from utils.database import DB_SCHEMA, engine
 from utils.mappings_section import create_mappings_section_header
-
-
-try:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_dir = os.path.abspath(os.path.join(script_dir, "..", ".."))
-    CONFIG_FILE_PATH = os.path.join(config_dir, "config.ini")
-except Exception:
-    CONFIG_FILE_PATH = "config.ini"
-
-config_reader = configparser.ConfigParser(interpolation=None)
-config_reader.read(CONFIG_FILE_PATH)
-DB_CONNECTION_STRING = config_reader.get("DATABASE", "CONNECTION_STRING", fallback=None)
-DB_SCHEMA = config_reader.get("DATABASE", "SCHEMA", fallback="at_lng")
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
 SOURCE_COLUMNS = ["provider_name", "provider_plant_id", "provider_train_id"]
 DISPLAY_COLUMNS = SOURCE_COLUMNS + [

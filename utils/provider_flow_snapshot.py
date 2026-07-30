@@ -129,6 +129,30 @@ def fetch_provider_flow_source_state() -> dict[str, object]:
         return state
 
 
+def fetch_provider_flow_mapping_state() -> dict[str, str]:
+    """Return the two effective mappings used by historical flow queries."""
+
+    def fetch_country_mapping_hash():
+        with engine.connect() as connection:
+            return str(
+                connection.execute(
+                    _SOURCE_STATE_QUERIES["mapping_hash"]
+                ).scalar()
+                or ""
+            )
+
+    with ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="provider-mapping-state",
+    ) as executor:
+        country_mapping_future = executor.submit(fetch_country_mapping_hash)
+        ea_mapping_future = executor.submit(_fetch_ea_balance_mapping_hash)
+        return {
+            "mapping_hash": country_mapping_future.result(),
+            "ea_balance_mapping_hash": ea_mapping_future.result(),
+        }
+
+
 def _fetch_mapping_df() -> pd.DataFrame:
     with engine.connect() as connection:
         return pd.read_sql_query(_MAPPING_QUERY, connection)

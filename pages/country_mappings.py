@@ -2,28 +2,13 @@ from dash import html, dcc, callback, Output, Input
 from utils.ag_grid_tables import create_ag_grid_from_datatable
 import dash_bootstrap_components as dbc
 import pandas as pd
-import configparser
-import os
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+from utils.database import engine
 from utils.mappings_section import create_mappings_section_header
 from utils.mapping_page_figures import build_summary_card_row as _build_summary_card_row
 from utils.table_styles import StandardTableStyleManager
 import dash_leaflet as dl
 import requests
-
-############################################ postgres sql connection ###################################################
-try:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))
-    CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except Exception:
-    CONFIG_FILE_PATH = 'config.ini'
-
-config_reader = configparser.ConfigParser(interpolation=None)
-config_reader.read(CONFIG_FILE_PATH)
-
-DB_CONNECTION_STRING = config_reader.get('DATABASE', 'CONNECTION_STRING', fallback=None)
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
 def fetch_country_mappings_data(engine, schema='at_lng'):
     """Fetch distinct country mappings data from the database"""

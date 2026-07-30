@@ -28,62 +28,260 @@ import datetime as dt
 import calendar
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from dash.exceptions import PreventUpdate
 
-import configparser
-import os
-from sqlalchemy import create_engine
 from sqlalchemy import text
 
 from utils.dashboard_snapshot_cache import (
+    SnapshotUnavailable as _SnapshotUnavailable,
     build_source_key as _build_source_key,
     get_or_build_snapshot as _get_or_build_snapshot,
+    get_snapshot_if_available as _get_snapshot_if_available,
+    is_snapshot_reference as _is_snapshot_reference,
     resolve_snapshot as _resolve_snapshot,
-    snapshot_is_shared as _snapshot_is_shared,
+    snapshot_is_resolvable as _snapshot_is_resolvable,
     was_global_refresh_triggered as _was_global_refresh_triggered,
 )
+from utils.database import DB_SCHEMA, engine
+from utils.source_revision import (
+    SourceRevision,
+    source_revision_from_context,
+)
+from utils.performance import log_callback_timing
 
 logger = logging.getLogger(__name__)
 
-############################################ postgres sql connection ###################################################
-#------ code to be able to access config.ini, even having the path in the .virtualenvs is not working without it ------#
-try:
-    # Get the directory where your script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Navigate to the directory containing config.ini
-    # Adjust the number of '..' as needed to reach the correct directory
-    config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))  # Go up one level
-    CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except Exception:
-    CONFIG_FILE_PATH = 'config.ini'  # Assumes it's in the same directory or the path it is detected
-
-
-# --- Load Configuration from INI File ---
-config_reader = configparser.ConfigParser(interpolation=None)
-config_reader.read(CONFIG_FILE_PATH)
-
-# Read values from the ini file sections
-DB_CONNECTION_STRING = config_reader.get('DATABASE', 'CONNECTION_STRING', fallback=None)
-DB_SCHEMA = config_reader.get('DATABASE', 'SCHEMA', fallback=None)
-
-# create engine
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
-
-EXPORTER_DETAIL_BASE_NAMESPACE = 'exporter-detail-base-v1'
+EXPORTER_DETAIL_BASE_NAMESPACE = 'exporter-detail-base-v2'
+EXPORTER_MAINTENANCE_SOURCE_NAMESPACE = (
+    'exporter-maintenance-source-v1'
+)
+EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE = (
+    'Cached exporter-detail data is unavailable. Click the global Refresh '
+    'button to reload it.'
+)
+EXPORTER_DETAIL_SOURCE_STALE_MESSAGE = (
+    'Source refresh failed. Showing the last verified exporter-detail snapshot.'
+)
+EXPORTER_DETAIL_SOURCE_UNAVAILABLE_MESSAGE = (
+    'Exporter-detail data is unavailable because a verified source revision '
+    'could not be loaded.'
+)
 
 
 def _fetch_exporter_detail_source_watermark():
     with engine.connect() as connection:
-        return connection.execute(
+        row = connection.execute(
             text(f"""
-                SELECT snapshot_timestamp_utc
-                FROM {DB_SCHEMA}.kpler_trade_snapshots
-                WHERE run_kind = 'canonical' AND status = 'published'
-                ORDER BY snapshot_date_utc DESC
-                LIMIT 1
+                WITH
+                latest_kpler AS (
+                    SELECT snapshot_timestamp_utc
+                    FROM {DB_SCHEMA}.kpler_trade_snapshots
+                    WHERE run_kind = 'canonical' AND status = 'published'
+                    ORDER BY snapshot_date_utc DESC
+                    LIMIT 1
+                ),
+                mapping_version AS (
+                    SELECT MD5(
+                        COALESCE(
+                            STRING_AGG(
+                                CONCAT_WS(
+                                    CHR(31),
+                                    COALESCE(country, ''),
+                                    COALESCE(country_name, ''),
+                                    COALESCE(continent, ''),
+                                    COALESCE(basin, ''),
+                                    COALESCE(shipping_region, ''),
+                                    COALESCE(subcontinent, ''),
+                                    COALESCE(
+                                        country_classification_level1,
+                                        ''
+                                    ),
+                                    COALESCE(
+                                        country_classification,
+                                        ''
+                                    )
+                                ),
+                                CHR(30)
+                                ORDER BY country, country_name, continent,
+                                    basin, shipping_region, subcontinent,
+                                    country_classification_level1,
+                                    country_classification
+                            ),
+                            ''
+                        )
+                    ) AS fingerprint
+                    FROM {DB_SCHEMA}.mappings_country
+                )
+                SELECT
+                    (SELECT snapshot_timestamp_utc FROM latest_kpler)
+                        AS kpler_watermark,
+                    (
+                        SELECT MAX(upload_timestamp_utc)
+                        FROM {WOODMAC_IMPORT_EXPORTS_TABLE}
+                    ) AS woodmac_watermark,
+                    (
+                        SELECT MAX(upload_timestamp_utc)
+                        FROM {DB_SCHEMA}.kpler_distance_matrix
+                    ) AS distance_watermark,
+                    (SELECT fingerprint FROM mapping_version)
+                        AS mapping_fingerprint
             """)
-        ).scalar()
+        ).mappings().one()
+    return dict(row)
+
+
+def _fetch_exporter_maintenance_source_version():
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(f"""
+                WITH
+                unplanned AS (
+                    SELECT MAX(upload_timestamp_utc) AS watermark,
+                           COUNT(*) AS row_count
+                    FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_unplanned_downtime_mta
+                ),
+                planned AS (
+                    SELECT MAX(upload_timestamp_utc) AS watermark,
+                           COUNT(*) AS row_count
+                    FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_planned_maintenance_mta
+                ),
+                train_capacity AS (
+                    SELECT MAX(upload_timestamp_utc) AS watermark,
+                           COUNT(*) AS row_count
+                    FROM {DB_SCHEMA}.woodmac_lng_plant_monthly_capacity_nominal_mta
+                ),
+                plant_capacity AS (
+                    SELECT MAX(upload_timestamp_utc) AS watermark,
+                           COUNT(*) AS row_count
+                    FROM {DB_SCHEMA}.woodmac_lng_plant_summary
+                ),
+                mapping_version AS (
+                    SELECT MD5(
+                        COALESCE(
+                            STRING_AGG(
+                                CONCAT_WS(
+                                    CHR(31),
+                                    COALESCE(country, ''),
+                                    COALESCE(country_name, '')
+                                ),
+                                CHR(30)
+                                ORDER BY country, country_name
+                            ),
+                            ''
+                        )
+                    ) AS fingerprint
+                    FROM {DB_SCHEMA}.mappings_country
+                )
+                SELECT
+                    unplanned.watermark AS unplanned_watermark,
+                    unplanned.row_count AS unplanned_row_count,
+                    planned.watermark AS planned_watermark,
+                    planned.row_count AS planned_row_count,
+                    train_capacity.watermark AS train_capacity_watermark,
+                    train_capacity.row_count AS train_capacity_row_count,
+                    plant_capacity.watermark AS plant_capacity_watermark,
+                    plant_capacity.row_count AS plant_capacity_row_count,
+                    mapping_version.fingerprint AS mapping_fingerprint
+                FROM unplanned, planned, train_capacity, plant_capacity,
+                     mapping_version
+            """)
+        ).mappings().one()
+    return dict(row)
+
+
+def _build_exporter_detail_source_context(
+    source_watermark,
+    force_refresh=False,
+    maintenance_source_version=None,
+    *,
+    status='fresh',
+    message=None,
+):
+    source_revision = SourceRevision(
+        status=status,
+        revision_key=source_watermark,
+        watermark=source_watermark,
+        message=message,
+    )
+    return {
+        'source_watermark': source_watermark,
+        'maintenance_source_version': maintenance_source_version,
+        'source_revision': source_revision.to_dict(),
+        'refresh_generation': (
+            dt.datetime.now().isoformat(timespec='microseconds')
+            if force_refresh
+            else None
+        ),
+    }
+
+
+def _stale_exporter_detail_source_context(previous_source_context):
+    if not isinstance(previous_source_context, dict):
+        return _build_exporter_detail_source_context(
+            None,
+            status='unavailable',
+            message=EXPORTER_DETAIL_SOURCE_UNAVAILABLE_MESSAGE,
+        )
+    stale_context = dict(previous_source_context)
+    source_watermark = stale_context.get('source_watermark')
+    stale_context['source_revision'] = SourceRevision(
+        status='stale',
+        revision_key=source_watermark,
+        watermark=source_watermark,
+        message=EXPORTER_DETAIL_SOURCE_STALE_MESSAGE,
+    ).to_dict()
+    return stale_context
+
+
+def _exporter_source_context_status(source_context):
+    return source_revision_from_context(source_context).status
+
+
+def _exporter_detail_source_context_parts(source_context):
+    if not isinstance(source_context, dict):
+        return None, None, False
+    source_watermark = source_context.get('source_watermark')
+    base_source_watermark = source_watermark
+    route_source_version = None
+    if isinstance(source_watermark, dict):
+        base_source_watermark = {
+            'kpler_watermark': source_watermark.get('kpler_watermark'),
+            'woodmac_watermark': source_watermark.get(
+                'woodmac_watermark'
+            ),
+            'mapping_fingerprint': source_watermark.get(
+                'mapping_fingerprint'
+            ),
+        }
+        route_source_version = {
+            'kpler_watermark': source_watermark.get('kpler_watermark'),
+            'distance_watermark': source_watermark.get(
+                'distance_watermark'
+            ),
+            'mapping_fingerprint': source_watermark.get(
+                'mapping_fingerprint'
+            ),
+        }
+    return (
+        base_source_watermark,
+        route_source_version,
+        source_context.get('refresh_generation'),
+    )
+
+
+def _exporter_maintenance_source_version_from_context(source_context):
+    source_version = (
+        source_context.get('maintenance_source_version')
+        if isinstance(source_context, dict)
+        else None
+    )
+    return dict(source_version) if isinstance(source_version, dict) else None
+
+
+def _exporter_detail_forecast_month_token():
+    return dt.date.today().replace(day=1).isoformat()
 
 
 BCM_PER_MMTPA = 1.36
@@ -199,6 +397,22 @@ WOODMAC_IMPORT_EXPORTS_TABLE = 'at_lng.woodmac_gas_imports_exports_monthly__mmtp
 WOODMAC_FORECAST_YEARS_AHEAD = 2
 SUPPLY_ALLOCATION_RUNS_TABLE = f'{DB_SCHEMA}.fundamentals_supply_allocation_runs'
 SUPPLY_ALLOCATION_DEMAND_DETAIL_TABLE = f'{DB_SCHEMA}.fundamentals_supply_allocation_demand_detail'
+EXPORTER_ALLOCATION_SOURCE_NAMESPACE = 'exporter-detail-allocation-source-v1'
+EXPORTER_ALLOCATION_RECOVERY_MESSAGE = (
+    'Cached destination-allocation data is unavailable. Click the global '
+    'Refresh button to reload it.'
+)
+EXPORTER_ROUTE_SOURCE_NAMESPACE = 'exporter-detail-route-source-v1'
+EXPORTER_ROUTE_RECOVERY_MESSAGE = (
+    'Cached route-analysis data is unavailable. Click the global Refresh '
+    'button to reload it.'
+)
+EXPORTER_DIVERSION_SOURCE_NAMESPACE = 'exporter-detail-diversion-source-v1'
+EXPORTER_DIVERSION_RECOVERY_MESSAGE = (
+    'Cached diversion data is unavailable. Click the global Refresh button '
+    'to reload it.'
+)
+_EXPORTER_DIVERSION_VERSION_UNSET = object()
 
 CONVERSION_NOTE_LINES = [
     (
@@ -1075,7 +1289,12 @@ def _resolve_origin_destination_scope(origin_country, mapping_df):
     return origin_scope
 
 
-def _fetch_normalized_destination_trades(engine, origin_country, min_start_date=None, mapping_df=None):
+def _fetch_normalized_destination_trades(
+    engine,
+    origin_country,
+    min_start_date=None,
+    mapping_df=None,
+):
     from sqlalchemy import text as sa_text
 
     current_date = pd.Timestamp(dt.date.today()).normalize()
@@ -1208,7 +1427,12 @@ def _prepare_destination_summary_scope_df(scoped_trades_df, destination_level):
     return summary_df
 
 
-def _fetch_origin_plant_destination_trades(engine, origin_country, min_start_date=None, mapping_df=None):
+def _fetch_origin_plant_destination_trades(
+    engine,
+    origin_country,
+    min_start_date=None,
+    mapping_df=None,
+):
     from sqlalchemy import text as sa_text
 
     current_date = pd.Timestamp(dt.date.today()).normalize()
@@ -1700,28 +1924,362 @@ def process_trade_and_distance_data(engine,origin_country_name):
 
     return final_df
 
-def _resolve_exporter_detail_base_data(base_data):
-    base_data = _resolve_snapshot(
-        base_data,
-        engine,
-        expected_namespace=EXPORTER_DETAIL_BASE_NAMESPACE,
-    )
-    if not base_data or base_data.get('error'):
-        return pd.DataFrame(), {}, pd.DataFrame(), base_data.get('origin_country') if base_data else None
 
-    destination_df = _load_store_dataframe(
+def _fetch_exporter_route_source_version():
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(f"""
+                WITH mapping_version AS (
+                    SELECT MD5(
+                        COALESCE(
+                            STRING_AGG(
+                                CONCAT_WS(
+                                    CHR(31),
+                                    COALESCE(country, ''),
+                                    COALESCE(country_name, ''),
+                                    COALESCE(continent, ''),
+                                    COALESCE(basin, ''),
+                                    COALESCE(shipping_region, ''),
+                                    COALESCE(subcontinent, ''),
+                                    COALESCE(
+                                        country_classification_level1,
+                                        ''
+                                    ),
+                                    COALESCE(
+                                        country_classification,
+                                        ''
+                                    )
+                                ),
+                                CHR(30)
+                                ORDER BY country, country_name, continent,
+                                    basin, shipping_region, subcontinent,
+                                    country_classification_level1,
+                                    country_classification
+                            ),
+                            ''
+                        )
+                    ) AS fingerprint
+                    FROM {DB_SCHEMA}.mappings_country
+                )
+                SELECT
+                    (
+                        SELECT snapshot_timestamp_utc
+                        FROM {DB_SCHEMA}.kpler_trade_snapshots
+                        WHERE run_kind = 'canonical'
+                            AND status = 'published'
+                        ORDER BY snapshot_date_utc DESC
+                        LIMIT 1
+                    ) AS kpler_watermark,
+                    (
+                        SELECT MAX(upload_timestamp_utc)
+                        FROM {DB_SCHEMA}.kpler_distance_matrix
+                    ) AS distance_watermark,
+                    (SELECT fingerprint FROM mapping_version)
+                        AS mapping_fingerprint
+            """)
+        ).mappings().one()
+    return dict(row)
+
+
+def _fetch_exporter_route_mapping_data():
+    return pd.read_sql(
+        text(f"""
+            SELECT DISTINCT
+                country,
+                country_name,
+                continent,
+                basin,
+                shipping_region,
+                subcontinent,
+                country_classification_level1,
+                country_classification
+            FROM {DB_SCHEMA}.mappings_country
+        """),
+        engine,
+    )
+
+
+def _build_exporter_route_source_payload(origin_country_name):
+    with ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix='exporter-route-source',
+    ) as executor:
+        route_future = executor.submit(
+            process_trade_and_distance_data,
+            engine,
+            origin_country_name,
+        )
+        mapping_future = executor.submit(
+            _fetch_exporter_route_mapping_data
+        )
+        processed_df = route_future.result()
+        mapping_df = mapping_future.result()
+    if processed_df is None:
+        raise RuntimeError('Unable to load route-analysis data')
+    return {
+        'origin_country': origin_country_name,
+        'processed_df': processed_df,
+        'mapping_df': mapping_df,
+    }
+
+
+def _resolve_exporter_route_source_data(source_reference):
+    if not source_reference:
+        return None
+    reference_input = _is_snapshot_reference(
+        source_reference,
+        EXPORTER_ROUTE_SOURCE_NAMESPACE,
+    )
+    if isinstance(source_reference, dict) and 'error' in source_reference:
+        raise _SnapshotUnavailable(source_reference['error'])
+    if (
+        _is_snapshot_reference(source_reference)
+        and not reference_input
+    ):
+        raise _SnapshotUnavailable(EXPORTER_ROUTE_RECOVERY_MESSAGE)
+    try:
+        source_data = _resolve_snapshot(
+            source_reference,
+            engine,
+            expected_namespace=EXPORTER_ROUTE_SOURCE_NAMESPACE,
+        )
+    except _SnapshotUnavailable as exc:
+        raise _SnapshotUnavailable(
+            EXPORTER_ROUTE_RECOVERY_MESSAGE
+        ) from exc
+    if not isinstance(source_data, dict):
+        raise _SnapshotUnavailable(EXPORTER_ROUTE_RECOVERY_MESSAGE)
+    if reference_input and not {
+        'origin_country',
+        'processed_df',
+        'mapping_df',
+    }.issubset(source_data):
+        raise _SnapshotUnavailable(EXPORTER_ROUTE_RECOVERY_MESSAGE)
+    return source_data
+
+
+def _prepare_exporter_route_source_for_level(
+    source_data,
+    destination_level,
+):
+    processed_df = source_data.get('processed_df')
+    mapping_df = source_data.get('mapping_df')
+    processed_df = (
+        processed_df.copy()
+        if isinstance(processed_df, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    mapping_df = (
+        mapping_df.copy()
+        if isinstance(mapping_df, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    resolved_level = destination_level
+    if resolved_level in processed_df.columns:
+        return processed_df, resolved_level
+
+    if (
+        resolved_level == 'destination_country_name'
+        and 'destination_shipping_region' in processed_df.columns
+    ):
+        region_map_df = (
+            mapping_df[['country', 'shipping_region']]
+            .drop_duplicates()
+            .rename(
+                columns={
+                    'country': 'destination_country_name',
+                    'shipping_region': 'destination_shipping_region',
+                }
+            )
+        )
+        processed_df = pd.merge(
+            processed_df,
+            region_map_df,
+            on='destination_shipping_region',
+            how='left',
+        )
+    elif (
+        resolved_level == 'destination_shipping_region'
+        and 'destination_country_name' in processed_df.columns
+    ):
+        region_map_df = (
+            mapping_df[['country', 'shipping_region']]
+            .drop_duplicates()
+            .rename(
+                columns={
+                    'country': 'destination_country_name',
+                    'shipping_region': 'destination_shipping_region',
+                }
+            )
+        )
+        processed_df = pd.merge(
+            processed_df,
+            region_map_df,
+            on='destination_country_name',
+            how='left',
+        )
+    elif resolved_level not in processed_df.columns:
+        level_col_map = {
+            'continent_destination_name': 'continent',
+            'destination_basin': 'basin',
+            'destination_subcontinent': 'subcontinent',
+            'destination_classification_level1': (
+                'country_classification_level1'
+            ),
+            'destination_classification': 'country_classification',
+        }
+        mapping_col = level_col_map.get(resolved_level)
+        if (
+            mapping_col
+            and 'destination_country_name' in processed_df.columns
+        ):
+            level_mapping_df = (
+                mapping_df[
+                    mapping_df['country_name'].notna()
+                ][['country_name', mapping_col]]
+                .drop_duplicates()
+                .rename(
+                    columns={
+                        'country_name': 'destination_country_name',
+                        mapping_col: resolved_level,
+                    }
+                )
+            )
+            processed_df = pd.merge(
+                processed_df,
+                level_mapping_df,
+                on='destination_country_name',
+                how='left',
+            )
+    return processed_df, resolved_level
+
+
+def _resolve_exporter_detail_base_payload(base_data):
+    if base_data is None:
+        raise _SnapshotUnavailable(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    reference_input = _is_snapshot_reference(
         base_data,
+        EXPORTER_DETAIL_BASE_NAMESPACE,
+    )
+    if (
+        _is_snapshot_reference(base_data)
+        and not reference_input
+    ):
+        raise _SnapshotUnavailable(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    try:
+        base_data = _resolve_snapshot(
+            base_data,
+            engine,
+            expected_namespace=EXPORTER_DETAIL_BASE_NAMESPACE,
+        )
+    except _SnapshotUnavailable as exc:
+        raise _SnapshotUnavailable(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+    if _is_snapshot_reference(base_data):
+        raise _SnapshotUnavailable(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    if not isinstance(base_data, dict):
+        raise _SnapshotUnavailable(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    if not base_data:
+        if reference_input:
+            raise _SnapshotUnavailable(
+                EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+            )
+        return base_data
+    if reference_input and not {
+        'origin_country',
         'normalized_destination_trades',
-        date_columns=['start_date']
-    )
-    origin_plant_df = _load_store_dataframe(
-        base_data,
         'origin_plant_destination_trades',
-        date_columns=['start_date']
-    )
+        'woodmac_export_forecast',
+        'origin_scope',
+    }.issubset(base_data):
+        raise _SnapshotUnavailable(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    if base_data.get('error'):
+        raise _SnapshotUnavailable(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    return base_data
+
+
+def _resolve_exporter_detail_base_data(base_data):
+    base_data = _resolve_exporter_detail_base_payload(base_data)
+    if not base_data:
+        return pd.DataFrame(), {}, pd.DataFrame(), None
+
+    try:
+        destination_df = _load_store_dataframe(
+            base_data,
+            'normalized_destination_trades',
+            date_columns=['start_date']
+        )
+        origin_plant_df = _load_store_dataframe(
+            base_data,
+            'origin_plant_destination_trades',
+            date_columns=['start_date']
+        )
+    except Exception as exc:
+        raise _SnapshotUnavailable(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
     origin_scope = base_data.get('origin_scope') or {}
     origin_country = base_data.get('origin_country')
     return destination_df, origin_scope, origin_plant_df, origin_country
+
+
+def _load_exporter_detail_forecast_data(base_data):
+    resolved = _resolve_exporter_detail_base_payload(base_data)
+    if not resolved:
+        return pd.DataFrame()
+    if 'woodmac_export_forecast' not in resolved:
+        return None
+    stored_forecast = resolved.get('woodmac_export_forecast')
+    if isinstance(stored_forecast, pd.DataFrame):
+        forecast_df = stored_forecast.copy()
+        if 'date' in forecast_df.columns:
+            forecast_df['date'] = pd.to_datetime(
+                forecast_df['date'],
+                errors='coerce',
+            ).dt.normalize()
+        return forecast_df
+    try:
+        return _load_store_dataframe(
+            resolved,
+            'woodmac_export_forecast',
+            date_columns=['date'],
+        )
+    except Exception as exc:
+        raise _SnapshotUnavailable(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+
+
+def _exporter_detail_snapshot_recovery_notice():
+    return html.Div(
+        EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE,
+        className='exporter-detail-snapshot-recovery-message',
+        role='alert',
+    )
+
+
+def _exporter_detail_snapshot_recovery_selector_result():
+    return (
+        [{
+            'label': EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE,
+            'value': '__snapshot_unavailable__',
+            'disabled': True,
+        }],
+        [],
+    )
 
 
 def _summary_store_payload(origin_country, rolling_window_days, destination_level, df=None, error=None):
@@ -3344,6 +3902,7 @@ EXPORTER_DETAIL_PERIOD_DEFAULT_COL_DEF = {
 
 # Dashboard layout
 layout = html.Div([
+    dcc.Store(id='exporter-detail-source-context-store', storage_type='memory'),
     dcc.Store(id='exporter-detail-base-data-store', storage_type='memory'),
     dcc.Store(id='exporter-detail-destination-summary-data-store', storage_type='memory'),
     dcc.Store(id='exporter-detail-origin-plant-summary-data-store', storage_type='memory'),
@@ -3354,11 +3913,19 @@ layout = html.Div([
     dcc.Store(id='maintenance-raw-data-store', storage_type='memory'),
     dcc.Store(id='maintenance-style-refresh-store', storage_type='memory'),
     dcc.Store(id='exp-destination-forecast-expanded-continents', data=[]),
+    dcc.Store(id='exp-destination-forecast-source-store', storage_type='memory'),
+    dcc.Store(id='exporter-route-analysis-source-store', storage_type='memory'),
     dcc.Download(id='download-exporter-detail-supply-excel'),
     dcc.Download(id='download-route-analysis-excel'),
     dcc.Download(id='download-diversion-summary-excel'),
 
     _build_exporter_detail_filter_bar(),
+    html.Div(
+        id='exporter-detail-source-status',
+        className='detail-source-status detail-source-status-hidden',
+        role='status',
+        **{'aria-live': 'polite'},
+    ),
 
     html.Div([
         html.Div([
@@ -4786,6 +5353,35 @@ def fetch_latest_supply_allocation_run_metadata(engine):
     """Return the latest compatible monthly country-level base-view split-by-contract allocation run."""
     from sqlalchemy import text as sa_text
     query = sa_text(f"""
+        WITH mapping_version AS (
+            SELECT MD5(
+                COALESCE(
+                    STRING_AGG(
+                        CONCAT_WS(
+                            CHR(31),
+                            COALESCE(country, ''),
+                            COALESCE(country_name, ''),
+                            COALESCE(continent, ''),
+                            COALESCE(basin, ''),
+                            COALESCE(shipping_region, ''),
+                            COALESCE(subcontinent, ''),
+                            COALESCE(
+                                country_classification_level1,
+                                ''
+                            ),
+                            COALESCE(country_classification, '')
+                        ),
+                        CHR(30)
+                        ORDER BY country, country_name, continent,
+                            basin, shipping_region, subcontinent,
+                            country_classification_level1,
+                            country_classification
+                    ),
+                    ''
+                )
+            ) AS fingerprint
+            FROM {DB_SCHEMA}.mappings_country
+        )
         SELECT
             run_id,
             analysis_date,
@@ -4794,7 +5390,9 @@ def fetch_latest_supply_allocation_run_metadata(engine):
             supply_scenario,
             split_by_contract,
             woodmac_short_term_outlook,
-            woodmac_long_term_outlook
+            woodmac_long_term_outlook,
+            (SELECT fingerprint FROM mapping_version)
+                AS mapping_fingerprint
         FROM {SUPPLY_ALLOCATION_RUNS_TABLE}
         WHERE aggregation_level = 'monthly'
             AND origin_aggregation = 'country_name'
@@ -5132,6 +5730,267 @@ def fetch_destination_forecast_summary_data(engine, origin_country, current_date
     return summary_df, footer_rows, run_metadata
 
 
+def _fetch_destination_forecast_source_data(
+    engine,
+    origin_country,
+    current_date=None,
+    run_metadata=None,
+):
+    if not origin_country:
+        return {
+            'origin_country': origin_country,
+            'run_metadata': None,
+            'mapping_df': pd.DataFrame(),
+            'allocation_df': pd.DataFrame(),
+        }
+
+    from sqlalchemy import text as sa_text
+
+    if run_metadata is None:
+        run_metadata = fetch_latest_supply_allocation_run_metadata(engine)
+    if not run_metadata:
+        return {
+            'origin_country': origin_country,
+            'run_metadata': None,
+            'mapping_df': pd.DataFrame(),
+            'allocation_df': pd.DataFrame(),
+        }
+
+    period_config = get_origin_forecast_period_config(current_date)
+    mapping_df = pd.read_sql(
+        sa_text(f"""
+            SELECT DISTINCT
+                country,
+                country_name,
+                continent,
+                basin,
+                shipping_region,
+                subcontinent,
+                country_classification_level1,
+                country_classification
+            FROM {DB_SCHEMA}.mappings_country
+            WHERE country IS NOT NULL
+        """),
+        engine,
+    )
+
+    origin_aliases = {origin_country}
+    if not mapping_df.empty and 'country' in mapping_df.columns:
+        matching_rows = mapping_df[mapping_df['country'] == origin_country]
+        if 'country_name' in matching_rows.columns:
+            origin_aliases.update(
+                value.strip()
+                for value in matching_rows['country_name'].dropna().astype(str)
+                if value.strip()
+            )
+        matching_rows = mapping_df[
+            mapping_df['country_name'] == origin_country
+        ]
+        if 'country' in matching_rows.columns:
+            origin_aliases.update(
+                value.strip()
+                for value in matching_rows['country'].dropna().astype(str)
+                if value.strip()
+            )
+    origin_aliases = tuple(sorted(origin_aliases))
+
+    allocation_df = pd.read_sql(
+        sa_text(f"""
+            SELECT
+                date,
+                destination AS destination_country,
+                origin,
+                COALESCE(
+                    new_total_allocated_bcm,
+                    total_allocated_bcm
+                ) AS allocated_volume_bcm
+            FROM {SUPPLY_ALLOCATION_DEMAND_DETAIL_TABLE}
+            WHERE run_id = :run_id
+                AND origin IN :origin_aliases
+                AND COALESCE(
+                    new_total_allocated_bcm,
+                    total_allocated_bcm
+                ) IS NOT NULL
+                AND date >= :current_month_start
+                AND date <= :horizon_end
+        """),
+        engine,
+        params={
+            'run_id': run_metadata['run_id'],
+            'origin_aliases': origin_aliases,
+            'current_month_start': (
+                period_config['current_month_start'].date()
+            ),
+            'horizon_end': period_config['horizon_end'].date(),
+        },
+    )
+
+    if not allocation_df.empty:
+        alias_lookup = build_supply_allocation_country_alias_lookup(
+            mapping_df
+        )
+        allocation_df['date'] = pd.to_datetime(
+            allocation_df['date'],
+            errors='coerce',
+        )
+        allocation_df = allocation_df[
+            allocation_df['date'].notna()
+        ].copy()
+        allocation_df = allocation_df[
+            ~allocation_df['destination_country'].isin(origin_aliases)
+        ].copy()
+        allocation_df = allocation_df.groupby(
+            ['date', 'destination_country'],
+            as_index=False,
+        )['allocated_volume_bcm'].sum()
+        allocation_df = pd.merge(
+            allocation_df,
+            alias_lookup,
+            how='left',
+            left_on='destination_country',
+            right_on='alias',
+        )
+        allocation_df['continent'] = (
+            allocation_df['continent']
+            .replace('', np.nan)
+            .fillna('Unknown')
+        )
+        allocation_df['country'] = (
+            allocation_df['country_display'].replace('', np.nan)
+        )
+        allocation_df['country'] = allocation_df['country'].fillna(
+            allocation_df['destination_country']
+        )
+
+    return {
+        'origin_country': origin_country,
+        'run_metadata': run_metadata,
+        'mapping_df': mapping_df,
+        'allocation_df': allocation_df,
+    }
+
+
+def _build_destination_forecast_summary_from_source(
+    source_data,
+    current_date=None,
+    destination_level=DEFAULT_DESTINATION_LEVEL,
+):
+    source_data = source_data or {}
+    run_metadata = source_data.get('run_metadata')
+    allocation_df = source_data.get('allocation_df')
+    if allocation_df is None:
+        allocation_df = pd.DataFrame()
+    else:
+        allocation_df = allocation_df.copy()
+    if not run_metadata:
+        return pd.DataFrame(), [], None
+    if allocation_df.empty:
+        return pd.DataFrame(), [], run_metadata
+
+    period_config = get_origin_forecast_period_config(current_date)
+    level_col_map = {
+        'destination_country_name': None,
+        'continent_destination_name': 'continent',
+        'destination_shipping_region': 'shipping_region',
+        'destination_basin': 'basin',
+        'destination_subcontinent': 'subcontinent',
+        'destination_classification_level1': (
+            'country_classification_level1'
+        ),
+        'destination_classification': 'country_classification',
+    }
+    flat_col = level_col_map.get(destination_level)
+    if flat_col is None:
+        group_cols = ['continent', 'country']
+        df_for_table = allocation_df[
+            ['date', 'continent', 'country', 'allocated_volume_bcm']
+        ]
+    else:
+        if flat_col in allocation_df.columns:
+            allocation_df[flat_col] = (
+                allocation_df[flat_col]
+                .replace('', np.nan)
+                .fillna('Unknown')
+            )
+        else:
+            allocation_df[flat_col] = 'Unknown'
+        allocation_df['continent'] = allocation_df[flat_col]
+        df_for_table = allocation_df[
+            ['date', 'continent', flat_col, 'allocated_volume_bcm']
+        ].rename(columns={flat_col: 'country'})
+        group_cols = ['continent', 'country']
+
+    summary_df = build_destination_forecast_period_table(
+        df_for_table,
+        'allocated_volume_bcm',
+        group_cols,
+        current_date=current_date,
+    )
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(
+            [column for column in group_cols if column in summary_df.columns]
+        ).reset_index(drop=True)
+        for column in period_config['ordered_labels']:
+            summary_df[column] = summary_df[column].round(1)
+
+    allocated_values = build_destination_forecast_total_values(
+        allocation_df[['date', 'allocated_volume_bcm']],
+        'allocated_volume_bcm',
+        current_date=current_date,
+    )
+    footer_rows = [{
+        'Continent': 'ALLOCATED SUPPLY',
+        'Country': '',
+        **allocated_values,
+    }]
+    return summary_df, footer_rows, run_metadata
+
+
+def _resolve_destination_forecast_source_data(source_reference):
+    if not source_reference:
+        return None
+    reference_input = _is_snapshot_reference(
+        source_reference,
+        EXPORTER_ALLOCATION_SOURCE_NAMESPACE,
+    )
+    if isinstance(source_reference, dict) and 'error' in source_reference:
+        raise _SnapshotUnavailable(source_reference['error'])
+    if (
+        _is_snapshot_reference(source_reference)
+        and not _is_snapshot_reference(
+            source_reference,
+            EXPORTER_ALLOCATION_SOURCE_NAMESPACE,
+        )
+    ):
+        raise _SnapshotUnavailable(
+            EXPORTER_ALLOCATION_RECOVERY_MESSAGE
+        )
+    try:
+        source_data = _resolve_snapshot(
+            source_reference,
+            engine,
+            expected_namespace=EXPORTER_ALLOCATION_SOURCE_NAMESPACE,
+        )
+    except _SnapshotUnavailable as exc:
+        raise _SnapshotUnavailable(
+            EXPORTER_ALLOCATION_RECOVERY_MESSAGE
+        ) from exc
+    if not isinstance(source_data, dict):
+        raise _SnapshotUnavailable(
+            EXPORTER_ALLOCATION_RECOVERY_MESSAGE
+        )
+    if reference_input and not {
+        'origin_country',
+        'run_metadata',
+        'mapping_df',
+        'allocation_df',
+    }.issubset(source_data):
+        raise _SnapshotUnavailable(
+            EXPORTER_ALLOCATION_RECOVERY_MESSAGE
+        )
+    return source_data
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 def create_continent_destination_chart(
@@ -5423,6 +6282,80 @@ def create_destination_forecast_summary_table(display_df):
 
 
 @callback(
+    Output('exp-destination-forecast-source-store', 'data'),
+    Input('origin-country-dropdown', 'value'),
+    Input('exporter-detail-source-context-store', 'data'),
+    prevent_initial_call=False,
+)
+def refresh_destination_forecast_source(
+    origin_country,
+    source_context,
+):
+    if not origin_country:
+        return None
+    try:
+        run_metadata = fetch_latest_supply_allocation_run_metadata(engine)
+        if run_metadata and run_metadata.get('run_id') is not None:
+            run_metadata = dict(run_metadata)
+            run_metadata['run_id'] = str(run_metadata['run_id'])
+        current_month = dt.date.today().replace(day=1).isoformat()
+        refresh_generation = (
+            source_context.get('refresh_generation')
+            if isinstance(source_context, dict)
+            else None
+        )
+        source_key = _build_source_key(
+            EXPORTER_ALLOCATION_SOURCE_NAMESPACE,
+            run_metadata,
+            refresh_generation,
+            origin_country,
+            current_month,
+        )
+        reference, _payload = _get_or_build_snapshot(
+            engine,
+            namespace=EXPORTER_ALLOCATION_SOURCE_NAMESPACE,
+            source_key=source_key,
+            builder=(
+                lambda: _fetch_destination_forecast_source_data(
+                    engine,
+                    origin_country,
+                    run_metadata=run_metadata,
+                )
+                if run_metadata is not None
+                else {
+                    'origin_country': origin_country,
+                    'run_metadata': None,
+                    'mapping_df': pd.DataFrame(),
+                    'allocation_df': pd.DataFrame(),
+                }
+            ),
+            force=False,
+            manifest={
+                'origin_country': origin_country,
+                'run_id': (
+                    run_metadata.get('run_id')
+                    if run_metadata
+                    else None
+                ),
+                'current_month': current_month,
+                'refresh_generation': refresh_generation,
+            },
+        )
+        if not _snapshot_is_resolvable(reference):
+            raise _SnapshotUnavailable(
+                EXPORTER_ALLOCATION_RECOVERY_MESSAGE
+            )
+        return reference
+    except Exception as exc:
+        return {
+            'error': (
+                str(exc)
+                or EXPORTER_ALLOCATION_RECOVERY_MESSAGE
+            )
+        }
+
+
+@callback(
     Output('exp-destination-forecast-summary-subtitle', 'children'),
     Output('exp-destination-forecast-summary-table-container', 'children'),
     Output('destination-forecast-header', 'children'),
@@ -5430,9 +6363,16 @@ def create_destination_forecast_summary_table(display_df):
     Input('exp-destination-forecast-expanded-continents', 'data'),
     Input('destination-level-dropdown', 'value'),
     Input('volume-metric-dropdown', 'value'),
+    Input('exp-destination-forecast-source-store', 'data'),
     prevent_initial_call=False
 )
-def update_destination_forecast_summary_table(origin_country, expanded_continents, destination_level, volume_metric):
+def update_destination_forecast_summary_table(
+    origin_country,
+    expanded_continents,
+    destination_level,
+    volume_metric,
+    source_reference=None,
+):
     vol_info = _get_detail_volume_metric_info(volume_metric)
     vol_label = vol_info['label']
     forecast_header = f'Destination Forecast Allocation Summary (WoodMac, {vol_label})'
@@ -5447,11 +6387,28 @@ def update_destination_forecast_summary_table(origin_country, expanded_continent
     try:
         expanded_continents = expanded_continents or []
         destination_level = destination_level or DEFAULT_DESTINATION_LEVEL
-        summary_df, footer_rows, run_metadata = fetch_destination_forecast_summary_data(
-            engine,
-            origin_country,
-            destination_level=destination_level
+        source_data = _resolve_destination_forecast_source_data(
+            source_reference
         )
+        if source_data is None:
+            summary_df, footer_rows, run_metadata = (
+                fetch_destination_forecast_summary_data(
+                    engine,
+                    origin_country,
+                    destination_level=destination_level,
+                )
+            )
+        else:
+            if source_data.get('origin_country') != origin_country:
+                raise _SnapshotUnavailable(
+                    EXPORTER_ALLOCATION_RECOVERY_MESSAGE
+                )
+            summary_df, footer_rows, run_metadata = (
+                _build_destination_forecast_summary_from_source(
+                    source_data,
+                    destination_level=destination_level,
+                )
+            )
         subtitle = format_supply_allocation_run_subtitle(run_metadata)
         if run_metadata is None:
             return (
@@ -5574,6 +6531,7 @@ def update_supply_analysis_title(rolling_window_days):
     Input('volume-metric-dropdown', 'value'),
     Input('exporter-detail-supply-year-selector', 'value'),
 )
+@log_callback_timing("exporter_detail.supply_charts_render")
 def update_exporter_detail_supply_charts(
     base_data,
     rolling_window_days,
@@ -5581,7 +6539,32 @@ def update_exporter_detail_supply_charts(
     selected_years
 ):
     """Update the three supply analysis charts from one resolved base frame."""
-    destination_df, origin_scope, _, selected_country = _resolve_exporter_detail_base_data(base_data)
+    try:
+        destination_df, origin_scope, _, selected_country = (
+            _resolve_exporter_detail_base_data(base_data)
+        )
+    except _SnapshotUnavailable:
+        recovery_chart = _empty_timeseries_chart(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        )
+        return (
+            recovery_chart,
+            "Total Exports + WoodMac Forecast",
+            None,
+            None,
+            _empty_timeseries_chart(
+                EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+            ),
+            "By Destination Continent",
+            None,
+            None,
+            _empty_timeseries_chart(
+                EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+            ),
+            "Destination Market Share",
+            None,
+            _exporter_detail_snapshot_recovery_notice(),
+        )
     normalized_window_days = normalize_rolling_window_days(rolling_window_days)
     vol_info = _get_detail_volume_metric_info(volume_metric)
 
@@ -5611,7 +6594,11 @@ def update_exporter_detail_supply_charts(
         scoped_trades_df=destination_df,
         origin_scope=origin_scope
     )
-    forecast_df = fetch_woodmac_country_export_forecast_data(selected_country)
+    forecast_df = _load_exporter_detail_forecast_data(base_data)
+    if forecast_df is None:
+        forecast_df = fetch_woodmac_country_export_forecast_data(
+            selected_country
+        )
     country_fig = _create_total_export_chart_with_woodmac_forecast(
         historical_df,
         forecast_df,
@@ -5710,8 +6697,10 @@ def export_supply_analysis_to_excel(n_clicks, selected_country, rolling_window_d
     vol_info = _get_detail_volume_metric_info(volume_metric)
     vol_label = vol_info['label']
     scoped_trades_df, origin_scope, _, stored_origin_country = _resolve_exporter_detail_base_data(base_data)
-    if scoped_trades_df.empty or stored_origin_country != selected_country:
-        scoped_trades_df, origin_scope = _fetch_normalized_destination_trades(engine, selected_country)
+    if stored_origin_country != selected_country:
+        raise _SnapshotUnavailable(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        )
 
     supply_df = fetch_country_supply_chart_data(
         selected_country,
@@ -5805,41 +6794,189 @@ def export_supply_analysis_to_excel(n_clicks, selected_country, rolling_window_d
 @callback(
     Output('origin-country-dropdown', 'options'),
     Output('origin-country-dropdown', 'value'),
+    Output('exporter-detail-source-context-store', 'data'),
     Input('global-refresh-button', 'n_clicks'),
+    State('origin-country-dropdown', 'options'),
+    State('origin-country-dropdown', 'value'),
+    State('exporter-detail-source-context-store', 'data'),
     prevent_initial_call=False  # This will run on page load
 )
-def initialize_country_dropdown(_n_clicks):
+def initialize_country_dropdown(
+    _n_clicks,
+    existing_options=None,
+    existing_value=None,
+    previous_source_context=None,
+):
     """Initialize the country dropdown with all available origin countries."""
-    try:
-        # Query to get all unique origin countries from the database
-        query = f"""
-        SELECT DISTINCT origin_country_name
-        FROM {DB_SCHEMA}.kpler_trades
-        WHERE origin_country_name IS NOT NULL
-        AND upload_timestamp_utc = (
-            SELECT snapshot_timestamp_utc
-            FROM {DB_SCHEMA}.kpler_trade_snapshots
-            WHERE run_kind = 'canonical' AND status = 'published'
-            ORDER BY snapshot_date_utc DESC
-            LIMIT 1
+    force_refresh = _was_global_refresh_triggered()
+    with ThreadPoolExecutor(
+        max_workers=3,
+        thread_name_prefix='exporter-detail-context',
+    ) as executor:
+        countries_future = executor.submit(
+            pd.read_sql,
+            f"""
+            SELECT DISTINCT origin_country_name
+            FROM {DB_SCHEMA}.kpler_trades
+            WHERE origin_country_name IS NOT NULL
+            AND upload_timestamp_utc = (
+                SELECT snapshot_timestamp_utc
+                FROM {DB_SCHEMA}.kpler_trade_snapshots
+                WHERE run_kind = 'canonical' AND status = 'published'
+                ORDER BY snapshot_date_utc DESC
+                LIMIT 1
+            )
+            ORDER BY origin_country_name
+            """,
+            engine,
         )
-        ORDER BY origin_country_name
-        """
-        countries_df = pd.read_sql(query, engine)
-        if countries_df.empty:
-            # If no countries found, provide a default
-            return [{'label': 'United States', 'value': 'United States'}], 'United States'
-        # Convert countries to dropdown options format
-        country_options = [{'label': country, 'value': country}
-                          for country in countries_df['origin_country_name'].tolist()]
-        # Set United States as default if available, otherwise first country
-        default_country = 'United States'
-        if default_country not in countries_df['origin_country_name'].values:
-            default_country = countries_df['origin_country_name'].iloc[0]
-        return country_options, default_country
-    except Exception:
-        # Return a default option if there's an error
-        return [{'label': 'United States', 'value': 'United States'}], 'United States'
+        watermark_future = executor.submit(
+            _fetch_exporter_detail_source_watermark
+        )
+        maintenance_version_future = executor.submit(
+            _fetch_exporter_maintenance_source_version
+        )
+
+        try:
+            countries_df = countries_future.result()
+            countries_error = None
+        except Exception as exc:
+            logger.warning(
+                "Exporter country catalog refresh failed",
+                exc_info=True,
+            )
+            countries_df = pd.DataFrame()
+            countries_error = exc
+
+        try:
+            source_watermark = watermark_future.result()
+            watermark_error = None
+        except Exception as exc:
+            logger.warning(
+                "Exporter source revision refresh failed",
+                exc_info=True,
+            )
+            source_watermark = None
+            watermark_error = exc
+
+        try:
+            maintenance_source_version = (
+                maintenance_version_future.result()
+            )
+        except Exception:
+            logger.warning(
+                "Exporter maintenance revision refresh failed",
+                exc_info=True,
+            )
+            maintenance_source_version = None
+
+    previous_revision = source_revision_from_context(
+        previous_source_context
+    )
+    previous_is_usable = (
+        isinstance(previous_source_context, dict)
+        and previous_source_context.get('source_watermark') is not None
+        and previous_revision.status != 'unavailable'
+    )
+
+    if watermark_error is not None:
+        source_context = (
+            _stale_exporter_detail_source_context(
+                previous_source_context
+            )
+            if previous_is_usable
+            else _build_exporter_detail_source_context(
+                None,
+                status='unavailable',
+                message=EXPORTER_DETAIL_SOURCE_UNAVAILABLE_MESSAGE,
+            )
+        )
+    else:
+        source_context = _build_exporter_detail_source_context(
+            source_watermark,
+            force_refresh=force_refresh,
+            maintenance_source_version=maintenance_source_version,
+        )
+
+    if countries_error is not None or countries_df.empty:
+        if existing_options and previous_is_usable:
+            option_values = {
+                option.get('value')
+                for option in existing_options
+                if isinstance(option, dict)
+            }
+            selected_value = (
+                existing_value
+                if existing_value in option_values
+                else next(
+                    (
+                        option.get('value')
+                        for option in existing_options
+                        if isinstance(option, dict)
+                    ),
+                    None,
+                )
+            )
+            return (
+                existing_options,
+                selected_value,
+                _stale_exporter_detail_source_context(
+                    previous_source_context
+                ),
+            )
+        return (
+            [],
+            None,
+            _build_exporter_detail_source_context(
+                None,
+                status='unavailable',
+                message=EXPORTER_DETAIL_SOURCE_UNAVAILABLE_MESSAGE,
+            ),
+        )
+
+    country_values = countries_df['origin_country_name'].tolist()
+    country_options = [
+        {'label': country, 'value': country}
+        for country in country_values
+    ]
+    default_country = (
+        'United States'
+        if 'United States' in country_values
+        else country_values[0]
+    )
+    selected_country = (
+        existing_value
+        if (
+            watermark_error is not None
+            and previous_is_usable
+            and existing_value in country_values
+        )
+        else default_country
+    )
+    return country_options, selected_country, source_context
+
+
+@callback(
+    Output('exporter-detail-source-status', 'children'),
+    Output('exporter-detail-source-status', 'className'),
+    Input('exporter-detail-source-context-store', 'data'),
+)
+def render_exporter_detail_source_status(source_context):
+    revision = source_revision_from_context(source_context)
+    if revision.status == 'fresh':
+        return (
+            '',
+            'detail-source-status detail-source-status-hidden',
+        )
+    label = (
+        'Stale source'
+        if revision.status == 'stale'
+        else 'Data unavailable'
+    )
+    return (
+        f"{label}: {revision.message or EXPORTER_DETAIL_SOURCE_UNAVAILABLE_MESSAGE}",
+        f"detail-source-status detail-source-status-{revision.status}",
+    )
 
 # ========================================
 # TRAIN MAINTENANCE DATA FUNCTIONS
@@ -5950,18 +7087,129 @@ def fetch_train_maintenance_data(engine, country_name=None):
         return df
 
     except Exception:
-        return pd.DataFrame()
+        raise
 
 
-def _store_maintenance_raw_data(country_name, raw_data):
-    return {
+def _store_maintenance_raw_data(
+    country_name,
+    raw_data,
+    refresh_generation=None,
+):
+    stored_data = {
         'origin_country': country_name,
         'raw_data': _store_dataframe(raw_data) if raw_data is not None and not raw_data.empty else None,
         'loaded_at': dt.datetime.now().isoformat(timespec='seconds'),
     }
+    if refresh_generation is not None:
+        stored_data['refresh_generation'] = refresh_generation
+    return stored_data
+
+
+def _build_exporter_maintenance_source_payload(country_name):
+    return {
+        'origin_country': country_name,
+        'raw_data': fetch_train_maintenance_data(engine, country_name),
+    }
+
+
+def _exporter_maintenance_source_key(country_name, source_context):
+    source_version = _exporter_maintenance_source_version_from_context(
+        source_context
+    )
+    if source_version is None:
+        return None, None
+    return (
+        _build_source_key(
+            EXPORTER_MAINTENANCE_SOURCE_NAMESPACE,
+            source_version,
+            source_context.get('refresh_generation'),
+            country_name,
+        ),
+        source_version,
+    )
+
+
+def _get_exporter_maintenance_source_reference(
+    country_name,
+    source_context,
+):
+    source_key, source_version = _exporter_maintenance_source_key(
+        country_name,
+        source_context,
+    )
+    if source_key is None:
+        raise _SnapshotUnavailable(
+            'Exporter maintenance data is unavailable because its source '
+            'revision could not be verified.'
+        )
+    refresh_generation = source_context.get('refresh_generation')
+    if _exporter_source_context_status(source_context) == 'stale':
+        snapshot_result = _get_snapshot_if_available(
+            engine,
+            namespace=EXPORTER_MAINTENANCE_SOURCE_NAMESPACE,
+            source_key=source_key,
+        )
+        if snapshot_result is None:
+            raise _SnapshotUnavailable(
+                'Cached exporter maintenance data is unavailable.'
+            )
+        reference, payload = snapshot_result
+    else:
+        reference, payload = _get_or_build_snapshot(
+            engine,
+            namespace=EXPORTER_MAINTENANCE_SOURCE_NAMESPACE,
+            source_key=source_key,
+            builder=lambda: _build_exporter_maintenance_source_payload(
+                country_name
+            ),
+            force=False,
+            manifest={
+                'origin_country': country_name,
+                'source_version': source_version,
+                'refresh_generation': refresh_generation,
+            },
+        )
+    if not _snapshot_is_resolvable(reference):
+        raise _SnapshotUnavailable(
+            'Cached exporter maintenance data is unavailable. Click the '
+            'global Refresh button to reload it.'
+        )
+    reference = dict(reference)
+    reference['origin_country'] = country_name
+    return reference, payload
 
 
 def _load_maintenance_raw_data(payload, country_name):
+    if (
+        _is_snapshot_reference(payload)
+        and not _is_snapshot_reference(
+            payload,
+            EXPORTER_MAINTENANCE_SOURCE_NAMESPACE,
+        )
+    ):
+        raise _SnapshotUnavailable(
+            'Cached exporter maintenance data is unavailable. Click the '
+            'global Refresh button to reload it.'
+        )
+    if _is_snapshot_reference(
+        payload,
+        EXPORTER_MAINTENANCE_SOURCE_NAMESPACE,
+    ):
+        stored_payload = _resolve_snapshot(
+            payload,
+            engine,
+            expected_namespace=EXPORTER_MAINTENANCE_SOURCE_NAMESPACE,
+        )
+        if (
+            not isinstance(stored_payload, dict)
+            or stored_payload.get('origin_country') != country_name
+            or not isinstance(stored_payload.get('raw_data'), pd.DataFrame)
+        ):
+            raise _SnapshotUnavailable(
+                'Cached exporter maintenance data is unavailable. Click '
+                'the global Refresh button to reload it.'
+            )
+        return stored_payload['raw_data'].copy()
     if not payload or payload.get('origin_country') != country_name:
         return pd.DataFrame()
     return _load_store_dataframe(payload, 'raw_data', date_columns=['date'])
@@ -6817,34 +8065,54 @@ clientside_callback(
 
 
 def _build_exporter_detail_base_payload(origin_country):
-    mapping_df = _load_destination_mapping_df(engine)
-    destination_df, origin_scope = _fetch_normalized_destination_trades(
-        engine,
-        origin_country,
-        mapping_df=mapping_df,
-    )
-    origin_plant_df = _fetch_origin_plant_destination_trades(
-        engine,
-        origin_country,
-        mapping_df=mapping_df,
-    )
+    with ThreadPoolExecutor(
+        max_workers=3,
+        thread_name_prefix='exporter-detail-source',
+    ) as executor:
+        mapping_future = executor.submit(
+            _load_destination_mapping_df,
+            engine,
+        )
+        forecast_future = executor.submit(
+            fetch_woodmac_country_export_forecast_data,
+            origin_country,
+        )
+        mapping_df = mapping_future.result()
+        destination_future = executor.submit(
+            _fetch_normalized_destination_trades,
+            engine,
+            origin_country,
+            None,
+            mapping_df,
+        )
+        origin_plant_future = executor.submit(
+            _fetch_origin_plant_destination_trades,
+            engine,
+            origin_country,
+            None,
+            mapping_df,
+        )
+        destination_df, origin_scope = destination_future.result()
+        origin_plant_df = origin_plant_future.result()
+        forecast_df = forecast_future.result()
+
     return {
         'origin_country': origin_country,
         'normalized_destination_trades': _store_dataframe(destination_df),
         'origin_plant_destination_trades': _store_dataframe(origin_plant_df),
+        'woodmac_export_forecast': forecast_df,
         'origin_scope': origin_scope,
+        'available_years': _detail_chart_years(),
         'loaded_at': dt.datetime.now().isoformat(timespec='seconds'),
     }
 
 
-# --- Callbacks for exporter detail base data ---
-@callback(
-    Output('exporter-detail-base-data-store', 'data'),
-    Input('origin-country-dropdown', 'value'),
-    Input('global-refresh-button', 'n_clicks'),
-    prevent_initial_call=False
-)
-def refresh_exporter_detail_base_data(origin_country, _global_refresh_clicks=None):
+@log_callback_timing("exporter_detail.base_source_load")
+def refresh_exporter_detail_base_data(
+    origin_country,
+    _global_refresh_clicks=None,
+    source_context=None,
+):
     """Fetch the reusable origin-scoped Kpler frames once for the detail page."""
     if not origin_country:
         return {
@@ -6856,33 +8124,97 @@ def refresh_exporter_detail_base_data(origin_country, _global_refresh_clicks=Non
         }
 
     try:
-        try:
-            source_watermark = _fetch_exporter_detail_source_watermark()
-        except Exception:
-            source_watermark = dt.datetime.now().isoformat(timespec='microseconds')
+        force_refresh = False
+        if source_context is None:
+            try:
+                source_watermark = (
+                    _fetch_exporter_detail_source_watermark()
+                )
+            except Exception as exc:
+                raise _SnapshotUnavailable(
+                    EXPORTER_DETAIL_SOURCE_UNAVAILABLE_MESSAGE
+                ) from exc
+            source_context = _build_exporter_detail_source_context(
+                source_watermark
+            )
+            force_refresh = _was_global_refresh_triggered()
+
+        source_status = _exporter_source_context_status(source_context)
+        if source_status == 'unavailable':
+            return {
+                'origin_country': origin_country,
+                'error': EXPORTER_DETAIL_SOURCE_UNAVAILABLE_MESSAGE,
+                'loaded_at': None,
+            }
+
+        (
+            base_source_watermark,
+            route_source_version,
+            refresh_generation,
+        ) = _exporter_detail_source_context_parts(source_context)
+        if base_source_watermark is None:
+            raise _SnapshotUnavailable(
+                EXPORTER_DETAIL_SOURCE_UNAVAILABLE_MESSAGE
+            )
         source_key = _build_source_key(
             EXPORTER_DETAIL_BASE_NAMESPACE,
-            source_watermark,
+            base_source_watermark,
+            refresh_generation,
+            _exporter_detail_forecast_month_token(),
             origin_country,
         )
-        reference, payload = _get_or_build_snapshot(
-            engine,
-            namespace=EXPORTER_DETAIL_BASE_NAMESPACE,
-            source_key=source_key,
-            builder=lambda: _build_exporter_detail_base_payload(origin_country),
-            force=_was_global_refresh_triggered(),
-            manifest={'origin_country': origin_country},
-        )
-        return reference if _snapshot_is_shared(reference) else payload
+        if source_status == 'stale':
+            snapshot_result = _get_snapshot_if_available(
+                engine,
+                namespace=EXPORTER_DETAIL_BASE_NAMESPACE,
+                source_key=source_key,
+            )
+            if snapshot_result is None:
+                raise _SnapshotUnavailable(
+                    EXPORTER_DETAIL_SOURCE_UNAVAILABLE_MESSAGE
+                )
+            reference, _payload = snapshot_result
+        else:
+            reference, _payload = _get_or_build_snapshot(
+                engine,
+                namespace=EXPORTER_DETAIL_BASE_NAMESPACE,
+                source_key=source_key,
+                builder=lambda: _build_exporter_detail_base_payload(
+                    origin_country
+                ),
+                force=force_refresh,
+                manifest={'origin_country': origin_country},
+            )
+        if not _snapshot_is_resolvable(reference):
+            raise _SnapshotUnavailable(
+                EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+            )
+        reference = dict(reference)
+        reference['route_source_version'] = route_source_version
+        return reference
+    except _SnapshotUnavailable:
+        raise
     except Exception as exc:
-        return {
-            'origin_country': origin_country,
-            'normalized_destination_trades': None,
-            'origin_plant_destination_trades': None,
-            'origin_scope': {},
-            'loaded_at': dt.datetime.now().isoformat(timespec='seconds'),
-            'error': str(exc),
-        }
+        raise _SnapshotUnavailable(
+            EXPORTER_DETAIL_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+
+
+# --- Callback for exporter detail base data ---
+@callback(
+    Output('exporter-detail-base-data-store', 'data'),
+    Input('origin-country-dropdown', 'value'),
+    Input('exporter-detail-source-context-store', 'data'),
+    prevent_initial_call=False
+)
+def _refresh_exporter_detail_base_data_callback(
+    origin_country,
+    source_context,
+):
+    return refresh_exporter_detail_base_data(
+        origin_country,
+        source_context=source_context,
+    )
 
 
 @callback(
@@ -6979,7 +8311,12 @@ def refresh_exporter_detail_summary_data_stores(origin_country, rolling_window_d
     prevent_initial_call=False
 )
 def update_exporter_detail_supply_year_selector(base_data, selected_years):
-    destination_df, origin_scope, _, origin_country = _resolve_exporter_detail_base_data(base_data)
+    try:
+        destination_df, origin_scope, _, origin_country = (
+            _resolve_exporter_detail_base_data(base_data)
+        )
+    except _SnapshotUnavailable:
+        return _exporter_detail_snapshot_recovery_selector_result()
     years = set()
     if not destination_df.empty:
         filtered_df, _ = _apply_destination_exclusion(
@@ -7009,7 +8346,12 @@ def update_exporter_detail_supply_year_selector(base_data, selected_years):
     prevent_initial_call=False
 )
 def update_exporter_detail_continent_year_selector(base_data, selected_years):
-    destination_df, origin_scope, _, _ = _resolve_exporter_detail_base_data(base_data)
+    try:
+        destination_df, origin_scope, _, _ = (
+            _resolve_exporter_detail_base_data(base_data)
+        )
+    except _SnapshotUnavailable:
+        return _exporter_detail_snapshot_recovery_selector_result()
     years = []
     if not destination_df.empty:
         filtered_df, _ = _apply_destination_exclusion(
@@ -7372,81 +8714,210 @@ def update_origin_plant_summary_table(
 
 
 @callback(
+    Output('exporter-route-analysis-source-store', 'data'),
+    Input('origin-country-dropdown', 'value'),
+    Input('exporter-detail-source-context-store', 'data'),
+)
+def refresh_exporter_route_analysis_source(
+    origin_country_name,
+    base_reference=None,
+    source_context=None,
+):
+    if not origin_country_name:
+        return None
+    try:
+        if source_context is None and isinstance(base_reference, dict):
+            if 'source_watermark' in base_reference:
+                source_context = base_reference
+                base_reference = None
+        (
+            _base_source_watermark,
+            context_route_source_version,
+            refresh_generation,
+        ) = _exporter_detail_source_context_parts(source_context)
+        source_version = context_route_source_version
+        base_revision = None
+        if source_version is None:
+            if _is_snapshot_reference(
+                base_reference,
+                EXPORTER_DETAIL_BASE_NAMESPACE,
+            ):
+                source_version = base_reference.get(
+                    'route_source_version'
+                )
+                base_revision = base_reference.get('revision')
+            else:
+                source_version = _fetch_exporter_route_source_version()
+        if source_version is None:
+            raise _SnapshotUnavailable(
+                EXPORTER_ROUTE_RECOVERY_MESSAGE
+            )
+        source_key = _build_source_key(
+            EXPORTER_ROUTE_SOURCE_NAMESPACE,
+            source_version,
+            refresh_generation,
+            base_revision,
+            origin_country_name,
+        )
+        reference, _payload = _get_or_build_snapshot(
+            engine,
+            namespace=EXPORTER_ROUTE_SOURCE_NAMESPACE,
+            source_key=source_key,
+            builder=lambda: _build_exporter_route_source_payload(
+                origin_country_name
+            ),
+            force=(
+                False
+                if source_context is not None
+                else _was_global_refresh_triggered()
+            ),
+            manifest={
+                'origin_country': origin_country_name,
+                'source_version': source_version,
+            },
+        )
+        if not _snapshot_is_resolvable(reference):
+            raise _SnapshotUnavailable(
+                EXPORTER_ROUTE_RECOVERY_MESSAGE
+            )
+        return reference
+    except Exception as exc:
+        return {
+            'error': str(exc) or EXPORTER_ROUTE_RECOVERY_MESSAGE
+        }
+
+
+@callback(
     Output('route-analysis-kpi-container', 'children'),
     Output('graph-route-suez-only', 'figure'),
     [Input('aggregation-dropdown', 'value'),
      Input('destination-level-dropdown', 'value'),
-     Input('origin-country-dropdown', 'value')]
+     Input('origin-country-dropdown', 'value'),
+     Input('exporter-route-analysis-source-store', 'data')]
 )
-def update_route_analysis_charts_and_tables(agg_level, destination_level, origin_country_name):
+def update_route_analysis_charts_and_tables(
+    agg_level,
+    destination_level,
+    origin_country_name,
+    source_reference=None,
+):
     """
     This callback updates the route analysis charts and tables based on the selected aggregation level
     and destination level. Uses a unified subplot figure with shared legend.
     """
     # --- Process the data ---
     try:
-        processed_df = process_trade_and_distance_data(engine, origin_country_name=origin_country_name)
-        # Verify destination_level column exists in the data
-        if destination_level not in processed_df.columns:
-            # If destination_country_name is requested but not in data, attempt to add it
-            if destination_level == 'destination_country_name' and 'destination_shipping_region' in processed_df.columns:
-                try:
-                    # Pull the mapping from regions to countries
-                    query_regions = f'''
-                        SELECT DISTINCT country, shipping_region
-                        FROM {DB_SCHEMA}.mappings_country
-                    '''
-                    region_map_df = pd.read_sql(query_regions, engine)
-                    region_map_df.columns = ['destination_country_name', 'destination_shipping_region']
-                    # Merge the mapping to add destination_country_name
-                    processed_df = pd.merge(
-                        processed_df,
-                        region_map_df,
-                        on='destination_shipping_region',
-                        how='left'
-                    )
-                except Exception:
-                    # Continue with destination_shipping_region as fallback
-                    destination_level = 'destination_shipping_region'
-            elif destination_level == 'destination_shipping_region' and 'destination_country_name' in processed_df.columns:
-                try:
-                    # Pull the mapping from countries to regions
-                    query_regions = f'''
-                        SELECT DISTINCT country, shipping_region
-                        FROM {DB_SCHEMA}.mappings_country
-                    '''
-                    region_map_df = pd.read_sql(query_regions, engine)
-                    region_map_df.columns = ['destination_country_name', 'destination_shipping_region']
-                    # Merge the mapping to add destination_shipping_region
-                    processed_df = pd.merge(
-                        processed_df,
-                        region_map_df,
-                        on='destination_country_name',
-                        how='left'
-                    )
-                except Exception:
-                    # Continue with destination_country_name as fallback
-                    destination_level = 'destination_country_name'
-            elif destination_level not in processed_df.columns:
-                # For basin, continent, subcontinent, classification levels
-                level_col_map = {
-                    'continent_destination_name': 'continent',
-                    'destination_basin': 'basin',
-                    'destination_subcontinent': 'subcontinent',
-                    'destination_classification_level1': 'country_classification_level1',
-                    'destination_classification': 'country_classification',
-                }
-                mapping_col = level_col_map.get(destination_level)
-                if mapping_col and 'destination_country_name' in processed_df.columns:
+        source_data = _resolve_exporter_route_source_data(
+            source_reference
+        )
+        if source_data is not None:
+            if source_data.get('origin_country') != origin_country_name:
+                raise _SnapshotUnavailable(
+                    EXPORTER_ROUTE_RECOVERY_MESSAGE
+                )
+            processed_df, destination_level = (
+                _prepare_exporter_route_source_for_level(
+                    source_data,
+                    destination_level,
+                )
+            )
+        else:
+            processed_df = process_trade_and_distance_data(
+                engine,
+                origin_country_name=origin_country_name,
+            )
+            if destination_level not in processed_df.columns:
+                if (
+                    destination_level == 'destination_country_name'
+                    and 'destination_shipping_region'
+                    in processed_df.columns
+                ):
                     try:
-                        mapping_df = pd.read_sql(
-                            f"SELECT DISTINCT country_name AS destination_country_name, {mapping_col} AS \"{destination_level}\" "
-                            f"FROM {DB_SCHEMA}.mappings_country WHERE country_name IS NOT NULL",
-                            engine
+                        region_map_df = pd.read_sql(
+                            f"""
+                                SELECT DISTINCT country, shipping_region
+                                FROM {DB_SCHEMA}.mappings_country
+                            """,
+                            engine,
                         )
-                        processed_df = pd.merge(processed_df, mapping_df, on='destination_country_name', how='left')
+                        region_map_df.columns = [
+                            'destination_country_name',
+                            'destination_shipping_region',
+                        ]
+                        processed_df = pd.merge(
+                            processed_df,
+                            region_map_df,
+                            on='destination_shipping_region',
+                            how='left',
+                        )
                     except Exception:
-                        pass  # fall through to the column-not-found error below
+                        destination_level = (
+                            'destination_shipping_region'
+                        )
+                elif (
+                    destination_level
+                    == 'destination_shipping_region'
+                    and 'destination_country_name'
+                    in processed_df.columns
+                ):
+                    try:
+                        region_map_df = pd.read_sql(
+                            f"""
+                                SELECT DISTINCT country, shipping_region
+                                FROM {DB_SCHEMA}.mappings_country
+                            """,
+                            engine,
+                        )
+                        region_map_df.columns = [
+                            'destination_country_name',
+                            'destination_shipping_region',
+                        ]
+                        processed_df = pd.merge(
+                            processed_df,
+                            region_map_df,
+                            on='destination_country_name',
+                            how='left',
+                        )
+                    except Exception:
+                        destination_level = 'destination_country_name'
+                elif destination_level not in processed_df.columns:
+                    level_col_map = {
+                        'continent_destination_name': 'continent',
+                        'destination_basin': 'basin',
+                        'destination_subcontinent': 'subcontinent',
+                        'destination_classification_level1': (
+                            'country_classification_level1'
+                        ),
+                        'destination_classification': (
+                            'country_classification'
+                        ),
+                    }
+                    mapping_col = level_col_map.get(destination_level)
+                    if (
+                        mapping_col
+                        and 'destination_country_name'
+                        in processed_df.columns
+                    ):
+                        try:
+                            mapping_df = pd.read_sql(
+                                (
+                                    "SELECT DISTINCT country_name AS "
+                                    "destination_country_name, "
+                                    f'{mapping_col} AS '
+                                    f'"{destination_level}" '
+                                    f"FROM {DB_SCHEMA}.mappings_country "
+                                    "WHERE country_name IS NOT NULL"
+                                ),
+                                engine,
+                            )
+                            processed_df = pd.merge(
+                                processed_df,
+                                mapping_df,
+                                on='destination_country_name',
+                                how='left',
+                            )
+                        except Exception:
+                            pass
     except Exception:
         # Create error figure and table
         error_fig = go.Figure().update_layout(
@@ -7581,14 +9052,37 @@ def update_route_analysis_charts_and_tables(agg_level, destination_level, origin
     State('aggregation-dropdown', 'value'),
     State('destination-level-dropdown', 'value'),
     State('origin-country-dropdown', 'value'),
+    State('exporter-route-analysis-source-store', 'data'),
     prevent_initial_call=True
 )
-def export_route_analysis_to_excel(n_clicks, agg_level, destination_level, origin_country_name):
+def export_route_analysis_to_excel(
+    n_clicks,
+    agg_level,
+    destination_level,
+    origin_country_name,
+    source_reference=None,
+):
     if not n_clicks:
         raise PreventUpdate
 
     try:
-        processed_df = process_trade_and_distance_data(engine, origin_country_name=origin_country_name)
+        source_data = _resolve_exporter_route_source_data(
+            source_reference
+        )
+        if source_data is None:
+            processed_df = process_trade_and_distance_data(
+                engine,
+                origin_country_name=origin_country_name,
+            )
+        else:
+            if source_data.get('origin_country') != origin_country_name:
+                raise PreventUpdate
+            processed_df = source_data.get('processed_df')
+            processed_df = (
+                processed_df.copy()
+                if isinstance(processed_df, pd.DataFrame)
+                else pd.DataFrame()
+            )
         if processed_df is None or processed_df.empty:
             raise PreventUpdate
     except PreventUpdate:
@@ -7678,15 +9172,32 @@ def export_route_analysis_to_excel(n_clicks, agg_level, destination_level, origi
     return dcc.send_bytes(output.getvalue(), filename)
 
 
-@callback(
-    Output('diversion-processed-data', 'data'),
-    Input('global-refresh-button', 'n_clicks'),
-    Input('origin-country-dropdown', 'value'),
-    # prevent_initial_call=True
-)
-def process_diversion_data(_n_clicks, origin_country_name):
-    # -------------------------------- Table with the trades ----------------------------------------------------------#
+def _fetch_exporter_diversion_rows(
+    origin_country_name,
+    source_version=_EXPORTER_DIVERSION_VERSION_UNSET,
+):
     from sqlalchemy import text as sa_text
+    if source_version is _EXPORTER_DIVERSION_VERSION_UNSET:
+        source_filter = f'''
+            upload_timestamp_utc = (
+                select max(upload_timestamp_utc)
+                from {DB_SCHEMA}.kpler_lng_diversions
+            )
+        '''
+        query_params = {
+            'origin_country_name': origin_country_name,
+        }
+    else:
+        effective_source_version = (
+            source_version.get('diversion_watermark')
+            if isinstance(source_version, dict)
+            else source_version
+        )
+        source_filter = 'upload_timestamp_utc = :source_version'
+        query_params = {
+            'origin_country_name': origin_country_name,
+            'source_version': effective_source_version,
+        }
     query = sa_text(f'''
             select 
                 diversion_date as "Diversion date",
@@ -7708,14 +9219,156 @@ def process_diversion_data(_n_clicks, origin_country_name):
                 new_destination_country_name as "New destination country",
                 new_destination_date  as "New destination date"
                 from {DB_SCHEMA}.kpler_lng_diversions
-            where upload_timestamp_utc = (select max(upload_timestamp_utc) from {DB_SCHEMA}.kpler_lng_diversions)
+            where {source_filter}
             and origin_diversion_country_name = :origin_country_name
         ''')
-    df_kpler_diversions = pd.read_sql(
+    return pd.read_sql(
         query,
         engine,
-        params={'origin_country_name': origin_country_name}
+        params=query_params,
     )
+
+
+def _fetch_exporter_diversion_country_mapping():
+    return pd.read_sql(
+        f'''
+            select country, basin, shipping_region
+            from {DB_SCHEMA}.mappings_country
+        ''',
+        engine,
+    )
+
+
+def _fetch_exporter_diversion_location_mapping():
+    return pd.read_sql(
+        f'''
+            select destination_location_name, basin, shipping_region
+            from {DB_SCHEMA}.mapping_destination_location_name
+        ''',
+        engine,
+    )
+
+
+def _fetch_exporter_diversion_source_version():
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(f"""
+                WITH
+                country_mapping_version AS (
+                    SELECT MD5(
+                        COALESCE(
+                            STRING_AGG(
+                                CONCAT_WS(
+                                    CHR(31),
+                                    CASE
+                                        WHEN country IS NULL THEN 'N'
+                                        ELSE 'V' || country
+                                    END,
+                                    CASE
+                                        WHEN basin IS NULL THEN 'N'
+                                        ELSE 'V' || basin
+                                    END,
+                                    CASE
+                                        WHEN shipping_region IS NULL
+                                            THEN 'N'
+                                        ELSE 'V' || shipping_region
+                                    END
+                                ),
+                                CHR(30)
+                                ORDER BY country, basin, shipping_region
+                            ),
+                            ''
+                        )
+                    ) AS fingerprint
+                    FROM {DB_SCHEMA}.mappings_country
+                ),
+                location_mapping_version AS (
+                    SELECT MD5(
+                        COALESCE(
+                            STRING_AGG(
+                                CONCAT_WS(
+                                    CHR(31),
+                                    CASE
+                                        WHEN destination_location_name
+                                            IS NULL THEN 'N'
+                                        ELSE
+                                            'V'
+                                            || destination_location_name
+                                    END,
+                                    CASE
+                                        WHEN basin IS NULL THEN 'N'
+                                        ELSE 'V' || basin
+                                    END,
+                                    CASE
+                                        WHEN shipping_region IS NULL
+                                            THEN 'N'
+                                        ELSE 'V' || shipping_region
+                                    END
+                                ),
+                                CHR(30)
+                                ORDER BY destination_location_name,
+                                    basin, shipping_region
+                            ),
+                            ''
+                        )
+                    ) AS fingerprint
+                    FROM {DB_SCHEMA}.mapping_destination_location_name
+                )
+                SELECT
+                    (
+                        SELECT MAX(upload_timestamp_utc)
+                        FROM {DB_SCHEMA}.kpler_lng_diversions
+                    ) AS diversion_watermark,
+                    (
+                        SELECT fingerprint
+                        FROM country_mapping_version
+                    ) AS country_mapping_fingerprint,
+                    (
+                        SELECT fingerprint
+                        FROM location_mapping_version
+                    ) AS location_mapping_fingerprint
+            """)
+        ).mappings().one()
+    return dict(row)
+
+
+def _build_exporter_diversion_payload(
+    origin_country_name,
+    *,
+    concurrent=True,
+    source_version=_EXPORTER_DIVERSION_VERSION_UNSET,
+):
+    if concurrent:
+        with ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix='exporter-diversion',
+        ) as executor:
+            diversions_future = executor.submit(
+                _fetch_exporter_diversion_rows,
+                origin_country_name,
+                source_version,
+            )
+            country_mapping_future = executor.submit(
+                _fetch_exporter_diversion_country_mapping
+            )
+            location_mapping_future = executor.submit(
+                _fetch_exporter_diversion_location_mapping
+            )
+            df_kpler_diversions = diversions_future.result()
+            df_mapping_country = country_mapping_future.result()
+            df_mapping_location = location_mapping_future.result()
+    else:
+        df_kpler_diversions = _fetch_exporter_diversion_rows(
+            origin_country_name,
+            source_version,
+        )
+        df_mapping_country = (
+            _fetch_exporter_diversion_country_mapping()
+        )
+        df_mapping_location = (
+            _fetch_exporter_diversion_location_mapping()
+        )
+
     df_kpler_diversions['Added shipping days'] = (df_kpler_diversions['New destination date'] - df_kpler_diversions['Diverted from date']).dt.days
     # Convert date columns to strings for JSON serialization
     date_columns = ['Diversion date', 'Origin date', 'Diverted from date', 'New destination date']
@@ -7729,18 +9382,6 @@ def process_diversion_data(_n_clicks, origin_country_name):
     # -------------------------------- charts ----------------------------------------------------------#
     df_kpler_charts = df_kpler_diversions.copy()
     df_kpler_charts = df_kpler_charts[df_kpler_charts.State=='Loaded']
-    # country mapping
-    query_country_mapping = f'''
-                select country, basin, shipping_region
-                    from {DB_SCHEMA}.mappings_country
-            '''
-    df_mapping_country = pd.read_sql(query_country_mapping, engine)
-    # destination mapping
-    query_location_mapping = f'''
-                    select destination_location_name, basin, shipping_region
-                        from {DB_SCHEMA}.mapping_destination_location_name
-                '''
-    df_mapping_location = pd.read_sql(query_location_mapping, engine)
     ######## Mapings from Diverted from
     df_kpler_charts = pd.merge(df_kpler_charts,
              df_mapping_country[['country','basin','shipping_region']].rename(columns={'country':'Diverted from country',
@@ -7820,6 +9461,107 @@ def process_diversion_data(_n_clicks, origin_country_name):
         'charts_data': charts_data,
         'origin_country': origin_country_name
     }
+
+
+def process_diversion_data(_n_clicks, origin_country_name):
+    """Compatibility wrapper returning the legacy raw diversion payload."""
+    return _build_exporter_diversion_payload(
+        origin_country_name,
+        concurrent=False,
+    )
+
+
+def _resolve_exporter_diversion_data(stored_data):
+    if not stored_data:
+        return None
+    reference_input = _is_snapshot_reference(
+        stored_data,
+        EXPORTER_DIVERSION_SOURCE_NAMESPACE,
+    )
+    if isinstance(stored_data, dict) and 'error' in stored_data:
+        raise _SnapshotUnavailable(stored_data['error'])
+    if _is_snapshot_reference(stored_data) and not reference_input:
+        raise _SnapshotUnavailable(EXPORTER_DIVERSION_RECOVERY_MESSAGE)
+    try:
+        payload = _resolve_snapshot(
+            stored_data,
+            engine,
+            expected_namespace=EXPORTER_DIVERSION_SOURCE_NAMESPACE,
+        )
+    except _SnapshotUnavailable as exc:
+        raise _SnapshotUnavailable(
+            EXPORTER_DIVERSION_RECOVERY_MESSAGE
+        ) from exc
+    if not isinstance(payload, dict):
+        raise _SnapshotUnavailable(EXPORTER_DIVERSION_RECOVERY_MESSAGE)
+    required_keys = {'main_data', 'charts_data', 'origin_country'}
+    if reference_input and not required_keys.issubset(payload):
+        raise _SnapshotUnavailable(EXPORTER_DIVERSION_RECOVERY_MESSAGE)
+    if (
+        reference_input
+        and stored_data.get('origin_country')
+        != payload.get('origin_country')
+    ):
+        raise _SnapshotUnavailable(EXPORTER_DIVERSION_RECOVERY_MESSAGE)
+    return payload
+
+
+@callback(
+    Output('diversion-processed-data', 'data'),
+    Input('exporter-detail-source-context-store', 'data'),
+    Input('origin-country-dropdown', 'value'),
+)
+def refresh_exporter_diversion_source(
+    source_context,
+    origin_country_name,
+):
+    if not origin_country_name:
+        return None
+    try:
+        source_version = (
+            _fetch_exporter_diversion_source_version()
+        )
+        refresh_generation = (
+            source_context.get('refresh_generation')
+            if isinstance(source_context, dict)
+            else None
+        )
+        source_key = _build_source_key(
+            EXPORTER_DIVERSION_SOURCE_NAMESPACE,
+            source_version,
+            refresh_generation,
+            origin_country_name,
+        )
+        reference, _payload = _get_or_build_snapshot(
+            engine,
+            namespace=EXPORTER_DIVERSION_SOURCE_NAMESPACE,
+            source_key=source_key,
+            builder=lambda: _build_exporter_diversion_payload(
+                origin_country_name,
+                concurrent=True,
+                source_version=source_version,
+            ),
+            force=False,
+            manifest={
+                'origin_country': origin_country_name,
+                'source_version': source_version,
+                'refresh_generation': refresh_generation,
+            },
+        )
+        if not _snapshot_is_resolvable(reference):
+            raise _SnapshotUnavailable(
+                EXPORTER_DIVERSION_RECOVERY_MESSAGE
+            )
+        reference = dict(reference)
+        reference['origin_country'] = origin_country_name
+        return reference
+    except Exception as exc:
+        return {
+            'error': (
+                str(exc)
+                or EXPORTER_DIVERSION_RECOVERY_MESSAGE
+            )
+        }
 
 
 def _empty_diversion_analysis_figure(message="No diversions data available"):
@@ -8117,10 +9859,22 @@ def _build_diversion_analysis_figure(df_kpler_charts, combo_field):
 )
 def update_diversion_ui(stored_data, destination_level):
     if not stored_data:
-        # Return empty/placeholder values if no data is available yet
-        empty_columns = [{"name": "No Data", "id": "no_data"}]
-        empty_defs = _style_diversion_column_defs(datatable_columns_to_ag_grid_column_defs(empty_columns))
-        return [], empty_defs, _empty_diversion_analysis_figure()
+        stored_data = {'main_data': [], 'charts_data': []}
+    else:
+        try:
+            stored_data = _resolve_exporter_diversion_data(stored_data)
+        except _SnapshotUnavailable:
+            empty_columns = [{"name": "No Data", "id": "no_data"}]
+            empty_defs = _style_diversion_column_defs(
+                datatable_columns_to_ag_grid_column_defs(empty_columns)
+            )
+            return (
+                [],
+                empty_defs,
+                _empty_diversion_analysis_figure(
+                    EXPORTER_DIVERSION_RECOVERY_MESSAGE
+                ),
+            )
 
     # Get data from the store. Keep the dashboard table compact while the store
     # remains the full export source.
@@ -8165,6 +9919,10 @@ def update_diversion_ui(stored_data, destination_level):
 )
 def export_diversion_summary_to_excel(n_clicks, stored_data, table_columns):
     if not n_clicks or not stored_data:
+        raise PreventUpdate
+    try:
+        stored_data = _resolve_exporter_diversion_data(stored_data)
+    except _SnapshotUnavailable:
         raise PreventUpdate
     table_data = _prepare_diversion_table_records(stored_data.get('main_data') or [])
     if not table_data:
@@ -8300,18 +10058,16 @@ def toggle_origin_plant_zone_expansion(active_cells, table_data_list, expanded_z
     return expanded_zones or []
 
 
-# Callback for Train Maintenance Schedule
-@callback(
-    [Output('maintenance-summary-container', 'children'),
-     Output('maintenance-summary-header', 'children'),
-     Output('maintenance-raw-data-store', 'data')],
-    Input('origin-country-dropdown', 'value'),
-    Input('volume-metric-dropdown', 'value'),
-    Input('exporter-detail-maintenance-quarter-count-dropdown', 'value'),
-    Input('exporter-detail-maintenance-month-count-dropdown', 'value'),
-    State('maintenance-expanded-plants', 'data')
-)
-def update_maintenance_table(selected_country, volume_metric, quarter_count, month_count, expanded_plants):
+def _update_maintenance_table_from_source(
+    selected_country,
+    volume_metric,
+    quarter_count,
+    month_count,
+    expanded_plants,
+    maintenance_raw_data=None,
+    force_source=False,
+    source_context=None,
+):
     """
     Update maintenance table based on selected country.
     Shows planned and unplanned maintenance outages converted to selected volume unit.
@@ -8328,8 +10084,83 @@ def update_maintenance_table(selected_country, volume_metric, quarter_count, mon
         )
 
     try:
-        raw_data = fetch_train_maintenance_data(engine, selected_country)
-        raw_data_store = _store_maintenance_raw_data(selected_country, raw_data)
+        source_is_reference = _is_snapshot_reference(
+            maintenance_raw_data,
+            EXPORTER_MAINTENANCE_SOURCE_NAMESPACE,
+        )
+        expected_source_key, _source_version = (
+            _exporter_maintenance_source_key(
+                selected_country,
+                source_context,
+            )
+            if source_context is not None
+            else (None, None)
+        )
+        source_is_current = (
+            isinstance(maintenance_raw_data, dict)
+            and maintenance_raw_data.get('origin_country')
+            == selected_country
+            and 'error' not in maintenance_raw_data
+            and (
+                (
+                    source_is_reference
+                    and (
+                        source_context is None
+                        or (
+                            expected_source_key is not None
+                            and maintenance_raw_data.get('source_key')
+                            == expected_source_key
+                        )
+                    )
+                )
+                or (
+                    not source_is_reference
+                    and (
+                        source_context is None
+                        or (
+                            expected_source_key is None
+                            and maintenance_raw_data.get(
+                                'refresh_generation'
+                            )
+                            == source_context.get('refresh_generation')
+                        )
+                    )
+                )
+            )
+        )
+        if source_is_current and not force_source:
+            raw_data = _load_maintenance_raw_data(
+                maintenance_raw_data,
+                selected_country,
+            )
+            raw_data_store = maintenance_raw_data
+        else:
+            if source_context is not None:
+                (
+                    raw_data_store,
+                    source_payload,
+                ) = _get_exporter_maintenance_source_reference(
+                    selected_country,
+                    source_context,
+                )
+            else:
+                raw_data_store, source_payload = None, None
+            if raw_data_store is not None:
+                raw_data = source_payload['raw_data'].copy()
+            else:
+                raw_data = fetch_train_maintenance_data(
+                    engine,
+                    selected_country,
+                )
+                raw_data_store = _store_maintenance_raw_data(
+                    selected_country,
+                    raw_data,
+                    refresh_generation=(
+                        source_context.get('refresh_generation')
+                        if isinstance(source_context, dict)
+                        else None
+                    ),
+                )
 
         if raw_data.empty:
             return (
@@ -8377,11 +10208,69 @@ def update_maintenance_table(selected_country, volume_metric, quarter_count, mon
         )
 
     except Exception as e:
+        error_store = _store_maintenance_raw_data(
+            selected_country,
+            pd.DataFrame(),
+        )
+        error_store['error'] = str(e)
         return (
             html.Div(f"Error loading maintenance data: {str(e)}", style={'textAlign': 'center', 'padding': '20px', 'color': 'red'}),
             header_text,
-            _store_maintenance_raw_data(selected_country, pd.DataFrame())
+            error_store,
         )
+
+
+# Compatibility wrapper retained for tests and direct callers.
+def update_maintenance_table(
+    selected_country,
+    volume_metric,
+    quarter_count,
+    month_count,
+    expanded_plants,
+):
+    return _update_maintenance_table_from_source(
+        selected_country,
+        volume_metric,
+        quarter_count,
+        month_count,
+        expanded_plants,
+        maintenance_raw_data=None,
+        force_source=True,
+    )
+
+
+# Callback for Train Maintenance Schedule
+@callback(
+    [Output('maintenance-summary-container', 'children'),
+     Output('maintenance-summary-header', 'children'),
+     Output('maintenance-raw-data-store', 'data')],
+    Input('origin-country-dropdown', 'value'),
+    Input('volume-metric-dropdown', 'value'),
+    Input('exporter-detail-maintenance-quarter-count-dropdown', 'value'),
+    Input('exporter-detail-maintenance-month-count-dropdown', 'value'),
+    Input('exporter-detail-source-context-store', 'data'),
+    State('maintenance-expanded-plants', 'data'),
+    State('maintenance-raw-data-store', 'data'),
+)
+def _update_maintenance_table_callback(
+    selected_country,
+    volume_metric,
+    quarter_count,
+    month_count,
+    source_context,
+    expanded_plants,
+    maintenance_raw_data,
+):
+    return _update_maintenance_table_from_source(
+        selected_country,
+        volume_metric,
+        quarter_count,
+        month_count,
+        expanded_plants,
+        maintenance_raw_data=maintenance_raw_data,
+        force_source=False,
+        source_context=source_context,
+    )
 
 
 @callback(

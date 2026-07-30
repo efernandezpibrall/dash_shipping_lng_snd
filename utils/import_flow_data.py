@@ -1,9 +1,7 @@
-import configparser
-import os
-
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
+from utils.database import DB_SCHEMA, engine
 from utils.ea_balance_catalog import build_resolved_ea_lng_balance_ctes
 from utils.ea_run_interface import (
     ea_values_at_run_source_sql,
@@ -18,27 +16,6 @@ from utils.flow_country_selection import (
     resolve_default_selected_countries,
     sanitize_raw_flow_data,
 )
-
-
-try:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_dir = os.path.abspath(os.path.join(script_dir, "..", ".."))
-    CONFIG_FILE_PATH = os.path.join(config_dir, "config.ini")
-except Exception:
-    CONFIG_FILE_PATH = "config.ini"
-
-
-config_reader = configparser.ConfigParser(interpolation=None)
-config_reader.read(CONFIG_FILE_PATH)
-
-DB_CONNECTION_STRING = config_reader.get("DATABASE", "CONNECTION_STRING", fallback=None)
-DB_SCHEMA = config_reader.get("DATABASE", "SCHEMA", fallback="at_lng")
-
-if not DB_CONNECTION_STRING:
-    raise ValueError(f"Missing DATABASE CONNECTION_STRING in {CONFIG_FILE_PATH}")
-
-
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
 
 DEFAULT_SELECTED_COUNTRIES = [

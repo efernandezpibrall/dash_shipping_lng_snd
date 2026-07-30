@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -51,6 +52,7 @@ from utils.ea_run_interface import (
     fetch_ea_comparison_runs,
     normalize_ea_run_id,
 )
+from utils.ea_balance_catalog import build_resolved_ea_lng_balance_ctes
 from utils.provider_flow_snapshot import (
     build_provider_flow_payload,
     get_provider_flow_snapshot,
@@ -628,23 +630,37 @@ def fetch_net_balance_for_woodmac_publications(
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> pd.DataFrame:
-    mapping_df = fetch_country_mapping_df()
-    export_raw_df = fetch_woodmac_export_flow_raw_data_for_publications(
-        short_term_market_outlook,
-        short_term_publication_timestamp,
-        long_term_market_outlook,
-        long_term_publication_timestamp,
-    )
-    import_raw_df = fetch_woodmac_import_flow_raw_data_for_publications(
-        short_term_market_outlook,
-        short_term_publication_timestamp,
-        long_term_market_outlook,
-        long_term_publication_timestamp,
-    )
+    tasks = {
+        "mapping": fetch_country_mapping_df,
+        "exports": lambda: fetch_woodmac_export_flow_raw_data_for_publications(
+            short_term_market_outlook,
+            short_term_publication_timestamp,
+            long_term_market_outlook,
+            long_term_publication_timestamp,
+        ),
+        "imports": lambda: fetch_woodmac_import_flow_raw_data_for_publications(
+            short_term_market_outlook,
+            short_term_publication_timestamp,
+            long_term_market_outlook,
+            long_term_publication_timestamp,
+        ),
+    }
+    with ThreadPoolExecutor(
+        max_workers=3,
+        thread_name_prefix="market-balance-comparison",
+    ) as executor:
+        futures = {
+            name: executor.submit(task)
+            for name, task in tasks.items()
+        }
+        results = {
+            name: futures[name].result()
+            for name in tasks
+        }
     return _build_provider_net_balance_table(
-        export_raw_df,
-        import_raw_df,
-        mapping_df=mapping_df,
+        results["exports"],
+        results["imports"],
+        mapping_df=results["mapping"],
         country_group=country_group,
         time_group=time_group,
         unit=unit,
@@ -666,21 +682,39 @@ def fetch_net_balance_for_ea_upload(
     run_id = normalize_ea_run_id(
         ea_as_of_run_id if ea_as_of_run_id is not None else upload_timestamp_utc
     )
-    mapping_df = fetch_country_mapping_df()
-    export_raw_df = fetch_ea_export_flow_raw_data_for_upload(
-        run_id,
-        start_date=start_date,
-        end_date=end_date,
-    )
-    import_raw_df = fetch_ea_import_flow_raw_data_for_upload(
-        run_id,
-        start_date=start_date,
-        end_date=end_date,
-    )
+    # Resolve the shared catalog capability probes before starting workers.
+    # The cache they populate is intentionally process-local and the export
+    # and import query builders consume the same resolved capability tuple.
+    build_resolved_ea_lng_balance_ctes(engine, DB_SCHEMA)
+    tasks = {
+        "mapping": fetch_country_mapping_df,
+        "exports": lambda: fetch_ea_export_flow_raw_data_for_upload(
+            run_id,
+            start_date=start_date,
+            end_date=end_date,
+        ),
+        "imports": lambda: fetch_ea_import_flow_raw_data_for_upload(
+            run_id,
+            start_date=start_date,
+            end_date=end_date,
+        ),
+    }
+    with ThreadPoolExecutor(
+        max_workers=3,
+        thread_name_prefix="market-balance-comparison",
+    ) as executor:
+        futures = {
+            name: executor.submit(task)
+            for name, task in tasks.items()
+        }
+        results = {
+            name: futures[name].result()
+            for name in tasks
+        }
     return _build_provider_net_balance_table(
-        export_raw_df,
-        import_raw_df,
-        mapping_df=mapping_df,
+        results["exports"],
+        results["imports"],
+        mapping_df=results["mapping"],
         country_group=country_group,
         time_group=time_group,
         unit=unit,

@@ -1,22 +1,39 @@
-from dash import html, dcc, callback, Output, Input, State
+from dash import (
+    html,
+    dcc,
+    callback,
+    Output,
+    Input,
+    State,
+    callback_context,
+)
 from dash.dash_table.Format import Format, Scheme
 from utils.ag_grid_tables import ag_grid_cell_clicked_to_active_cell, create_ag_grid_from_datatable
-from dash.exceptions import PreventUpdate
+from dash.exceptions import MissingCallbackContextException, PreventUpdate
 import plotly.graph_objects as go
+import numpy as np
 import pandas as pd
+import json
+import uuid
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from datetime import datetime, timedelta
 from sqlalchemy import text
 from utils.dashboard_snapshot_cache import (
+    SnapshotUnavailable as _SnapshotUnavailable,
     build_source_key as _build_source_key,
     get_or_build_snapshot as _get_or_build_snapshot,
+    is_snapshot_reference as _is_snapshot_reference,
     pack_record_mapping as _pack_record_mapping,
     resolve_snapshot as _resolve_snapshot,
+    snapshot_is_resolvable as _snapshot_is_resolvable,
     snapshot_is_shared as _snapshot_is_shared,
     unpack_record_mapping as _unpack_record_mapping,
     was_global_refresh_triggered as _was_global_refresh_triggered,
     with_snapshot_slot as _with_snapshot_slot,
 )
+from utils.performance import log_callback_timing
 
 from pages.importer_detail import (
     engine,
@@ -28,7 +45,11 @@ from pages.importer_detail import (
     _apply_importer_self_flow_exclusion,
     _build_importer_total_import_df,
     _build_importer_continent_chart_df,
+    _prepare_importer_summary_scope_df,
+    _build_importer_rolling_windows_pivot,
     build_importer_origin_summary_from_scoped_trades,
+    DESTINATION_AGGREGATION_LABELS,
+    IMPORTER_MAPPING_RENAME,
     IMPORTER_ORIGIN_LEVEL_TO_SCOPE,
     VOLUME_METRIC_OPTIONS,
     get_volume_metric_info,
@@ -85,6 +106,15 @@ IMPORTER_PERIOD_COMPARISON_BASIS_OPTIONS = [
 ]
 IMPORTER_PERIOD_TEXT_COLUMNS = ['Importer', 'Aggregation']
 IMPORTER_PERIOD_DELTA_RAW_FIELD_PREFIX = '__importer_period_delta_raw_'
+IMPORTER_PERIOD_PBD_CURRENT_COLUMNS = (
+    '30D_PBD_CURRENT',
+    '7D_PBD_CURRENT',
+)
+IMPORTER_PERIOD_PBD_REFERENCE_COLUMNS = ('30D_PBD', '7D_PBD')
+IMPORTER_PERIOD_PBD_DELTA_COLUMNS = (
+    'Δ 30D vs PBD',
+    'Δ 7D vs PBD',
+)
 ORIGIN_CONTINENT_CHART_COLOR_MAP = {
     'Africa': '#7a5195',
     'Americas': '#2f9e7e',
@@ -101,29 +131,445 @@ ORIGIN_CONTINENT_CHART_TYPE_OPTIONS = [
     {'label': 'Market Share (%)', 'value': 'percentage'},
 ]
 
-IMPORTERS_OVERVIEW_NAMESPACE = 'importers-overview-v1'
-IMPORTERS_PERIOD_NAMESPACE = 'importers-period-v1'
+IMPORTERS_SOURCE_NAMESPACE = 'importers-source-v3'
+IMPORTERS_OVERVIEW_NAMESPACE = 'importers-overview-v3'
+IMPORTERS_PERIOD_NAMESPACE = 'importers-period-v3'
+IMPORTERS_SOURCE_STATE_FORMAT = 'importers-source-state-v3'
+IMPORTERS_PERIOD_PAYLOAD_FORMAT = 'importers-period-summary-v3'
+IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE = (
+    'Cached importer data is unavailable. Click the global Refresh button '
+    'to reload it.'
+)
+IMPORTERS_RECORD_CUBE_FORMAT = 'importers-record-cube-zlib-json-v1'
+IMPORTERS_SCALAR_TAG = '__importers_scalar_v1__'
+
+
+def _tag_importers_json_value(value):
+    value_type = type(value)
+    if value is None or value_type in (str, int, float, bool):
+        return value
+    if value is pd.NaT:
+        return {IMPORTERS_SCALAR_TAG: 'pandas.NaT'}
+    if value is pd.NA:
+        return {IMPORTERS_SCALAR_TAG: 'pandas.NA'}
+    if isinstance(value, pd.Timestamp):
+        timezone = value.tz
+        timezone_name = (
+            getattr(timezone, 'zone', None)
+            or getattr(timezone, 'key', None)
+            or (str(timezone) if timezone is not None else None)
+        )
+        return {
+            IMPORTERS_SCALAR_TAG: 'pandas.Timestamp',
+            'nanoseconds': value.value,
+            'timezone': timezone_name,
+        }
+    if isinstance(value, np.generic):
+        return {
+            IMPORTERS_SCALAR_TAG: 'numpy.scalar',
+            'dtype': value.dtype.str,
+            'bytes': value.tobytes().hex(),
+        }
+    if isinstance(value, datetime):
+        return {
+            IMPORTERS_SCALAR_TAG: 'datetime.datetime',
+            'isoformat': value.isoformat(),
+            'fold': value.fold,
+        }
+    if isinstance(value, bytes):
+        return {
+            IMPORTERS_SCALAR_TAG: 'builtins.bytes',
+            'hex': value.hex(),
+        }
+    if isinstance(value, tuple):
+        return {
+            IMPORTERS_SCALAR_TAG: 'builtins.tuple',
+            'items': [
+                _tag_importers_json_value(item)
+                for item in value
+            ],
+        }
+    if isinstance(value, list):
+        return [
+            _tag_importers_json_value(item)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _tag_importers_json_value(item)
+            for key, item in value.items()
+        }
+    raise TypeError(f'{type(value).__name__} is not JSON serializable')
+
+
+def _decode_importers_json_object(value):
+    scalar_type = value.get(IMPORTERS_SCALAR_TAG)
+    if scalar_type == 'pandas.NaT' and len(value) == 1:
+        return pd.NaT
+    if scalar_type == 'pandas.NA' and len(value) == 1:
+        return pd.NA
+    if (
+        scalar_type == 'pandas.Timestamp'
+        and set(value) == {
+            IMPORTERS_SCALAR_TAG,
+            'nanoseconds',
+            'timezone',
+        }
+    ):
+        return pd.Timestamp(
+            value['nanoseconds'],
+            unit='ns',
+            tz=value['timezone'],
+        )
+    if (
+        scalar_type == 'numpy.scalar'
+        and set(value) == {
+            IMPORTERS_SCALAR_TAG,
+            'dtype',
+            'bytes',
+        }
+    ):
+        return np.frombuffer(
+            bytes.fromhex(value['bytes']),
+            dtype=np.dtype(value['dtype']),
+            count=1,
+        )[0]
+    if (
+        scalar_type == 'datetime.datetime'
+        and set(value) == {
+            IMPORTERS_SCALAR_TAG,
+            'isoformat',
+            'fold',
+        }
+    ):
+        return datetime.fromisoformat(value['isoformat']).replace(
+            fold=value['fold']
+        )
+    if (
+        scalar_type == 'builtins.bytes'
+        and set(value) == {IMPORTERS_SCALAR_TAG, 'hex'}
+    ):
+        return bytes.fromhex(value['hex'])
+    if (
+        scalar_type == 'builtins.tuple'
+        and set(value) == {IMPORTERS_SCALAR_TAG, 'items'}
+    ):
+        return tuple(value['items'])
+    return value
+
+
+def _encode_importers_json_payload(value, payload_format):
+    raw_payload = json.dumps(
+        _tag_importers_json_value(value),
+        ensure_ascii=False,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return {
+        'format': payload_format,
+        'payload': zlib.compress(raw_payload, level=1),
+    }
+
+
+def _decode_importers_json_payload(value, payload_format):
+    if not (
+        isinstance(value, dict)
+        and value.get('format') == payload_format
+    ):
+        return value
+    try:
+        encoded_payload = value['payload']
+        if not isinstance(encoded_payload, bytes):
+            raise TypeError('encoded importer payload is not bytes')
+        return json.loads(
+            zlib.decompress(encoded_payload).decode('utf-8'),
+            object_hook=_decode_importers_json_object,
+        )
+    except Exception as exc:
+        raise _SnapshotUnavailable(
+            IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+
+
+def _prepare_importers_overview_snapshot_payload(payload):
+    prepared = dict(payload)
+    if 'demand_years' not in prepared:
+        prepared['demand_years'] = _get_importer_chart_available_years(
+            _unpack_record_mapping(payload['demand_cube'])
+        )
+    if 'origin_years' not in prepared:
+        prepared['origin_years'] = _get_importer_chart_available_years(
+            _unpack_record_mapping(payload['origin_cube'])
+        )
+    prepared['demand_cube'] = _encode_importers_json_payload(
+        payload['demand_cube'],
+        IMPORTERS_RECORD_CUBE_FORMAT,
+    )
+    prepared['origin_cube'] = _encode_importers_json_payload(
+        payload['origin_cube'],
+        IMPORTERS_RECORD_CUBE_FORMAT,
+    )
+    return prepared
 
 
 def _fetch_importers_source_watermark():
-    query = text(f"""
-        SELECT snapshot_timestamp_utc
-        FROM {DB_SCHEMA}.kpler_trade_snapshots
-        WHERE run_kind = 'canonical' AND status = 'published'
-        ORDER BY snapshot_date_utc DESC
-        LIMIT 1
-    """)
     with engine.connect() as connection:
-        return connection.execute(query).scalar()
+        row = connection.execute(
+            text(f"""
+                WITH current_snapshot AS (
+                    SELECT
+                        snapshot_id,
+                        snapshot_date_utc,
+                        snapshot_timestamp_utc,
+                        facts_retained
+                    FROM {DB_SCHEMA}.kpler_trade_snapshots
+                    WHERE run_kind = 'canonical'
+                      AND status = 'published'
+                    ORDER BY
+                        snapshot_date_utc DESC,
+                        snapshot_timestamp_utc DESC,
+                        snapshot_id DESC
+                    LIMIT 1
+                )
+                SELECT
+                    current_snapshot.snapshot_id
+                        AS current_snapshot_id,
+                    current_snapshot.snapshot_date_utc
+                        AS current_snapshot_date_utc,
+                    current_snapshot.snapshot_timestamp_utc
+                        AS current_snapshot_timestamp_utc,
+                    current_snapshot.facts_retained
+                        AS current_facts_retained,
+                    baseline.snapshot_id
+                        AS baseline_snapshot_id,
+                    baseline.snapshot_date_utc
+                        AS baseline_snapshot_date_utc,
+                    baseline.snapshot_timestamp_utc
+                        AS baseline_snapshot_timestamp_utc,
+                    baseline.facts_retained
+                        AS baseline_facts_retained
+                FROM current_snapshot
+                LEFT JOIN LATERAL (
+                    SELECT
+                        snapshot_id,
+                        snapshot_date_utc,
+                        snapshot_timestamp_utc,
+                        facts_retained
+                    FROM {DB_SCHEMA}.kpler_trade_snapshots
+                    WHERE run_kind = 'canonical'
+                      AND status = 'published'
+                      AND facts_retained IS TRUE
+                      AND snapshot_date_utc
+                          < current_snapshot.snapshot_date_utc
+                      AND EXTRACT(
+                          ISODOW FROM snapshot_date_utc
+                      ) BETWEEN 1 AND 5
+                    ORDER BY
+                        snapshot_date_utc DESC,
+                        snapshot_timestamp_utc DESC,
+                        snapshot_id DESC
+                    LIMIT 1
+                ) AS baseline ON TRUE
+            """)
+        ).mappings().one_or_none()
+    return dict(row) if row is not None else None
+
+
+def _normalize_importers_source_watermark(value):
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    if value is None:
+        return None
+    return str(value)
+
+
+def _normalize_importers_snapshot_metadata(source_pair, prefix):
+    """Normalize one snapshot row from the atomic current/PBD lookup."""
+    if not isinstance(source_pair, dict):
+        return None
+    snapshot_id = source_pair.get(f'{prefix}_snapshot_id')
+    snapshot_date = source_pair.get(f'{prefix}_snapshot_date_utc')
+    snapshot_timestamp = source_pair.get(
+        f'{prefix}_snapshot_timestamp_utc'
+    )
+    if snapshot_id is None or snapshot_date is None or snapshot_timestamp is None:
+        return None
+    return {
+        'snapshot_id': int(snapshot_id),
+        'snapshot_date_utc': pd.Timestamp(snapshot_date).date().isoformat(),
+        'snapshot_timestamp_utc': _normalize_importers_source_watermark(
+            snapshot_timestamp
+        ),
+        'facts_retained': bool(
+            source_pair.get(f'{prefix}_facts_retained')
+        ),
+    }
+
+
+def _previous_importer_weekday_utc(value):
+    candidate = pd.Timestamp(value).date() - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _importer_business_day_gap(start_date, end_date):
+    if start_date is None or end_date is None:
+        return None
+    start = pd.Timestamp(start_date).date()
+    end = pd.Timestamp(end_date).date()
+    if start >= end:
+        return 0
+    return int(np.busday_count(start.isoformat(), end.isoformat()))
+
+
+def _build_importers_source_state(source_pair, refresh_token=None):
+    """Build the versioned current/PBD source contract."""
+    current_snapshot = _normalize_importers_snapshot_metadata(
+        source_pair,
+        'current',
+    )
+    baseline_snapshot = _normalize_importers_snapshot_metadata(
+        source_pair,
+        'baseline',
+    )
+    if current_snapshot is None:
+        scalar_watermark = (
+            source_pair
+            if not isinstance(source_pair, dict)
+            else None
+        )
+        return {
+            'format': IMPORTERS_SOURCE_STATE_FORMAT,
+            'watermark': _normalize_importers_source_watermark(
+                scalar_watermark
+            ),
+            'as_of_date': datetime.now().date().isoformat(),
+            'current_snapshot': None,
+            'baseline_snapshot': None,
+            'baseline_status': 'unavailable',
+            'business_day_gap': None,
+            'refresh_token': refresh_token,
+        }
+
+    expected_baseline_date = _previous_importer_weekday_utc(
+        current_snapshot['snapshot_date_utc']
+    )
+    baseline_status = 'unavailable'
+    business_day_gap = None
+    if baseline_snapshot is not None:
+        baseline_date = pd.Timestamp(
+            baseline_snapshot['snapshot_date_utc']
+        ).date()
+        baseline_status = (
+            'exact'
+            if baseline_date == expected_baseline_date
+            else 'fallback'
+        )
+        business_day_gap = _importer_business_day_gap(
+            baseline_date,
+            current_snapshot['snapshot_date_utc'],
+        )
+
+    return {
+        'format': IMPORTERS_SOURCE_STATE_FORMAT,
+        'watermark': current_snapshot['snapshot_timestamp_utc'],
+        'as_of_date': current_snapshot['snapshot_date_utc'],
+        'current_snapshot': current_snapshot,
+        'baseline_snapshot': baseline_snapshot,
+        'baseline_status': baseline_status,
+        'business_day_gap': business_day_gap,
+        'refresh_token': refresh_token,
+    }
+
+
+def _resolve_importers_source_store(source_data):
+    try:
+        resolved = _resolve_snapshot(
+            source_data,
+            engine,
+            expected_namespace=IMPORTERS_SOURCE_NAMESPACE,
+        )
+    except _SnapshotUnavailable as exc:
+        raise _SnapshotUnavailable(
+            IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+    if not (
+        isinstance(resolved, dict)
+        and isinstance(resolved.get('catalog_df'), pd.DataFrame)
+        and isinstance(resolved.get('ranking_df'), pd.DataFrame)
+        and isinstance(resolved.get('scoped_trades_df'), pd.DataFrame)
+    ):
+        raise _SnapshotUnavailable(
+            IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    return resolved
+
+
+def _reject_noncurrent_importers_overview_reference(value):
+    if (
+        _is_snapshot_reference(value)
+        and not _is_snapshot_reference(
+            value,
+            IMPORTERS_OVERVIEW_NAMESPACE,
+        )
+    ):
+        raise _SnapshotUnavailable(
+            IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        )
 
 
 def _resolve_importers_chart_store(charts_data):
-    resolved = _resolve_snapshot(
-        charts_data,
-        engine,
-        expected_namespace=IMPORTERS_OVERVIEW_NAMESPACE,
+    _reject_noncurrent_importers_overview_reference(charts_data)
+    try:
+        resolved = _resolve_snapshot(
+            charts_data,
+            engine,
+            expected_namespace=IMPORTERS_OVERVIEW_NAMESPACE,
+        )
+    except _SnapshotUnavailable as exc:
+        raise _SnapshotUnavailable(
+            IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+    resolved = _decode_importers_json_payload(
+        resolved,
+        IMPORTERS_RECORD_CUBE_FORMAT,
     )
     return _unpack_record_mapping(resolved)
+
+
+def _resolve_importers_entities_store(entities_data, slot):
+    _reject_noncurrent_importers_overview_reference(entities_data)
+    try:
+        return _resolve_snapshot(
+            entities_data,
+            engine,
+            expected_namespace=IMPORTERS_OVERVIEW_NAMESPACE,
+            slot=slot,
+        )
+    except _SnapshotUnavailable as exc:
+        raise _SnapshotUnavailable(
+            IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+
+
+def _resolve_importers_years_store(charts_data, slot):
+    _reject_noncurrent_importers_overview_reference(charts_data)
+    try:
+        years = _resolve_snapshot(
+            charts_data,
+            engine,
+            expected_namespace=IMPORTERS_OVERVIEW_NAMESPACE,
+            slot=slot,
+        )
+    except _SnapshotUnavailable as exc:
+        raise _SnapshotUnavailable(
+            IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+    if isinstance(years, list):
+        return list(years)
+    return _get_importer_chart_available_years(
+        _resolve_importers_chart_store(charts_data)
+    )
 
 
 def _resolve_importers_period_store(period_data):
@@ -131,6 +577,25 @@ def _resolve_importers_period_store(period_data):
         period_data,
         engine,
         expected_namespace=IMPORTERS_PERIOD_NAMESPACE,
+    )
+
+
+def _importers_snapshot_recovery_notice():
+    return html.Div(
+        IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE,
+        className='importers-snapshot-recovery-message',
+        role='alert',
+    )
+
+
+def _importers_snapshot_recovery_selector_result():
+    return (
+        [{
+            'label': IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE,
+            'value': '__snapshot_unavailable__',
+            'disabled': True,
+        }],
+        [],
     )
 
 IMPORTER_CLASSIFICATION_OPTIONS = [
@@ -356,6 +821,352 @@ def _build_chart_export_df(charts_data, volume_metric='mcm_d', selected_years=No
     return pd.concat(all_frames, ignore_index=True)
 
 
+def _normalize_importer_mapping_value(value):
+    if pd.isna(value):
+        return None
+    normalized = str(value).strip()
+    return normalized if normalized else None
+
+
+def _collapse_importer_mapping_values(series):
+    normalized_values = sorted({
+        value
+        for value in (
+            _normalize_importer_mapping_value(item)
+            for item in series
+        )
+        if value is not None
+    })
+    if len(normalized_values) == 1:
+        return normalized_values[0]
+    return 'Unknown'
+
+
+def _first_importer_mapping_value(series, fallback=''):
+    for item in series:
+        normalized = _normalize_importer_mapping_value(item)
+        if normalized is not None:
+            return normalized
+    return fallback
+
+
+def _fetch_importers_catalog_ranking_source_df(
+    snapshot_timestamp_utc=None,
+    as_of_date=None,
+):
+    """Fetch the destination catalog and exact 30-day ranking inputs once."""
+    if snapshot_timestamp_utc is None:
+        snapshot_cte = f"""
+            SELECT snapshot_timestamp_utc AS max_ts
+            FROM {DB_SCHEMA}.kpler_trade_snapshots
+            WHERE run_kind = 'canonical' AND status = 'published'
+            ORDER BY
+                snapshot_date_utc DESC,
+                snapshot_timestamp_utc DESC,
+                snapshot_id DESC
+            LIMIT 1
+        """
+        ranking_start_clause = (
+            "CURRENT_DATE - INTERVAL '29 days'"
+        )
+        ranking_end_clause = (
+            "CURRENT_DATE + INTERVAL '1 day'"
+        )
+        params = None
+    else:
+        normalized_as_of_date = pd.Timestamp(
+            as_of_date
+        ).normalize().date()
+        snapshot_cte = (
+            'SELECT CAST(:snapshot_timestamp_utc AS timestamptz) '
+            'AS max_ts'
+        )
+        ranking_start_clause = ':ranking_start_date'
+        ranking_end_clause = ':ranking_end_date'
+        params = {
+            'snapshot_timestamp_utc': snapshot_timestamp_utc,
+            'ranking_start_date': (
+                normalized_as_of_date - timedelta(days=29)
+            ),
+            'ranking_end_date': (
+                normalized_as_of_date + timedelta(days=1)
+            ),
+        }
+    query = text(f"""
+        WITH latest_timestamp AS (
+            {snapshot_cte}
+        ),
+        destinations AS (
+            SELECT DISTINCT kt.destination_country_name
+            FROM {DB_SCHEMA}.kpler_trades kt
+            CROSS JOIN latest_timestamp
+            WHERE kt.upload_timestamp_utc = latest_timestamp.max_ts
+                AND kt.destination_country_name IS NOT NULL
+        ),
+        ranking AS (
+            SELECT
+                kt.destination_country_name,
+                SUM(
+                    COALESCE(
+                        kt.cargo_destination_cubic_meters,
+                        0
+                    ) * {MCM_PER_CUBIC_METER}
+                ) / 30.0 AS avg_30d_mcmd
+            FROM {DB_SCHEMA}.kpler_trades kt
+            CROSS JOIN latest_timestamp
+            INNER JOIN {DB_SCHEMA}.mappings_country
+                destination_map
+                ON destination_map.country =
+                    kt.destination_country_name
+            LEFT JOIN {DB_SCHEMA}.mappings_country origin_map
+                ON origin_map.country = kt.origin_country_name
+            WHERE kt.upload_timestamp_utc = latest_timestamp.max_ts
+                AND kt.destination_country_name IS NOT NULL
+                AND kt."end" IS NOT NULL
+                AND kt.cargo_destination_cubic_meters IS NOT NULL
+                AND kt."end" >= {ranking_start_clause}
+                AND kt."end" < {ranking_end_clause}
+                AND (
+                    origin_map.country IS NULL
+                    OR NULLIF(BTRIM(origin_map.country_name), '')
+                        IS DISTINCT FROM NULLIF(BTRIM(
+                            destination_map.country_name
+                        ), '')
+                )
+            GROUP BY kt.destination_country_name
+        )
+        SELECT
+            destinations.destination_country_name,
+            ranking.avg_30d_mcmd
+        FROM destinations
+        LEFT JOIN ranking USING (destination_country_name)
+        ORDER BY destinations.destination_country_name
+    """)
+    if params is None:
+        return pd.read_sql(query, engine)
+    return pd.read_sql(query, engine, params=params)
+
+
+def _fetch_importers_mapping_source_df():
+    """Load the single mapping source shared by catalog and scoped trades."""
+    mapping_columns = [
+        'country_name',
+        'country',
+        *[
+            column
+            for column in DESTINATION_AGGREGATION_LABELS
+            if column != 'country'
+        ],
+    ]
+    return pd.read_sql(
+        text(f"""
+            SELECT {', '.join(mapping_columns)}
+            FROM {DB_SCHEMA}.mappings_country
+            WHERE country_name IS NOT NULL OR country IS NOT NULL
+        """),
+        engine,
+    )
+
+
+def _build_destination_catalog_mapping_df(mapping_source_df):
+    mapping_df = (
+        mapping_source_df.copy()
+        if mapping_source_df is not None
+        else pd.DataFrame()
+    )
+    expected_columns = [
+        'country_name',
+        'country',
+        *[
+            column
+            for column in DESTINATION_AGGREGATION_LABELS
+            if column != 'country'
+        ],
+    ]
+    for column in expected_columns:
+        if column not in mapping_df.columns:
+            mapping_df[column] = None
+
+    mapping_df['country'] = mapping_df['country'].apply(
+        _normalize_importer_mapping_value
+    )
+    mapping_df = mapping_df[mapping_df['country'].notna()].copy()
+    if mapping_df.empty:
+        return pd.DataFrame(columns=[
+            'country',
+            'country_display',
+            *[
+                column
+                for column in DESTINATION_AGGREGATION_LABELS
+                if column != 'country'
+            ],
+        ])
+
+    mapping_df['country_display'] = mapping_df['country_name']
+    aggregation_spec = {
+        'country_display': (
+            lambda series: _first_importer_mapping_value(series)
+        ),
+    }
+    for column in DESTINATION_AGGREGATION_LABELS:
+        if column == 'country':
+            continue
+        aggregation_spec[column] = _collapse_importer_mapping_values
+    return mapping_df.groupby(
+        'country',
+        as_index=False,
+    ).agg(aggregation_spec)
+
+
+def _build_importer_mapping_lookup_from_source(mapping_source_df):
+    """Build importer-detail's origin lookup without another database read."""
+    lookup_columns = [
+        'mapping_key',
+        *list(IMPORTER_MAPPING_RENAME.values()),
+    ]
+    mapping_df = (
+        mapping_source_df.copy()
+        if mapping_source_df is not None
+        else pd.DataFrame()
+    )
+    expected_columns = [
+        'country_name',
+        'country',
+        *list(IMPORTER_MAPPING_RENAME.keys()),
+    ]
+    for column in expected_columns:
+        if column not in mapping_df.columns:
+            mapping_df[column] = None
+        mapping_df[column] = mapping_df[column].apply(
+            _normalize_importer_mapping_value
+        )
+
+    mapping_df['country_name'] = mapping_df['country_name'].fillna(
+        mapping_df['country']
+    )
+    mapping_df = mapping_df[
+        mapping_df['country_name'].notna()
+    ].copy()
+    if mapping_df.empty:
+        return pd.DataFrame(columns=lookup_columns)
+
+    canonical_spec = {}
+    for column in IMPORTER_MAPPING_RENAME:
+        canonical_spec[column] = _collapse_importer_mapping_values
+
+    raw_alias_df = mapping_df[
+        ['country', *list(IMPORTER_MAPPING_RENAME.keys())]
+    ].rename(columns={'country': 'mapping_key'})
+    canonical_alias_df = (
+        mapping_df.groupby('country_name', as_index=False)
+        .agg(canonical_spec)
+        .rename(columns={'country_name': 'mapping_key'})
+    )
+    lookup_df = pd.concat(
+        [raw_alias_df, canonical_alias_df],
+        ignore_index=True,
+    )
+    lookup_df['mapping_key'] = lookup_df['mapping_key'].apply(
+        _normalize_importer_mapping_value
+    )
+    lookup_df = lookup_df[lookup_df['mapping_key'].notna()].copy()
+    lookup_df = lookup_df.drop_duplicates(
+        subset=['mapping_key'],
+        keep='first',
+    )
+    lookup_df = lookup_df.rename(columns=IMPORTER_MAPPING_RENAME)
+    for column in IMPORTER_MAPPING_RENAME.values():
+        lookup_df[column] = (
+            lookup_df[column]
+            .apply(_normalize_importer_mapping_value)
+            .fillna('Unknown')
+        )
+    return lookup_df[lookup_columns]
+
+
+def _build_destination_catalog_and_ranking_from_sources(
+    catalog_ranking_source_df,
+    mapping_source_df,
+):
+    source_df = (
+        catalog_ranking_source_df.copy()
+        if catalog_ranking_source_df is not None
+        else pd.DataFrame()
+    )
+    if source_df.empty:
+        empty_catalog = get_destination_catalog_dataframe([])
+        return empty_catalog, pd.DataFrame()
+
+    if 'destination_country_name' not in source_df.columns:
+        source_df['destination_country_name'] = None
+    if 'avg_30d_mcmd' not in source_df.columns:
+        source_df['avg_30d_mcmd'] = pd.NA
+    source_df['destination_country_name'] = (
+        source_df['destination_country_name']
+        .apply(_normalize_importer_mapping_value)
+    )
+    source_df = (
+        source_df[source_df['destination_country_name'].notna()]
+        .drop_duplicates(subset=['destination_country_name'])
+        .copy()
+    )
+    if source_df.empty:
+        empty_catalog = get_destination_catalog_dataframe([])
+        return empty_catalog, pd.DataFrame()
+
+    mapping_df = _build_destination_catalog_mapping_df(
+        mapping_source_df
+    )
+    catalog_df = source_df[
+        ['destination_country_name']
+    ].merge(
+        mapping_df,
+        how='left',
+        left_on='destination_country_name',
+        right_on='country',
+    )
+    catalog_df['country'] = catalog_df['destination_country_name']
+    catalog_df['country_display'] = catalog_df[
+        'country_display'
+    ].fillna(catalog_df['destination_country_name'])
+    for column in DESTINATION_AGGREGATION_LABELS:
+        if column == 'country':
+            continue
+        catalog_df[column] = catalog_df[column].fillna('Unknown')
+    catalog_df = get_destination_catalog_dataframe(
+        catalog_df.to_dict('records')
+    )
+    catalog_df = catalog_df.sort_values(
+        ['country_display', 'destination_country_name']
+    ).reset_index(drop=True)
+
+    ranked_source_df = source_df[
+        source_df['avg_30d_mcmd'].notna()
+    ][['destination_country_name', 'avg_30d_mcmd']].copy()
+    if ranked_source_df.empty:
+        ranking_df = catalog_df[
+            ['destination_country_name', 'country_display']
+        ].copy()
+        ranking_df['avg_30d_mcmd'] = pd.NA
+        return catalog_df, ranking_df
+
+    ranking_df = ranked_source_df.merge(
+        catalog_df[
+            ['destination_country_name', 'country_display']
+        ],
+        how='left',
+        on='destination_country_name',
+    )
+    ranking_df['country_display'] = ranking_df[
+        'country_display'
+    ].fillna(ranking_df['destination_country_name'])
+    ranking_df = ranking_df.sort_values(
+        ['avg_30d_mcmd', 'destination_country_name'],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+    return catalog_df, ranking_df
+
+
 def _fetch_destination_ranking_df(catalog_df=None):
     """Return latest-30D destination demand rankings at country level."""
     if catalog_df is None:
@@ -377,14 +1188,23 @@ def _fetch_destination_ranking_df(catalog_df=None):
             SUM(COALESCE(kt.cargo_destination_cubic_meters, 0) * {MCM_PER_CUBIC_METER}) / 30.0 AS avg_30d_mcmd
         FROM {DB_SCHEMA}.kpler_trades kt
         CROSS JOIN latest_timestamp
+        INNER JOIN {DB_SCHEMA}.mappings_country destination_map
+            ON destination_map.country = kt.destination_country_name
+        LEFT JOIN {DB_SCHEMA}.mappings_country origin_map
+            ON origin_map.country = kt.origin_country_name
         WHERE kt.upload_timestamp_utc = latest_timestamp.max_ts
             AND kt.destination_country_name IS NOT NULL
             AND kt."end" IS NOT NULL
             AND kt.cargo_destination_cubic_meters IS NOT NULL
-            AND kt."end"::date > CURRENT_DATE - INTERVAL '30 days'
-            AND kt."end"::date <= CURRENT_DATE
-            AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
-                IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
+            AND kt."end" >= CURRENT_DATE - INTERVAL '29 days'
+            AND kt."end" < CURRENT_DATE + INTERVAL '1 day'
+            AND (
+                origin_map.country IS NULL
+                OR NULLIF(BTRIM(origin_map.country_name), '')
+                    IS DISTINCT FROM NULLIF(BTRIM(
+                        destination_map.country_name
+                    ), '')
+            )
         GROUP BY kt.destination_country_name
         ORDER BY avg_30d_mcmd DESC, kt.destination_country_name
     """)
@@ -534,7 +1354,9 @@ def _filter_scoped_trades_for_entity(scoped_trades_df, entity, classification_mo
 
 
 def _build_chart_data_payload(importer_entities, classification_mode='Country',
-                              rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS):
+                              rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS,
+                              scoped_trades_df=None,
+                              global_scoped_trades_df=None):
     """Build the demand and origin-continent chart payloads for overview importers."""
     demand_charts_data = {}
     origin_continent_charts_data = {}
@@ -546,16 +1368,42 @@ def _build_chart_data_payload(importer_entities, classification_mode='Country',
     if not all_destination_countries:
         return demand_charts_data, origin_continent_charts_data
 
-    scoped_trades_df = _fetch_importer_scoped_trades(
-        engine,
-        all_destination_countries,
-        min_end_date=IMPORTER_CHART_QUERY_START_DATE,
-        include_destination_context=True
-    )
+    if scoped_trades_df is None:
+        selected_aggregation = (
+            _classification_mode_to_destination_aggregation(
+                classification_mode
+            )
+        )
+        scoped_trades_df = _fetch_importer_scoped_trades(
+            engine,
+            all_destination_countries,
+            min_end_date=IMPORTER_CHART_QUERY_START_DATE,
+            include_destination_context=True,
+            selected_destination_aggregation=selected_aggregation,
+        )
+        if selected_aggregation != 'country':
+            global_scoped_trades_df = _fetch_importer_scoped_trades(
+                engine,
+                all_destination_countries,
+                min_end_date=IMPORTER_CHART_QUERY_START_DATE,
+                include_destination_context=True,
+                selected_destination_aggregation='country',
+            )
+    if global_scoped_trades_df is None:
+        global_scoped_trades_df = scoped_trades_df
     for entity in importer_entities:
         entity_label = entity['label']
         try:
-            filtered_df = _filter_scoped_trades_for_entity(scoped_trades_df, entity, classification_mode)
+            entity_source_df = (
+                global_scoped_trades_df
+                if entity.get('is_global')
+                else scoped_trades_df
+            )
+            filtered_df = _filter_scoped_trades_for_entity(
+                entity_source_df,
+                entity,
+                classification_mode,
+            )
 
             demand_df = _build_importer_total_import_df(
                 filtered_df,
@@ -582,33 +1430,40 @@ def _build_chart_data_payload(importer_entities, classification_mode='Country',
     return demand_charts_data, origin_continent_charts_data
 
 
-def group_small_importer_origin_countries(scoped_trades_df, origin_level='origin_shipping_region',
-                                          threshold_mcmd=10, lookback_months=24):
-    """Group low-volume origin countries into Rest of countries for the importer period table."""
+def _build_small_importer_origin_grouping(
+    scoped_trades_df,
+    origin_level='origin_shipping_region',
+    threshold_mcmd=10,
+    lookback_months=24,
+    as_of_date=None,
+):
+    """Derive the small-origin taxonomy once from the current vintage."""
     if scoped_trades_df is None or scoped_trades_df.empty:
-        return scoped_trades_df
+        return None
     if 'origin_country' not in scoped_trades_df.columns or 'end_date' not in scoped_trades_df.columns:
-        return scoped_trades_df
+        return None
 
     grouped_df = scoped_trades_df.copy()
     grouped_df['end_date'] = pd.to_datetime(grouped_df['end_date'], errors='coerce').dt.normalize()
     grouped_df = grouped_df[grouped_df['end_date'].notna()].copy()
     if grouped_df.empty:
-        return grouped_df
+        return None
 
     scope_column = IMPORTER_ORIGIN_LEVEL_TO_SCOPE.get(origin_level or 'origin_shipping_region', 'origin_shipping_region')
     parent_cols = []
     if scope_column != 'origin_country':
         if scope_column not in grouped_df.columns:
-            return grouped_df
+            return None
         parent_cols = [scope_column]
 
-    current_timestamp = pd.Timestamp(datetime.now()).normalize()
+    current_timestamp = pd.Timestamp(
+        as_of_date or datetime.now()
+    ).normalize()
     current_month = current_timestamp.to_period('M')
     start_month = current_month - (lookback_months - 1)
     lookback_df = grouped_df[grouped_df['end_date'].dt.to_period('M') >= start_month].copy()
     if lookback_df.empty:
-        return grouped_df
+        return None
 
     lookback_df['__month_period'] = lookback_df['end_date'].dt.to_period('M')
     monthly_totals = (
@@ -618,7 +1473,7 @@ def group_small_importer_origin_countries(scoped_trades_df, origin_level='origin
         .reset_index()
     )
     if monthly_totals.empty:
-        return grouped_df
+        return None
 
     monthly_totals['__days'] = monthly_totals['__month_period'].apply(
         lambda month_period: (
@@ -641,8 +1496,36 @@ def group_small_importer_origin_countries(scoped_trades_df, origin_level='origin
     pair_threshold_df['__monthly_mcmd'] = pair_threshold_df['__monthly_mcmd'].fillna(0)
     small_pairs = pair_threshold_df[pair_threshold_df['__monthly_mcmd'] <= threshold_mcmd][pair_cols].copy()
     if small_pairs.empty:
-        return grouped_df
+        return None
 
+    return {
+        'pair_cols': pair_cols,
+        'small_pairs': small_pairs.to_dict('records'),
+    }
+
+
+def _apply_small_importer_origin_grouping(
+    scoped_trades_df,
+    grouping_config,
+):
+    if (
+        scoped_trades_df is None
+        or scoped_trades_df.empty
+        or not isinstance(grouping_config, dict)
+    ):
+        return scoped_trades_df
+    pair_cols = list(grouping_config.get('pair_cols') or [])
+    small_pairs = pd.DataFrame(
+        grouping_config.get('small_pairs') or []
+    )
+    if (
+        'origin_country' not in pair_cols
+        or small_pairs.empty
+        or not set(pair_cols).issubset(scoped_trades_df.columns)
+    ):
+        return scoped_trades_df
+
+    grouped_df = scoped_trades_df.copy()
     small_pairs['__group_small_country'] = True
     grouped_df = grouped_df.merge(small_pairs, on=pair_cols, how='left')
     grouped_df['__group_small_country'] = grouped_df['__group_small_country'].eq(True)
@@ -650,8 +1533,36 @@ def group_small_importer_origin_countries(scoped_trades_df, origin_level='origin
     return grouped_df.drop(columns='__group_small_country')
 
 
+def group_small_importer_origin_countries(
+    scoped_trades_df,
+    origin_level='origin_shipping_region',
+    threshold_mcmd=10,
+    lookback_months=24,
+    as_of_date=None,
+    grouping_config=None,
+    return_grouping_config=False,
+):
+    """Apply one current-vintage small-origin taxonomy to importer facts."""
+    if grouping_config is None:
+        grouping_config = _build_small_importer_origin_grouping(
+            scoped_trades_df,
+            origin_level=origin_level,
+            threshold_mcmd=threshold_mcmd,
+            lookback_months=lookback_months,
+            as_of_date=as_of_date,
+        )
+    grouped_df = _apply_small_importer_origin_grouping(
+        scoped_trades_df,
+        grouping_config,
+    )
+    if return_grouping_config:
+        return grouped_df, grouping_config
+    return grouped_df
+
+
 def _get_small_importer_destination_countries(scoped_trades_df, importer_entities,
-                                              threshold_mcmd=10, lookback_months=24):
+                                              threshold_mcmd=10, lookback_months=24,
+                                              as_of_date=None):
     """Return importer countries whose delivered import volume stays below the small-country threshold."""
     if scoped_trades_df is None or scoped_trades_df.empty:
         return set()
@@ -689,7 +1600,9 @@ def _get_small_importer_destination_countries(scoped_trades_df, importer_entitie
         (grouped_df['origin_country'] != grouped_df['destination_country_name'])
     ].copy()
 
-    current_timestamp = pd.Timestamp(datetime.now()).normalize()
+    current_timestamp = pd.Timestamp(
+        as_of_date or datetime.now()
+    ).normalize()
     current_month = current_timestamp.to_period('M')
     start_month = current_month - (lookback_months - 1)
     lookback_df = grouped_df[grouped_df['end_date'].dt.to_period('M') >= start_month].copy()
@@ -736,7 +1649,8 @@ def _get_small_importer_destination_countries(scoped_trades_df, importer_entitie
 
 
 def _group_small_importer_entities(importer_entities, scoped_trades_df, classification_mode='Country',
-                                   threshold_mcmd=10, lookback_months=24):
+                                   threshold_mcmd=10, lookback_months=24,
+                                   as_of_date=None):
     """Collapse low-volume importer countries into Rest of Importers for the grouped table payload."""
     if classification_mode != 'Country':
         return importer_entities or []
@@ -746,7 +1660,8 @@ def _group_small_importer_entities(importer_entities, scoped_trades_df, classifi
         scoped_trades_df,
         importer_entities,
         threshold_mcmd=threshold_mcmd,
-        lookback_months=lookback_months
+        lookback_months=lookback_months,
+        as_of_date=as_of_date,
     )
     if not small_destinations:
         return importer_entities
@@ -788,7 +1703,18 @@ def _group_small_importer_entities(importer_entities, scoped_trades_df, classifi
 
 def _empty_importer_period_payload(grouping_mode='group_small_countries'):
     grouping_mode = _normalize_importer_period_origin_grouping(grouping_mode)
-    return {'active_grouping_mode': grouping_mode, 'show_all': [], 'group_small_countries': []}
+    return {
+        'format': IMPORTERS_PERIOD_PAYLOAD_FORMAT,
+        'active_grouping_mode': grouping_mode,
+        'show_all': [],
+        'group_small_countries': [],
+        'snapshot_comparison': {
+            'status': 'unavailable',
+            'current_snapshot': None,
+            'baseline_snapshot': None,
+            'business_day_gap': None,
+        },
+    }
 
 
 def _resolve_importer_period_payload(period_payload, grouping_mode='group_small_countries'):
@@ -809,25 +1735,261 @@ def _resolve_importer_period_payload(period_payload, grouping_mode='group_small_
     return []
 
 
+def _build_importer_period_snapshot_comparison(
+    source_state,
+    baseline_data_available,
+):
+    source_state = (
+        source_state if isinstance(source_state, dict) else {}
+    )
+    current_snapshot = source_state.get('current_snapshot')
+    baseline_snapshot = source_state.get('baseline_snapshot')
+    status = source_state.get('baseline_status')
+    if (
+        status not in {'exact', 'fallback'}
+        or not isinstance(current_snapshot, dict)
+        or not isinstance(baseline_snapshot, dict)
+        or not baseline_data_available
+    ):
+        status = 'unavailable'
+    return {
+        'status': status,
+        'current_snapshot': (
+            dict(current_snapshot)
+            if isinstance(current_snapshot, dict)
+            else None
+        ),
+        'baseline_snapshot': (
+            dict(baseline_snapshot)
+            if isinstance(baseline_snapshot, dict)
+            else None
+        ),
+        'business_day_gap': source_state.get('business_day_gap'),
+    }
+
+
+def _build_importer_pbd_rolling_summary(
+    scoped_trades_df,
+    origin_level,
+    as_of_date,
+):
+    """Build only the exact 30D/7D levels needed for PBD comparison."""
+    summary_scope_df = _prepare_importer_summary_scope_df(
+        scoped_trades_df,
+        origin_level or 'origin_shipping_region',
+    )
+    rolling_df = _build_importer_rolling_windows_pivot(
+        summary_scope_df,
+        rolling_window_days=30,
+        current_date=as_of_date,
+    )
+    return rolling_df[
+        [
+            column_name
+            for column_name in (
+                'continent',
+                'country',
+                '30D',
+                '7D',
+            )
+            if column_name in rolling_df.columns
+        ]
+    ].copy()
+
+
+def _merge_importer_period_pbd_windows(
+    summary_df,
+    current_pbd_df,
+    baseline_pbd_df,
+    baseline_available,
+):
+    """Outer-join current/PBD rolling levels so additions/removals survive."""
+    id_cols = ['continent', 'country']
+    merged = (
+        summary_df.copy()
+        if summary_df is not None
+        else pd.DataFrame()
+    )
+    if not baseline_available:
+        if merged.empty:
+            return merged
+        for column_name in (
+            *IMPORTER_PERIOD_PBD_CURRENT_COLUMNS,
+            *IMPORTER_PERIOD_PBD_REFERENCE_COLUMNS,
+            *IMPORTER_PERIOD_PBD_DELTA_COLUMNS,
+        ):
+            merged[column_name] = np.nan
+        return merged
+
+    if merged.empty:
+        merged = pd.DataFrame(columns=id_cols)
+    original_numeric_columns = [
+        column_name
+        for column_name in merged.columns
+        if column_name not in id_cols
+    ]
+
+    def _rolling_values(frame, rename_map):
+        frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+        columns = [
+            column_name
+            for column_name in [*id_cols, '30D', '7D']
+            if column_name in frame.columns
+        ]
+        if not set(id_cols).issubset(columns):
+            return pd.DataFrame(columns=[*id_cols, *rename_map.values()])
+        result = frame[columns].copy().rename(columns=rename_map)
+        for target_column in rename_map.values():
+            if target_column not in result.columns:
+                result[target_column] = 0.0
+        return result[[*id_cols, *rename_map.values()]]
+
+    current_values = _rolling_values(
+        current_pbd_df,
+        {
+            '30D': '30D_PBD_CURRENT',
+            '7D': '7D_PBD_CURRENT',
+        },
+    )
+    baseline_values = _rolling_values(
+        baseline_pbd_df,
+        {
+            '30D': '30D_PBD',
+            '7D': '7D_PBD',
+        },
+    )
+    merged = merged.merge(current_values, on=id_cols, how='outer')
+    merged = merged.merge(baseline_values, on=id_cols, how='outer')
+    merged = merged.copy()
+
+    pbd_level_columns = [
+        *original_numeric_columns,
+        *IMPORTER_PERIOD_PBD_CURRENT_COLUMNS,
+        *IMPORTER_PERIOD_PBD_REFERENCE_COLUMNS,
+    ]
+    missing_level_columns = [
+        column_name
+        for column_name in pbd_level_columns
+        if column_name not in merged.columns
+    ]
+    if missing_level_columns:
+        merged = pd.concat(
+            [
+                merged,
+                pd.DataFrame(
+                    0.0,
+                    index=merged.index,
+                    columns=missing_level_columns,
+                ),
+            ],
+            axis=1,
+        )
+    merged[pbd_level_columns] = (
+        merged[pbd_level_columns]
+        .apply(pd.to_numeric, errors='coerce')
+        .fillna(0.0)
+    )
+    merged = merged.copy()
+
+    merged['Δ 30D vs PBD'] = (
+        merged['30D_PBD_CURRENT'] - merged['30D_PBD']
+    ).round(1)
+    merged['Δ 7D vs PBD'] = (
+        merged['7D_PBD_CURRENT'] - merged['7D_PBD']
+    ).round(1)
+    return merged
+
+
 def _build_period_payload(importer_entities, classification_mode, origin_level,
                           grouping_mode='group_small_countries',
-                          rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS):
+                          rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS,
+                          source_state=None):
     """Build the raw per-importer period-analysis payload."""
     grouping_mode = _normalize_importer_period_origin_grouping(grouping_mode)
+    source_state = _normalize_importers_source_state(source_state)
+    has_snapshot_pair_contract = (
+        source_state.get('format') == IMPORTERS_SOURCE_STATE_FORMAT
+        and isinstance(source_state.get('current_snapshot'), dict)
+    )
+    current_snapshot = source_state.get('current_snapshot') or {}
+    baseline_snapshot = source_state.get('baseline_snapshot') or {}
+    current_as_of_date = (
+        current_snapshot.get('snapshot_date_utc')
+        or source_state.get('as_of_date')
+        or datetime.now().date().isoformat()
+    )
+    baseline_as_of_date = baseline_snapshot.get(
+        'snapshot_date_utc'
+    )
     all_destination_countries = sorted({
         country
         for entity in importer_entities or []
         for country in entity.get('destination_countries', [])
     })
     scoped_trades_df = pd.DataFrame()
+    selected_destination_aggregation = (
+        _classification_mode_to_destination_aggregation(
+            classification_mode
+        )
+    )
     if all_destination_countries:
+        current_query_kwargs = {
+            'delivered_only': True,
+            'include_destination_context': True,
+            'selected_destination_aggregation': (
+                selected_destination_aggregation
+            ),
+        }
+        if has_snapshot_pair_contract:
+            current_query_kwargs.update({
+                'snapshot_timestamp_utc': current_snapshot.get(
+                    'snapshot_timestamp_utc'
+                ),
+                'max_end_date': current_as_of_date,
+            })
         scoped_trades_df = _fetch_importer_scoped_trades(
             engine,
             all_destination_countries,
-            vessel_type='All',
-            delivered_only=True,
-            include_destination_context=True
+            **current_query_kwargs,
         )
+
+    baseline_scoped_trades_df = pd.DataFrame()
+    baseline_candidate_available = (
+        has_snapshot_pair_contract
+        and source_state.get('baseline_status') in {'exact', 'fallback'}
+        and baseline_snapshot.get('snapshot_timestamp_utc')
+        and baseline_as_of_date
+    )
+    if all_destination_countries and baseline_candidate_available:
+        baseline_start_date = (
+            pd.Timestamp(baseline_as_of_date)
+            - pd.Timedelta(days=29)
+        ).date()
+        try:
+            baseline_scoped_trades_df = _fetch_importer_scoped_trades(
+                engine,
+                all_destination_countries,
+                min_end_date=baseline_start_date,
+                delivered_only=True,
+                include_destination_context=True,
+                selected_destination_aggregation=(
+                    selected_destination_aggregation
+                ),
+                snapshot_timestamp_utc=baseline_snapshot[
+                    'snapshot_timestamp_utc'
+                ],
+                max_end_date=baseline_as_of_date,
+            )
+        except Exception:
+            baseline_scoped_trades_df = pd.DataFrame()
+    baseline_data_available = (
+        baseline_candidate_available
+        and not baseline_scoped_trades_df.empty
+    )
+    snapshot_comparison = _build_importer_period_snapshot_comparison(
+        source_state,
+        baseline_data_available,
+    )
 
     def _build_payload_variant(entities, group_small_origins=False):
         payload = []
@@ -838,10 +2000,27 @@ def _build_period_payload(importer_entities, classification_mode, origin_level,
                     entity,
                     classification_mode
                 )
+                baseline_entity_scoped_df = _filter_scoped_trades_for_entity(
+                    baseline_scoped_trades_df,
+                    entity,
+                    classification_mode,
+                )
                 if group_small_origins:
-                    entity_scoped_df = group_small_importer_origin_countries(
+                    (
                         entity_scoped_df,
-                        origin_level or 'origin_shipping_region'
+                        origin_grouping_config,
+                    ) = group_small_importer_origin_countries(
+                        entity_scoped_df,
+                        origin_level or 'origin_shipping_region',
+                        as_of_date=current_as_of_date,
+                        return_grouping_config=True,
+                    )
+                    baseline_entity_scoped_df = (
+                        group_small_importer_origin_countries(
+                            baseline_entity_scoped_df,
+                            origin_level or 'origin_shipping_region',
+                            grouping_config=origin_grouping_config,
+                        )
                     )
                 summary_df = build_importer_origin_summary_from_scoped_trades(
                     entity_scoped_df,
@@ -850,8 +2029,30 @@ def _build_period_payload(importer_entities, classification_mode, origin_level,
                     quarter_count=IMPORTER_PERIOD_MAX_QUARTER_COUNT + 4,
                     month_count=IMPORTER_PERIOD_MAX_MONTH_COUNT + 12,
                     week_count=IMPORTER_PERIOD_MAX_WEEK_COUNT + 53,
-                    include_comparison_reference_columns=True
+                    include_comparison_reference_columns=True,
+                    current_date=current_as_of_date,
                 )
+                if has_snapshot_pair_contract:
+                    current_pbd_df = _build_importer_pbd_rolling_summary(
+                        entity_scoped_df,
+                        origin_level,
+                        current_as_of_date,
+                    )
+                    baseline_pbd_df = (
+                        _build_importer_pbd_rolling_summary(
+                            baseline_entity_scoped_df,
+                            origin_level,
+                            baseline_as_of_date,
+                        )
+                        if baseline_data_available
+                        else pd.DataFrame()
+                    )
+                    summary_df = _merge_importer_period_pbd_windows(
+                        summary_df,
+                        current_pbd_df,
+                        baseline_pbd_df,
+                        baseline_available=baseline_data_available,
+                    )
             except Exception:
                 summary_df = pd.DataFrame()
             payload.append({
@@ -862,9 +2063,11 @@ def _build_period_payload(importer_entities, classification_mode, origin_level,
         return payload
 
     payload = {
+        'format': IMPORTERS_PERIOD_PAYLOAD_FORMAT,
         'active_grouping_mode': grouping_mode,
         'show_all': [],
         'group_small_countries': [],
+        'snapshot_comparison': snapshot_comparison,
     }
     if grouping_mode == 'show_all':
         payload['show_all'] = _build_payload_variant(importer_entities, group_small_origins=False)
@@ -873,7 +2076,8 @@ def _build_period_payload(importer_entities, classification_mode, origin_level,
     grouped_importer_entities = _group_small_importer_entities(
         importer_entities,
         scoped_trades_df,
-        classification_mode
+        classification_mode,
+        as_of_date=current_as_of_date,
     )
     payload['group_small_countries'] = _build_payload_variant(
         grouped_importer_entities,
@@ -1231,6 +2435,16 @@ def get_importer_demand_chart_header_metrics(
     rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS
 ):
     df = _prepare_importer_demand_chart_dataframe(data, volume_metric, rolling_avg_days)
+    return _get_importer_demand_chart_header_metrics_from_df(
+        df,
+        selected_years,
+    )
+
+
+def _get_importer_demand_chart_header_metrics_from_df(
+    df,
+    selected_years=None,
+):
     if df.empty:
         return None
 
@@ -1317,6 +2531,18 @@ def create_importer_demand_chart(
 ):
     vol_label = get_volume_metric_info(volume_metric)['label']
     df = _prepare_importer_demand_chart_dataframe(data, volume_metric, rolling_avg_days)
+    return _create_importer_demand_chart_from_df(
+        df,
+        vol_label,
+        selected_years,
+    )
+
+
+def _create_importer_demand_chart_from_df(
+    df,
+    vol_label,
+    selected_years=None,
+):
     if df.empty:
         return _empty_importer_chart_figure('No data available.')
 
@@ -1436,6 +2662,20 @@ def create_importer_origin_continent_chart(
         chart_type,
         volume_metric
     )
+    return _create_importer_origin_continent_chart_from_df(
+        df,
+        metric_column,
+        vol_label,
+        selected_years,
+    )
+
+
+def _create_importer_origin_continent_chart_from_df(
+    df,
+    metric_column,
+    vol_label,
+    selected_years=None,
+):
     if df.empty:
         return _empty_importer_chart_figure('No data available.')
 
@@ -1656,6 +2896,22 @@ def _calculate_origin_continent_kpis(
         chart_type,
         volume_metric
     )
+    return _calculate_origin_continent_kpis_from_df(
+        df,
+        metric_column,
+        vol_label,
+        chart_type,
+        selected_years,
+    )
+
+
+def _calculate_origin_continent_kpis_from_df(
+    df,
+    metric_column,
+    vol_label,
+    chart_type='absolute',
+    selected_years=None,
+):
     if df.empty:
         return []
 
@@ -2392,6 +3648,14 @@ def _get_period_numeric_columns(
             if col in available_cols:
                 numeric_cols.append(col)
 
+    for col in (
+        *IMPORTER_PERIOD_PBD_CURRENT_COLUMNS,
+        *IMPORTER_PERIOD_PBD_REFERENCE_COLUMNS,
+        *IMPORTER_PERIOD_PBD_DELTA_COLUMNS,
+    ):
+        if col in available_cols and col not in numeric_cols:
+            numeric_cols.append(col)
+
     metadata = {
         'comparison_basis': comparison_basis,
         'visible_comparison_cols': visible_comparison_cols,
@@ -2430,6 +3694,8 @@ def _get_importer_period_column_family(column_id):
         return 'delta-mom'
     if column_id.startswith('Δ ') and column_id.endswith(' Y/Y'):
         return 'delta-yoy'
+    if column_id in IMPORTER_PERIOD_PBD_DELTA_COLUMNS:
+        return 'delta-pbd'
     if column_id.startswith('Q') and "'" in column_id:
         return 'quarter'
     if column_id.startswith('W') and "'" in column_id:
@@ -2600,7 +3866,7 @@ def _apply_importer_period_column_classes(columns, display_df, delta_like_cols=N
         if family != 'label':
             if 'importer-period-number-cell' not in existing_cell_class.split():
                 extra_cell_classes.append('importer-period-number-cell')
-            if family in {'delta-mom', 'delta-yoy'} or column_id in delta_like_cols:
+            if family in {'delta-mom', 'delta-yoy', 'delta-pbd'} or column_id in delta_like_cols:
                 extra_cell_classes.append('importer-period-delta-cell')
                 column['cellClassRules'] = _build_importer_period_delta_heatmap_class_rules(
                     display_df,
@@ -2634,7 +3900,7 @@ def _build_importer_period_column_width_styles(display_df, columns):
         if family == 'label':
             min_width, max_width = text_width_limits.get(column_id, (124, 180))
             width = int(min(max(max_chars * 6.1 + 30, min_width), max_width))
-        elif family in {'delta-mom', 'delta-yoy'}:
+        elif family in {'delta-mom', 'delta-yoy', 'delta-pbd'}:
             width = int(min(max(len(header_text) * 7.0 + 26, 106), 132))
         elif family in {'rolling-window', 'rolling-7d'}:
             width = int(min(max(len(header_text) * 7.0 + 28, 78), 98))
@@ -2656,7 +3922,7 @@ def _build_importer_period_delta_styles(display_df, columns, delta_like_cols=Non
     raw_field_map = raw_field_map or {}
     for column in columns:
         column_id = column.get('id')
-        if _get_importer_period_column_family(column_id) in {'delta-mom', 'delta-yoy'} or column_id in delta_like_cols:
+        if _get_importer_period_column_family(column_id) in {'delta-mom', 'delta-yoy', 'delta-pbd'} or column_id in delta_like_cols:
             styles.extend(
                 _build_importer_period_delta_gradient_styles(
                     display_df,
@@ -2667,9 +3933,14 @@ def _build_importer_period_delta_styles(display_df, columns, delta_like_cols=Non
     return styles
 
 
-def _format_importer_period_grid_value(value, view_type='absolute', is_delta=False):
+def _format_importer_period_grid_value(
+    value,
+    view_type='absolute',
+    is_delta=False,
+    is_pbd_delta=False,
+):
     if value is None or (isinstance(value, float) and pd.isna(value)):
-        return ''
+        return '—' if is_pbd_delta else ''
 
     try:
         numeric_value = float(value)
@@ -2685,6 +3956,8 @@ def _format_importer_period_grid_value(value, view_type='absolute', is_delta=Fal
         return f'{numeric_value:.0f}%'
     if is_delta and abs(numeric_value) < 0.05:
         numeric_value = 0
+    if is_pbd_delta and numeric_value > 0:
+        return f'+{numeric_value:,.1f}'
     return f'{numeric_value:,.1f}'
 
 
@@ -2701,7 +3974,7 @@ def _build_importer_period_grid_display(display_df, columns, view_type='absolute
     }
     delta_ids = {
         column_id for column_id in numeric_ids
-        if _get_importer_period_column_family(column_id) in {'delta-mom', 'delta-yoy'}
+        if _get_importer_period_column_family(column_id) in {'delta-mom', 'delta-yoy', 'delta-pbd'}
     } | delta_like_cols
 
     for column_id, raw_field in raw_field_map.items():
@@ -2713,10 +3986,13 @@ def _build_importer_period_grid_display(display_df, columns, view_type='absolute
             continue
         is_delta = column_id in delta_ids
         grid_df[column_id] = grid_df[column_id].apply(
-            lambda value, delta=is_delta: _format_importer_period_grid_value(
+            lambda value, delta=is_delta, pbd_delta=(
+                column_id in IMPORTER_PERIOD_PBD_DELTA_COLUMNS
+            ): _format_importer_period_grid_value(
                 value,
                 view_type=view_type,
-                is_delta=delta
+                is_delta=delta,
+                is_pbd_delta=pbd_delta,
             )
         )
 
@@ -2782,6 +4058,87 @@ def _apply_importer_period_percentage_view(display_df, numeric_cols):
                 percentage_df.at[row_index, col] = None
 
     return percentage_df
+
+
+def _apply_importer_period_pbd_percentage_view(display_df):
+    """Convert hidden current/PBD levels to origin-mix percentage levels."""
+    if display_df is None or display_df.empty:
+        return display_df
+
+    percentage_df = display_df.copy()
+    pbd_level_columns = [
+        column_name
+        for column_name in (
+            *IMPORTER_PERIOD_PBD_CURRENT_COLUMNS,
+            *IMPORTER_PERIOD_PBD_REFERENCE_COLUMNS,
+        )
+        if column_name in percentage_df.columns
+    ]
+    for column_name in pbd_level_columns:
+        current_total = None
+        for row_index, row in display_df.iterrows():
+            importer_label = str(row.get('Importer', '') or '')
+            value = pd.to_numeric(
+                row.get(column_name),
+                errors='coerce',
+            )
+            if importer_label == IMPORTER_GLOBAL_LABEL:
+                percentage_df.at[row_index, column_name] = (
+                    100.0
+                    if pd.notna(value) and value != 0
+                    else 0.0
+                )
+                current_total = None
+                continue
+            if _is_importer_expandable_label(importer_label):
+                current_total = value
+                percentage_df.at[row_index, column_name] = (
+                    100.0
+                    if pd.notna(value) and value != 0
+                    else 0.0
+                )
+                continue
+            if current_total is None or pd.isna(current_total):
+                continue
+            percentage_df.at[row_index, column_name] = (
+                (value / current_total) * 100
+                if current_total != 0 and pd.notna(value)
+                else 0.0
+            )
+    return percentage_df
+
+
+def _recalculate_importer_period_pbd_deltas(display_df):
+    if display_df is None or display_df.empty:
+        return display_df
+    recalculated_df = display_df.copy()
+    for delta_column, current_column, baseline_column in (
+        (
+            'Δ 30D vs PBD',
+            '30D_PBD_CURRENT',
+            '30D_PBD',
+        ),
+        (
+            'Δ 7D vs PBD',
+            '7D_PBD_CURRENT',
+            '7D_PBD',
+        ),
+    ):
+        if {
+            current_column,
+            baseline_column,
+        }.issubset(recalculated_df.columns):
+            recalculated_df[delta_column] = (
+                pd.to_numeric(
+                    recalculated_df[current_column],
+                    errors='coerce',
+                )
+                - pd.to_numeric(
+                    recalculated_df[baseline_column],
+                    errors='coerce',
+                )
+            )
+    return recalculated_df
 
 
 def _apply_importer_period_comparison(display_df, comparison_metadata):
@@ -2892,7 +4249,7 @@ def _create_period_analysis_table(display_df, delta_like_cols=None, view_type='a
         if (
             col not in IMPORTER_PERIOD_TEXT_COLUMNS and
             (
-                _get_importer_period_column_family(col) in {'delta-mom', 'delta-yoy'} or
+                _get_importer_period_column_family(col) in {'delta-mom', 'delta-yoy', 'delta-pbd'} or
                 col in delta_like_cols
             )
         )
@@ -2986,10 +4343,28 @@ def _create_period_analysis_table(display_df, delta_like_cols=None, view_type='a
     )
 
 
-def _build_period_table_footnote(rolling_avg_days, vol_label, comparison_basis='levels'):
+def _build_period_table_footnote(
+    rolling_avg_days,
+    vol_label,
+    comparison_basis='levels',
+    snapshot_comparison=None,
+):
     rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
     comparison_basis = _normalize_importer_period_comparison_basis(comparison_basis)
-    today = datetime.now().date()
+    snapshot_comparison = (
+        snapshot_comparison
+        if isinstance(snapshot_comparison, dict)
+        else {}
+    )
+    current_snapshot = snapshot_comparison.get('current_snapshot')
+    today = pd.Timestamp(
+        (
+            current_snapshot.get('snapshot_date_utc')
+            if isinstance(current_snapshot, dict)
+            else None
+        )
+        or datetime.now().date()
+    ).date()
     date_7d_start = (today - timedelta(days=6)).strftime('%b %d, %Y')
     date_window_start = (today - timedelta(days=rolling_avg_days - 1)).strftime('%b %d, %Y')
     date_today = today.strftime('%b %d, %Y')
@@ -3004,6 +4379,72 @@ def _build_period_table_footnote(rolling_avg_days, vol_label, comparison_basis='
     elif comparison_basis == 'same_period_last_year':
         comparison_note = ' | Comparison: vs previous year'
 
+    def _format_snapshot_lineage(snapshot):
+        if not isinstance(snapshot, dict):
+            return None
+        snapshot_date = snapshot.get('snapshot_date_utc')
+        snapshot_timestamp = snapshot.get(
+            'snapshot_timestamp_utc'
+        )
+        if snapshot_date is None or snapshot_timestamp is None:
+            return None
+        parsed_timestamp = pd.Timestamp(snapshot_timestamp)
+        fractional_seconds = (
+            f'.{parsed_timestamp.microsecond:06d}'
+            if parsed_timestamp.microsecond
+            else ''
+        )
+        return (
+            f"{pd.Timestamp(snapshot_date).strftime('%b %d, %Y')} "
+            f"{parsed_timestamp.strftime('%H:%M:%S')}"
+            f"{fractional_seconds} UTC"
+        )
+
+    current_lineage = _format_snapshot_lineage(current_snapshot)
+    baseline_lineage = _format_snapshot_lineage(
+        snapshot_comparison.get('baseline_snapshot')
+    )
+    baseline_status = snapshot_comparison.get('status')
+    business_day_gap = snapshot_comparison.get('business_day_gap')
+    if baseline_status == 'exact' and baseline_lineage:
+        baseline_note_text = (
+            f'Current snapshot: {current_lineage} | '
+            f'PBD baseline: {baseline_lineage} | '
+            'PBD changes are current minus baseline and include '
+            'window roll plus Kpler revisions.'
+        )
+        baseline_note_class = 'importer-period-baseline-status'
+    elif baseline_status == 'fallback' and baseline_lineage:
+        baseline_note_text = (
+            f'Current snapshot: {current_lineage} | '
+            f'Fallback PBD baseline: {baseline_lineage}'
+            + (
+                f' ({business_day_gap} Mon–Fri business days earlier)'
+                if business_day_gap is not None
+                else ''
+            )
+            + ' | PBD changes are current minus baseline and include '
+            'window roll plus Kpler revisions.'
+        )
+        baseline_note_class = (
+            'importer-period-baseline-status '
+            'importer-period-baseline-status-warning'
+        )
+    else:
+        baseline_note_text = (
+            (
+                f'Current snapshot: {current_lineage} | '
+                if current_lineage
+                else ''
+            )
+            + 'PBD baseline unavailable; Δ 30D vs PBD and '
+            'Δ 7D vs PBD show —.'
+        )
+        baseline_note_class = (
+            'importer-period-baseline-status '
+            'importer-period-baseline-status-unavailable'
+        )
+
     return html.Div(
         [
             html.P(
@@ -3015,7 +4456,16 @@ def _build_period_table_footnote(rolling_avg_days, vol_label, comparison_basis='
                     html.Span(f'Values shown in {vol_label}{comparison_note}')
                 ],
                 className='importer-period-table-footnote-text'
-            )
+            ),
+            html.P(
+                baseline_note_text,
+                className=baseline_note_class,
+                role=(
+                    'alert'
+                    if baseline_status == 'unavailable'
+                    else None
+                ),
+            ),
         ],
         className='importer-period-table-footnote'
     )
@@ -3291,11 +4741,124 @@ def update_importer_rolling_section_titles(rolling_avg_days):
     )
 
 
-def _build_importers_overview_payload(classification_mode, rolling_avg_days):
+def _build_importers_source_payload(source_state=None):
+    """Load immutable overview catalog data in two database reads."""
+    source_state = _normalize_importers_source_state(source_state)
+    current_snapshot = source_state.get('current_snapshot') or {}
+    if (
+        source_state.get('format') == IMPORTERS_SOURCE_STATE_FORMAT
+        and current_snapshot.get('snapshot_timestamp_utc')
+        and current_snapshot.get('snapshot_date_utc')
+    ):
+        catalog_ranking_loader = (
+            lambda: _fetch_importers_catalog_ranking_source_df(
+                current_snapshot['snapshot_timestamp_utc'],
+                current_snapshot['snapshot_date_utc'],
+            )
+        )
+    else:
+        catalog_ranking_loader = (
+            _fetch_importers_catalog_ranking_source_df
+        )
+    loaders = {
+        'catalog_ranking': catalog_ranking_loader,
+        'mappings': _fetch_importers_mapping_source_df,
+    }
+    with ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix='importers-source',
+    ) as executor:
+        futures = {
+            name: executor.submit(loader)
+            for name, loader in loaders.items()
+        }
+        loaded = {
+            name: futures[name].result()
+            for name in loaders
+        }
+
+    catalog_df, ranking_df = (
+        _build_destination_catalog_and_ranking_from_sources(
+            loaded['catalog_ranking'],
+            loaded['mappings'],
+        )
+    )
+    return {
+        'catalog_df': catalog_df,
+        'ranking_df': ranking_df,
+        'scoped_trades_df': pd.DataFrame(),
+    }
+
+
+def _build_importers_overview_payload_from_source(
+    source_payload,
+    classification_mode,
+    rolling_avg_days,
+):
     rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
-    catalog_records = build_destination_catalog(engine)
-    catalog_df = get_destination_catalog_dataframe(catalog_records)
-    ranking_df = _fetch_destination_ranking_df(catalog_df)
+    catalog_df = source_payload['catalog_df']
+    ranking_df = source_payload['ranking_df']
+    scoped_trades_df = source_payload.get('scoped_trades_df')
+    selected_aggregation = (
+        _classification_mode_to_destination_aggregation(
+            classification_mode
+        )
+    )
+    destination_countries = sorted(
+        catalog_df['destination_country_name']
+        .dropna()
+        .unique()
+        .tolist()
+    ) if not catalog_df.empty else []
+    if not isinstance(scoped_trades_df, pd.DataFrame):
+        scoped_trades_df = pd.DataFrame()
+    source_scoped_trades_provided = not scoped_trades_df.empty
+    if scoped_trades_df.empty and destination_countries:
+        net_scopes = [selected_aggregation]
+        if selected_aggregation != 'country':
+            net_scopes.append('country')
+        with ThreadPoolExecutor(
+            max_workers=len(net_scopes),
+            thread_name_prefix='importers-net-scope',
+        ) as executor:
+            futures = {
+                net_scope: executor.submit(
+                    _fetch_importer_scoped_trades,
+                    engine,
+                    destination_countries,
+                    min_end_date=IMPORTER_CHART_QUERY_START_DATE,
+                    include_destination_context=True,
+                    selected_destination_aggregation=net_scope,
+                )
+                for net_scope in net_scopes
+            }
+            scoped_trades_df = futures[
+                selected_aggregation
+            ].result()
+            global_scoped_trades_df = futures.get(
+                'country'
+            )
+            if global_scoped_trades_df is not None:
+                global_scoped_trades_df = (
+                    global_scoped_trades_df.result()
+                )
+            else:
+                global_scoped_trades_df = scoped_trades_df
+    else:
+        global_scoped_trades_df = scoped_trades_df
+    if (
+        selected_aggregation != 'country'
+        and destination_countries
+        and not source_scoped_trades_provided
+        and global_scoped_trades_df is scoped_trades_df
+    ):
+        global_scoped_trades_df = _fetch_importer_scoped_trades(
+            engine,
+            destination_countries,
+            min_end_date=IMPORTER_CHART_QUERY_START_DATE,
+            include_destination_context=True,
+            selected_destination_aggregation='country',
+        )
     table_entities = _build_destination_entities(
         classification_mode,
         limit=None,
@@ -3314,14 +4877,134 @@ def _build_importers_overview_payload(classification_mode, rolling_avg_days):
     demand_charts_data, origin_continent_charts_data = _build_chart_data_payload(
         chart_entities,
         classification_mode,
-        rolling_avg_days
+        rolling_avg_days,
+        scoped_trades_df=scoped_trades_df,
+        global_scoped_trades_df=global_scoped_trades_df,
+    )
+    demand_cube = _pack_record_mapping(demand_charts_data)
+    origin_cube = _pack_record_mapping(
+        origin_continent_charts_data
     )
     return {
         'chart_entities': chart_entities,
         'table_entities': table_entities,
-        'demand_cube': _pack_record_mapping(demand_charts_data),
-        'origin_cube': _pack_record_mapping(origin_continent_charts_data),
+        'demand_cube': demand_cube,
+        'origin_cube': origin_cube,
+        'demand_years': _get_importer_chart_available_years(
+            demand_charts_data
+        ),
+        'origin_years': _get_importer_chart_available_years(
+            origin_continent_charts_data
+        ),
     }
+
+
+def _build_importers_overview_payload(classification_mode, rolling_avg_days):
+    """Build a standalone overview payload through the optimized source path."""
+    return _build_importers_overview_payload_from_source(
+        _build_importers_source_payload(),
+        classification_mode,
+        rolling_avg_days,
+    )
+
+
+def _normalize_importers_source_state(source_state):
+    source_state = (
+        dict(source_state)
+        if isinstance(source_state, dict)
+        else {}
+    )
+    watermark = source_state.get('watermark')
+    if watermark is None:
+        watermark = source_state.get('request_token')
+    normalized = {
+        'watermark': str(watermark) if watermark is not None else None,
+        'as_of_date': (
+            source_state.get('as_of_date')
+            or datetime.now().date().isoformat()
+        ),
+    }
+    if (
+        source_state.get('format') == IMPORTERS_SOURCE_STATE_FORMAT
+    ):
+        normalized.update({
+            'format': IMPORTERS_SOURCE_STATE_FORMAT,
+            'current_snapshot': (
+                dict(source_state['current_snapshot'])
+                if isinstance(
+                    source_state.get('current_snapshot'),
+                    dict,
+                )
+                else None
+            ),
+            'baseline_snapshot': (
+                dict(source_state['baseline_snapshot'])
+                if isinstance(
+                    source_state.get('baseline_snapshot'),
+                    dict,
+                )
+                else None
+            ),
+            'baseline_status': source_state.get(
+                'baseline_status',
+                'unavailable',
+            ),
+            'business_day_gap': source_state.get(
+                'business_day_gap'
+            ),
+        })
+    return normalized
+
+
+def _importers_source_snapshot_key(source_state):
+    source_state = _normalize_importers_source_state(source_state)
+    return _build_source_key(
+        IMPORTERS_SOURCE_NAMESPACE,
+        source_state,
+    )
+
+
+def _load_importers_source_snapshot(source_state):
+    force_refresh = bool(
+        isinstance(source_state, dict)
+        and source_state.get('refresh_token')
+    )
+    source_state = _normalize_importers_source_state(source_state)
+    source_builder = (
+        (
+            lambda: _build_importers_source_payload(
+                source_state
+            )
+        )
+        if source_state.get('format') == IMPORTERS_SOURCE_STATE_FORMAT
+        else _build_importers_source_payload
+    )
+    return _get_or_build_snapshot(
+        engine,
+        namespace=IMPORTERS_SOURCE_NAMESPACE,
+        source_key=_importers_source_snapshot_key(source_state),
+        builder=source_builder,
+        manifest={'source_state': source_state},
+        force=force_refresh,
+    )
+
+
+def _importers_overview_snapshot_key(
+    source_reference,
+    classification_mode,
+    rolling_avg_days,
+):
+    dependency = {
+        'namespace': source_reference.get('namespace'),
+        'source_key': source_reference.get('source_key'),
+        'revision': source_reference.get('revision'),
+    }
+    return _build_source_key(
+        IMPORTERS_OVERVIEW_NAMESPACE,
+        dependency,
+        classification_mode,
+        normalize_importer_rolling_avg_days(rolling_avg_days),
+    )
 
 
 @callback(
@@ -3329,11 +5012,48 @@ def _build_importers_overview_payload(classification_mode, rolling_avg_days):
     Input('global-refresh-button', 'n_clicks'),
 )
 def load_importers_overview_source_state(_n_clicks):
+    refresh_token = (
+        uuid.uuid4().hex
+        if _was_global_refresh_triggered()
+        else None
+    )
     try:
-        watermark = _fetch_importers_source_watermark()
-        return {'watermark': watermark.isoformat() if hasattr(watermark, 'isoformat') else str(watermark)}
+        source_pair = _fetch_importers_source_watermark()
     except Exception:
-        return {'request_token': datetime.now().isoformat(timespec='microseconds')}
+        source_pair = None
+        refresh_token = uuid.uuid4().hex
+    return _build_importers_source_state(
+        source_pair,
+        refresh_token=refresh_token,
+    )
+
+
+def _importers_overview_triggered_id():
+    try:
+        return callback_context.triggered_id
+    except MissingCallbackContextException:
+        return None
+
+
+def _source_state_for_importers_overview_load(source_state):
+    source_state = (
+        dict(source_state)
+        if isinstance(source_state, dict)
+        else source_state
+    )
+    if not (
+        isinstance(source_state, dict)
+        and source_state.get('refresh_token')
+    ):
+        return source_state
+    triggered_id = _importers_overview_triggered_id()
+    if triggered_id in (
+        None,
+        'imp-overview-source-state-store',
+    ):
+        return source_state
+    source_state.pop('refresh_token', None)
+    return source_state
 
 
 @callback(
@@ -3341,32 +5061,33 @@ def load_importers_overview_source_state(_n_clicks):
     Output('imp-overview-table-entities-store', 'data'),
     Output('imp-overview-demand-data-store', 'data'),
     Output('imp-overview-origin-continent-data-store', 'data'),
-    Input('global-refresh-button', 'n_clicks'),
+    Input('imp-overview-source-state-store', 'data'),
     Input('imp-overview-classification-mode', 'value'),
     Input('imp-overview-rolling-window-days-input', 'value'),
-    State('imp-overview-source-state-store', 'data'),
     prevent_initial_call=False
 )
-def refresh_overview_data(_n_clicks, classification_mode, rolling_avg_days, source_state=None):
+@log_callback_timing("importers.overview_source_load")
+def refresh_overview_data(source_state, classification_mode, rolling_avg_days):
     """Load the importer overview entities and compact server-side chart datasets."""
+    if not source_state:
+        raise PreventUpdate
     try:
         rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
-        if source_state and not _was_global_refresh_triggered():
-            source_watermark = source_state
-        else:
-            try:
-                watermark = _fetch_importers_source_watermark()
-                source_watermark = {
-                    'watermark': watermark.isoformat() if hasattr(watermark, 'isoformat') else str(watermark)
-                }
-            except Exception:
-                source_watermark = {
-                    'request_token': datetime.now().isoformat(timespec='microseconds')
-                }
-        source_key = _build_source_key(
-            IMPORTERS_OVERVIEW_NAMESPACE,
-            source_watermark,
-            datetime.now().date(),
+        source_state = _source_state_for_importers_overview_load(
+            source_state
+        )
+        source_reference, source_payload = (
+            _load_importers_source_snapshot(source_state)
+        )
+        if not _snapshot_is_resolvable(source_reference):
+            raise _SnapshotUnavailable(
+                IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+            )
+        source_payload = _resolve_importers_source_store(
+            source_reference
+        )
+        source_key = _importers_overview_snapshot_key(
+            source_reference,
             classification_mode,
             rolling_avg_days,
         )
@@ -3374,30 +5095,37 @@ def refresh_overview_data(_n_clicks, classification_mode, rolling_avg_days, sour
             engine,
             namespace=IMPORTERS_OVERVIEW_NAMESPACE,
             source_key=source_key,
-            builder=lambda: _build_importers_overview_payload(
-                classification_mode,
-                rolling_avg_days,
+            builder=lambda: _prepare_importers_overview_snapshot_payload(
+                _build_importers_overview_payload_from_source(
+                    source_payload,
+                    classification_mode,
+                    rolling_avg_days,
+                )
             ),
-            force=_was_global_refresh_triggered(),
             manifest={
+                'source_reference': {
+                    'namespace': source_reference.get('namespace'),
+                    'source_key': source_reference.get('source_key'),
+                    'revision': source_reference.get('revision'),
+                },
                 'classification_mode': classification_mode,
                 'rolling_avg_days': rolling_avg_days,
             },
         )
 
-        if _snapshot_is_shared(reference):
-            demand_store = _with_snapshot_slot(reference, 'demand_cube')
-            origin_store = _with_snapshot_slot(reference, 'origin_cube')
-        else:
-            demand_store = _unpack_record_mapping(payload['demand_cube'])
-            origin_store = _unpack_record_mapping(payload['origin_cube'])
+        if not _snapshot_is_resolvable(reference):
+            raise _SnapshotUnavailable(
+                IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+            )
 
         return (
-            payload['chart_entities'],
-            payload['table_entities'],
-            demand_store,
-            origin_store,
+            _with_snapshot_slot(reference, 'chart_entities'),
+            _with_snapshot_slot(reference, 'table_entities'),
+            _with_snapshot_slot(reference, 'demand_cube'),
+            _with_snapshot_slot(reference, 'origin_cube'),
         )
+    except _SnapshotUnavailable:
+        raise
     except Exception:
         return [], [], {}, {}
 
@@ -3410,8 +5138,13 @@ def refresh_overview_data(_n_clicks, classification_mode, rolling_avg_days, sour
     prevent_initial_call=False
 )
 def update_demand_year_selector_options(charts_data, selected_years):
-    charts_data = _resolve_importers_chart_store(charts_data)
-    available_years = _get_importer_chart_available_years(charts_data)
+    try:
+        available_years = _resolve_importers_years_store(
+            charts_data,
+            'demand_years',
+        )
+    except _SnapshotUnavailable:
+        return _importers_snapshot_recovery_selector_result()
     if not available_years:
         return [], []
 
@@ -3445,9 +5178,17 @@ def update_demand_year_selector_options(charts_data, selected_years):
     Input('imp-overview-rolling-window-days-input', 'value'),
     prevent_initial_call=False
 )
+@log_callback_timing("importers.demand_charts_render")
 def update_demand_charts(charts_data, importer_entities, volume_metric, selected_years, rolling_avg_days):
     """Render the demand chart grid using the upgraded exporter-page pattern."""
-    charts_data = _resolve_importers_chart_store(charts_data)
+    try:
+        charts_data = _resolve_importers_chart_store(charts_data)
+        importer_entities = _resolve_importers_entities_store(
+            importer_entities,
+            'chart_entities',
+        )
+    except _SnapshotUnavailable:
+        return _importers_snapshot_recovery_notice()
     if not charts_data or not importer_entities:
         return html.Div('No data available', className='importer-rolling-empty-state')
 
@@ -3457,17 +5198,19 @@ def update_demand_charts(charts_data, importer_entities, volume_metric, selected
     for entity in importer_entities:
         entity_name = entity['label']
         entity_data = charts_data.get(entity_name, [])
-        fig = create_importer_demand_chart(
+        prepared_df = _prepare_importer_demand_chart_dataframe(
             entity_data,
-            volume_metric=volume_metric,
-            selected_years=selected_years,
-            rolling_avg_days=rolling_avg_days
+            volume_metric,
+            rolling_avg_days,
         )
-        metrics = get_importer_demand_chart_header_metrics(
-            entity_data,
-            volume_metric=volume_metric,
-            selected_years=selected_years,
-            rolling_avg_days=rolling_avg_days
+        fig = _create_importer_demand_chart_from_df(
+            prepared_df,
+            vol_label,
+            selected_years,
+        )
+        metrics = _get_importer_demand_chart_header_metrics_from_df(
+            prepared_df,
+            selected_years,
         )
         current_value = _format_importer_chart_current_value(metrics, vol_label)
         card_class_name = (
@@ -3512,8 +5255,13 @@ def update_demand_charts(charts_data, importer_entities, volume_metric, selected
     prevent_initial_call=False
 )
 def update_origin_year_selector_options(charts_data, selected_years):
-    charts_data = _resolve_importers_chart_store(charts_data)
-    available_years = _get_importer_chart_available_years(charts_data)
+    try:
+        available_years = _resolve_importers_years_store(
+            charts_data,
+            'origin_years',
+        )
+    except _SnapshotUnavailable:
+        return _importers_snapshot_recovery_selector_result()
     if not available_years:
         return [], []
 
@@ -3541,10 +5289,18 @@ def update_origin_year_selector_options(charts_data, selected_years):
     Input('imp-overview-rolling-window-days-input', 'value'),
     prevent_initial_call=False
 )
+@log_callback_timing("importers.origin_charts_render")
 def update_origin_continent_charts(charts_data, importer_entities, volume_metric, selected_years,
                                    chart_type, _rolling_avg_days):
     """Render the origin-continent chart grid using the upgraded exporter-page pattern."""
-    charts_data = _resolve_importers_chart_store(charts_data)
+    try:
+        charts_data = _resolve_importers_chart_store(charts_data)
+        importer_entities = _resolve_importers_entities_store(
+            importer_entities,
+            'chart_entities',
+        )
+    except _SnapshotUnavailable:
+        return _importers_snapshot_recovery_notice()
     if not charts_data or not importer_entities:
         return html.Div(
             'No data available',
@@ -3553,22 +5309,31 @@ def update_origin_continent_charts(charts_data, importer_entities, volume_metric
 
     charts = []
     kpi_rows = []
+    vol_label = get_volume_metric_info(volume_metric)['label']
     for entity in importer_entities:
         entity_name = entity['label']
         entity_data = charts_data.get(entity_name, [])
-        fig = create_importer_origin_continent_chart(
-            entity_data,
-            chart_type=chart_type,
-            volume_metric=volume_metric,
-            selected_years=selected_years
+        prepared_df, metric_column = (
+            _prepare_importer_origin_chart_dataframe(
+                entity_data,
+                chart_type,
+                volume_metric,
+            )
+        )
+        fig = _create_importer_origin_continent_chart_from_df(
+            prepared_df,
+            metric_column,
+            vol_label,
+            selected_years,
         )
         kpi_rows.append({
             'entity': entity_name,
-            'metrics': _calculate_origin_continent_kpis(
-                entity_data,
+            'metrics': _calculate_origin_continent_kpis_from_df(
+                prepared_df,
+                metric_column,
+                vol_label,
                 chart_type=chart_type,
-                volume_metric=volume_metric,
-                selected_years=selected_years
+                selected_years=selected_years,
             )
         })
         card_class_name = (
@@ -3636,6 +5401,7 @@ def reset_period_expansion_state(_origin_level, _classification_mode, _importer_
     State('imp-overview-source-state-store', 'data'),
     prevent_initial_call=False
 )
+@log_callback_timing("importers.period_source_load")
 def refresh_period_data(importer_entities, classification_mode, origin_level, rolling_avg_days,
                         origin_country_grouping_mode, global_refresh_clicks, source_state=None):
     """Load the raw period-analysis payload for the overview importers."""
@@ -3643,11 +5409,19 @@ def refresh_period_data(importer_entities, classification_mode, origin_level, ro
         return _empty_importer_period_payload(origin_country_grouping_mode)
 
     try:
+        importer_entities = _resolve_importers_entities_store(
+            importer_entities,
+            'table_entities',
+        )
+        if not importer_entities:
+            return _empty_importer_period_payload(origin_country_grouping_mode)
         normalized_rolling_days = normalize_importer_rolling_avg_days(rolling_avg_days)
+        normalized_source_state = _normalize_importers_source_state(
+            source_state
+        )
         source_key = _build_source_key(
             IMPORTERS_PERIOD_NAMESPACE,
-            source_state,
-            global_refresh_clicks or 0,
+            normalized_source_state,
             importer_entities,
             classification_mode,
             origin_level,
@@ -3664,8 +5438,11 @@ def refresh_period_data(importer_entities, classification_mode, origin_level, ro
                 origin_level,
                 origin_country_grouping_mode,
                 normalized_rolling_days,
+                normalized_source_state,
             ),
             manifest={
+                'format': IMPORTERS_PERIOD_PAYLOAD_FORMAT,
+                'source_state': normalized_source_state,
                 'classification_mode': classification_mode,
                 'origin_level': origin_level,
                 'origin_country_grouping_mode': origin_country_grouping_mode,
@@ -3693,15 +5470,28 @@ def refresh_period_data(importer_entities, classification_mode, origin_level, ro
     Input('imp-overview-period-week-count-dropdown', 'value'),
     prevent_initial_call=False
 )
+@log_callback_timing("importers.period_table_render")
 def update_period_analysis_table(period_payload, expanded_importers, importer_entities, volume_metric,
                                  rolling_avg_days, origin_country_grouping_mode, view_type, comparison_basis,
                                  quarter_count, month_count, week_count):
     """Render the combined importer overview period-analysis table."""
+    try:
+        importer_entities = _resolve_importers_entities_store(
+            importer_entities,
+            'table_entities',
+        )
+    except _SnapshotUnavailable:
+        return _importers_snapshot_recovery_notice(), []
     if not period_payload or not importer_entities:
         message = html.Div('No data available for the selected configuration.', style={'textAlign': 'center', 'padding': '20px'})
         return message, []
 
     period_payload = _resolve_importers_period_store(period_payload)
+    snapshot_comparison = (
+        period_payload.get('snapshot_comparison')
+        if isinstance(period_payload, dict)
+        else {}
+    )
 
     rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
     origin_country_grouping_mode = _normalize_importer_period_origin_grouping(origin_country_grouping_mode)
@@ -3733,7 +5523,21 @@ def update_period_analysis_table(period_payload, expanded_importers, importer_en
         message = html.Div('No period-analysis data is available for the overview importers.', style={'textAlign': 'center', 'padding': '20px'})
         return message, []
 
+    pbd_available = (
+        isinstance(snapshot_comparison, dict)
+        and snapshot_comparison.get('status') in {
+            'exact',
+            'fallback',
+        }
+    )
     if view_type == 'percentage':
+        pbd_percentage_df = (
+            _apply_importer_period_pbd_percentage_view(
+                display_df
+            )
+            if pbd_available
+            else None
+        )
         level_delta_cols = [
             col for col in display_df.columns
             if col.startswith('Δ ')
@@ -3742,6 +5546,18 @@ def update_period_analysis_table(period_payload, expanded_importers, importer_en
             display_df = display_df.drop(columns=level_delta_cols)
         numeric_cols = [col for col in display_df.columns if col not in IMPORTER_PERIOD_TEXT_COLUMNS]
         display_df = _apply_importer_period_percentage_view(display_df, numeric_cols)
+        if pbd_percentage_df is not None:
+            for column_name in (
+                *IMPORTER_PERIOD_PBD_CURRENT_COLUMNS,
+                *IMPORTER_PERIOD_PBD_REFERENCE_COLUMNS,
+            ):
+                if column_name in display_df.columns:
+                    display_df[column_name] = (
+                        pbd_percentage_df[column_name]
+                    )
+            display_df = _recalculate_importer_period_pbd_deltas(
+                display_df
+            )
         vol_label = 'market share (%)'
     else:
         vol_label = get_volume_metric_info(volume_metric)['label']
@@ -3751,11 +5567,49 @@ def update_period_analysis_table(period_payload, expanded_importers, importer_en
             exclude_columns=IMPORTER_PERIOD_TEXT_COLUMNS,
             precision=1
         )
+        if pbd_available:
+            display_df = _recalculate_importer_period_pbd_deltas(
+                display_df
+            )
+
+    if not pbd_available:
+        for column_name in (
+            *IMPORTER_PERIOD_PBD_CURRENT_COLUMNS,
+            *IMPORTER_PERIOD_PBD_REFERENCE_COLUMNS,
+            *IMPORTER_PERIOD_PBD_DELTA_COLUMNS,
+        ):
+            if column_name in display_df.columns:
+                display_df[column_name] = np.nan
 
     display_df, comparison_delta_cols = _apply_importer_period_comparison(
         display_df,
         comparison_metadata
     )
+    display_df = display_df.drop(
+        columns=[
+            *IMPORTER_PERIOD_PBD_CURRENT_COLUMNS,
+            *IMPORTER_PERIOD_PBD_REFERENCE_COLUMNS,
+        ],
+        errors='ignore',
+    )
+    pbd_delta_cols = [
+        column_name
+        for column_name in IMPORTER_PERIOD_PBD_DELTA_COLUMNS
+        if column_name in display_df.columns
+    ]
+    if pbd_delta_cols:
+        non_pbd_columns = [
+            column_name
+            for column_name in display_df.columns
+            if column_name not in pbd_delta_cols
+        ]
+        display_df = display_df[
+            [*non_pbd_columns, *pbd_delta_cols]
+        ]
+    all_delta_cols = [
+        *comparison_delta_cols,
+        *pbd_delta_cols,
+    ]
     for col in [col for col in display_df.columns if col not in IMPORTER_PERIOD_TEXT_COLUMNS]:
         numeric_series = pd.to_numeric(display_df[col], errors='coerce').round(1)
         display_df[col] = numeric_series.where(pd.notnull(numeric_series), None)
@@ -3764,10 +5618,15 @@ def update_period_analysis_table(period_payload, expanded_importers, importer_en
         [
             _create_period_analysis_table(
                 display_df,
-                delta_like_cols=comparison_delta_cols,
+                delta_like_cols=all_delta_cols,
                 view_type=view_type
             ),
-            _build_period_table_footnote(rolling_avg_days, vol_label, comparison_basis)
+            _build_period_table_footnote(
+                rolling_avg_days,
+                vol_label,
+                comparison_basis,
+                snapshot_comparison,
+            )
         ],
         className='importer-period-table-shell'
     )

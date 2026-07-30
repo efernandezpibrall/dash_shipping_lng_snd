@@ -1,41 +1,9 @@
 import pandas as pd
-import configparser
-import os
-from sqlalchemy import create_engine
 from fundamentals.terminals.terminal_output_utils import (
     fetch_keyed_terminal_monthly_output,
     fetch_keyed_terminal_train_summary,
 )
-
-############################################ postgres sql connection ###################################################
-#------ code to be able to access config.ini, even having the path in the .virtualenvs is not working without it ------#
-try:
-    # Get the directory where your script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Navigate to the directory containing config.ini
-    # Adjust the number of '..' as needed to reach the correct directory
-    config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))  # Go up two levels
-    CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except Exception:
-    CONFIG_FILE_PATH = 'config.ini'  # Assumes it's in the same directory or the path it is detected
-
-
-# --- Load Configuration from INI File ---
-config_reader = configparser.ConfigParser(interpolation=None)
-config_reader.read(CONFIG_FILE_PATH)
-
-# Read values from the ini file sections
-DB_CONNECTION_STRING = config_reader.get('DATABASE', 'CONNECTION_STRING', fallback=None)
-DB_SCHEMA = config_reader.get('DATABASE', 'SCHEMA', fallback=None)
-
-
-# --- Essential Variable Checks ---
-if not DB_CONNECTION_STRING:
-    raise ValueError(f"Missing DATABASE CONNECTION_STRING in {CONFIG_FILE_PATH}")
-
-# create engine
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
-
+from utils.database import DB_SCHEMA, engine
 
 # Professional color palette (McKinsey-style) - matching original
 PRIMARY_COLORS = {

@@ -1,31 +1,39 @@
 from dash import html, dcc, callback, Output, Input, State, ALL, callback_context
 from dash.dash_table.Format import Format, Scheme
+from dash.exceptions import PreventUpdate
 from utils.ag_grid_tables import (
     ag_grid_cell_clicked_to_active_cell,
     ag_grid_column_defs_to_datatable_columns,
     create_ag_grid_from_datatable,
 )
 import plotly.graph_objects as go
+import numpy as np
 import pandas as pd
 from copy import deepcopy
 from datetime import datetime, timedelta
 from io import BytesIO
-import configparser
-import os
-from sqlalchemy import create_engine, text, bindparam
+import json
+import zlib
+from concurrent.futures import ThreadPoolExecutor
+from sqlalchemy import text, bindparam
 import calendar
+import uuid
 
 from utils.table_styles import StandardTableStyleManager, TABLE_COLORS
 from utils.dashboard_snapshot_cache import (
+    SnapshotUnavailable as _SnapshotUnavailable,
     build_source_key as _build_source_key,
     get_or_build_snapshot as _get_or_build_snapshot,
+    is_snapshot_reference as _is_snapshot_reference,
     pack_record_mapping as _pack_record_mapping,
     resolve_snapshot as _resolve_snapshot,
-    snapshot_is_shared as _snapshot_is_shared,
+    snapshot_is_resolvable as _snapshot_is_resolvable,
     unpack_record_mapping as _unpack_record_mapping,
     was_global_refresh_triggered as _was_global_refresh_triggered,
     with_snapshot_slot as _with_snapshot_slot,
 )
+from utils.database import DB_SCHEMA, engine
+from utils.performance import log_callback_timing
 
 # Month order constant for sorting (used in multiple functions)
 MONTH_ORDER = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
@@ -53,11 +61,21 @@ SUPPLY_DEST_TEXT_COLUMNS = [
     'Supply Installation'
 ]
 SUPPLY_DEST_TOTAL_LABELS = ('GRAND TOTAL', 'Global')
+SUPPLY_DEST_PBD_REFERENCE_COLUMNS = ('30D_PBD', '7D_PBD')
+SUPPLY_DEST_PBD_DELTA_COLUMNS = ('Δ 30D vs PBD', 'Δ 7D vs PBD')
 SUPPLY_DEST_DELTA_RAW_FIELDS = {
     'Δ 7D-30D': '__supply_dest_delta_7d_30d_raw',
     'Δ 30D Y/Y': '__supply_dest_delta_30d_yoy_raw',
+    'Δ 30D vs PBD': '__supply_dest_delta_30d_pbd_raw',
+    'Δ 7D vs PBD': '__supply_dest_delta_7d_pbd_raw',
 }
-SUPPLY_DEST_ROLLING_REFERENCE_COLUMNS = ('30D_PP', '30D_Y1', '7D_PP', '7D_Y1')
+SUPPLY_DEST_ROLLING_REFERENCE_COLUMNS = (
+    '30D_PP',
+    '30D_Y1',
+    '7D_PP',
+    '7D_Y1',
+    *SUPPLY_DEST_PBD_REFERENCE_COLUMNS,
+)
 SUPPLY_DEST_SOURCE_TEXT_COLUMNS = [
     'supply_classification',
     'demand_classification',
@@ -215,8 +233,15 @@ def _format_rolling_average_section_title(title_prefix, rolling_avg_days):
 def _empty_supply_dest_summary_store_payload():
     """Return the default store payload for grouped and ungrouped overview tables."""
     return {
+        'format': EXPORTERS_SUPPLY_DEST_SUMMARY_FORMAT,
         'show_all': [],
-        'group_small_countries': []
+        'group_small_countries': [],
+        'comparison': {
+            'status': 'unavailable',
+            'current_snapshot': None,
+            'baseline_snapshot': None,
+            'business_day_gap': None,
+        },
     }
 
 
@@ -325,9 +350,9 @@ def _get_supply_dest_summary_week_days(column_name):
 def _get_supply_dest_summary_column_period_days(column_name):
     """Return the represented period length for mcm/d-to-MT conversion."""
     column_name = str(column_name)
-    if column_name in {'30D', '30D_PP', '30D_Y1'}:
+    if column_name in {'30D', '30D_PP', '30D_Y1', '30D_PBD'}:
         return 30
-    if column_name in {'7D', '7D_PP', '7D_Y1'}:
+    if column_name in {'7D', '7D_PP', '7D_Y1', '7D_PBD'}:
         return 7
     if _is_supply_dest_summary_year_column(column_name):
         year = int(column_name)
@@ -381,6 +406,45 @@ def _recalculate_supply_dest_absolute_delta_columns(display_df):
             pd.to_numeric(recalculated_df['30D'], errors='coerce')
             - pd.to_numeric(recalculated_df['30D_Y1'], errors='coerce')
         ).round(1)
+    if {'Δ 30D vs PBD', '30D', '30D_PBD'}.issubset(recalculated_df.columns):
+        recalculated_df['Δ 30D vs PBD'] = (
+            pd.to_numeric(recalculated_df['30D'], errors='coerce')
+            - pd.to_numeric(recalculated_df['30D_PBD'], errors='coerce')
+        ).round(1)
+    if {'Δ 7D vs PBD', '7D', '7D_PBD'}.issubset(recalculated_df.columns):
+        recalculated_df['Δ 7D vs PBD'] = (
+            pd.to_numeric(recalculated_df['7D'], errors='coerce')
+            - pd.to_numeric(recalculated_df['7D_PBD'], errors='coerce')
+        ).round(1)
+    return recalculated_df
+
+
+def _recalculate_supply_dest_pbd_delta_columns(display_df, precision=None):
+    """Recalculate prior-business-day deltas from comparable level columns."""
+    recalculated_df = display_df.copy()
+    pairs = (
+        ('Δ 30D vs PBD', '30D', '30D_PBD'),
+        ('Δ 7D vs PBD', '7D', '7D_PBD'),
+    )
+    for delta_column, current_column, baseline_column in pairs:
+        if {
+            delta_column,
+            current_column,
+            baseline_column,
+        }.issubset(recalculated_df.columns):
+            values = (
+                pd.to_numeric(
+                    recalculated_df[current_column],
+                    errors='coerce',
+                )
+                - pd.to_numeric(
+                    recalculated_df[baseline_column],
+                    errors='coerce',
+                )
+            )
+            if precision is not None:
+                values = values.round(precision)
+            recalculated_df[delta_column] = values
     return recalculated_df
 
 
@@ -389,7 +453,7 @@ def _convert_supply_dest_absolute_volume_metric(display_df, volume_metric):
     if display_df is None or display_df.empty:
         return display_df
 
-    delta_cols = {'Δ 7D-30D', 'Δ 30D Y/Y'}
+    delta_cols = set(SUPPLY_DEST_DELTA_RAW_FIELDS)
     period_days_by_column = _build_supply_dest_summary_period_days_map(display_df.columns)
     converted_df = _convert_volume_metric_dataframe(
         display_df,
@@ -589,6 +653,32 @@ def _resolve_supply_dest_summary_payload(summary_payload, grouping_mode='show_al
     return []
 
 
+def _get_supply_dest_summary_comparison_metadata(summary_payload):
+    """Return normalized current/PBD snapshot metadata from the summary payload."""
+    if not isinstance(summary_payload, dict):
+        summary_payload = {}
+    comparison = summary_payload.get('comparison')
+    if not isinstance(comparison, dict):
+        comparison = {}
+    status = comparison.get('status')
+    if status not in {'exact', 'fallback', 'unavailable'}:
+        status = 'unavailable'
+    return {
+        'status': status,
+        'current_snapshot': (
+            comparison.get('current_snapshot')
+            if isinstance(comparison.get('current_snapshot'), dict)
+            else None
+        ),
+        'baseline_snapshot': (
+            comparison.get('baseline_snapshot')
+            if isinstance(comparison.get('baseline_snapshot'), dict)
+            else None
+        ),
+        'business_day_gap': comparison.get('business_day_gap'),
+    }
+
+
 def _format_supply_dest_period_label(period_start, period_view):
     """Format the period label shown in historical supply-destination views."""
     if pd.isna(period_start):
@@ -738,53 +828,332 @@ def exclude_internal_destination_flows(df, classification_mode='Country',
     return df[origin_values != destination_values].copy()
 
 
-############################################ postgres sql connection ###################################################
-#------ code to be able to access config.ini, even having the path in the .virtualenvs is not working without it ------#
-try:
-    # Get the directory where your script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Navigate to the directory containing config.ini
-    # Adjust the number of '..' as needed to reach the correct directory
-    config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))  # Go up two levels
-    CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except Exception:
-    CONFIG_FILE_PATH = 'config.ini'  # Assumes it's in the same directory or the path it is detected
-
-
-# --- Load Configuration from INI File ---
-config_reader = configparser.ConfigParser(interpolation=None)
-config_reader.read(CONFIG_FILE_PATH)
-
-# Read values from the ini file sections
-DB_CONNECTION_STRING = config_reader.get('DATABASE', 'CONNECTION_STRING', fallback=None)
-DB_SCHEMA = config_reader.get('DATABASE', 'SCHEMA', fallback=None)
-
-# create engine
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
-
 EXPORTERS_OVERVIEW_NAMESPACE = 'exporters-overview-v1'
+EXPORTERS_DESTINATION_BASE_NAMESPACE = 'exporters-destination-base-v2'
+EXPORTERS_DESTINATION_PBD_BASE_NAMESPACE = 'exporters-destination-pbd-base-v1'
+EXPORTERS_DESTINATION_SUMMARY_NAMESPACE = 'exporters-destination-summary-v2'
+EXPORTERS_SUPPLY_CHARTS_NAMESPACE = 'exporters-supply-charts-v1'
+EXPORTERS_CONTINENT_DATA_NAMESPACE = 'exporters-continent-data-v1'
+EXPORTERS_CONTINENT_EXPORT_NAMESPACE = 'exporters-continent-export-v1'
+EXPORTERS_REFERENCE_NAMESPACES = frozenset({
+    EXPORTERS_OVERVIEW_NAMESPACE,
+    EXPORTERS_DESTINATION_BASE_NAMESPACE,
+    EXPORTERS_DESTINATION_PBD_BASE_NAMESPACE,
+    EXPORTERS_DESTINATION_SUMMARY_NAMESPACE,
+    EXPORTERS_SUPPLY_CHARTS_NAMESPACE,
+    EXPORTERS_CONTINENT_DATA_NAMESPACE,
+    EXPORTERS_CONTINENT_EXPORT_NAMESPACE,
+})
+EXPORTERS_SOURCE_STATE_FORMAT = 'exporters-source-state-v2'
+EXPORTERS_SUPPLY_DEST_SUMMARY_FORMAT = 'exporters-supply-dest-summary-v2'
+EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE = (
+    'Cached exporter data is unavailable. Click the global Refresh button '
+    'to reload it.'
+)
+EXPORTERS_CHARTS_CUBE_FORMAT = 'exporters-record-cube-zlib-json-v1'
+EXPORTERS_SUPPLY_DEST_FORMAT = 'exporters-supply-dest-zlib-json-v1'
+EXPORTERS_SCALAR_TAG = '__exporters_scalar_v1__'
+
+
+def _tag_exporters_json_value(value):
+    value_type = type(value)
+    if value is None or value_type in (str, int, float, bool):
+        return value
+    if value is pd.NaT:
+        return {EXPORTERS_SCALAR_TAG: 'pandas.NaT'}
+    if value is pd.NA:
+        return {EXPORTERS_SCALAR_TAG: 'pandas.NA'}
+    if isinstance(value, pd.Timestamp):
+        timezone = value.tz
+        timezone_name = (
+            getattr(timezone, 'zone', None)
+            or getattr(timezone, 'key', None)
+            or (str(timezone) if timezone is not None else None)
+        )
+        return {
+            EXPORTERS_SCALAR_TAG: 'pandas.Timestamp',
+            'nanoseconds': value.value,
+            'timezone': timezone_name,
+        }
+    if isinstance(value, np.generic):
+        return {
+            EXPORTERS_SCALAR_TAG: 'numpy.scalar',
+            'dtype': value.dtype.str,
+            'bytes': value.tobytes().hex(),
+        }
+    if isinstance(value, datetime):
+        return {
+            EXPORTERS_SCALAR_TAG: 'datetime.datetime',
+            'isoformat': value.isoformat(),
+            'fold': value.fold,
+        }
+    if isinstance(value, bytes):
+        return {
+            EXPORTERS_SCALAR_TAG: 'builtins.bytes',
+            'hex': value.hex(),
+        }
+    if isinstance(value, tuple):
+        return {
+            EXPORTERS_SCALAR_TAG: 'builtins.tuple',
+            'items': [
+                _tag_exporters_json_value(item)
+                for item in value
+            ],
+        }
+    if isinstance(value, list):
+        return [
+            _tag_exporters_json_value(item)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _tag_exporters_json_value(item)
+            for key, item in value.items()
+        }
+    raise TypeError(f'{type(value).__name__} is not JSON serializable')
+
+
+def _decode_exporters_json_object(value):
+    scalar_type = value.get(EXPORTERS_SCALAR_TAG)
+    if scalar_type == 'pandas.NaT' and len(value) == 1:
+        return pd.NaT
+    if scalar_type == 'pandas.NA' and len(value) == 1:
+        return pd.NA
+    if (
+        scalar_type == 'pandas.Timestamp'
+        and set(value) == {
+            EXPORTERS_SCALAR_TAG,
+            'nanoseconds',
+            'timezone',
+        }
+    ):
+        return pd.Timestamp(
+            value['nanoseconds'],
+            unit='ns',
+            tz=value['timezone'],
+        )
+    if (
+        scalar_type == 'numpy.scalar'
+        and set(value) == {
+            EXPORTERS_SCALAR_TAG,
+            'dtype',
+            'bytes',
+        }
+    ):
+        return np.frombuffer(
+            bytes.fromhex(value['bytes']),
+            dtype=np.dtype(value['dtype']),
+            count=1,
+        )[0]
+    if (
+        scalar_type == 'datetime.datetime'
+        and set(value) == {
+            EXPORTERS_SCALAR_TAG,
+            'isoformat',
+            'fold',
+        }
+    ):
+        return datetime.fromisoformat(value['isoformat']).replace(
+            fold=value['fold']
+        )
+    if (
+        scalar_type == 'builtins.bytes'
+        and set(value) == {EXPORTERS_SCALAR_TAG, 'hex'}
+    ):
+        return bytes.fromhex(value['hex'])
+    if (
+        scalar_type == 'builtins.tuple'
+        and set(value) == {EXPORTERS_SCALAR_TAG, 'items'}
+    ):
+        return tuple(value['items'])
+    return value
+
+
+def _encode_exporters_json_payload(value, payload_format):
+    raw_payload = json.dumps(
+        _tag_exporters_json_value(value),
+        ensure_ascii=False,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return {
+        'format': payload_format,
+        'payload': zlib.compress(raw_payload, level=1),
+    }
+
+
+def _decode_exporters_json_payload(value):
+    if not (
+        isinstance(value, dict)
+        and value.get('format') in {
+            EXPORTERS_CHARTS_CUBE_FORMAT,
+            EXPORTERS_SUPPLY_DEST_FORMAT,
+        }
+    ):
+        return value
+    try:
+        encoded_payload = value['payload']
+        if not isinstance(encoded_payload, bytes):
+            raise TypeError('encoded exporter payload is not bytes')
+        return json.loads(
+            zlib.decompress(encoded_payload).decode('utf-8'),
+            object_hook=_decode_exporters_json_object,
+        )
+    except Exception as exc:
+        raise _SnapshotUnavailable(
+            EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+
+
+def _prepare_exporters_overview_snapshot_payload(payload):
+    prepared = dict(payload)
+    prepared['charts_cube'] = _encode_exporters_json_payload(
+        payload['charts_cube'],
+        EXPORTERS_CHARTS_CUBE_FORMAT,
+    )
+    prepared['supply_dest'] = _encode_exporters_json_payload(
+        payload['supply_dest'],
+        EXPORTERS_SUPPLY_DEST_FORMAT,
+    )
+    return prepared
+
+
+def _prepare_exporters_supply_charts_snapshot_payload(charts_data):
+    return {
+        'charts_cube': _encode_exporters_json_payload(
+            _pack_record_mapping(charts_data),
+            EXPORTERS_CHARTS_CUBE_FORMAT,
+        ),
+        'continent_entities': list(charts_data),
+    }
+
+
+def _prepare_exporters_destination_summary_snapshot_payload(payload):
+    return _encode_exporters_json_payload(
+        payload,
+        EXPORTERS_SUPPLY_DEST_FORMAT,
+    )
 
 
 def _fetch_exporters_source_watermark():
     with engine.connect() as connection:
-        return connection.execute(
+        row = connection.execute(
             text(f"""
-                SELECT snapshot_timestamp_utc
-                FROM {DB_SCHEMA}.kpler_trade_snapshots
-                WHERE run_kind = 'canonical' AND status = 'published'
-                ORDER BY snapshot_date_utc DESC
-                LIMIT 1
+                WITH current_snapshot AS (
+                    SELECT
+                        snapshot_id,
+                        snapshot_date_utc,
+                        snapshot_timestamp_utc,
+                        facts_retained
+                    FROM {DB_SCHEMA}.kpler_trade_snapshots
+                    WHERE run_kind = 'canonical'
+                      AND status = 'published'
+                    ORDER BY
+                        snapshot_date_utc DESC,
+                        snapshot_timestamp_utc DESC,
+                        snapshot_id DESC
+                    LIMIT 1
+                )
+                SELECT
+                    current_snapshot.snapshot_id
+                        AS current_snapshot_id,
+                    current_snapshot.snapshot_date_utc
+                        AS current_snapshot_date_utc,
+                    current_snapshot.snapshot_timestamp_utc
+                        AS current_snapshot_timestamp_utc,
+                    current_snapshot.facts_retained
+                        AS current_facts_retained,
+                    baseline.snapshot_id
+                        AS baseline_snapshot_id,
+                    baseline.snapshot_date_utc
+                        AS baseline_snapshot_date_utc,
+                    baseline.snapshot_timestamp_utc
+                        AS baseline_snapshot_timestamp_utc,
+                    baseline.facts_retained
+                        AS baseline_facts_retained
+                FROM current_snapshot
+                LEFT JOIN LATERAL (
+                    SELECT
+                        snapshot_id,
+                        snapshot_date_utc,
+                        snapshot_timestamp_utc,
+                        facts_retained
+                    FROM {DB_SCHEMA}.kpler_trade_snapshots
+                    WHERE run_kind = 'canonical'
+                      AND status = 'published'
+                      AND facts_retained IS TRUE
+                      AND snapshot_date_utc
+                          < current_snapshot.snapshot_date_utc
+                      AND EXTRACT(
+                          ISODOW FROM snapshot_date_utc
+                      ) BETWEEN 1 AND 5
+                    ORDER BY
+                        snapshot_date_utc DESC,
+                        snapshot_timestamp_utc DESC,
+                        snapshot_id DESC
+                    LIMIT 1
+                ) AS baseline ON TRUE
             """)
-        ).scalar()
+        ).mappings().one_or_none()
+    return dict(row) if row is not None else None
 
 
 def _resolve_exporters_store(value):
-    resolved = _resolve_snapshot(
-        value,
-        engine,
-        expected_namespace=EXPORTERS_OVERVIEW_NAMESPACE,
-    )
+    try:
+        if _is_snapshot_reference(value):
+            namespace = value.get('namespace')
+            if namespace not in EXPORTERS_REFERENCE_NAMESPACES:
+                raise _SnapshotUnavailable(
+                    EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+                )
+        else:
+            namespace = None
+        resolved = _resolve_snapshot(
+            value,
+            engine,
+            expected_namespace=namespace,
+        )
+        resolved = _decode_exporters_json_payload(resolved)
+    except _SnapshotUnavailable as exc:
+        raise _SnapshotUnavailable(
+            EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
     return _unpack_record_mapping(resolved)
+
+
+def _resolve_exporters_continent_payload(value):
+    resolved = _resolve_exporters_store(value)
+    if not (
+        isinstance(resolved, dict)
+        and isinstance(resolved.get('entities'), list)
+        and isinstance(resolved.get('data'), pd.DataFrame)
+        and isinstance(resolved.get('source_state'), dict)
+        and isinstance(resolved.get('classification_mode'), str)
+        and isinstance(resolved.get('rolling_avg_days'), int)
+        and isinstance(resolved.get('selected_years'), list)
+    ):
+        raise _SnapshotUnavailable(
+            EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    return resolved
+
+
+def _exporters_snapshot_recovery_notice():
+    return html.Div(
+        EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE,
+        className='exporters-snapshot-recovery-message',
+        role='alert',
+    )
+
+
+def _exporters_snapshot_recovery_selector_result():
+    return (
+        [{
+            'label': EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE,
+            'value': '__snapshot_unavailable__',
+            'disabled': True,
+        }],
+        [],
+    )
 
 
 def setup_database_connection():
@@ -842,7 +1211,12 @@ def get_all_classification_groups(engine, schema):
         return []
 
 
-def _build_supply_dest_rolling_windows_from_df(df, classification_mode='Country', demand_aggregation_mode='None'):
+def _build_supply_dest_rolling_windows_from_df(
+    df,
+    classification_mode='Country',
+    demand_aggregation_mode='None',
+    as_of_date=None,
+):
     """Build supply-destination rolling windows from a bilateral flow dataframe."""
     if df is None or df.empty:
         return pd.DataFrame()
@@ -860,7 +1234,9 @@ def _build_supply_dest_rolling_windows_from_df(df, classification_mode='Country'
 
     df['flow_date'] = pd.to_datetime(df['flow_date'])
 
-    current_date = datetime.now().date()
+    current_date = pd.Timestamp(
+        as_of_date if as_of_date is not None else datetime.now()
+    ).date()
     date_7d_ago = current_date - timedelta(days=7)
     date_14d_ago = current_date - timedelta(days=14)
     date_30d_ago = current_date - timedelta(days=30)
@@ -902,13 +1278,95 @@ def _build_supply_dest_rolling_windows_from_df(df, classification_mode='Country'
         classification_mode,
         demand_aggregation_mode
     )
-    final_result = final_result.fillna(0)
+    final_result = final_result.infer_objects(copy=False).fillna(0)
     for reference_col in ['7D', '7D_PP', '7D_Y1', '30D', '30D_PP', '30D_Y1']:
         if reference_col not in final_result.columns:
             final_result[reference_col] = 0
     final_result['Δ 7D-30D'] = (final_result['7D'] - final_result['30D']).round(1)
     final_result['Δ 30D Y/Y'] = (final_result['30D'] - final_result['30D_Y1']).round(1)
     return final_result
+
+
+def _merge_supply_dest_pbd_rolling_windows(
+    current_rolling,
+    baseline_rolling,
+    classification_mode='Country',
+    demand_aggregation_mode='None',
+    baseline_available=False,
+):
+    """Attach exact prior-vintage 30D/7D values and signed changes."""
+    if current_rolling is None:
+        current_rolling = pd.DataFrame()
+    merged = current_rolling.copy()
+    if not baseline_available or baseline_rolling is None or baseline_rolling.empty:
+        if merged.empty:
+            return merged
+        for column_name in (
+            *SUPPLY_DEST_PBD_REFERENCE_COLUMNS,
+            *SUPPLY_DEST_PBD_DELTA_COLUMNS,
+        ):
+            merged[column_name] = np.nan
+        return merged
+
+    id_cols = get_supply_dest_id_cols(
+        classification_mode,
+        demand_aggregation_mode,
+    )
+    if merged.empty:
+        merged = pd.DataFrame(
+            columns=[
+                *id_cols,
+                '30D',
+                '30D_PP',
+                '30D_Y1',
+                '7D',
+                '7D_PP',
+                '7D_Y1',
+                'Δ 7D-30D',
+                'Δ 30D Y/Y',
+            ]
+        )
+    current_numeric_columns = [
+        column_name
+        for column_name in merged.columns
+        if column_name not in id_cols
+    ]
+    baseline_columns = [
+        column_name
+        for column_name in (*id_cols, '30D', '7D')
+        if column_name in baseline_rolling.columns
+    ]
+    baseline_values = baseline_rolling[baseline_columns].copy()
+    baseline_values = baseline_values.rename(
+        columns={
+            '30D': '30D_PBD',
+            '7D': '7D_PBD',
+        }
+    )
+    merged = merged.merge(
+        baseline_values,
+        on=id_cols,
+        how='outer',
+    )
+
+    for column_name in current_numeric_columns:
+        merged[column_name] = pd.to_numeric(
+            merged[column_name],
+            errors='coerce',
+        ).fillna(0)
+    for column_name in SUPPLY_DEST_PBD_REFERENCE_COLUMNS:
+        merged[column_name] = pd.to_numeric(
+            merged[column_name],
+            errors='coerce',
+        ).fillna(0)
+
+    merged['Δ 30D vs PBD'] = (
+        merged['30D'] - merged['30D_PBD']
+    ).round(1)
+    merged['Δ 7D vs PBD'] = (
+        merged['7D'] - merged['7D_PBD']
+    ).round(1)
+    return merged
 
 
 def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Country', demand_aggregation_mode='None'):
@@ -1000,7 +1458,8 @@ def fetch_supply_dest_rolling_windows(engine, schema, classification_mode='Count
 
 def fetch_supply_dest_summary_data(engine, schema, classification_mode, demand_aggregation_mode,
                                    quarters_df, months_df, weeks_df,
-                                   years_df=None, rolling_data=None):
+                                   years_df=None, rolling_data=None,
+                                   current_date=None):
     """Combine supply-destination years, quarters, months, weeks, and rolling windows into summary format."""
     try:
         years_df = years_df if years_df is not None else pd.DataFrame()
@@ -1008,7 +1467,9 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, demand_a
             return pd.DataFrame()
 
         # Get current date to determine what's complete
-        current_date = datetime.now()
+        current_date = pd.Timestamp(
+            current_date if current_date is not None else datetime.now()
+        )
         current_quarter = (current_date.month - 1) // 3 + 1
         current_year = current_date.year
 
@@ -1142,7 +1603,17 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, demand_a
         # Finally add the remaining rolling window columns and hidden references.
         if not rolling_data.empty:
             final_rolling_cols = [
-                col for col in id_cols + ['7D', '7D_PP', '7D_Y1', 'Δ 7D-30D', 'Δ 30D Y/Y']
+                col for col in id_cols + [
+                    '7D',
+                    '7D_PP',
+                    '7D_Y1',
+                    'Δ 7D-30D',
+                    'Δ 30D Y/Y',
+                    '30D_PBD',
+                    '7D_PBD',
+                    'Δ 30D vs PBD',
+                    'Δ 7D vs PBD',
+                ]
                 if col in rolling_data.columns
             ]
             result = result.merge(
@@ -1156,9 +1627,31 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, demand_a
             result['7D_Y1'] = 0
             result['Δ 7D-30D'] = 0
             result['Δ 30D Y/Y'] = 0
+            result['30D_PBD'] = np.nan
+            result['7D_PBD'] = np.nan
+            result['Δ 30D vs PBD'] = np.nan
+            result['Δ 7D vs PBD'] = np.nan
 
-        # Fill NaN values with 0
+        pbd_available = (
+            rolling_data is not None
+            and not rolling_data.empty
+            and any(
+                column_name in rolling_data.columns
+                and rolling_data[column_name].notna().any()
+                for column_name in SUPPLY_DEST_PBD_REFERENCE_COLUMNS
+            )
+        )
+
+        # Fill valid absent-flow cells with zero while preserving an unavailable
+        # comparison snapshot as unavailable.
         result = result.fillna(0)
+        if not pbd_available:
+            for column_name in (
+                *SUPPLY_DEST_PBD_REFERENCE_COLUMNS,
+                *SUPPLY_DEST_PBD_DELTA_COLUMNS,
+            ):
+                if column_name in result.columns:
+                    result[column_name] = np.nan
 
         # Ensure numeric columns are float
         numeric_cols = (
@@ -1167,7 +1660,17 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, demand_a
             + selected_month_cols
             + ['30D', '30D_PP', '30D_Y1']
             + selected_week_cols
-            + ['7D', '7D_PP', '7D_Y1', 'Δ 7D-30D', 'Δ 30D Y/Y']
+            + [
+                '7D',
+                '7D_PP',
+                '7D_Y1',
+                'Δ 7D-30D',
+                'Δ 30D Y/Y',
+                '30D_PBD',
+                '7D_PBD',
+                'Δ 30D vs PBD',
+                'Δ 7D vs PBD',
+            ]
         )
         for col in numeric_cols:
             if col in result.columns:
@@ -1189,9 +1692,19 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, demand_a
                     '7D_PP',
                     '7D_Y1',
                     'Δ 7D-30D',
-                    'Δ 30D Y/Y'
+                    'Δ 30D Y/Y',
+                    '30D_PBD',
+                    '7D_PBD',
+                    'Δ 30D vs PBD',
+                    'Δ 7D vs PBD',
                 ]
             }
+            if not pbd_available:
+                for column_name in (
+                    *SUPPLY_DEST_PBD_REFERENCE_COLUMNS,
+                    *SUPPLY_DEST_PBD_DELTA_COLUMNS,
+                ):
+                    rolling_totals[column_name] = np.nan
             other_cols = {
                 col: result[col].sum()
                 for col in selected_year_cols + selected_quarter_cols + selected_month_cols + selected_week_cols
@@ -1233,12 +1746,60 @@ def fetch_supply_dest_summary_data(engine, schema, classification_mode, demand_a
         return pd.DataFrame()
 
 
-def build_supply_dest_summary_store_payload(engine, schema, base_df, classification_mode='Country',
-                                            demand_aggregation_mode='None'):
+def _build_supply_dest_snapshot_comparison_metadata(
+    source_state,
+    baseline_data_available,
+):
+    """Build JSON-safe lineage metadata for the current/PBD table pair."""
+    source_state = source_state if isinstance(source_state, dict) else {}
+    current_snapshot = source_state.get('current_snapshot')
+    baseline_snapshot = source_state.get('baseline_snapshot')
+    status = source_state.get('baseline_status')
+    if (
+        status not in {'exact', 'fallback'}
+        or not isinstance(current_snapshot, dict)
+        or not isinstance(baseline_snapshot, dict)
+        or not baseline_data_available
+    ):
+        status = 'unavailable'
+    return {
+        'status': status,
+        'current_snapshot': (
+            dict(current_snapshot)
+            if isinstance(current_snapshot, dict)
+            else None
+        ),
+        'baseline_snapshot': (
+            dict(baseline_snapshot)
+            if isinstance(baseline_snapshot, dict)
+            else None
+        ),
+        'business_day_gap': source_state.get('business_day_gap'),
+    }
+
+
+def build_supply_dest_summary_store_payload(
+    engine,
+    schema,
+    base_df,
+    classification_mode='Country',
+    demand_aggregation_mode='None',
+    previous_business_base_df=None,
+    source_state=None,
+):
     """Build grouped and ungrouped overview payloads for the supply-destination summary table."""
     if base_df is None or base_df.empty:
         return _empty_supply_dest_summary_store_payload()
 
+    source_state = source_state if isinstance(source_state, dict) else {}
+    current_as_of_date = (
+        (source_state.get('current_snapshot') or {}).get('snapshot_date_utc')
+        or source_state.get('as_of_date')
+        or datetime.now().date()
+    )
+    baseline_as_of_date = (
+        (source_state.get('baseline_snapshot') or {}).get('snapshot_date_utc')
+    )
     filtered_base_df = exclude_internal_destination_flows(
         base_df.copy(),
         classification_mode,
@@ -1250,18 +1811,53 @@ def build_supply_dest_summary_store_payload(engine, schema, base_df, classificat
     if filtered_base_df.empty:
         return _empty_supply_dest_summary_store_payload()
 
-    def _build_payload_records(summary_base_df):
+    filtered_baseline_df = pd.DataFrame()
+    if (
+        previous_business_base_df is not None
+        and not previous_business_base_df.empty
+        and baseline_as_of_date is not None
+    ):
+        filtered_baseline_df = exclude_internal_destination_flows(
+            previous_business_base_df.copy(),
+            classification_mode,
+            origin_country_col='supply_country',
+            destination_country_col='demand_country',
+            origin_classification_col='supply_classification',
+            destination_classification_col='demand_classification',
+        )
+    baseline_data_available = not filtered_baseline_df.empty
+    comparison_metadata = _build_supply_dest_snapshot_comparison_metadata(
+        source_state,
+        baseline_data_available,
+    )
+
+    def _build_payload_records(summary_base_df, summary_baseline_df):
         years_df, quarters_df, months_df, weeks_df = fetch_supply_destination_data(
             engine,
             schema,
             classification_mode,
             demand_aggregation_mode,
-            summary_base_df
+            summary_base_df,
+            current_as_of_date,
         )
         rolling_df = _build_supply_dest_rolling_windows_from_df(
             summary_base_df,
             classification_mode,
-            demand_aggregation_mode
+            demand_aggregation_mode,
+            current_as_of_date,
+        )
+        baseline_rolling_df = _build_supply_dest_rolling_windows_from_df(
+            summary_baseline_df,
+            classification_mode,
+            demand_aggregation_mode,
+            baseline_as_of_date,
+        )
+        rolling_df = _merge_supply_dest_pbd_rolling_windows(
+            rolling_df,
+            baseline_rolling_df,
+            classification_mode,
+            demand_aggregation_mode,
+            baseline_available=baseline_data_available,
         )
         summary_df = fetch_supply_dest_summary_data(
             engine,
@@ -1272,19 +1868,36 @@ def build_supply_dest_summary_store_payload(engine, schema, base_df, classificat
             months_df,
             weeks_df,
             years_df,
-            rolling_data=rolling_df
+            rolling_data=rolling_df,
+            current_date=current_as_of_date,
         )
         return summary_df.to_dict('records') if not summary_df.empty else []
 
-    grouped_base_df = group_small_supply_dest_countries(
+    grouped_base_df, grouping_config = group_small_supply_dest_countries(
         filtered_base_df,
         classification_mode,
-        demand_aggregation_mode
+        demand_aggregation_mode,
+        as_of_date=current_as_of_date,
+        return_grouping_config=True,
+    )
+    grouped_baseline_df = group_small_supply_dest_countries(
+        filtered_baseline_df,
+        classification_mode,
+        demand_aggregation_mode,
+        grouping_config=grouping_config,
     )
 
     return {
-        'show_all': _build_payload_records(filtered_base_df),
-        'group_small_countries': _build_payload_records(grouped_base_df)
+        'format': EXPORTERS_SUPPLY_DEST_SUMMARY_FORMAT,
+        'show_all': _build_payload_records(
+            filtered_base_df,
+            filtered_baseline_df,
+        ),
+        'group_small_countries': _build_payload_records(
+            grouped_base_df,
+            grouped_baseline_df,
+        ),
+        'comparison': comparison_metadata,
     }
 
 
@@ -2054,10 +2667,55 @@ def fetch_supply_chart_data(
     """Fetch all supply chart entities with a batched query and legacy fallback."""
     classification_mode = classification_mode or 'Country'
     rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
+    entity_names = _get_exporter_entity_names(
+        engine,
+        schema,
+        classification_mode,
+    )
+    return _fetch_supply_chart_data_for_entities(
+        engine,
+        schema,
+        classification_mode,
+        rolling_avg_days,
+        entity_names,
+    )
 
+
+def _get_exporter_entity_names(
+    engine,
+    schema,
+    classification_mode='Country',
+):
+    classification_mode = classification_mode or 'Country'
+    if classification_mode == 'Classification Level 1':
+        return list(dict.fromkeys(
+            ['Global'] + get_all_classification_groups(engine, schema)
+        ))
+    return (
+        ['Global']
+        + list(SUPPLY_CHART_VISIBLE_COUNTRIES)
+        + [SUPPLY_CHART_REST_OF_COUNTRIES_LABEL]
+    )
+
+
+def _fetch_supply_chart_data_for_entities(
+    engine,
+    schema,
+    classification_mode,
+    rolling_avg_days,
+    entity_names,
+):
+    """Fetch chart data for a precomputed, deterministically ordered roster."""
+    classification_mode = classification_mode or 'Country'
+    rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
+    entity_names = list(dict.fromkeys(entity_names or []))
     try:
         if classification_mode == 'Classification Level 1':
-            classification_groups = get_all_classification_groups(engine, schema)
+            classification_groups = [
+                entity_name
+                for entity_name in entity_names
+                if entity_name != 'Global'
+            ]
             return _fetch_classification_supply_chart_batch(
                 engine,
                 schema,
@@ -2084,18 +2742,92 @@ def fetch_supply_chart_data(
         )
 
 
-def fetch_supply_destination_base_data(engine, schema):
-    """Fetch and normalize bilateral trade flow data used across supply-destination views."""
-    try:
-        with engine.connect() as conn:
-            base_query = text(f"""
+def _normalize_supply_destination_base_frame(df):
+    """Normalize one exact Kpler snapshot to the destination-table contract."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    df['supply_classification'] = (
+        df['supply_classification']
+        .fillna('Unknown')
+        .astype(str)
+        .str.strip()
+    )
+    df['supply_country'] = (
+        df['supply_country'].fillna('Unknown').astype(str).str.strip()
+    )
+    df['supply_installation'] = (
+        df['supply_installation']
+        .fillna('Unknown')
+        .astype(str)
+        .str.strip()
+    )
+    df.loc[df['supply_installation'] == '', 'supply_installation'] = 'Unknown'
+    df['demand_classification'] = (
+        df['demand_classification']
+        .fillna('Unknown')
+        .astype(str)
+        .str.strip()
+    )
+    df['demand_country'] = (
+        df['demand_country'].fillna('Unknown').astype(str).str.strip()
+    )
+    df['mcmd'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0) * 0.6 / 1000
+    df['flow_date'] = pd.to_datetime(df['flow_date'])
+    return df
+
+
+def _fetch_supply_destination_snapshot_data(
+    engine,
+    schema,
+    snapshot_timestamp_utc=None,
+    as_of_date=None,
+    window_days=None,
+):
+    """Fetch one exact snapshot, optionally bounded to an inclusive N-day window."""
+    exact_snapshot = (
+        snapshot_timestamp_utc is not None
+        and as_of_date is not None
+    )
+    params = {}
+    if exact_snapshot:
+        as_of_timestamp = pd.Timestamp(as_of_date).normalize()
+        params = {
+            'snapshot_timestamp_utc': pd.Timestamp(snapshot_timestamp_utc),
+            'end_exclusive': as_of_timestamp + pd.Timedelta(days=1),
+        }
+        if window_days is None:
+            start_filter = "AND kt.start >= TIMESTAMP '2022-01-01'"
+        else:
+            params['window_start'] = (
+                as_of_timestamp - pd.Timedelta(days=int(window_days) - 1)
+            )
+            start_filter = 'AND kt.start >= :window_start'
+        source_cte = ''
+        source_join = ''
+        source_filter = (
+            'kt.upload_timestamp_utc = :snapshot_timestamp_utc'
+        )
+        end_filter = 'AND kt.start < :end_exclusive'
+    else:
+        source_cte = f"""
             WITH latest_data AS (
-                SELECT snapshot_timestamp_utc as max_timestamp
+                SELECT snapshot_timestamp_utc AS max_timestamp
                 FROM {schema}.kpler_trade_snapshots
                 WHERE run_kind = 'canonical' AND status = 'published'
                 ORDER BY snapshot_date_utc DESC
                 LIMIT 1
             )
+        """
+        source_join = ', latest_data ld'
+        source_filter = 'kt.upload_timestamp_utc = ld.max_timestamp'
+        start_filter = "AND kt.start >= TIMESTAMP '2022-01-01'"
+        end_filter = 'AND kt.start::date <= CURRENT_DATE'
+
+    try:
+        with engine.connect() as conn:
+            base_query = text(f"""
+            {source_cte}
             SELECT
                 COALESCE(mc_origin.country_classification_level1, 'Unknown') as supply_classification,
                 kt.origin_country_name as supply_country,
@@ -2111,99 +2843,194 @@ def fetch_supply_destination_base_data(engine, schema):
             FROM {schema}.kpler_trades kt
             LEFT JOIN {schema}.mappings_country mc_origin ON kt.origin_country_name = mc_origin.country
             LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
-            , latest_data ld
-            WHERE kt.upload_timestamp_utc = ld.max_timestamp
+            {source_join}
+            WHERE {source_filter}
                 AND kt.start IS NOT NULL
-                AND kt.start >= '2022-01-01'
-                AND kt.start::date <= CURRENT_DATE
+                {start_filter}
+                {end_filter}
             """)
-
-            df = pd.read_sql(base_query, conn)
-
+            df = pd.read_sql(base_query, conn, params=params)
     except Exception:
         return pd.DataFrame()
-
-    if df.empty:
-        return pd.DataFrame()
-
-    # Common data preparation
-    df['supply_classification'] = df['supply_classification'].fillna('Unknown').astype(str).str.strip()
-    df['supply_country'] = df['supply_country'].fillna('Unknown').astype(str).str.strip()
-    df['supply_installation'] = df['supply_installation'].fillna('Unknown').astype(str).str.strip()
-    df.loc[df['supply_installation'] == '', 'supply_installation'] = 'Unknown'
-    df['demand_classification'] = df['demand_classification'].fillna('Unknown').astype(str).str.strip()
-    df['demand_country'] = df['demand_country'].fillna('Unknown').astype(str).str.strip()
-
-    df['mcmd'] = df['volume'] * 0.6 / 1000
-    df['flow_date'] = pd.to_datetime(df['flow_date'])
-    return df
+    return _normalize_supply_destination_base_frame(df)
 
 
-def group_small_supply_dest_countries(df, classification_mode='Country',
-                                      demand_aggregation_mode='None',
-                                      threshold_mcmd=10, lookback_months=24):
-    """Group small countries on the visible country axis into Rest of countries."""
-    if df.empty:
-        return df
+def fetch_supply_destination_base_data(
+    engine,
+    schema,
+    snapshot_timestamp_utc=None,
+    as_of_date=None,
+):
+    """Fetch the full current-vintage input for destination summary periods."""
+    return _fetch_supply_destination_snapshot_data(
+        engine,
+        schema,
+        snapshot_timestamp_utc,
+        as_of_date,
+        None,
+    )
 
+
+def fetch_supply_destination_pbd_base_data(
+    engine,
+    schema,
+    snapshot_timestamp_utc,
+    as_of_date,
+):
+    """Fetch only the prior-vintage rows required by its 30D/7D windows."""
+    return _fetch_supply_destination_snapshot_data(
+        engine,
+        schema,
+        snapshot_timestamp_utc,
+        as_of_date,
+        30,
+    )
+
+
+def _build_supply_dest_small_country_grouping(
+    df,
+    classification_mode='Country',
+    demand_aggregation_mode='None',
+    threshold_mcmd=10,
+    lookback_months=24,
+    as_of_date=None,
+):
+    """Build one current-vintage grouping map reusable by both snapshots."""
     country_col, parent_cols = get_supply_dest_small_country_grouping_config(
         classification_mode,
-        demand_aggregation_mode
+        demand_aggregation_mode,
     )
-    if country_col not in df.columns:
-        return df
+    pair_cols = parent_cols + [country_col]
+    empty_config = {
+        'country_col': country_col,
+        'pair_cols': pair_cols,
+        'small_pairs': pd.DataFrame(columns=pair_cols),
+    }
+    if df is None or df.empty or country_col not in df.columns:
+        return empty_config
 
-    grouped_df = df.copy()
-    current_timestamp = pd.Timestamp(datetime.now()).normalize()
+    current_timestamp = pd.Timestamp(
+        as_of_date if as_of_date is not None else datetime.now()
+    ).normalize()
     current_month = current_timestamp.to_period('M')
     start_month = current_month - (lookback_months - 1)
-
-    lookback_df = grouped_df[
-        grouped_df['flow_date'].dt.to_period('M') >= start_month
+    lookback_df = df[
+        df['flow_date'].dt.to_period('M') >= start_month
     ].copy()
     if lookback_df.empty:
-        return grouped_df
+        return empty_config
 
     lookback_df['__month_period'] = lookback_df['flow_date'].dt.to_period('M')
     monthly_totals = (
-        lookback_df.groupby(parent_cols + [country_col, '__month_period'], dropna=False)['mcmd']
+        lookback_df.groupby(
+            pair_cols + ['__month_period'],
+            dropna=False,
+        )['mcmd']
         .sum()
         .reset_index()
     )
     if monthly_totals.empty:
-        return grouped_df
+        return empty_config
 
     monthly_totals['__days'] = monthly_totals['__month_period'].apply(
         lambda month_period: (
-            current_timestamp.day if month_period == current_month else month_period.days_in_month
+            current_timestamp.day
+            if month_period == current_month
+            else month_period.days_in_month
         )
     )
     monthly_totals['__monthly_mcmd'] = (
         monthly_totals['mcmd'] / monthly_totals['__days']
     ).fillna(0)
-
-    pair_cols = parent_cols + [country_col]
     max_monthly_by_pair = (
-        monthly_totals.groupby(pair_cols, dropna=False)['__monthly_mcmd']
+        monthly_totals.groupby(
+            pair_cols,
+            dropna=False,
+        )['__monthly_mcmd']
         .max()
         .reset_index()
     )
-    all_pairs = grouped_df[pair_cols].drop_duplicates()
-    pair_threshold_df = all_pairs.merge(max_monthly_by_pair, on=pair_cols, how='left')
-    pair_threshold_df['__monthly_mcmd'] = pair_threshold_df['__monthly_mcmd'].fillna(0)
-    small_pairs = pair_threshold_df[pair_threshold_df['__monthly_mcmd'] <= threshold_mcmd][pair_cols].copy()
+    all_pairs = df[pair_cols].drop_duplicates()
+    pair_threshold_df = all_pairs.merge(
+        max_monthly_by_pair,
+        on=pair_cols,
+        how='left',
+    )
+    pair_threshold_df['__monthly_mcmd'] = (
+        pair_threshold_df['__monthly_mcmd'].fillna(0)
+    )
+    small_pairs = pair_threshold_df[
+        pair_threshold_df['__monthly_mcmd'] <= threshold_mcmd
+    ][pair_cols].copy()
+    return {
+        'country_col': country_col,
+        'pair_cols': pair_cols,
+        'small_pairs': small_pairs,
+    }
 
-    if small_pairs.empty:
-        return grouped_df
 
+def _apply_supply_dest_small_country_grouping(df, grouping_config):
+    """Apply a frozen current-vintage grouping map to a supply frame."""
+    if df is None or df.empty:
+        return df
+    grouping_config = grouping_config or {}
+    country_col = grouping_config.get('country_col')
+    pair_cols = grouping_config.get('pair_cols') or []
+    small_pairs = grouping_config.get('small_pairs')
+    if (
+        not country_col
+        or country_col not in df.columns
+        or not pair_cols
+        or any(column_name not in df.columns for column_name in pair_cols)
+        or not isinstance(small_pairs, pd.DataFrame)
+        or small_pairs.empty
+    ):
+        return df.copy()
+
+    grouped_df = df.copy()
+    small_pairs = small_pairs[pair_cols].drop_duplicates().copy()
     small_pairs['__group_small_country'] = True
-    grouped_df = grouped_df.merge(small_pairs, on=pair_cols, how='left')
-    grouped_df['__group_small_country'] = grouped_df['__group_small_country'].eq(True)
+    grouped_df = grouped_df.merge(
+        small_pairs,
+        on=pair_cols,
+        how='left',
+    )
+    grouped_df['__group_small_country'] = (
+        grouped_df['__group_small_country'].eq(True)
+    )
     grouped_df.loc[
         grouped_df['__group_small_country'],
-        country_col
+        country_col,
     ] = 'Rest of countries'
-    grouped_df = grouped_df.drop(columns='__group_small_country')
+    return grouped_df.drop(columns='__group_small_country')
+
+
+def group_small_supply_dest_countries(
+    df,
+    classification_mode='Country',
+    demand_aggregation_mode='None',
+    threshold_mcmd=10,
+    lookback_months=24,
+    as_of_date=None,
+    grouping_config=None,
+    return_grouping_config=False,
+):
+    """Group small countries using one explicit, reusable grouping taxonomy."""
+    if grouping_config is None:
+        grouping_config = _build_supply_dest_small_country_grouping(
+            df,
+            classification_mode,
+            demand_aggregation_mode,
+            threshold_mcmd,
+            lookback_months,
+            as_of_date,
+        )
+    grouped_df = _apply_supply_dest_small_country_grouping(
+        df,
+        grouping_config,
+    )
+    if return_grouping_config:
+        return grouped_df, grouping_config
     return grouped_df
 
 
@@ -2365,9 +3192,12 @@ def _build_supply_dest_period_matrix(df, current_date, period_view='monthly',
 
 
 def fetch_supply_destination_data(engine, schema, classification_mode='Country',
-                                  demand_aggregation_mode='None', base_df=None):
+                                  demand_aggregation_mode='None', base_df=None,
+                                  current_date=None):
     """Fetch bilateral trade flow data for the default supply-destination table."""
-    current_date = datetime.now()
+    current_date = pd.Timestamp(
+        current_date if current_date is not None else datetime.now()
+    )
     df = base_df.copy() if base_df is not None else fetch_supply_destination_base_data(engine, schema)
     df = exclude_internal_destination_flows(
         df,
@@ -3770,7 +4600,11 @@ def _build_supply_dest_summary_grid_display(display_df, columns, view_type='abso
 
         def format_value(value):
             if value is None or (isinstance(value, float) and pd.isna(value)):
-                return ''
+                return (
+                    '—'
+                    if column_id in SUPPLY_DEST_PBD_DELTA_COLUMNS
+                    else ''
+                )
             try:
                 numeric_value = float(value)
             except (TypeError, ValueError):
@@ -3785,6 +4619,11 @@ def _build_supply_dest_summary_grid_display(display_df, columns, view_type='abso
                 return f'{numeric_value:.0%}'
             if column_id in delta_ids and abs(numeric_value) < 0.5:
                 numeric_value = 0
+            if (
+                column_id in SUPPLY_DEST_PBD_DELTA_COLUMNS
+                and numeric_value > 0
+            ):
+                return f'+{numeric_value:,.0f}'
             return f'{numeric_value:,.0f}'
 
         grid_df[column_id] = grid_df[column_id].apply(format_value)
@@ -3856,6 +4695,8 @@ def _get_supply_dest_summary_column_family(column_id):
         return 'delta-mom'
     if column_id == 'Δ 30D Y/Y':
         return 'delta-yoy'
+    if column_id in SUPPLY_DEST_PBD_DELTA_COLUMNS:
+        return 'delta-pbd'
     if _is_supply_dest_summary_year_column(column_id):
         return 'year'
     if column_id.startswith('Q') and "'" in column_id:
@@ -4925,6 +5766,7 @@ layout = html.Div([
     dcc.Interval(id='initial-load-trigger', interval=1000*60*60*24, n_intervals=0, max_intervals=1),
 
     # Store components for caching data (memory is faster than local storage)
+    dcc.Store(id='exporters-source-state-store', storage_type='memory'),
     dcc.Store(id='supply-charts-data', storage_type='memory'),  # Single store for all supply chart data
     dcc.Store(id='continent-charts-data', storage_type='memory'),  # Store for continent charts data
     dcc.Store(id='supply-dest-data-store', storage_type='memory'),  # Store for supply-destination data
@@ -5293,73 +6135,784 @@ def _build_exporters_overview_payload(
     }
 
 
+def _normalize_exporters_source_watermark(value):
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    if value is None:
+        return None
+    return str(value)
+
+
+def _normalize_exporters_snapshot_metadata(source_pair, prefix):
+    """Normalize one snapshot row from the atomic current/baseline lookup."""
+    if not isinstance(source_pair, dict):
+        return None
+    snapshot_id = source_pair.get(f'{prefix}_snapshot_id')
+    snapshot_date = source_pair.get(f'{prefix}_snapshot_date_utc')
+    snapshot_timestamp = source_pair.get(
+        f'{prefix}_snapshot_timestamp_utc'
+    )
+    if snapshot_id is None or snapshot_date is None or snapshot_timestamp is None:
+        return None
+    return {
+        'snapshot_id': int(snapshot_id),
+        'snapshot_date_utc': pd.Timestamp(snapshot_date).date().isoformat(),
+        'snapshot_timestamp_utc': _normalize_exporters_source_watermark(
+            snapshot_timestamp
+        ),
+        'facts_retained': bool(
+            source_pair.get(f'{prefix}_facts_retained')
+        ),
+    }
+
+
+def _previous_weekday_utc(value):
+    """Return the prior Monday-Friday date for a UTC snapshot date."""
+    candidate = pd.Timestamp(value).date() - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _business_day_gap(start_date, end_date):
+    """Count Monday-Friday business-day steps between two snapshot dates."""
+    if start_date is None or end_date is None:
+        return None
+    start = pd.Timestamp(start_date).date()
+    end = pd.Timestamp(end_date).date()
+    if start >= end:
+        return 0
+    return int(np.busday_count(start.isoformat(), end.isoformat()))
+
+
+def _build_exporters_source_state(source_pair, refresh_token=None):
+    """Build the versioned source contract used by all exporter snapshots."""
+    current_snapshot = _normalize_exporters_snapshot_metadata(
+        source_pair,
+        'current',
+    )
+    baseline_snapshot = _normalize_exporters_snapshot_metadata(
+        source_pair,
+        'baseline',
+    )
+    if current_snapshot is None:
+        scalar_watermark = (
+            source_pair
+            if not isinstance(source_pair, dict)
+            else None
+        )
+        return {
+            'format': EXPORTERS_SOURCE_STATE_FORMAT,
+            'source_watermark': _normalize_exporters_source_watermark(
+                scalar_watermark
+            ),
+            'as_of_date': datetime.now().date().isoformat(),
+            'current_snapshot': None,
+            'baseline_snapshot': None,
+            'baseline_status': 'unavailable',
+            'business_day_gap': None,
+            'refresh_token': refresh_token,
+        }
+
+    expected_baseline_date = _previous_weekday_utc(
+        current_snapshot['snapshot_date_utc']
+    )
+    baseline_status = 'unavailable'
+    business_day_gap = None
+    if baseline_snapshot is not None:
+        baseline_date = pd.Timestamp(
+            baseline_snapshot['snapshot_date_utc']
+        ).date()
+        baseline_status = (
+            'exact'
+            if baseline_date == expected_baseline_date
+            else 'fallback'
+        )
+        business_day_gap = _business_day_gap(
+            baseline_date,
+            current_snapshot['snapshot_date_utc'],
+        )
+
+    return {
+        'format': EXPORTERS_SOURCE_STATE_FORMAT,
+        'source_watermark': current_snapshot['snapshot_timestamp_utc'],
+        'as_of_date': current_snapshot['snapshot_date_utc'],
+        'current_snapshot': current_snapshot,
+        'baseline_snapshot': baseline_snapshot,
+        'baseline_status': baseline_status,
+        'business_day_gap': business_day_gap,
+        'refresh_token': refresh_token,
+    }
+
+
+def _validate_exporters_source_state(source_state):
+    if not (
+        isinstance(source_state, dict)
+        and source_state.get('format') == EXPORTERS_SOURCE_STATE_FORMAT
+        and source_state.get('as_of_date')
+    ):
+        raise _SnapshotUnavailable(
+            EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    return dict(source_state)
+
+
+@callback(
+    Output('exporters-source-state-store', 'data'),
+    [Input('initial-load-trigger', 'n_intervals'),
+     Input('global-refresh-button', 'n_clicks')],
+    prevent_initial_call=False
+)
+def refresh_exporters_source_state(_n_intervals, _global_refresh_clicks):
+    """Capture one coherent current/PBD snapshot pair on refresh."""
+    refresh_token = (
+        uuid.uuid4().hex
+        if _was_global_refresh_triggered()
+        else None
+    )
+    try:
+        source_pair = _fetch_exporters_source_watermark()
+    except Exception:
+        source_pair = None
+        refresh_token = uuid.uuid4().hex
+    return _build_exporters_source_state(
+        source_pair,
+        refresh_token,
+    )
+
+
+def _exporters_destination_base_source_key(source_state):
+    return _build_source_key(
+        EXPORTERS_DESTINATION_BASE_NAMESPACE,
+        _validate_exporters_source_state(source_state),
+    )
+
+
+def _exporters_destination_pbd_base_source_key(source_state):
+    source_state = _validate_exporters_source_state(source_state)
+    return _build_source_key(
+        EXPORTERS_DESTINATION_PBD_BASE_NAMESPACE,
+        source_state.get('baseline_snapshot'),
+    )
+
+
+def _exporters_supply_charts_source_key(
+    source_state,
+    classification_mode,
+    rolling_avg_days,
+    entity_names,
+):
+    return _build_source_key(
+        EXPORTERS_SUPPLY_CHARTS_NAMESPACE,
+        _validate_exporters_source_state(source_state),
+        classification_mode,
+        rolling_avg_days,
+        list(entity_names),
+    )
+
+
+def _exporters_continent_data_source_key(
+    source_state,
+    classification_mode,
+    rolling_avg_days,
+    entity_names,
+    selected_years,
+):
+    selected_years, _query_start_date, _display_start_date = (
+        _get_continent_chart_selected_window(selected_years)
+    )
+    return _build_source_key(
+        EXPORTERS_CONTINENT_DATA_NAMESPACE,
+        _validate_exporters_source_state(source_state),
+        classification_mode,
+        rolling_avg_days,
+        list(entity_names),
+        selected_years,
+    )
+
+
+def _exporters_continent_export_source_key(
+    source_state,
+    classification_mode,
+    rolling_avg_days,
+    entity_names,
+):
+    return _build_source_key(
+        EXPORTERS_CONTINENT_EXPORT_NAMESPACE,
+        _validate_exporters_source_state(source_state),
+        classification_mode,
+        rolling_avg_days,
+        list(entity_names),
+        CONTINENT_CHART_QUERY_START_DATE,
+        CONTINENT_CHART_DISPLAY_START_DATE,
+    )
+
+
+def _exporters_destination_summary_source_key(
+    destination_base_reference,
+    classification_mode,
+    demand_aggregation_mode,
+    destination_pbd_reference=None,
+    source_state=None,
+):
+    source_state = source_state if isinstance(source_state, dict) else {}
+    current_dependency = {
+        'namespace': destination_base_reference.get('namespace'),
+        'source_key': destination_base_reference.get('source_key'),
+        'revision': destination_base_reference.get('revision'),
+    }
+    baseline_dependency = None
+    if isinstance(destination_pbd_reference, dict):
+        baseline_dependency = {
+            'namespace': destination_pbd_reference.get('namespace'),
+            'source_key': destination_pbd_reference.get('source_key'),
+            'revision': destination_pbd_reference.get('revision'),
+        }
+    return _build_source_key(
+        EXPORTERS_DESTINATION_SUMMARY_NAMESPACE,
+        current_dependency,
+        baseline_dependency,
+        {
+            'format': source_state.get('format'),
+            'current_snapshot': source_state.get('current_snapshot'),
+            'baseline_snapshot': source_state.get('baseline_snapshot'),
+            'baseline_status': source_state.get('baseline_status'),
+            'business_day_gap': source_state.get('business_day_gap'),
+        },
+        classification_mode,
+        demand_aggregation_mode,
+    )
+
+
+def _build_exporters_supply_charts_snapshot_payload(
+    engine_inst,
+    schema,
+    classification_mode,
+    rolling_avg_days,
+    entity_names,
+):
+    chart_dfs = _fetch_supply_chart_data_for_entities(
+        engine_inst,
+        schema,
+        classification_mode,
+        rolling_avg_days,
+        entity_names,
+    )
+    charts_data = {
+        entity_name: (
+            chart_dfs[entity_name].to_dict('records')
+            if (
+                entity_name in chart_dfs
+                and chart_dfs[entity_name] is not None
+                and not chart_dfs[entity_name].empty
+            )
+            else []
+        )
+        for entity_name in entity_names
+    }
+    return _prepare_exporters_supply_charts_snapshot_payload(
+        charts_data
+    )
+
+
+def _build_exporters_continent_snapshot_payload(
+    engine_inst,
+    schema,
+    source_state,
+    classification_mode,
+    rolling_avg_days,
+    entity_names,
+    selected_years,
+):
+    selected_years, _query_start_date, _display_start_date = (
+        _get_continent_chart_selected_window(selected_years)
+    )
+    source_state = _validate_exporters_source_state(source_state)
+    classification_mode = classification_mode or 'Country'
+    rolling_avg_days = normalize_supply_rolling_avg_days(
+        rolling_avg_days
+    )
+    continent_df = fetch_continent_chart_data_batch(
+        engine_inst,
+        schema,
+        entity_names,
+        classification_mode,
+        selected_years=selected_years,
+        rolling_avg_days=rolling_avg_days,
+    )
+    return {
+        'entities': list(entity_names),
+        'data': continent_df,
+        'source_state': source_state,
+        'classification_mode': classification_mode,
+        'rolling_avg_days': rolling_avg_days,
+        'selected_years': selected_years,
+    }
+
+
+def _load_exporters_destination_base_snapshot(
+    engine_inst,
+    schema,
+    source_state,
+):
+    current_snapshot = source_state.get('current_snapshot') or {}
+    return _get_or_build_snapshot(
+        engine_inst,
+        namespace=EXPORTERS_DESTINATION_BASE_NAMESPACE,
+        source_key=_exporters_destination_base_source_key(
+            source_state
+        ),
+        builder=lambda: fetch_supply_destination_base_data(
+            engine_inst,
+            schema,
+            current_snapshot.get('snapshot_timestamp_utc'),
+            current_snapshot.get('snapshot_date_utc'),
+        ),
+        manifest={
+            'source_state': source_state,
+        },
+    )
+
+
+def _load_exporters_destination_pbd_base_snapshot(
+    engine_inst,
+    schema,
+    source_state,
+):
+    baseline_snapshot = source_state.get('baseline_snapshot') or {}
+    if (
+        source_state.get('baseline_status') not in {'exact', 'fallback'}
+        or not baseline_snapshot.get('snapshot_timestamp_utc')
+        or not baseline_snapshot.get('snapshot_date_utc')
+    ):
+        return None, pd.DataFrame()
+    return _get_or_build_snapshot(
+        engine_inst,
+        namespace=EXPORTERS_DESTINATION_PBD_BASE_NAMESPACE,
+        source_key=_exporters_destination_pbd_base_source_key(
+            source_state
+        ),
+        builder=lambda: fetch_supply_destination_pbd_base_data(
+            engine_inst,
+            schema,
+            baseline_snapshot['snapshot_timestamp_utc'],
+            baseline_snapshot['snapshot_date_utc'],
+        ),
+        manifest={
+            'baseline_snapshot': baseline_snapshot,
+            'window_days': 30,
+        },
+    )
+
+
+def _load_exporters_supply_charts_snapshot(
+    engine_inst,
+    schema,
+    source_state,
+    classification_mode,
+    rolling_avg_days,
+    entity_names,
+):
+    return _get_or_build_snapshot(
+        engine_inst,
+        namespace=EXPORTERS_SUPPLY_CHARTS_NAMESPACE,
+        source_key=_exporters_supply_charts_source_key(
+            source_state,
+            classification_mode,
+            rolling_avg_days,
+            entity_names,
+        ),
+        builder=lambda: _build_exporters_supply_charts_snapshot_payload(
+            engine_inst,
+            schema,
+            classification_mode,
+            rolling_avg_days,
+            entity_names,
+        ),
+        manifest={
+            'source_state': source_state,
+            'classification_mode': classification_mode,
+            'rolling_avg_days': rolling_avg_days,
+            'entity_names': list(entity_names),
+        },
+    )
+
+
+def _load_exporters_continent_snapshot(
+    engine_inst,
+    schema,
+    source_state,
+    classification_mode,
+    rolling_avg_days,
+    entity_names,
+    selected_years,
+):
+    selected_years, _query_start_date, _display_start_date = (
+        _get_continent_chart_selected_window(selected_years)
+    )
+    return _get_or_build_snapshot(
+        engine_inst,
+        namespace=EXPORTERS_CONTINENT_DATA_NAMESPACE,
+        source_key=_exporters_continent_data_source_key(
+            source_state,
+            classification_mode,
+            rolling_avg_days,
+            entity_names,
+            selected_years,
+        ),
+        builder=lambda: _build_exporters_continent_snapshot_payload(
+            engine_inst,
+            schema,
+            source_state,
+            classification_mode,
+            rolling_avg_days,
+            entity_names,
+            selected_years,
+        ),
+        manifest={
+            'source_state': source_state,
+            'classification_mode': classification_mode,
+            'rolling_avg_days': rolling_avg_days,
+            'entity_names': list(entity_names),
+            'selected_years': selected_years,
+        },
+    )
+
+
+def _load_exporters_continent_export_snapshot(
+    engine_inst,
+    schema,
+    source_state,
+    classification_mode,
+    rolling_avg_days,
+    entity_names,
+):
+    selected_years = _get_continent_chart_available_years()
+    return _get_or_build_snapshot(
+        engine_inst,
+        namespace=EXPORTERS_CONTINENT_EXPORT_NAMESPACE,
+        source_key=_exporters_continent_export_source_key(
+            source_state,
+            classification_mode,
+            rolling_avg_days,
+            entity_names,
+        ),
+        builder=lambda: _build_exporters_continent_snapshot_payload(
+            engine_inst,
+            schema,
+            source_state,
+            classification_mode,
+            rolling_avg_days,
+            entity_names,
+            selected_years,
+        ),
+        manifest={
+            'source_state': source_state,
+            'classification_mode': classification_mode,
+            'rolling_avg_days': rolling_avg_days,
+            'entity_names': list(entity_names),
+            'query_start_date': CONTINENT_CHART_QUERY_START_DATE,
+            'display_start_date': CONTINENT_CHART_DISPLAY_START_DATE,
+        },
+    )
+
+
+def _resolve_or_load_exporters_continent_payload(
+    continent_data,
+    classification_mode,
+    rolling_avg_days,
+    selected_years,
+):
+    """Resolve the exact selected-year continent snapshot for an interaction."""
+    payload = _resolve_exporters_continent_payload(continent_data)
+    classification_mode = classification_mode or 'Country'
+    rolling_avg_days = normalize_supply_rolling_avg_days(
+        rolling_avg_days
+    )
+    selected_years, _query_start_date, _display_start_date = (
+        _get_continent_chart_selected_window(selected_years)
+    )
+    payload_selected_years, _payload_query_start, _payload_display_start = (
+        _get_continent_chart_selected_window(
+            payload['selected_years']
+        )
+    )
+
+    if (
+        payload['classification_mode'] != classification_mode
+        or payload['rolling_avg_days'] != rolling_avg_days
+    ):
+        # Classification/rolling changes rebuild the roster/default snapshot.
+        # Preserve the current chart until that coordinated refresh publishes.
+        raise PreventUpdate
+
+    if payload_selected_years == selected_years:
+        return payload
+
+    engine_inst, schema = setup_database_connection()
+    reference, _built_payload = _load_exporters_continent_snapshot(
+        engine_inst,
+        schema,
+        payload['source_state'],
+        classification_mode,
+        rolling_avg_days,
+        payload['entities'],
+        selected_years,
+    )
+    if not _snapshot_is_resolvable(reference):
+        raise _SnapshotUnavailable(
+            EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    return _resolve_exporters_continent_payload(reference)
+
+
+def _resolve_or_load_exporters_continent_export_payload(
+    continent_data,
+    classification_mode,
+    rolling_avg_days,
+):
+    """Resolve the lazy full-history continent snapshot used only by Excel."""
+    payload = _resolve_exporters_continent_payload(continent_data)
+    classification_mode = classification_mode or 'Country'
+    rolling_avg_days = normalize_supply_rolling_avg_days(
+        rolling_avg_days
+    )
+    if (
+        payload['classification_mode'] != classification_mode
+        or payload['rolling_avg_days'] != rolling_avg_days
+    ):
+        raise PreventUpdate
+
+    engine_inst, schema = setup_database_connection()
+    reference, _built_payload = (
+        _load_exporters_continent_export_snapshot(
+            engine_inst,
+            schema,
+            payload['source_state'],
+            classification_mode,
+            rolling_avg_days,
+            payload['entities'],
+        )
+    )
+    if not _snapshot_is_resolvable(reference):
+        raise _SnapshotUnavailable(
+            EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    return _resolve_exporters_continent_payload(reference)
+
+
+def _load_exporters_destination_summary_snapshot(
+    engine_inst,
+    schema,
+    destination_base_reference,
+    destination_base_df,
+    destination_pbd_reference,
+    destination_pbd_df,
+    source_state,
+    classification_mode,
+    demand_aggregation_mode,
+):
+    return _get_or_build_snapshot(
+        engine_inst,
+        namespace=EXPORTERS_DESTINATION_SUMMARY_NAMESPACE,
+        source_key=_exporters_destination_summary_source_key(
+            destination_base_reference,
+            classification_mode,
+            demand_aggregation_mode,
+            destination_pbd_reference,
+            source_state,
+        ),
+        builder=lambda: (
+            _prepare_exporters_destination_summary_snapshot_payload(
+                build_supply_dest_summary_store_payload(
+                    engine_inst,
+                    schema,
+                    destination_base_df,
+                    classification_mode,
+                    demand_aggregation_mode,
+                    destination_pbd_df,
+                    source_state,
+                )
+            )
+        ),
+        manifest={
+            'destination_base_reference': {
+                'namespace': destination_base_reference.get('namespace'),
+                'source_key': destination_base_reference.get('source_key'),
+                'revision': destination_base_reference.get('revision'),
+            },
+            'destination_pbd_reference': (
+                {
+                    'namespace': destination_pbd_reference.get('namespace'),
+                    'source_key': destination_pbd_reference.get('source_key'),
+                    'revision': destination_pbd_reference.get('revision'),
+                }
+                if isinstance(destination_pbd_reference, dict)
+                else None
+            ),
+            'source_state': source_state,
+            'classification_mode': classification_mode,
+            'demand_aggregation_mode': demand_aggregation_mode,
+        },
+    )
+
+
+def _load_exporters_independent_snapshots(
+    engine_inst,
+    schema,
+    source_state,
+    classification_mode,
+    rolling_avg_days,
+    entity_names,
+    continent_selected_years=None,
+):
+    loaders = {
+        'destination_base': lambda: (
+            _load_exporters_destination_base_snapshot(
+                engine_inst,
+                schema,
+                source_state,
+            )
+        ),
+        'supply_charts': lambda: (
+            _load_exporters_supply_charts_snapshot(
+                engine_inst,
+                schema,
+                source_state,
+                classification_mode,
+                rolling_avg_days,
+                entity_names,
+            )
+        ),
+        'continent_data': lambda: (
+            _load_exporters_continent_snapshot(
+                engine_inst,
+                schema,
+                source_state,
+                classification_mode,
+                rolling_avg_days,
+                entity_names,
+                continent_selected_years,
+            )
+        ),
+    }
+    if (
+        source_state.get('baseline_status') in {'exact', 'fallback'}
+        and isinstance(source_state.get('baseline_snapshot'), dict)
+    ):
+        loaders['destination_pbd'] = lambda: (
+            _load_exporters_destination_pbd_base_snapshot(
+                engine_inst,
+                schema,
+                source_state,
+            )
+        )
+    with ThreadPoolExecutor(
+        max_workers=3,
+        thread_name_prefix='exporters-load',
+    ) as executor:
+        futures = {
+            name: executor.submit(loader)
+            for name, loader in loaders.items()
+        }
+        return {
+            name: futures[name].result()
+            for name in loaders
+        }
+
+
 @callback(
     [Output('supply-charts-data', 'data'),
      Output('continent-charts-data', 'data'),
      Output('supply-dest-data-store', 'data')],
-    [Input('initial-load-trigger', 'n_intervals'),
-     Input('global-refresh-button', 'n_clicks'),
+    [Input('exporters-source-state-store', 'data'),
      Input('country-classification-dropdown', 'value'),
      Input('aggregation-demand-dropdown', 'value'),
      Input('supply-rolling-window-days-input', 'value')],
     prevent_initial_call=False
 )
-def refresh_all_data(_n_intervals, _global_refresh_clicks, classification_mode, demand_aggregation_mode, rolling_avg_days):
+@log_callback_timing("exporters.source_load")
+def refresh_all_data(
+    source_state,
+    classification_mode,
+    demand_aggregation_mode,
+    rolling_avg_days,
+):
     """Load all data from database"""
+    if not source_state:
+        raise PreventUpdate
     try:
-        # Fetch data
         engine_inst, schema = setup_database_connection()
-
-        # Default to 'Country' if classification_mode is None
+        source_state = _validate_exporters_source_state(
+            source_state
+        )
         if classification_mode is None:
             classification_mode = 'Country'
         demand_aggregation_mode = normalize_demand_aggregation_mode(demand_aggregation_mode)
         rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
-
-        try:
-            source_watermark = _fetch_exporters_source_watermark()
-        except Exception:
-            source_watermark = datetime.now().isoformat(timespec='microseconds')
-        source_key = _build_source_key(
-            EXPORTERS_OVERVIEW_NAMESPACE,
-            source_watermark,
-            datetime.now().date(),
-            classification_mode,
-            demand_aggregation_mode,
-            rolling_avg_days,
-        )
-        reference, payload = _get_or_build_snapshot(
+        entity_names = _get_exporter_entity_names(
             engine_inst,
-            namespace=EXPORTERS_OVERVIEW_NAMESPACE,
-            source_key=source_key,
-            builder=lambda: _build_exporters_overview_payload(
+            schema,
+            classification_mode,
+        )
+        loaded = _load_exporters_independent_snapshots(
+            engine_inst,
+            schema,
+            source_state,
+            classification_mode,
+            rolling_avg_days,
+            entity_names,
+        )
+        destination_base_reference, destination_base_df = (
+            loaded['destination_base']
+        )
+        destination_pbd_reference, destination_pbd_df = loaded.get(
+            'destination_pbd',
+            (None, pd.DataFrame()),
+        )
+        charts_reference, charts_payload = loaded['supply_charts']
+        continent_reference, _continent_payload = (
+            loaded['continent_data']
+        )
+        summary_reference, _summary_payload = (
+            _load_exporters_destination_summary_snapshot(
                 engine_inst,
                 schema,
+                destination_base_reference,
+                destination_base_df,
+                destination_pbd_reference,
+                destination_pbd_df,
+                source_state,
                 classification_mode,
                 demand_aggregation_mode,
-                rolling_avg_days,
-            ),
-            force=_was_global_refresh_triggered(),
-            manifest={
-                'classification_mode': classification_mode,
-                'demand_aggregation_mode': demand_aggregation_mode,
-                'rolling_avg_days': rolling_avg_days,
-            },
+            )
         )
-
-        if _snapshot_is_shared(reference):
-            charts_store = _with_snapshot_slot(reference, 'charts_cube')
-            supply_dest_store = _with_snapshot_slot(reference, 'supply_dest')
-        else:
-            charts_store = _unpack_record_mapping(payload['charts_cube'])
-            supply_dest_store = payload['supply_dest']
-
+        references = (
+            destination_base_reference,
+            destination_pbd_reference,
+            charts_reference,
+            continent_reference,
+            summary_reference,
+        )
+        if not all(
+            _snapshot_is_resolvable(reference)
+            for reference in references
+            if reference is not None
+        ):
+            raise _SnapshotUnavailable(
+                EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+            )
         return (
-            charts_store,
-            payload['continent_entities'],
-            supply_dest_store,
+            _with_snapshot_slot(
+                charts_reference,
+                'charts_cube',
+            ),
+            continent_reference,
+            summary_reference,
         )
 
+    except _SnapshotUnavailable:
+        raise
     except Exception:
         return {}, [], _empty_supply_dest_summary_store_payload()
 
@@ -5722,7 +7275,10 @@ def _empty_supply_chart_figure(message, height=328):
 )
 def update_supply_year_selector_options(charts_data, selected_years):
     """Populate the inline year legend from the loaded rolling-average data."""
-    charts_data = _resolve_exporters_store(charts_data)
+    try:
+        charts_data = _resolve_exporters_store(charts_data)
+    except _SnapshotUnavailable:
+        return _exporters_snapshot_recovery_selector_result()
     available_years = _get_supply_chart_available_years(charts_data)
     if not available_years:
         return [], []
@@ -5976,13 +7532,17 @@ def create_supply_chart(
      Input('supply-dest-week-count-dropdown', 'value')],
     prevent_initial_call=False
 )
+@log_callback_timing("exporters.destination_table_render")
 def update_supply_dest_table(supply_dest_data, expanded_classifications, expanded_countries,
                              expanded_supply_countries, classification_mode, view_type,
                              demand_aggregation_mode, summary_comparison_basis,
                              country_grouping_mode, volume_metric, year_count,
                              quarter_count, month_count, week_count):
     """Update the supply-destination table with expandable rows"""
-    supply_dest_data = _resolve_exporters_store(supply_dest_data)
+    try:
+        supply_dest_data = _resolve_exporters_store(supply_dest_data)
+    except _SnapshotUnavailable:
+        return _exporters_snapshot_recovery_notice()
     vol_label = _get_volume_metric_info(volume_metric)['label']
     show_demand_aggregation = use_demand_classification_mode(classification_mode, demand_aggregation_mode)
     show_demand_country = use_demand_country_mode(demand_aggregation_mode)
@@ -6000,6 +7560,11 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
         )
 
     try:
+        snapshot_comparison_metadata = (
+            _get_supply_dest_summary_comparison_metadata(
+                supply_dest_data
+            )
+        )
         resolved_supply_dest_data = _resolve_supply_dest_summary_payload(
             supply_dest_data,
             country_grouping_mode
@@ -6040,7 +7605,7 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
         if view_type == 'percentage' and classification_mode == 'Classification Level 1' and show_demand_aggregation:
             # Identify numeric columns (exclude text columns and delta columns)
             text_cols = ['Aggregation Supply', 'Aggregation Demand', 'Country Demand', 'Supply Country']
-            delta_cols = ['Δ 7D-30D', 'Δ 30D Y/Y']
+            delta_cols = list(SUPPLY_DEST_DELTA_RAW_FIELDS)
             # Include 30D_Y1 in numeric columns for subtotal calculation
             numeric_cols = [col for col in display_df.columns if col not in text_cols and col not in delta_cols]
             # Also include 30D_Y1 if present for subtotal storage
@@ -6127,7 +7692,7 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
 
         elif view_type == 'percentage' and classification_mode == 'Classification Level 1' and show_demand_country:
             text_cols = ['Aggregation Supply', 'Demand Country', 'Supply Country']
-            delta_cols = ['Δ 7D-30D', 'Δ 30D Y/Y']
+            delta_cols = list(SUPPLY_DEST_DELTA_RAW_FIELDS)
             numeric_cols = [col for col in display_df.columns if col not in text_cols and col not in delta_cols]
             numeric_cols_with_y1 = numeric_cols + (['30D_Y1'] if '30D_Y1' in display_df.columns else [])
 
@@ -6197,7 +7762,7 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
 
         elif view_type == 'percentage' and classification_mode == 'Classification Level 1':
             text_cols = ['Aggregation Supply', 'Supply Country']
-            delta_cols = ['Δ 7D-30D', 'Δ 30D Y/Y']
+            delta_cols = list(SUPPLY_DEST_DELTA_RAW_FIELDS)
             numeric_cols = [col for col in display_df.columns if col not in text_cols and col not in delta_cols]
             numeric_cols_with_y1 = numeric_cols + (['30D_Y1'] if '30D_Y1' in display_df.columns else [])
 
@@ -6259,7 +7824,7 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
             # For Country mode, calculate percentages relative to supply country subtotals
             import_col = 'Import Country' if show_demand_country else 'Import Classification'
             text_cols = ['Supply Country', import_col]
-            delta_cols = ['Δ 7D-30D', 'Δ 30D Y/Y']
+            delta_cols = list(SUPPLY_DEST_DELTA_RAW_FIELDS)
             # Exclude delta columns from percentage conversion but include 30D_Y1 for subtotal storage
             numeric_cols = [col for col in display_df.columns if col not in text_cols and col not in delta_cols]
             numeric_cols_with_y1 = numeric_cols + (['30D_Y1'] if '30D_Y1' in display_df.columns else [])
@@ -6366,7 +7931,7 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
 
         elif view_type == 'percentage':
             text_cols = ['Supply Country', 'Supply Installation']
-            delta_cols = ['Δ 7D-30D', 'Δ 30D Y/Y']
+            delta_cols = list(SUPPLY_DEST_DELTA_RAW_FIELDS)
             numeric_cols = [col for col in display_df.columns if col not in text_cols and col not in delta_cols]
             if 'Supply Installation' in display_df.columns:
                 parent_mask = (
@@ -6415,11 +7980,27 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
                 display_df,
                 volume_metric
             )
+        elif snapshot_comparison_metadata['status'] in {'exact', 'fallback'}:
+            display_df = _recalculate_supply_dest_pbd_delta_columns(
+                display_df
+            )
+
+        if snapshot_comparison_metadata['status'] == 'unavailable':
+            for column_name in (
+                *SUPPLY_DEST_PBD_REFERENCE_COLUMNS,
+                *SUPPLY_DEST_PBD_DELTA_COLUMNS,
+            ):
+                if column_name in display_df.columns:
+                    display_df[column_name] = np.nan
 
         display_df, summary_comparison_delta_cols = _apply_supply_dest_summary_comparison(
             display_df,
             summary_comparison_metadata,
             view_type
+        )
+        display_df = display_df.drop(
+            columns=list(SUPPLY_DEST_PBD_REFERENCE_COLUMNS),
+            errors='ignore',
         )
 
         display_df = _label_supply_dest_total_as_global(display_df)
@@ -6563,6 +8144,16 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
                         value_scale=delta_value_scale
                     )
                 )
+            elif col in SUPPLY_DEST_PBD_DELTA_COLUMNS:
+                conditional_styles.extend(
+                    _build_supply_dest_delta_gradient_styles(
+                        display_df,
+                        col,
+                        base_bg='#eef4fb',
+                        border_color='#9bb4cf',
+                        value_scale=delta_value_scale
+                    )
+                )
 
         # Re-add Global style at the end to ensure highest priority
         total_filter_query = (
@@ -6659,8 +8250,18 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
             **table_config
         )
 
-        # Calculate date ranges for footnote
-        today = datetime.now().date()
+        # Calculate source-aligned date ranges for the footnote.
+        current_snapshot = snapshot_comparison_metadata.get(
+            'current_snapshot'
+        ) or {}
+        current_snapshot_date = current_snapshot.get(
+            'snapshot_date_utc'
+        )
+        today = pd.Timestamp(
+            current_snapshot_date
+            if current_snapshot_date is not None
+            else datetime.now()
+        ).date()
         date_7d_start = (today - timedelta(days=6)).strftime('%b %d, %Y')
         date_30d_start = (today - timedelta(days=29)).strftime('%b %d, %Y')
         date_today = today.strftime('%b %d, %Y')
@@ -6683,6 +8284,74 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
             else f'Values shown are bilateral trade flows in {vol_label}{comparison_note}'
         )
 
+        def _format_snapshot_lineage(snapshot):
+            if not isinstance(snapshot, dict):
+                return None
+            snapshot_date = snapshot.get('snapshot_date_utc')
+            snapshot_timestamp = snapshot.get('snapshot_timestamp_utc')
+            if snapshot_date is None or snapshot_timestamp is None:
+                return None
+            parsed_timestamp = pd.Timestamp(snapshot_timestamp)
+            fractional_seconds = (
+                f'.{parsed_timestamp.microsecond:06d}'
+                if parsed_timestamp.microsecond
+                else ''
+            )
+            return (
+                f"{pd.Timestamp(snapshot_date).strftime('%b %d, %Y')} "
+                f"{parsed_timestamp.strftime('%H:%M:%S')}"
+                f"{fractional_seconds} UTC"
+            )
+
+        current_lineage = _format_snapshot_lineage(
+            snapshot_comparison_metadata.get('current_snapshot')
+        )
+        baseline_lineage = _format_snapshot_lineage(
+            snapshot_comparison_metadata.get('baseline_snapshot')
+        )
+        baseline_status = snapshot_comparison_metadata.get('status')
+        business_day_gap = snapshot_comparison_metadata.get(
+            'business_day_gap'
+        )
+        if baseline_status == 'exact' and baseline_lineage:
+            baseline_note_text = (
+                f'Current snapshot: {current_lineage} | '
+                f'PBD baseline: {baseline_lineage} | '
+                'PBD changes are current minus baseline and include '
+                'window roll plus Kpler revisions.'
+            )
+            baseline_note_class = 'supply-dest-baseline-status'
+        elif baseline_status == 'fallback' and baseline_lineage:
+            baseline_note_text = (
+                f'Current snapshot: {current_lineage} | '
+                f'Fallback PBD baseline: {baseline_lineage}'
+                + (
+                    f' ({business_day_gap} Mon–Fri business days earlier)'
+                    if business_day_gap is not None
+                    else ''
+                )
+                + ' | PBD changes are current minus baseline and include '
+                'window roll plus Kpler revisions.'
+            )
+            baseline_note_class = (
+                'supply-dest-baseline-status '
+                'supply-dest-baseline-status-warning'
+            )
+        else:
+            baseline_note_text = (
+                (
+                    f'Current snapshot: {current_lineage} | '
+                    if current_lineage
+                    else ''
+                )
+                + 'PBD baseline unavailable; Δ 30D vs PBD and '
+                'Δ 7D vs PBD show —.'
+            )
+            baseline_note_class = (
+                'supply-dest-baseline-status '
+                'supply-dest-baseline-status-unavailable'
+            )
+
         # Create footnote
         footnote = html.Div([
             html.P([
@@ -6691,7 +8360,11 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
                 html.Span(f'7D: {date_7d_start} to {date_today} | ', style={'color': '#666'}),
                 html.Span(f'30D Y-1: {date_30d_y1_start} to {date_30d_y1_end} | ', style={'color': '#666'}),
                 html.Span(value_note_text, style={'color': '#666'})
-            ], className='supply-dest-table-footnote-text')
+            ], className='supply-dest-table-footnote-text'),
+            html.P(
+                baseline_note_text,
+                className=baseline_note_class,
+            ),
         ], className='supply-dest-table-footnote')
 
         return html.Div([table, footnote], className='supply-dest-table-shell')
@@ -6897,8 +8570,14 @@ def handle_supply_dest_row_expansion(_active_cells, table_data_list, expanded_cl
     State('continent-year-selector', 'value'),
     prevent_initial_call=False
 )
-def update_continent_year_selector_options(_entities_list, selected_years):
+def update_continent_year_selector_options(continent_data, selected_years):
     """Populate the continent chart year selector from the configured chart window."""
+    if continent_data:
+        try:
+            _resolve_exporters_continent_payload(continent_data)
+        except _SnapshotUnavailable:
+            return _exporters_snapshot_recovery_selector_result()
+
     available_years = _get_continent_chart_available_years()
     if not available_years:
         return [], []
@@ -6919,8 +8598,9 @@ def update_continent_year_selector_options(_entities_list, selected_years):
      Input('supply-rolling-window-days-input', 'value')],
     prevent_initial_call=False
 )
+@log_callback_timing("exporters.continent_charts_render")
 def update_continent_charts(
-    entities_list,
+    continent_data,
     chart_type,
     classification_mode,
     volume_metric,
@@ -6928,26 +8608,44 @@ def update_continent_charts(
     rolling_avg_days
 ):
     """Dynamically generate continent charts based on classification mode"""
+    if not continent_data:
+        return html.Div("No data available", className='continent-rolling-empty-state')
+
+    try:
+        continent_payload = (
+            _resolve_or_load_exporters_continent_payload(
+                continent_data,
+                classification_mode,
+                rolling_avg_days,
+                selected_years,
+            )
+        )
+    except _SnapshotUnavailable:
+        return _exporters_snapshot_recovery_notice()
+    except PreventUpdate:
+        raise
+    except Exception:
+        # Match the frozen callback behavior for transient DB/build failures:
+        # preserve the entity cards, but render them from an empty dataframe.
+        try:
+            continent_payload = dict(
+                _resolve_exporters_continent_payload(
+                    continent_data
+                )
+            )
+        except _SnapshotUnavailable:
+            return _exporters_snapshot_recovery_notice()
+        continent_payload['data'] = pd.DataFrame()
+
+    entities_list = continent_payload['entities']
+    continent_batch_df = continent_payload['data']
     if not entities_list:
         return html.Div("No data available", className='continent-rolling-empty-state')
 
-    # Get database connection
-    engine_inst, schema = setup_database_connection()
     rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
 
     charts = []
     kpi_summary_rows = []
-    try:
-        continent_batch_df = fetch_continent_chart_data_batch(
-            engine_inst,
-            schema,
-            entities_list,
-            classification_mode or 'Country',
-            selected_years=selected_years,
-            rolling_avg_days=rolling_avg_days
-        )
-    except Exception:
-        continent_batch_df = pd.DataFrame()
 
     # Create chart for each entity
     for entity_name in entities_list:
@@ -7076,6 +8774,7 @@ def _build_supply_chart_delta_indicators(metrics):
      Input('supply-rolling-window-days-input', 'value')],
     prevent_initial_call=False
 )
+@log_callback_timing("exporters.supply_charts_render")
 def update_supply_charts(
     charts_data,
     volume_metric,
@@ -7083,7 +8782,10 @@ def update_supply_charts(
     rolling_avg_days
 ):
     """Dynamically generate supply charts based on classification mode"""
-    charts_data = _resolve_exporters_store(charts_data)
+    try:
+        charts_data = _resolve_exporters_store(charts_data)
+    except _SnapshotUnavailable:
+        return _exporters_snapshot_recovery_notice()
     if not charts_data:
         return html.Div("No data available", className='supply-rolling-empty-state')
 
@@ -7343,7 +9045,7 @@ def export_supply_charts_to_excel(n_clicks, charts_data, volume_metric, rolling_
 )
 def export_continent_charts_to_excel(
     n_clicks,
-    entities_list,
+    continent_data,
     chart_type,
     classification_mode,
     volume_metric,
@@ -7351,260 +9053,88 @@ def export_continent_charts_to_excel(
     rolling_avg_days
 ):
     """Export LNG Supply by Destination Continent data to Excel"""
-    if n_clicks == 0 or not entities_list:
+    if n_clicks == 0 or not continent_data:
         return None
-    rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
-    rolling_window_preceding_days = _supply_rolling_window_preceding_days(rolling_avg_days)
-    vol_label = _get_volume_metric_info(volume_metric)['label']
+    try:
+        continent_payload = (
+            _resolve_or_load_exporters_continent_export_payload(
+                continent_data,
+                classification_mode,
+                rolling_avg_days,
+            )
+        )
+    except _SnapshotUnavailable:
+        raise
+    except PreventUpdate:
+        raise
+    except Exception:
+        return None
+    entities_list = continent_payload['entities']
+    continent_batch_df = continent_payload['data']
+    if not entities_list:
+        return None
 
-    engine_inst, schema = setup_database_connection()
+    rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
+    vol_label = _get_volume_metric_info(volume_metric)['label']
 
     all_data = []
     for entity_name in entities_list:
         try:
-            country_filter, params = _get_continent_entity_filter(entity_name, classification_mode)
-
-            # Add join for classification mode
-            join_clause = ""
-            internal_flow_filter = """
-                        AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
-                            IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
-            """
-            if classification_mode == 'Classification Level 1':
-                if entity_name != "Global":
-                    join_clause = f"""
-                    INNER JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country
-                    LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
-                    """
-                else:
-                    join_clause = f"""
-                    LEFT JOIN {schema}.mappings_country mc ON kt.origin_country_name = mc.country
-                    LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
-                    """
-                internal_flow_filter = """
-                        AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
-                            IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
-                """
-
-            # Use different query based on chart_type
-            if chart_type == 'percentage':
-                # Query with percentage calculation for the active batched percentage chart.
-                query = f"""
-                WITH latest_data AS (
-                    SELECT snapshot_timestamp_utc as max_timestamp
-                    FROM {schema}.kpler_trade_snapshots
-                    WHERE run_kind = 'canonical' AND status = 'published'
-                    ORDER BY snapshot_date_utc DESC
-                    LIMIT 1
-                ),
-                all_continents AS (
-                    SELECT DISTINCT
-                        COALESCE(NULLIF(continent_destination_name, ''), 'Unknown') as continent_destination
-                    FROM {schema}.kpler_trades kt
-                    {join_clause}
-                    , latest_data ld
-                    WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                        {country_filter}
-                        AND kt.start >= '{CONTINENT_CHART_QUERY_START_DATE}'
-                        {internal_flow_filter}
-                ),
-                all_dates AS (
-                    SELECT generate_series(
-                        '{CONTINENT_CHART_QUERY_START_DATE}'::date,
-                        (CURRENT_DATE + INTERVAL '14 days')::date,
-                        '1 day'::interval
-                    )::date as date
-                ),
-                date_continent_matrix AS (
-                    SELECT
-                        d.date,
-                        c.continent_destination
-                    FROM all_dates d
-                    CROSS JOIN all_continents c
-                ),
-                daily_exports_raw AS (
-                    SELECT
-                        kt.start::date as date,
-                        COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
-                        SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
-                    FROM {schema}.kpler_trades kt
-                    {join_clause}
-                    , latest_data ld
-                    WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                        {country_filter}
-                        AND kt.start >= '{CONTINENT_CHART_QUERY_START_DATE}'
-                        AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
-                        {internal_flow_filter}
-                    GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
-                ),
-                daily_exports_complete AS (
-                    SELECT
-                        dcm.date,
-                        dcm.continent_destination,
-                        COALESCE(der.daily_export_mcmd, 0) as daily_export_mcmd
-                    FROM date_continent_matrix dcm
-                    LEFT JOIN daily_exports_raw der
-                        ON dcm.date = der.date
-                        AND dcm.continent_destination = der.continent_destination
-                ),
-                rolling_continents AS (
-                    SELECT
-                        date,
-                        continent_destination,
-                        daily_export_mcmd,
-                        AVG(daily_export_mcmd) OVER (
-                            PARTITION BY continent_destination
-                            ORDER BY date
-                            ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
-                        ) as rolling_avg_30d,
-                        CASE
-                            WHEN date > CURRENT_DATE THEN true
-                            ELSE false
-                        END as is_forecast
-                    FROM daily_exports_complete
-                ),
-                rolling_totals AS (
-                    SELECT
-                        date,
-                        SUM(rolling_avg_30d) as total_rolling_avg_30d
-                    FROM rolling_continents
-                    GROUP BY date
+            df = (
+                continent_batch_df[
+                    continent_batch_df['entity_name'] == entity_name
+                ].copy()
+                if (
+                    not continent_batch_df.empty
+                    and 'entity_name' in continent_batch_df.columns
                 )
-                SELECT
-                    rc.date,
-                    rc.continent_destination,
-                    EXTRACT(YEAR FROM rc.date) as year,
-                    EXTRACT(DOY FROM rc.date) as day_of_year,
-                    TO_CHAR(rc.date, 'Mon DD') as month_day,
-                    rc.rolling_avg_30d as rolling_avg,
-                    CASE
-                        WHEN rt.total_rolling_avg_30d > 0
-                        THEN (rc.rolling_avg_30d / rt.total_rolling_avg_30d) * 100
-                        ELSE 0
-                    END as percentage,
-                    rc.is_forecast
-                FROM rolling_continents rc
-                JOIN rolling_totals rt ON rc.date = rt.date
-                WHERE rc.date >= '{CONTINENT_CHART_DISPLAY_START_DATE}'
-                ORDER BY rc.continent_destination, rc.date
-                """
-            else:
-                # Query for absolute values (original query)
-                query = f"""
-                WITH latest_data AS (
-                    SELECT snapshot_timestamp_utc as max_timestamp
-                    FROM {schema}.kpler_trade_snapshots
-                    WHERE run_kind = 'canonical' AND status = 'published'
-                    ORDER BY snapshot_date_utc DESC
-                    LIMIT 1
-                ),
-                all_continents AS (
-                    SELECT DISTINCT
-                        COALESCE(NULLIF(continent_destination_name, ''), 'Unknown') as continent_destination
-                    FROM {schema}.kpler_trades kt
-                    {join_clause}
-                    , latest_data ld
-                    WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                        {country_filter}
-                        AND kt.start >= '{CONTINENT_CHART_QUERY_START_DATE}'
-                        {internal_flow_filter}
-                ),
-                all_dates AS (
-                    SELECT generate_series(
-                        '{CONTINENT_CHART_QUERY_START_DATE}'::date,
-                        (CURRENT_DATE + INTERVAL '14 days')::date,
-                        '1 day'::interval
-                    )::date as date
-                ),
-                date_continent_matrix AS (
-                    SELECT
-                        d.date,
-                        c.continent_destination
-                    FROM all_dates d
-                    CROSS JOIN all_continents c
-                ),
-                daily_exports_raw AS (
-                    SELECT
-                        kt.start::date as date,
-                        COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown') as continent_destination,
-                        SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
-                    FROM {schema}.kpler_trades kt
-                    {join_clause}
-                    , latest_data ld
-                    WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                        {country_filter}
-                        AND kt.start >= '{CONTINENT_CHART_QUERY_START_DATE}'
-                        AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
-                        {internal_flow_filter}
-                    GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
-                ),
-                daily_exports_complete AS (
-                    SELECT
-                        m.date,
-                        m.continent_destination,
-                        COALESCE(e.daily_export_mcmd, 0) as daily_export_mcmd
-                    FROM date_continent_matrix m
-                    LEFT JOIN daily_exports_raw e
-                        ON m.date = e.date AND m.continent_destination = e.continent_destination
-                ),
-                rolling_exports AS (
-                    SELECT
-                        date,
-                        continent_destination,
-                        daily_export_mcmd,
-                        AVG(daily_export_mcmd) OVER (
-                            PARTITION BY continent_destination
-                            ORDER BY date
-                            ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
-                        ) as rolling_avg_30d,
-                        CASE
-                            WHEN date > CURRENT_DATE THEN true
-                            ELSE false
-                        END as is_forecast
-                    FROM daily_exports_complete
+                else pd.DataFrame()
+            )
+            if df.empty:
+                continue
+
+            df['_year_token'] = df['year'].apply(
+                _continent_chart_year_token
+            )
+            available_years = sorted(
+                [
+                    year
+                    for year
+                    in df['_year_token'].dropna().unique()
+                ],
+                key=_continent_chart_year_sort_key
+            )
+            active_years = _normalize_continent_chart_selected_years(
+                selected_years,
+                available_years,
+                use_default=selected_years is None
+            )
+            if not active_years:
+                continue
+
+            df = (
+                df[df['_year_token'].isin(active_years)]
+                .drop(columns=['_year_token'])
+                .copy()
+            )
+            if df.empty:
+                continue
+
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(
+                    df['date'],
+                    errors='coerce'
+                ).dt.date
+
+            if chart_type != 'percentage':
+                df = _convert_volume_metric_dataframe(
+                    df,
+                    volume_metric,
+                    columns=['rolling_avg'],
+                    period_days=rolling_avg_days
                 )
-                SELECT
-                    date,
-                    continent_destination,
-                    EXTRACT(YEAR FROM date) as year,
-                    EXTRACT(DOY FROM date) as day_of_year,
-                    TO_CHAR(date, 'Mon DD') as month_day,
-                    rolling_avg_30d as rolling_avg,
-                    is_forecast
-                FROM rolling_exports
-                WHERE date >= '{CONTINENT_CHART_DISPLAY_START_DATE}'
-                ORDER BY continent_destination, date
-                """
-
-            df = pd.read_sql(query, engine_inst, params=params)
-
-            if not df.empty:
-                df['_year_token'] = df['year'].apply(_continent_chart_year_token)
-                available_years = sorted(
-                    [year for year in df['_year_token'].dropna().unique()],
-                    key=_continent_chart_year_sort_key
-                )
-                active_years = _normalize_continent_chart_selected_years(
-                    selected_years,
-                    available_years,
-                    use_default=selected_years is None
-                )
-                if not active_years:
-                    continue
-                df = df[df['_year_token'].isin(active_years)].drop(columns=['_year_token']).copy()
-                if df.empty:
-                    continue
-
-                if chart_type != 'percentage':
-                    df = _convert_volume_metric_dataframe(
-                        df,
-                        volume_metric,
-                        columns=['rolling_avg'],
-                        period_days=rolling_avg_days
-                    )
-                df['entity'] = entity_name
-                all_data.append(df)
-
+            df['entity'] = entity_name
+            all_data.append(df)
         except Exception:
             continue
 

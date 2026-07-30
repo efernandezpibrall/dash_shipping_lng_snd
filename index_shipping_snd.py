@@ -1,214 +1,299 @@
-# index.py
-from dash import html, dcc
-from dash.dependencies import Input, Output
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable
+
+from dash import dcc, html
+from dash.development.base_component import Component
+from dash.dependencies import Input, Output, State
+
 from app import app
-import pages.shipping_balance
-import pages.fleet_metrics
-import pages.supply
-import pages.demand
-import pages.market_balance
-import pages.exporter_detail
-import pages.importer_detail
-import pages.exporters
-import pages.importers
-import pages.country_mappings
-import pages.train_names_mapping
-import pages.contracts
 import pages.capacity
+import pages.contracts
+import pages.country_mappings
+import pages.demand
+import pages.exporter_detail
+import pages.exporters
+import pages.fleet_metrics
+import pages.importer_detail
+import pages.importers
+import pages.lng_phys_snapshot
+import pages.market_balance
 import pages.production
+import pages.supply
 import pages.terminal_adjustments
-
-# Professional Navigation Bar with Option B Blue System
-nav_links = html.Header([
-    html.Div([
-        # Primary navigation section
-        html.Nav([
-            dcc.Link(
-                'Shipping Balance',
-                href='/shipping_balance',
-                id='nav-shipping-balance',
-                className='nav-link-primary'
-            ),
-
-            # Secondary navigation group
-            html.Div([
-                dcc.Link('Fleet Metrics', href='/fleet_metrics', id='nav-fleet-metrics', className='nav-link-secondary'),
-                dcc.Link('Supply', href='/supply', id='nav-supply', className='nav-link-secondary'),
-                dcc.Link('Demand', href='/demand', id='nav-demand', className='nav-link-secondary'),
-                dcc.Link('Market Balance', href='/market_balance', id='nav-market-balance', className='nav-link-secondary'),
-                dcc.Link('Exporters', href='/exporters', id='nav-exporters', className='nav-link-secondary'),
-                dcc.Link('Importers', href='/importers', id='nav-importers', className='nav-link-secondary'),
-                dcc.Link('Exporter Detail', href='/exporter_detail', id='nav-exporter-detail', className='nav-link-secondary'),
-                dcc.Link('Importer Detail', href='/importer_detail', id='nav-importer-detail', className='nav-link-secondary'),
-                dcc.Link('Contracts', href='/contracts', id='nav-contracts', className='nav-link-secondary'),
-                dcc.Link('Production', href='/production', id='nav-production', className='nav-link-secondary'),
-                dcc.Link('Capacity', href='/capacity', id='nav-capacity', className='nav-link-secondary'),
-                dcc.Link('Mappings', href='/mappings', id='nav-mappings', className='nav-link-secondary'),
-            ], className='nav-group-secondary')
-        ], className='main-navigation'),
-        
-        # Professional Controls Section
-        html.Div([
-            # Professional refresh button
-            html.Button(
-                'Refresh Data', 
-                id='global-refresh-button', 
-                n_clicks=0,
-                className='btn-refresh'
-            ),
-        ], className='top-bar-controls')
-    ], className='top-bar-content')
-], className='top-bar-header')
-
-app.layout = html.Div([
-    dcc.Location(id='url', refresh=False),
-    nav_links,
-    html.Div(id='page-content'),
-])
+import pages.train_names_mapping
 
 
-# Callback to handle page routing
-@app.callback(Output('page-content', 'children'),
-              Input('url', 'pathname'))
+@dataclass(frozen=True)
+class PageSpec:
+    path: str
+    title: str
+    nav_id: str | None
+    layout_factory: Callable[[], Component] | None
+    aliases: tuple[str, ...] = ()
+    redirect_to: str | None = None
+    nav_label: str | None = None
+
+
+def _static_layout(layout: Component) -> Callable[[], Component]:
+    return lambda: layout
+
+
+PAGE_SPECS = (
+    PageSpec(
+        path="/fleet_metrics",
+        title="LNG Shipping - Fleet Metrics",
+        nav_id="nav-fleet-metrics",
+        nav_label="Fleet Metrics",
+        layout_factory=_static_layout(pages.fleet_metrics.layout),
+    ),
+    PageSpec(
+        path="/supply",
+        title="LNG Shipping - Supply",
+        nav_id="nav-supply",
+        nav_label="Supply",
+        layout_factory=_static_layout(pages.supply.layout),
+    ),
+    PageSpec(
+        path="/demand",
+        title="LNG Shipping - Demand",
+        nav_id="nav-demand",
+        nav_label="Demand",
+        layout_factory=_static_layout(pages.demand.layout),
+    ),
+    PageSpec(
+        path="/market_balance",
+        title="LNG Shipping - Market Balance",
+        nav_id="nav-market-balance",
+        nav_label="Market Balance",
+        layout_factory=_static_layout(pages.market_balance.layout),
+    ),
+    PageSpec(
+        path="/lng-phys-snapshot",
+        title="LNG Shipping - LNG Physical Snapshot",
+        nav_id="nav-lng-phys-snapshot",
+        nav_label="LNG Phys Snapshot",
+        layout_factory=_static_layout(pages.lng_phys_snapshot.layout),
+    ),
+    PageSpec(
+        path="/exporters",
+        title="LNG Shipping - Exporters",
+        nav_id="nav-exporters",
+        nav_label="Exporters",
+        layout_factory=_static_layout(pages.exporters.layout),
+        aliases=("/",),
+    ),
+    PageSpec(
+        path="/importers",
+        title="LNG Shipping - Importers",
+        nav_id="nav-importers",
+        nav_label="Importers",
+        layout_factory=_static_layout(pages.importers.layout),
+    ),
+    PageSpec(
+        path="/exporter_detail",
+        title="LNG Shipping - Exporter Detail",
+        nav_id="nav-exporter-detail",
+        nav_label="Exporter Detail",
+        layout_factory=_static_layout(pages.exporter_detail.layout),
+    ),
+    PageSpec(
+        path="/importer_detail",
+        title="LNG Shipping - Importer Detail",
+        nav_id="nav-importer-detail",
+        nav_label="Importer Detail",
+        layout_factory=_static_layout(pages.importer_detail.layout),
+    ),
+    PageSpec(
+        path="/contracts",
+        title="LNG Shipping - Contracts",
+        nav_id="nav-contracts",
+        nav_label="Contracts",
+        layout_factory=pages.contracts.layout,
+    ),
+    PageSpec(
+        path="/production",
+        title="LNG Shipping - Production",
+        nav_id="nav-production",
+        nav_label="Production",
+        layout_factory=pages.production.layout,
+    ),
+    PageSpec(
+        path="/capacity",
+        title="LNG Shipping - Capacity",
+        nav_id="nav-capacity",
+        nav_label="Capacity",
+        layout_factory=_static_layout(pages.capacity.layout),
+    ),
+    PageSpec(
+        path="/mappings",
+        title="LNG Shipping - Country Mappings",
+        nav_id="nav-mappings",
+        nav_label="Mappings",
+        layout_factory=_static_layout(pages.country_mappings.layout),
+        aliases=("/country_mappings",),
+    ),
+    PageSpec(
+        path="/train_names_mapping",
+        title="LNG Shipping - Train Mapping",
+        nav_id="nav-mappings",
+        layout_factory=_static_layout(pages.train_names_mapping.layout),
+    ),
+    PageSpec(
+        path="/terminal_adjustments",
+        title="LNG Shipping - Terminal Adjustments",
+        nav_id=None,
+        layout_factory=pages.terminal_adjustments.layout,
+    ),
+    PageSpec(
+        path="/balance",
+        title="LNG Shipping - Supply",
+        nav_id="nav-supply",
+        layout_factory=None,
+        redirect_to="/supply",
+    ),
+    PageSpec(
+        path="/terminals",
+        title="LNG Shipping - Capacity",
+        nav_id="nav-capacity",
+        layout_factory=None,
+        redirect_to="/capacity",
+    ),
+)
+
+PAGE_SPEC_BY_PATH = {
+    route_path: page_spec
+    for page_spec in PAGE_SPECS
+    for route_path in (page_spec.path, *page_spec.aliases)
+}
+
+CLIENT_PAGE_REGISTRY = {
+    route_path: {
+        "title": page_spec.title,
+        "navId": page_spec.nav_id or "",
+    }
+    for route_path, page_spec in PAGE_SPEC_BY_PATH.items()
+}
+
+
+def _build_routed_page(page_spec: PageSpec) -> Component:
+    page_heading = page_spec.title.removeprefix("LNG Shipping - ")
+    return html.Main(
+        [
+            html.H1(page_heading, className="visually-hidden-page-title"),
+            page_spec.layout_factory(),
+        ],
+        className="routed-page-main",
+    )
+
+
+_EXPORTERS_ROUTED_PAGE = _build_routed_page(
+    PAGE_SPEC_BY_PATH["/exporters"]
+)
+
+
+nav_links = html.Header(
+    [
+        html.Div(
+            [
+                html.Nav(
+                    [
+                        html.Div(
+                            [
+                                dcc.Link(
+                                    page_spec.nav_label,
+                                    href=page_spec.path,
+                                    id=page_spec.nav_id,
+                                    className="nav-link-secondary",
+                                )
+                                for page_spec in PAGE_SPECS
+                                if page_spec.nav_label is not None
+                            ],
+                            className="nav-group-secondary",
+                        )
+                    ],
+                    className="main-navigation",
+                    **{"aria-label": "Dashboard pages"},
+                ),
+                html.Div(
+                    [
+                        html.Button(
+                            "Refresh Data",
+                            id="global-refresh-button",
+                            n_clicks=0,
+                            className="btn-refresh",
+                        ),
+                    ],
+                    className="top-bar-controls",
+                ),
+            ],
+            className="top-bar-content",
+        )
+    ],
+    className="top-bar-header",
+)
+
+app.layout = html.Div(
+    [
+        dcc.Location(id="url", refresh=False),
+        dcc.Store(id="page-registry", data=CLIENT_PAGE_REGISTRY),
+        nav_links,
+        html.Div(id="page-content"),
+    ]
+)
+
+
+@app.callback(
+    Output("page-content", "children"),
+    Input("url", "pathname"),
+)
 def display_page(pathname):
-    if pathname == '/' or pathname == '/shipping_balance':
-        return pages.shipping_balance.layout
-    elif pathname == '/fleet_metrics':
-        return pages.fleet_metrics.layout
-    elif pathname == '/balance':
-        return dcc.Location(pathname='/supply', id='redirect-supply-from-balance')
-    elif pathname == '/supply':
-        return pages.supply.layout
-    elif pathname == '/demand':
-        return pages.demand.layout
-    elif pathname == '/market_balance':
-        return pages.market_balance.layout
-    elif pathname == '/exporters':
-        return pages.exporters.layout
-    elif pathname == '/importers':
-        return pages.importers.layout
-    elif pathname == '/exporter_detail':
-        return pages.exporter_detail.layout
-    elif pathname == '/importer_detail':
-        return pages.importer_detail.layout
-    elif pathname == '/contracts':
-        return pages.contracts.layout()
-    elif pathname == '/terminals':
-        return dcc.Location(pathname='/capacity', id='redirect-capacity-from-terminals')
-    elif pathname == '/production':
-        return pages.production.layout()
-    elif pathname == '/capacity':
-        return pages.capacity.layout
-    elif pathname == '/terminal_adjustments':
-        return pages.terminal_adjustments.layout()
-    elif pathname == '/mappings':
-        return pages.country_mappings.layout
-    elif pathname == '/country_mappings':
-        return pages.country_mappings.layout
-    elif pathname == '/train_names_mapping':
-        return pages.train_names_mapping.layout
-    else:
-        return '404 - Page not found'
+    page_spec = PAGE_SPEC_BY_PATH.get(pathname)
+    if page_spec is None:
+        return "404 - Page not found"
 
-# Enhanced clientside callback to update page title and navigation active states
+    if page_spec.redirect_to:
+        redirect_id = (
+            "redirect-supply-from-balance"
+            if pathname == "/balance"
+            else "redirect-capacity-from-terminals"
+        )
+        return dcc.Location(pathname=page_spec.redirect_to, id=redirect_id)
+
+    if page_spec.path == "/exporters":
+        return _EXPORTERS_ROUTED_PAGE
+    return _build_routed_page(page_spec)
+
+
 app.clientside_callback(
     """
-    function(pathname) {
-        // Update page title
-        if (pathname === '/' || pathname === '/shipping_balance') {
-            document.title = 'LNG Shipping - Shipping Balance';
-        } else if (pathname === '/fleet_metrics') {
-            document.title = 'LNG Shipping - Fleet Metrics';
-        } else if (pathname === '/balance' || pathname === '/supply') {
-            document.title = 'LNG Shipping - Supply';
-        } else if (pathname === '/demand') {
-            document.title = 'LNG Shipping - Demand';
-        } else if (pathname === '/market_balance') {
-            document.title = 'LNG Shipping - Market Balance';
-        } else if (pathname === '/exporters') {
-            document.title = 'LNG Shipping - Exporters';
-        } else if (pathname === '/importers') {
-            document.title = 'LNG Shipping - Importers';
-        } else if (pathname === '/exporter_detail') {
-            document.title = 'LNG Shipping - Exporter Detail';
-        } else if (pathname === '/importer_detail') {
-            document.title = 'LNG Shipping - Importer Detail';
-        } else if (pathname === '/contracts') {
-            document.title = 'LNG Shipping - Contracts';
-        } else if (pathname === '/terminals') {
-            document.title = 'LNG Shipping - Capacity';
-        } else if (pathname === '/production') {
-            document.title = 'LNG Shipping - Production';
-        } else if (pathname === '/capacity') {
-            document.title = 'LNG Shipping - Capacity';
-        } else if (pathname === '/terminal_adjustments') {
-            document.title = 'LNG Shipping - Terminal Adjustments';
-        } else if (pathname === '/mappings') {
-            document.title = 'LNG Shipping - Country Mappings';
-        } else if (pathname === '/country_mappings') {
-            document.title = 'LNG Shipping - Country Mappings';
-        } else if (pathname === '/train_names_mapping') {
-            document.title = 'LNG Shipping - Train Mapping';
-        } else {
-            document.title = 'LNG Shipping - Page Not Found';
-        }
-        
-        // Update navigation active states
-        const navLinks = document.querySelectorAll('.nav-link-primary, .nav-link-secondary');
-        navLinks.forEach(link => {
-            link.classList.remove('active');
-        });
-        
-        // Add active class to current page link
-        let activeNavId = '';
-        if (pathname === '/' || pathname === '/shipping_balance') {
-            activeNavId = 'nav-shipping-balance';
-        } else if (pathname === '/fleet_metrics') {
-            activeNavId = 'nav-fleet-metrics';
-        } else if (pathname === '/balance' || pathname === '/supply') {
-            activeNavId = 'nav-supply';
-        } else if (pathname === '/demand') {
-            activeNavId = 'nav-demand';
-        } else if (pathname === '/market_balance') {
-            activeNavId = 'nav-market-balance';
-        } else if (pathname === '/exporters') {
-            activeNavId = 'nav-exporters';
-        } else if (pathname === '/importers') {
-            activeNavId = 'nav-importers';
-        } else if (pathname === '/exporter_detail') {
-            activeNavId = 'nav-exporter-detail';
-        } else if (pathname === '/importer_detail') {
-            activeNavId = 'nav-importer-detail';
-        } else if (pathname === '/contracts') {
-            activeNavId = 'nav-contracts';
-        } else if (pathname === '/terminals') {
-            activeNavId = 'nav-capacity';
-        } else if (pathname === '/production') {
-            activeNavId = 'nav-production';
-        } else if (pathname === '/capacity') {
-            activeNavId = 'nav-capacity';
-        } else if (
-            pathname === '/mappings' ||
-            pathname === '/country_mappings' ||
-            pathname === '/train_names_mapping'
-        ) {
-            activeNavId = 'nav-mappings';
-        }
-        
-        if (activeNavId) {
-            const activeLink = document.getElementById(activeNavId);
+    function(pathname, pageRegistry) {
+        const pageSpec = (pageRegistry || {})[pathname];
+        document.title = pageSpec
+            ? pageSpec.title
+            : 'LNG Shipping - Page Not Found';
+
+        const navLinks = document.querySelectorAll(
+            '.nav-link-primary, .nav-link-secondary'
+        );
+        navLinks.forEach(link => link.classList.remove('active'));
+
+        if (pageSpec && pageSpec.navId) {
+            const activeLink = document.getElementById(pageSpec.navId);
             if (activeLink) {
                 activeLink.classList.add('active');
             }
         }
-        
+
         return {};
     }
     """,
-    Output('page-content', 'style'),  # Dummy output
-    Input('url', 'pathname')
+    Output("page-content", "style"),
+    Input("url", "pathname"),
+    State("page-registry", "data"),
 )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True, port=8067)

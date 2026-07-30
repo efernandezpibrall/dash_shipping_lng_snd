@@ -1,3 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+import logging
+from threading import Lock
+
 from dash import html, dcc, callback, Output, Input, State, ALL, MATCH
 import dash_ag_grid as dag
 import plotly.graph_objects as go
@@ -5,9 +10,11 @@ import plotly.express as px
 import pandas as pd
 from datetime import datetime
 from dash.exceptions import PreventUpdate
-import configparser
-import os
-from sqlalchemy import create_engine
+from sqlalchemy import text
+
+from utils.database import engine
+
+logger = logging.getLogger(__name__)
 
 ############################################ Style Constants ###################################################
 
@@ -41,19 +48,6 @@ CONTRACTS_AG_GRID_OPTIONS = {
     "headerHeight": 32,
 }
 
-############################################ postgres sql connection ###################################################
-try:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))
-    CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except Exception:
-    CONFIG_FILE_PATH = 'config.ini'
-
-config_reader = configparser.ConfigParser(interpolation=None)
-config_reader.read(CONFIG_FILE_PATH)
-
-DB_CONNECTION_STRING = config_reader.get('DATABASE', 'CONNECTION_STRING', fallback=None)
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 ############################################ Data Loading Functions ###################################################
 
 def normalize_flex_flag(value):
@@ -869,7 +863,7 @@ def create_timeline_section():
             className="inline-dropdown",
             placeholder='Select metric...',
             clearable=False,
-            style={'width': '210px'}
+            style={'width': '230px'}
         ),
     )
 
@@ -906,7 +900,7 @@ def create_volume_analysis_section():
             className="inline-dropdown",
             placeholder='Select view...',
             clearable=False,
-            style={'width': '180px'}
+            style={'width': '230px'}
         ),
     )
 
@@ -1636,13 +1630,55 @@ def get_detailed_pricing_type(row):
 
 
 CONTRACTS_RUNTIME_COLUMNS = CONTRACTS_DATA_COLUMNS + ['detailed_pricing_type']
-contracts_df = pd.DataFrame(columns=CONTRACTS_RUNTIME_COLUMNS)
-demand_df = pd.DataFrame(columns=ANNUAL_DEMAND_DATA_COLUMNS)
-price_assumptions_df = pd.DataFrame(columns=PRICE_ASSUMPTIONS_COLUMNS)
-price_formula_df = pd.DataFrame(columns=PRICE_FORMULA_COLUMNS)
+CONTRACTS_SOURCE_NAMES = (
+    'contracts',
+    'demand',
+    'price_assumptions',
+    'price_formula',
+)
+CONTRACTS_SOURCE_LABELS = {
+    'contracts': 'Contracts',
+    'demand': 'Demand',
+    'price_assumptions': 'Assumptions',
+    'price_formula': 'Formula',
+}
+CONTRACTS_REVISION_QUERY = text("""
+    SELECT 'contracts' AS source_name,
+           COUNT(*) AS row_count,
+           MAX(upload_timestamp_utc) AS watermark
+    FROM at_lng.woodmac_lng_contract
+    UNION ALL
+    SELECT 'demand',
+           COUNT(*),
+           MAX(upload_timestamp_utc)
+    FROM at_lng.woodmac_lng_contract_annual_contracted_demand_mta
+    UNION ALL
+    SELECT 'price_assumptions',
+           COUNT(*),
+           MAX(upload_timestamp_utc)
+    FROM at_lng.woodmac_lng_contract_price_assumptions
+    UNION ALL
+    SELECT 'price_formula',
+           COUNT(*),
+           MAX(upload_timestamp_utc)
+    FROM at_lng.woodmac_lng_contract_price_formula
+""")
 
-_contracts_data_loaded = False
-_contracts_year_settings = None
+
+@dataclass(frozen=True)
+class ContractsSnapshot:
+    revision_key: tuple[tuple[str, int, str | None], ...]
+    contracts: pd.DataFrame
+    demand: pd.DataFrame
+    price_assumptions: pd.DataFrame
+    price_formula: pd.DataFrame
+    year_settings: dict
+
+
+_contracts_snapshot: ContractsSnapshot | None = None
+_contracts_snapshot_status = 'unavailable'
+_contracts_snapshot_message = 'Contracts data has not been loaded.'
+_contracts_snapshot_lock = Lock()
 
 
 def _default_year_settings():
@@ -1734,39 +1770,222 @@ def _enhance_contracts_data(loaded_contracts_df, loaded_price_assumptions_df):
     return enhanced_contracts_df
 
 
-def _ensure_contracts_data_loaded():
-    global contracts_df
-    global demand_df
-    global price_assumptions_df
-    global price_formula_df
-    global _contracts_data_loaded
-    global _contracts_year_settings
-
-    if _contracts_data_loaded:
-        return
-
-    loaded_contracts_df = load_contracts_data()
-    loaded_demand_df = load_annual_demand_data()
-    loaded_price_assumptions_df = load_price_assumptions_data()
-    loaded_price_formula_df = load_price_formula_data()
-
-    contracts_df = _enhance_contracts_data(
-        loaded_contracts_df,
-        loaded_price_assumptions_df,
+def _empty_contracts_snapshot():
+    return ContractsSnapshot(
+        revision_key=tuple(),
+        contracts=pd.DataFrame(columns=CONTRACTS_RUNTIME_COLUMNS),
+        demand=pd.DataFrame(columns=ANNUAL_DEMAND_DATA_COLUMNS),
+        price_assumptions=pd.DataFrame(
+            columns=PRICE_ASSUMPTIONS_COLUMNS
+        ),
+        price_formula=pd.DataFrame(columns=PRICE_FORMULA_COLUMNS),
+        year_settings=_default_year_settings(),
     )
-    demand_df = loaded_demand_df
-    price_assumptions_df = loaded_price_assumptions_df
-    price_formula_df = loaded_price_formula_df
-    _contracts_year_settings = _calculate_contract_year_settings(contracts_df)
-    _contracts_data_loaded = True
+
+
+def _normalize_contracts_revision_value(value):
+    if value is None or pd.isna(value):
+        return None
+    if hasattr(value, 'isoformat'):
+        return value.isoformat()
+    return str(value)
+
+
+def fetch_contracts_revision_key():
+    with engine.connect() as connection:
+        rows = connection.execute(
+            CONTRACTS_REVISION_QUERY
+        ).mappings().all()
+    revisions = {
+        str(row['source_name']): (
+            int(row['row_count'] or 0),
+            _normalize_contracts_revision_value(row['watermark']),
+        )
+        for row in rows
+    }
+    if set(revisions) != set(CONTRACTS_SOURCE_NAMES):
+        raise RuntimeError('Contracts source revision query was incomplete')
+    return tuple(
+        (
+            source_name,
+            revisions[source_name][0],
+            revisions[source_name][1],
+        )
+        for source_name in CONTRACTS_SOURCE_NAMES
+    )
+
+
+def _build_contracts_snapshot(revision_key):
+    loaders = {
+        'contracts': load_contracts_data,
+        'demand': load_annual_demand_data,
+        'price_assumptions': load_price_assumptions_data,
+        'price_formula': load_price_formula_data,
+    }
+    with ThreadPoolExecutor(
+        max_workers=4,
+        thread_name_prefix='contracts-load',
+    ) as executor:
+        futures = {
+            name: executor.submit(loader)
+            for name, loader in loaders.items()
+        }
+        loaded_frames = {
+            name: futures[name].result()
+            for name in loaders
+        }
+
+    expected_counts = {
+        source_name: row_count
+        for source_name, row_count, _watermark in revision_key
+    }
+    for source_name, frame in loaded_frames.items():
+        if expected_counts.get(source_name, 0) > 0 and frame.empty:
+            raise RuntimeError(
+                f'Contracts source {source_name} returned no rows'
+            )
+
+    enhanced_contracts_df = _enhance_contracts_data(
+        loaded_frames['contracts'],
+        loaded_frames['price_assumptions'],
+    )
+    year_settings = _calculate_contract_year_settings(
+        enhanced_contracts_df
+    )
+    return ContractsSnapshot(
+        revision_key=revision_key,
+        contracts=enhanced_contracts_df,
+        demand=loaded_frames['demand'],
+        price_assumptions=loaded_frames['price_assumptions'],
+        price_formula=loaded_frames['price_formula'],
+        year_settings=year_settings,
+    )
+
+
+def _ensure_contracts_snapshot(*, force=False):
+    global _contracts_snapshot
+    global _contracts_snapshot_status
+    global _contracts_snapshot_message
+
+    try:
+        revision_key = fetch_contracts_revision_key()
+    except Exception:
+        logger.warning(
+            'Contracts source revision check failed',
+            exc_info=True,
+        )
+        with _contracts_snapshot_lock:
+            if _contracts_snapshot is None:
+                _contracts_snapshot = _empty_contracts_snapshot()
+                _contracts_snapshot_status = 'unavailable'
+                _contracts_snapshot_message = (
+                    'Contracts data is unavailable because source revisions '
+                    'could not be verified.'
+                )
+            else:
+                _contracts_snapshot_status = 'stale'
+                _contracts_snapshot_message = (
+                    'Source refresh failed. Showing the last verified '
+                    'contracts snapshot.'
+                )
+            return _contracts_snapshot
+
+    with _contracts_snapshot_lock:
+        if (
+            not force
+            and _contracts_snapshot is not None
+            and _contracts_snapshot.revision_key == revision_key
+        ):
+            _contracts_snapshot_status = 'fresh'
+            _contracts_snapshot_message = ''
+            return _contracts_snapshot
+
+        try:
+            candidate = _build_contracts_snapshot(revision_key)
+        except Exception:
+            logger.warning(
+                'Contracts snapshot refresh failed',
+                exc_info=True,
+            )
+            if _contracts_snapshot is None:
+                _contracts_snapshot = _empty_contracts_snapshot()
+                _contracts_snapshot_status = 'unavailable'
+                _contracts_snapshot_message = (
+                    'Contracts data is unavailable because a complete '
+                    'snapshot could not be loaded.'
+                )
+            else:
+                _contracts_snapshot_status = 'stale'
+                _contracts_snapshot_message = (
+                    'Source refresh failed. Showing the last verified '
+                    'contracts snapshot.'
+                )
+            return _contracts_snapshot
+
+        _contracts_snapshot = candidate
+        _contracts_snapshot_status = 'fresh'
+        _contracts_snapshot_message = ''
+        return _contracts_snapshot
+
+
+def _contracts_snapshot_token(snapshot, refresh_generation=None):
+    token = repr(snapshot.revision_key)
+    if refresh_generation is not None:
+        token = f"{token}|refresh:{refresh_generation}"
+    return token
+
+
+def _contracts_source_status(snapshot):
+    if _contracts_snapshot_status == 'unavailable':
+        return (
+            _contracts_snapshot_message,
+            'contracts-source-status contracts-source-status-unavailable',
+        )
+
+    revision_labels = []
+    for source_name, row_count, watermark in snapshot.revision_key:
+        label = CONTRACTS_SOURCE_LABELS[source_name]
+        revision_labels.append(
+            f"{label} {watermark or '—'} ({row_count:,} rows)"
+        )
+    revision_text = ' | '.join(revision_labels)
+    if _contracts_snapshot_status == 'stale':
+        return (
+            f"{_contracts_snapshot_message} Source revisions (UTC): "
+            f"{revision_text}",
+            'contracts-source-status contracts-source-status-stale',
+        )
+    return (
+        f"Source revisions (UTC): {revision_text}",
+        'contracts-source-status contracts-source-status-fresh',
+    )
+
+
+def _current_contracts_snapshot():
+    return _contracts_snapshot or _empty_contracts_snapshot()
+
+
+def _ensure_contracts_data_loaded():
+    """Compatibility wrapper for callers that previously initialized globals."""
+    return _ensure_contracts_snapshot()
 
 
 def layout():
-    _ensure_contracts_data_loaded()
-    year_settings = _contracts_year_settings or _default_year_settings()
+    snapshot = _ensure_contracts_snapshot()
+    year_settings = snapshot.year_settings
+    source_status_text, source_status_class = _contracts_source_status(
+        snapshot
+    )
 
     return html.Div(
         [
+            html.Div(
+                source_status_text,
+                id='contracts-source-status',
+                className=source_status_class,
+                role='status',
+                **{'aria-live': 'polite'},
+            ),
             create_filter_controls(
                 year_settings['min_year'],
                 year_settings['max_year'],
@@ -1780,7 +1999,11 @@ def layout():
                 ],
                 className="contracts-content-stack",
             ),
-            html.Div(id='contracts-data-store', style={'display': 'none'}),
+            html.Div(
+                _contracts_snapshot_token(snapshot),
+                id='contracts-data-store',
+                style={'display': 'none'},
+            ),
             dcc.Store(id='volume-country-expanded-store', data=[]),
             dcc.Store(id='volume-seller-expanded-store', data=[]),
             dcc.Store(id='volume-destination-expanded-store', data=[]),
@@ -1790,6 +2013,26 @@ def layout():
     )
 
 ############################################ Callbacks ###################################################
+
+
+@callback(
+    Output('contracts-data-store', 'children'),
+    Output('contracts-source-status', 'children'),
+    Output('contracts-source-status', 'className'),
+    Input('global-refresh-button', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def refresh_contracts_snapshot(n_clicks):
+    snapshot = _ensure_contracts_snapshot(force=True)
+    source_status_text, source_status_class = _contracts_source_status(
+        snapshot
+    )
+    return (
+        _contracts_snapshot_token(snapshot, n_clicks),
+        source_status_text,
+        source_status_class,
+    )
+
 
 @callback(
     [Output('destination-country-dropdown', 'options'),
@@ -1801,6 +2044,9 @@ def layout():
 )
 def update_filter_options(_):
     """Update filter dropdown options based on available data"""
+    snapshot = _current_contracts_snapshot()
+    contracts_df = snapshot.contracts
+    demand_df = snapshot.demand
     if contracts_df.empty and demand_df.empty:
         empty_options = []
         return [empty_options] * 5
@@ -1843,13 +2089,18 @@ def update_filter_options(_):
      Input('volume-country-expanded-store', 'data'),
      Input('volume-seller-expanded-store', 'data'),
      Input('volume-destination-expanded-store', 'data'),
-     Input('volume-buyer-expanded-store', 'data')]
+     Input('volume-buyer-expanded-store', 'data'),
+     Input('contracts-data-store', 'children')]
 )
 def update_volume_analysis_section(dest_countries, contract_types, 
                                   pricing_types, sellers, year_range, cargo_basis, 
                                   source_flexible, dest_flexible, volume_view_section,
-                                  expanded_countries, expanded_sellers, expanded_destinations, expanded_buyers):
+                                  expanded_countries, expanded_sellers, expanded_destinations, expanded_buyers,
+                                  _snapshot_token):
     """Update volume analysis section content"""
+    snapshot = _current_contracts_snapshot()
+    contracts_df = snapshot.contracts
+    demand_df = snapshot.demand
     
     # Apply filters to dataframes
     filtered_contracts = contracts_df.copy()
@@ -1918,10 +2169,16 @@ def update_volume_analysis_section(dest_countries, contract_types,
      Input('seller-company-dropdown', 'value'),
      Input('source-flexible-dropdown', 'value'),
      Input('dest-flexible-dropdown', 'value'),
-     Input('timeline-metric-dropdown', 'value')]
+     Input('timeline-metric-dropdown', 'value'),
+     Input('contracts-data-store', 'children')]
 )
-def update_timeline_charts(dest_countries, contract_types, pricing_types, sellers, source_flexible, dest_flexible, timeline_metric):
+def update_timeline_charts(dest_countries, contract_types, pricing_types, sellers, source_flexible, dest_flexible, timeline_metric, _snapshot_token):
     """Update contract signing timeline charts"""
+    snapshot = _current_contracts_snapshot()
+    contracts_df = snapshot.contracts
+    demand_df = snapshot.demand
+    price_assumptions_df = snapshot.price_assumptions
+    price_formula_df = snapshot.price_formula
     
     # Timeline charts intentionally show the full historical range.
     filtered_contracts = contracts_df.copy()
@@ -2316,12 +2573,17 @@ def update_timeline_charts(dest_countries, contract_types, pricing_types, seller
      Input('seller-company-dropdown', 'value'),
      Input('year-range-slider', 'value'),
      Input('source-flexible-dropdown', 'value'),
-     Input('dest-flexible-dropdown', 'value')]
+     Input('dest-flexible-dropdown', 'value'),
+     Input('contracts-data-store', 'children')]
 )
 def update_contracts_table(dest_countries, contract_types, 
                           pricing_types, sellers, year_range, source_flexible,
-                          dest_flexible):
+                          dest_flexible, _snapshot_token):
     """Update contracts table based on filters"""
+    snapshot = _current_contracts_snapshot()
+    contracts_df = snapshot.contracts
+    price_assumptions_df = snapshot.price_assumptions
+    price_formula_df = snapshot.price_formula
     
     # Apply same filters as tab content
     filtered_contracts = contracts_df.copy()

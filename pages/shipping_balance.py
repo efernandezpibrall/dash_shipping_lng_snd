@@ -9,9 +9,6 @@ import logging
 import threading
 from io import StringIO, BytesIO
 from dash.exceptions import PreventUpdate
-import configparser
-import os
-from sqlalchemy import create_engine
 from concurrent.futures import ThreadPoolExecutor
 
 from utils.dashboard_snapshot_cache import (
@@ -22,34 +19,10 @@ from utils.dashboard_snapshot_cache import (
     was_global_refresh_triggered as _was_global_refresh_triggered,
     with_snapshot_slot as _with_snapshot_slot,
 )
+from utils.database import engine
 
 from fundamentals.shipping_balance_calculator import global_shipping_balance as calc_global_shipping_balance, kpler_analysis
 
-############################################ postgres sql connection ###################################################
-#------ code to be able to access config.ini, even having the path in the .virtualenvs is not working without it ------#
-try:
-    # Get the directory where your script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Navigate to the directory containing config.ini
-    # Adjust the number of '..' as needed to reach the correct directory
-    config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))  # Go up one level
-    CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except Exception:
-    CONFIG_FILE_PATH = 'config.ini'  # Assumes it's in the same directory or the path it is detected
-
-
-# --- Load Configuration from INI File ---
-config_reader = configparser.ConfigParser(interpolation=None)
-config_reader.read(CONFIG_FILE_PATH)
-
-# Read values from the ini file sections
-DB_CONNECTION_STRING = config_reader.get('DATABASE', 'CONNECTION_STRING', fallback=None)
-# --- Essential Variable Checks ---
-if not DB_CONNECTION_STRING:
-    raise ValueError(f"Missing DATABASE CONNECTION_STRING in {CONFIG_FILE_PATH}")
-
-# create engine
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 logger = logging.getLogger(__name__)
 
 SHIPPING_BALANCE_NAMESPACE = "shipping-balance-v1"

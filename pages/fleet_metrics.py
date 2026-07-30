@@ -1,46 +1,31 @@
 import datetime as dt
-import os
-import configparser
 import logging
 import math
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import OrderedDict
 import threading
 
 import dash_ag_grid as dag
 import pandas as pd
 import plotly.graph_objects as go
-from dash import callback, dcc, html
+from dash import callback, ctx, dcc, html, no_update
 from dash.dependencies import Input, Output
+from dash.exceptions import MissingCallbackContextException
 from plotly.subplots import make_subplots
-from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy import bindparam, text
 
 from utils.dashboard_snapshot_cache import (
     build_source_key as _build_source_key,
     get_or_build_snapshot as _get_or_build_snapshot,
+    is_snapshot_reference as _is_snapshot_reference,
+    resolve_snapshot as _resolve_snapshot,
+    snapshot_is_resolvable as _snapshot_is_resolvable,
     was_global_refresh_triggered as _was_global_refresh_triggered,
 )
+from utils.database import DB_SCHEMA, engine
+from utils.performance import log_callback_timing
 
 logger = logging.getLogger(__name__)
-
-
-try:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_dir = os.path.abspath(os.path.join(script_dir, "..", ".."))
-    CONFIG_FILE_PATH = os.path.join(config_dir, "config.ini")
-except Exception:
-    CONFIG_FILE_PATH = "config.ini"
-
-config_reader = configparser.ConfigParser(interpolation=None)
-config_reader.read(CONFIG_FILE_PATH)
-
-DB_CONNECTION_STRING = config_reader.get("DATABASE", "CONNECTION_STRING", fallback=None)
-DB_SCHEMA = config_reader.get("DATABASE", "SCHEMA", fallback=None)
-
-if not DB_CONNECTION_STRING:
-    raise ValueError(f"Missing DATABASE CONNECTION_STRING in {CONFIG_FILE_PATH}")
-
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
 
 KPLER_FLEET_METRICS_TABLE = "kpler_lng_fleet_metrics_series"
@@ -79,7 +64,9 @@ KPLER_FLEET_DIVERSION_REGION_ORDER = [
 FLEET_METRICS_SNAPSHOT_NAMESPACE = "fleet-metrics-source-v1"
 _FLEET_RENDER_CACHE = OrderedDict()
 _FLEET_COMMON_RENDER_CACHE = OrderedDict()
+_FLEET_COMMON_RENDER_FLIGHTS: dict[tuple, Future] = {}
 _FLEET_RENDER_CACHE_LOCK = threading.Lock()
+_FLEET_REGION_OUTPUT_INDICES = frozenset({0, 1, 3, 5, 6, 13})
 
 
 def _fetch_fleet_metrics_source_state():
@@ -571,6 +558,72 @@ def fetch_area_options(split_dimension, zone_filter):
         return areas or _default_area_candidates(zone_filter, split_dimension)
     except Exception:
         return _default_area_candidates(zone_filter, split_dimension)
+
+
+def fetch_all_area_options(split_dimension):
+    """Return the current per-region 120-day daily ranking in one query."""
+
+    if split_dimension not in {
+        option["value"] for option in KPLER_FLEET_SPLIT_OPTIONS
+    }:
+        split_dimension = "current_subcontinents"
+
+    fallback = {
+        zone_filter: list(
+            _default_area_candidates(zone_filter, split_dimension)
+        )
+        for zone_filter in KPLER_FLEET_REGION_ORDER
+    }
+    if not _fleet_metrics_table_exists():
+        return fallback
+
+    query = text(f"""
+        SELECT
+            zone_filter,
+            area_name,
+            SUM(quantity_mtonnes) AS recent_quantity
+        FROM {_table_ref(KPLER_FLEET_METRICS_TABLE)}
+        WHERE period = 'daily'
+          AND zone_filter IN :zone_filters
+          AND split_dimension = :split_dimension
+          AND metric IN ('loaded_vessels', 'floating_storage')
+          AND date >= CURRENT_DATE - INTERVAL '120 days'
+        GROUP BY zone_filter, area_name
+        ORDER BY
+            zone_filter,
+            recent_quantity DESC NULLS LAST,
+            area_name
+    """).bindparams(bindparam("zone_filters", expanding=True))
+    try:
+        frame = pd.read_sql(
+            query,
+            engine,
+            params={
+                "zone_filters": tuple(KPLER_FLEET_REGION_ORDER),
+                "split_dimension": split_dimension,
+            },
+        )
+        if not {"zone_filter", "area_name"}.issubset(frame.columns):
+            raise ValueError("Fleet area options query returned invalid columns")
+        options = {}
+        for zone_filter in KPLER_FLEET_REGION_ORDER:
+            zone_areas = (
+                frame.loc[
+                    frame["zone_filter"] == zone_filter,
+                    "area_name",
+                ]
+                .dropna()
+                .astype(str)
+                .tolist()
+            )
+            options[zone_filter] = zone_areas or fallback[zone_filter]
+        return options
+    except Exception:
+        logger.warning(
+            "Fleet area options query failed; using configured defaults",
+            exc_info=True,
+        )
+        return fallback
 
 
 def fetch_fleet_metrics_weekly(
@@ -3832,6 +3885,10 @@ def _region_definitions_section():
 
 layout = html.Div(
     [
+        dcc.Store(
+            id="fleet-metrics-source-ref-store",
+            storage_type="memory",
+        ),
         html.Div(
             [
                 html.Div(
@@ -4028,16 +4085,56 @@ layout = html.Div(
 )
 
 
+def _resolve_fleet_metrics_source_bundle(source_reference):
+    if not _is_snapshot_reference(
+        source_reference,
+        FLEET_METRICS_SNAPSHOT_NAMESPACE,
+    ) or not _snapshot_is_resolvable(source_reference):
+        raise RuntimeError("Fleet metrics source snapshot is unavailable")
+    source_bundle = _resolve_snapshot(
+        source_reference,
+        engine,
+        expected_namespace=FLEET_METRICS_SNAPSHOT_NAMESPACE,
+    )
+    if (
+        not isinstance(source_bundle, dict)
+        or not isinstance(source_bundle.get("context"), dict)
+        or not {
+            "start_date",
+            "end_date",
+            "split_dimension",
+            "today",
+        }.issubset(source_bundle["context"])
+    ):
+        raise TypeError("Fleet metrics source snapshot is invalid")
+    return source_bundle
+
+
 @callback(
     Output("fleet-metrics-area-dropdown", "options"),
     Output("fleet-metrics-area-dropdown", "value"),
+    Input("fleet-metrics-source-ref-store", "data"),
     Input("fleet-metrics-region-tabs", "value"),
-    Input("fleet-metrics-split-dropdown", "value"),
     prevent_initial_call=False,
 )
-def update_area_options(zone_filter, split_dimension):
+def update_area_options(source_reference, zone_filter):
     zone_filter = zone_filter or KPLER_FLEET_DEFAULT_ZONE_FILTER
-    areas = fetch_area_options(split_dimension, zone_filter)
+    try:
+        source_bundle = _resolve_fleet_metrics_source_bundle(
+            source_reference
+        )
+        context = source_bundle.get("context") or {}
+        split_dimension = context.get(
+            "split_dimension",
+            "current_subcontinents",
+        )
+        areas = (
+            source_bundle.get("area_options_by_region", {}).get(zone_filter)
+            or _default_area_candidates(zone_filter, split_dimension)
+        )
+    except Exception:
+        split_dimension = "current_subcontinents"
+        areas = _default_area_candidates(zone_filter, split_dimension)
     options = [{"label": _area_display_name(area), "value": area} for area in areas]
 
     default_candidates = _default_area_candidates(zone_filter, split_dimension)
@@ -4105,6 +4202,9 @@ def _build_fleet_metrics_source_bundle(
             start_date=start_date_val,
             end_date=end_date_val,
         ),
+        "area_options_by_region": lambda: fetch_all_area_options(
+            split_dimension
+        ),
         "price_context": fetch_price_context,
         **diversion_tasks,
     }
@@ -4138,6 +4238,12 @@ def _build_fleet_metrics_source_bundle(
 
     results["upload_timestamp"] = source_state.get("fleet_upload")
     results["signal_upload_timestamp"] = source_state.get("signal_upload")
+    results["context"] = {
+        "start_date": start_date_val.isoformat(),
+        "end_date": end_date_val.isoformat(),
+        "split_dimension": split_dimension,
+        "today": today.isoformat(),
+    }
     return results
 
 
@@ -4230,19 +4336,158 @@ def _get_fleet_metrics_common_render(
         if cached is not None:
             _FLEET_COMMON_RENDER_CACHE.move_to_end(source_key)
             return cached
+        flight = _FLEET_COMMON_RENDER_FLIGHTS.get(source_key)
+        if flight is None:
+            flight = Future()
+            _FLEET_COMMON_RENDER_FLIGHTS[source_key] = flight
+            owns_flight = True
+        else:
+            owns_flight = False
 
-    prepared = _build_fleet_metrics_common_render(
-        source_bundle,
-        start_date_val=start_date_val,
-        end_date_val=end_date_val,
-        split_dimension=split_dimension,
+    if not owns_flight:
+        return flight.result()
+
+    try:
+        prepared = _build_fleet_metrics_common_render(
+            source_bundle,
+            start_date_val=start_date_val,
+            end_date_val=end_date_val,
+            split_dimension=split_dimension,
+        )
+        with _FLEET_RENDER_CACHE_LOCK:
+            _FLEET_COMMON_RENDER_CACHE[source_key] = prepared
+            _FLEET_COMMON_RENDER_CACHE.move_to_end(source_key)
+            while len(_FLEET_COMMON_RENDER_CACHE) > 32:
+                _FLEET_COMMON_RENDER_CACHE.popitem(last=False)
+        flight.set_result(prepared)
+        return prepared
+    except BaseException as exc:
+        flight.set_exception(exc)
+        raise
+    finally:
+        with _FLEET_RENDER_CACHE_LOCK:
+            _FLEET_COMMON_RENDER_FLIGHTS.pop(source_key, None)
+
+
+def _normalize_fleet_metrics_source_controls(
+    split_dimension,
+    start_date,
+    end_date,
+):
+    if split_dimension not in {
+        option["value"] for option in KPLER_FLEET_SPLIT_OPTIONS
+    }:
+        split_dimension = "current_subcontinents"
+    today = dt.date.today()
+    start_date_val = (
+        pd.to_datetime(start_date).date()
+        if start_date
+        else KPLER_FLEET_DEFAULT_START_DATE
     )
-    with _FLEET_RENDER_CACHE_LOCK:
-        _FLEET_COMMON_RENDER_CACHE[source_key] = prepared
-        _FLEET_COMMON_RENDER_CACHE.move_to_end(source_key)
-        while len(_FLEET_COMMON_RENDER_CACHE) > 32:
-            _FLEET_COMMON_RENDER_CACHE.popitem(last=False)
-    return prepared
+    end_date_val = (
+        pd.to_datetime(end_date).date()
+        if end_date
+        else today
+    )
+    if start_date_val > end_date_val:
+        start_date_val, end_date_val = end_date_val, start_date_val
+    return split_dimension, start_date_val, end_date_val, today
+
+
+@callback(
+    Output("fleet-metrics-source-ref-store", "data"),
+    Input("fleet-metrics-split-dropdown", "value"),
+    Input("fleet-metrics-date-range", "start_date"),
+    Input("fleet-metrics-date-range", "end_date"),
+    Input("global-refresh-button", "n_clicks"),
+    prevent_initial_call=False,
+)
+@log_callback_timing("fleet_metrics.source_load")
+def load_fleet_metrics_source(
+    split_dimension,
+    start_date,
+    end_date,
+    _global_refresh_clicks=None,
+):
+    (
+        split_dimension,
+        start_date_val,
+        end_date_val,
+        today,
+    ) = _normalize_fleet_metrics_source_controls(
+        split_dimension,
+        start_date,
+        end_date,
+    )
+    try:
+        try:
+            source_state = _fetch_fleet_metrics_source_state()
+        except Exception:
+            logger.warning(
+                "Fleet snapshot watermark lookup failed; "
+                "using live-query fallback",
+                exc_info=True,
+            )
+            source_state = {
+                "request_token": dt.datetime.now(
+                    dt.timezone.utc
+                ).isoformat()
+            }
+        source_key = _build_source_key(
+            FLEET_METRICS_SNAPSHOT_NAMESPACE,
+            source_state,
+            split_dimension,
+            start_date_val,
+            end_date_val,
+            today,
+        )
+        source_reference, _source_bundle = _get_or_build_snapshot(
+            engine,
+            namespace=FLEET_METRICS_SNAPSHOT_NAMESPACE,
+            source_key=source_key,
+            builder=lambda: _build_fleet_metrics_source_bundle(
+                start_date_val=start_date_val,
+                end_date_val=end_date_val,
+                split_dimension=split_dimension,
+                today=today,
+                source_state=source_state,
+            ),
+            force=_was_global_refresh_triggered(),
+            manifest={
+                "start_date": start_date_val.isoformat(),
+                "end_date": end_date_val.isoformat(),
+                "split_dimension": split_dimension,
+                "today": today.isoformat(),
+                "source_state": source_state,
+            },
+        )
+        if not _snapshot_is_resolvable(source_reference):
+            raise RuntimeError(
+                "Fleet metrics source snapshot is unavailable"
+            )
+        return source_reference
+    except Exception as exc:
+        logger.exception("Error loading Kpler fleet metrics source")
+        return {
+            "format": "fleet-metrics-source-error-v1",
+            "error": str(exc),
+        }
+
+
+def _fleet_region_only_triggered():
+    try:
+        return ctx.triggered_id == "fleet-metrics-region-tabs"
+    except MissingCallbackContextException:
+        return False
+
+
+def _fleet_render_response(result, *, region_only):
+    if not region_only:
+        return result
+    return tuple(
+        value if index in _FLEET_REGION_OUTPUT_INDICES else no_update
+        for index, value in enumerate(result)
+    )
 
 
 @callback(
@@ -4264,66 +4509,44 @@ def _get_fleet_metrics_common_render(
     Output("fleet-metrics-floating-seasonal-chart", "figure"),
     Output("fleet-metrics-region-detail-matrix-legend", "children"),
     Output("fleet-metrics-region-detail-matrix-chart", "figure"),
+    Input("fleet-metrics-source-ref-store", "data"),
     Input("fleet-metrics-region-tabs", "value"),
-    Input("fleet-metrics-split-dropdown", "value"),
-    Input("fleet-metrics-date-range", "start_date"),
-    Input("fleet-metrics-date-range", "end_date"),
-    Input("global-refresh-button", "n_clicks"),
     prevent_initial_call=False,
 )
-def update_fleet_metrics_page(zone_filter, split_dimension, start_date, end_date, _global_refresh_clicks=None):
+@log_callback_timing("fleet_metrics.page_render")
+def update_fleet_metrics_page(source_reference, zone_filter):
     zone_filter = zone_filter or KPLER_FLEET_DEFAULT_ZONE_FILTER
     if zone_filter not in KPLER_FLEET_REGION_ORDER:
         zone_filter = KPLER_FLEET_DEFAULT_ZONE_FILTER
-    if split_dimension not in {option["value"] for option in KPLER_FLEET_SPLIT_OPTIONS}:
-        split_dimension = "current_subcontinents"
 
     try:
-        today = dt.date.today()
-        start_date_val = pd.to_datetime(start_date).date() if start_date else KPLER_FLEET_DEFAULT_START_DATE
-        end_date_val = pd.to_datetime(end_date).date() if end_date else today
-        if start_date_val > end_date_val:
-            start_date_val, end_date_val = end_date_val, start_date_val
-
-        try:
-            source_state = _fetch_fleet_metrics_source_state()
-        except Exception:
-            logger.warning("Fleet snapshot watermark lookup failed; using live-query fallback", exc_info=True)
-            source_state = {"request_token": dt.datetime.now(dt.timezone.utc).isoformat()}
-        source_key = _build_source_key(
-            FLEET_METRICS_SNAPSHOT_NAMESPACE,
-            source_state,
-            split_dimension,
-            start_date_val,
-            end_date_val,
-            today,
+        source_bundle = _resolve_fleet_metrics_source_bundle(
+            source_reference
         )
-        source_reference, source_bundle = _get_or_build_snapshot(
-            engine,
-            namespace=FLEET_METRICS_SNAPSHOT_NAMESPACE,
-            source_key=source_key,
-            builder=lambda: _build_fleet_metrics_source_bundle(
-                start_date_val=start_date_val,
-                end_date_val=end_date_val,
-                split_dimension=split_dimension,
-                today=today,
-                source_state=source_state,
-            ),
-            force=_was_global_refresh_triggered(),
-            manifest={
-                "start_date": start_date_val.isoformat(),
-                "end_date": end_date_val.isoformat(),
-                "split_dimension": split_dimension,
-                "source_state": source_state,
-            },
+        context = source_bundle.get("context") or {}
+        split_dimension = context.get(
+            "split_dimension",
+            "current_subcontinents",
         )
-        render_source_key = (source_key, int(source_reference["revision"]))
+        start_date_val = pd.to_datetime(
+            context["start_date"]
+        ).date()
+        end_date_val = pd.to_datetime(context["end_date"]).date()
+        render_source_key = (
+            str(source_reference["namespace"]),
+            str(source_reference["source_key"]),
+            source_reference["revision"],
+        )
         render_cache_key = (render_source_key, zone_filter)
+        region_only = _fleet_region_only_triggered()
         with _FLEET_RENDER_CACHE_LOCK:
             cached_render = _FLEET_RENDER_CACHE.get(render_cache_key)
             if cached_render is not None:
                 _FLEET_RENDER_CACHE.move_to_end(render_cache_key)
-                return cached_render
+                return _fleet_render_response(
+                    cached_render,
+                    region_only=region_only,
+                )
 
         price_context = source_bundle["price_context"]
         upload_timestamp = source_bundle["upload_timestamp"]
@@ -4396,7 +4619,10 @@ def update_fleet_metrics_page(zone_filter, split_dimension, start_date, end_date
             _FLEET_RENDER_CACHE.move_to_end(render_cache_key)
             while len(_FLEET_RENDER_CACHE) > 32:
                 _FLEET_RENDER_CACHE.popitem(last=False)
-        return result
+        return _fleet_render_response(
+            result,
+            region_only=region_only,
+        )
     except Exception as exc:
         logger.exception("Error loading Kpler fleet metrics page")
         error_fig = _empty_figure(f"Error loading Kpler fleet metrics: {exc}")
@@ -4417,6 +4643,9 @@ def update_fleet_metrics_page(zone_filter, split_dimension, start_date, end_date
             [],
             error_fig,
             error_fig,
-            build_region_detail_matrix_legend(pd.DataFrame(), split_dimension),
+            build_region_detail_matrix_legend(
+                pd.DataFrame(),
+                "current_subcontinents",
+            ),
             error_fig,
         )

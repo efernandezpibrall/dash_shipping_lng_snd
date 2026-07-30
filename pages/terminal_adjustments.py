@@ -11,6 +11,7 @@ This page allows analysts to:
 Uses append-only design - never updates or deletes, only inserts with timestamps.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import datetime
 import base64
 import io
@@ -18,12 +19,11 @@ import pandas as pd
 import dash
 from dash import html, dcc, callback, Input, Output, State
 import dash_bootstrap_components as dbc
-from sqlalchemy import create_engine
-import configparser
 import os
 import sys
 
 from utils.ag_grid_tables import create_ag_grid_from_datatable
+from utils.database import DB_SCHEMA, engine
 
 # Add project root to path for imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -42,28 +42,6 @@ from fundamentals.terminals.terminal_output_utils import (
     fetch_keyed_terminal_monthly_output,
 )
 from fundamentals.terminals.terminal_registry_utils import find_terminal_train_candidates
-
-###############################################################################
-# Database Connection
-###############################################################################
-
-# Load config
-try:
-    config_dir = os.path.abspath(os.path.join(script_dir, '..', '..'))
-    CONFIG_FILE_PATH = os.path.join(config_dir, 'config.ini')
-except Exception:
-    CONFIG_FILE_PATH = 'config.ini'
-
-config_reader = configparser.ConfigParser(interpolation=None)
-config_reader.read(CONFIG_FILE_PATH)
-
-DB_CONNECTION_STRING = config_reader.get('DATABASE', 'CONNECTION_STRING', fallback=None)
-DB_SCHEMA = config_reader.get('DATABASE', 'SCHEMA', fallback='at_lng')
-
-if not DB_CONNECTION_STRING:
-    raise ValueError(f"Missing DATABASE CONNECTION_STRING in {CONFIG_FILE_PATH}")
-
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True)
 
 ###############################################################################
 # Data Fetching Functions
@@ -247,9 +225,27 @@ def get_trains_list():
 ###############################################################################
 
 def layout():
-    scenarios = get_available_scenarios(engine)
-    plants_df = get_plants_list()
-    trains_df = get_trains_list()
+    loaders = {
+        'scenarios': lambda: get_available_scenarios(engine),
+        'plants': get_plants_list,
+        'trains': get_trains_list,
+    }
+    with ThreadPoolExecutor(
+        max_workers=3,
+        thread_name_prefix='terminal-adjustments-options',
+    ) as executor:
+        futures = {
+            name: executor.submit(loader)
+            for name, loader in loaders.items()
+        }
+        loaded_options = {
+            name: futures[name].result()
+            for name in loaders
+        }
+
+    scenarios = loaded_options['scenarios']
+    plants_df = loaded_options['plants']
+    trains_df = loaded_options['trains']
 
     return dbc.Container([
         dbc.Row([

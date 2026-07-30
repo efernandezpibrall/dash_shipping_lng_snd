@@ -29,15 +29,20 @@ from utils.dataframe_store import (
     serialize_dataframe_store as _serialize_dataframe,
 )
 from utils.dashboard_snapshot_cache import (
-    snapshot_is_shared as _snapshot_is_shared,
+    SnapshotUnavailable as _SnapshotUnavailable,
+    is_snapshot_reference as _is_snapshot_reference,
+    snapshot_is_resolvable as _snapshot_is_resolvable,
     was_global_refresh_triggered as _was_global_refresh_triggered,
     with_snapshot_slot as _with_snapshot_slot,
 )
 from utils.provider_flow_snapshot import (
-    build_provider_flow_payload as _build_provider_flow_payload,
     get_provider_flow_snapshot as _get_provider_flow_snapshot,
     resolve_provider_flow_snapshot as _resolve_provider_flow_snapshot,
 )
+from utils.historical_comparison_snapshot import (
+    get_historical_comparison_frame as _get_historical_comparison_frame,
+)
+from utils.performance import log_callback_timing
 from utils.snapshot_controls import (
     build_ea_metadata_lines as _build_ea_metadata_lines,
     build_woodmac_metadata_lines as _build_woodmac_metadata_lines,
@@ -150,12 +155,48 @@ DESTINATION_AGGREGATION_LOOKUP_COLUMNS = [
     "shipping_region",
 ]
 
+DEMAND_SNAPSHOT_RECOVERY_MESSAGE = (
+    "Cached demand data is unavailable. Click the global Refresh button "
+    "to reload it."
+)
+
 
 def _deserialize_dataframe(value):
-    resolved = _resolve_provider_flow_snapshot(value)
+    if value is None:
+        raise _SnapshotUnavailable(
+            DEMAND_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    try:
+        resolved = _resolve_provider_flow_snapshot(value)
+        if _is_snapshot_reference(resolved):
+            raise _SnapshotUnavailable(
+                DEMAND_SNAPSHOT_RECOVERY_MESSAGE
+            )
+    except _SnapshotUnavailable as exc:
+        raise _SnapshotUnavailable(
+            DEMAND_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
     if isinstance(resolved, pd.DataFrame):
         return resolved.copy()
     return _deserialize_dataframe_payload(resolved)
+
+
+def _snapshot_recovery_notice():
+    return html.Div(
+        DEMAND_SNAPSHOT_RECOVERY_MESSAGE,
+        className="balance-error-banner",
+        role="alert",
+    )
+
+
+def _snapshot_recovery_option():
+    return [
+        {
+            "label": DEMAND_SNAPSHOT_RECOVERY_MESSAGE,
+            "value": "__snapshot_unavailable__",
+            "disabled": True,
+        }
+    ]
 
 
 def _normalize_mapping_value(value):
@@ -662,34 +703,64 @@ def _fetch_comparison_raw_df(
     ea_upload_value: int | None,
     start_date: str | None = None,
     end_date: str | None = None,
+    base_reference=None,
 ) -> tuple[pd.DataFrame | None, str | None]:
     try:
         if comparison_source == "ea":
             if not ea_upload_value:
                 return None, "No Energy Aspects comparison run available."
-            return (
-                fetch_ea_import_flow_raw_data_for_upload(
+            _, comparison_df = _get_historical_comparison_frame(
+                direction="demand",
+                base_reference=base_reference,
+                selection={
+                    "source": "ea",
+                    "run_id": int(ea_upload_value),
+                },
+                query_dependencies={
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+                builder=lambda: fetch_ea_import_flow_raw_data_for_upload(
                     ea_upload_value,
                     start_date=start_date,
                     end_date=end_date,
                 ),
-                None,
             )
+            return comparison_df, None
 
         short_term_snapshot = _deserialize_snapshot_value(short_term_value)
         long_term_snapshot = _deserialize_snapshot_value(long_term_value)
         if not short_term_snapshot or not long_term_snapshot:
             return None, "No WoodMac comparison publications available."
 
-        return (
-            fetch_woodmac_import_flow_raw_data_for_publications(
+        selection = {
+            "source": "woodmac",
+            "short_term_market_outlook": short_term_snapshot.get(
+                "market_outlook"
+            ),
+            "short_term_publication_timestamp": short_term_snapshot.get(
+                "publication_timestamp"
+            ),
+            "long_term_market_outlook": long_term_snapshot.get(
+                "market_outlook"
+            ),
+            "long_term_publication_timestamp": long_term_snapshot.get(
+                "publication_timestamp"
+            ),
+        }
+        _, comparison_df = _get_historical_comparison_frame(
+            direction="demand",
+            base_reference=base_reference,
+            selection=selection,
+            query_dependencies={},
+            builder=lambda: fetch_woodmac_import_flow_raw_data_for_publications(
                 short_term_snapshot.get("market_outlook"),
                 short_term_snapshot.get("publication_timestamp"),
                 long_term_snapshot.get("market_outlook"),
                 long_term_snapshot.get("publication_timestamp"),
             ),
-            None,
         )
+        return comparison_df, None
     except Exception as exc:
         return None, f"Comparison load failed: {exc}"
 
@@ -831,7 +902,11 @@ def _create_comparison_section(
                         [
                             html.Div(
                                 [
-                                    html.Label("Source:", className="filter-label"),
+                                    html.Label(
+                                        "Source:",
+                                        htmlFor=comparison_source_dropdown_id,
+                                        className="filter-label",
+                                    ),
                                     dcc.Dropdown(
                                         id=comparison_source_dropdown_id,
                                         options=[
@@ -858,6 +933,7 @@ def _create_comparison_section(
                                         [
                                             html.Label(
                                                 "ST publication:",
+                                                htmlFor=comparison_st_dropdown_id,
                                                 className="filter-label",
                                             ),
                                             dcc.Dropdown(
@@ -875,6 +951,7 @@ def _create_comparison_section(
                                         [
                                             html.Label(
                                                 "LT publication:",
+                                                htmlFor=comparison_lt_dropdown_id,
                                                 className="filter-label",
                                             ),
                                             dcc.Dropdown(
@@ -898,6 +975,7 @@ def _create_comparison_section(
                                         [
                                             html.Label(
                                                 "upload_timestamp_utc:",
+                                                htmlFor=comparison_ea_upload_dropdown_id,
                                                 className="filter-label",
                                             ),
                                             dcc.Dropdown(
@@ -993,7 +1071,11 @@ layout = html.Div(
             [
                 html.Div(
                     [
-                        html.Div("Date Range", className="filter-group-header"),
+                        html.Label(
+                            "Date Range",
+                            htmlFor="demand-date-range",
+                            className="filter-group-header",
+                        ),
                         html.Div(
                             [
                                 dcc.DatePickerRange(
@@ -1019,8 +1101,9 @@ layout = html.Div(
                 ),
                 html.Div(
                     [
-                        html.Div(
+                        html.Label(
                             "Time View",
+                            htmlFor="demand-time-view",
                             className="filter-group-header",
                             title=SEASONAL_TIME_VIEW_TOOLTIP,
                             style={"cursor": "help"},
@@ -1061,7 +1144,11 @@ layout = html.Div(
                 ),
                 html.Div(
                     [
-                        html.Div("Destination Aggregation", className="filter-group-header"),
+                        html.Label(
+                            "Destination Aggregation",
+                            htmlFor="demand-destination-aggregation-dropdown",
+                            className="filter-group-header",
+                        ),
                         dcc.Dropdown(
                             id="demand-destination-aggregation-dropdown",
                             options=DESTINATION_AGGREGATION_OPTIONS,
@@ -1076,9 +1163,10 @@ layout = html.Div(
                 ),
                 html.Div(
                     [
-                        html.Div(
+                        html.Label(
                             "Country Columns",
                             id="demand-country-columns-header",
+                            htmlFor="demand-country-dropdown",
                             className="filter-group-header",
                         ),
                         dcc.Dropdown(
@@ -1096,7 +1184,11 @@ layout = html.Div(
                 ),
                 html.Div(
                     [
-                        html.Div("Other Countries", className="filter-group-header"),
+                        html.Label(
+                            "Other Countries",
+                            htmlFor="demand-other-country-mode",
+                            className="filter-group-header",
+                        ),
                         dcc.RadioItems(
                             id="demand-other-country-mode",
                             options=[
@@ -1124,7 +1216,7 @@ layout = html.Div(
                     style={"minWidth": "300px"},
                 ),
             ],
-            className="professional-section-header",
+            className="professional-section-header balance-desktop-filter-grid",
             style=DEMAND_STICKY_HEADER_STYLE,
         ),
         html.Div(
@@ -1160,6 +1252,7 @@ layout = html.Div(
     Output("demand-comparison-options-store", "data"),
     Input("global-refresh-button", "n_clicks"),
 )
+@log_callback_timing("demand.source_load")
 def load_balance_source_data(_):
     woodmac_df = pd.DataFrame()
     ea_df = pd.DataFrame()
@@ -1172,20 +1265,23 @@ def load_balance_source_data(_):
     }
     errors = []
 
-    provider_reference = None
-    provider_payload = {}
-    provider_errors = {}
+    force_refresh = _was_global_refresh_triggered()
     try:
         provider_reference, provider_payload = _get_provider_flow_snapshot(
-            force=_was_global_refresh_triggered(),
+            force=force_refresh,
         )
-        provider_errors = provider_payload.get("errors") or {}
-    except Exception:
-        try:
-            _, provider_payload = _build_provider_flow_payload()
-            provider_errors = provider_payload.get("errors") or {}
-        except Exception as fallback_exc:
-            provider_errors["provider_payload"] = str(fallback_exc)
+        if not _snapshot_is_resolvable(provider_reference):
+            raise _SnapshotUnavailable(
+                DEMAND_SNAPSHOT_RECOVERY_MESSAGE
+            )
+    except _SnapshotUnavailable:
+        raise
+    except Exception as exc:
+        raise _SnapshotUnavailable(
+            DEMAND_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+
+    provider_errors = provider_payload.get("errors") or {}
 
     woodmac_df = provider_payload.get("woodmac_import", pd.DataFrame())
     ea_df = provider_payload.get("ea_import", pd.DataFrame())
@@ -1235,12 +1331,14 @@ def load_balance_source_data(_):
     available_countries = get_available_countries([woodmac_df, ea_df])
     error_message = " | ".join(errors) if errors else None
 
-    if provider_reference is not None and _snapshot_is_shared(provider_reference):
-        woodmac_store = _with_snapshot_slot(provider_reference, "woodmac_import")
-        ea_store = _with_snapshot_slot(provider_reference, "ea_import")
-    else:
-        woodmac_store = _serialize_dataframe(woodmac_df)
-        ea_store = _serialize_dataframe(ea_df)
+    woodmac_store = _with_snapshot_slot(
+        provider_reference,
+        "woodmac_import",
+    )
+    ea_store = _with_snapshot_slot(
+        provider_reference,
+        "ea_import",
+    )
 
     return (
         woodmac_store,
@@ -1332,16 +1430,27 @@ def update_balance_country_options(
             selected_values,
         )
 
-    filtered_woodmac_df = _filter_by_date_range(
-        _deserialize_dataframe(woodmac_data),
-        start_date,
-        end_date,
-    )
-    filtered_ea_df = _filter_by_date_range(
-        _deserialize_dataframe(ea_data),
-        start_date,
-        end_date,
-    )
+    try:
+        filtered_woodmac_df = _filter_by_date_range(
+            _deserialize_dataframe(woodmac_data),
+            start_date,
+            end_date,
+        )
+        filtered_ea_df = _filter_by_date_range(
+            _deserialize_dataframe(ea_data),
+            start_date,
+            end_date,
+        )
+    except _SnapshotUnavailable:
+        return (
+            _snapshot_recovery_option(),
+            [],
+            True,
+            "Country Columns",
+            DEMAND_SNAPSHOT_RECOVERY_MESSAGE,
+            True,
+            [],
+        )
     filtered_available_countries = get_available_countries(
         [filtered_woodmac_df, filtered_ea_df]
     )
@@ -1454,8 +1563,11 @@ def update_ea_comparison_snapshot_controls(
     State("demand-date-range", "end_date"),
 )
 def update_balance_date_range(woodmac_data, ea_data, current_start_date, current_end_date):
-    woodmac_raw_df = _deserialize_dataframe(woodmac_data)
-    ea_raw_df = _deserialize_dataframe(ea_data)
+    try:
+        woodmac_raw_df = _deserialize_dataframe(woodmac_data)
+        ea_raw_df = _deserialize_dataframe(ea_data)
+    except _SnapshotUnavailable:
+        return None, None, None, None
 
     min_date, max_date = _get_date_bounds([woodmac_raw_df, ea_raw_df])
     if min_date is None or max_date is None:
@@ -1512,6 +1624,7 @@ def update_balance_error_banner(error_message):
     Input("demand-destination-aggregation-dropdown", "value"),
     Input("demand-destination-aggregation-lookup-store", "data"),
 )
+@log_callback_timing("demand.tables_render")
 def render_balance_tables(
     woodmac_data,
     ea_data,
@@ -1525,16 +1638,28 @@ def render_balance_tables(
     destination_aggregation,
     destination_aggregation_lookup,
 ):
-    woodmac_raw_df = _filter_by_date_range(
-        _deserialize_dataframe(woodmac_data),
-        start_date,
-        end_date,
-    )
-    ea_raw_df = _filter_by_date_range(
-        _deserialize_dataframe(ea_data),
-        start_date,
-        end_date,
-    )
+    try:
+        woodmac_raw_df = _filter_by_date_range(
+            _deserialize_dataframe(woodmac_data),
+            start_date,
+            end_date,
+        )
+        ea_raw_df = _filter_by_date_range(
+            _deserialize_dataframe(ea_data),
+            start_date,
+            end_date,
+        )
+    except _SnapshotUnavailable:
+        return (
+            _snapshot_recovery_notice(),
+            _create_empty_state(
+                DEMAND_SNAPSHOT_RECOVERY_MESSAGE
+            ),
+            _snapshot_recovery_notice(),
+            _create_empty_state(
+                DEMAND_SNAPSHOT_RECOVERY_MESSAGE
+            ),
+        )
 
     available_countries = get_available_countries([woodmac_raw_df, ea_raw_df])
     resolved_destination_columns = _resolve_destination_columns_selection(
@@ -1615,6 +1740,7 @@ def render_balance_tables(
     Input("demand-comparison-lt-dropdown", "value"),
     Input("demand-comparison-ea-upload-dropdown", "value"),
 )
+@log_callback_timing("demand.woodmac_comparison_render")
 def render_comparison_delta_table(
     woodmac_data,
     ea_data,
@@ -1630,16 +1756,24 @@ def render_comparison_delta_table(
     long_term_value,
     ea_upload_value,
 ):
-    baseline_raw_df = _filter_by_date_range(
-        _deserialize_dataframe(woodmac_data),
-        start_date,
-        end_date,
-    )
-    ea_filtered_df = _filter_by_date_range(
-        _deserialize_dataframe(ea_data),
-        start_date,
-        end_date,
-    )
+    try:
+        baseline_raw_df = _filter_by_date_range(
+            _deserialize_dataframe(woodmac_data),
+            start_date,
+            end_date,
+        )
+        ea_filtered_df = _filter_by_date_range(
+            _deserialize_dataframe(ea_data),
+            start_date,
+            end_date,
+        )
+    except _SnapshotUnavailable:
+        return (
+            _snapshot_recovery_notice(),
+            _create_empty_state(
+                DEMAND_SNAPSHOT_RECOVERY_MESSAGE
+            ),
+        )
 
     available_countries = get_available_countries([baseline_raw_df, ea_filtered_df])
     resolved_destination_columns = _resolve_destination_columns_selection(
@@ -1656,6 +1790,7 @@ def render_comparison_delta_table(
         ea_upload_value,
         start_date,
         end_date,
+        base_reference=woodmac_data,
     )
 
     comparison_filtered_df = _filter_by_date_range(
@@ -1695,6 +1830,7 @@ def render_comparison_delta_table(
     Input("demand-ea-comparison-lt-dropdown", "value"),
     Input("demand-ea-comparison-ea-upload-dropdown", "value"),
 )
+@log_callback_timing("demand.ea_comparison_render")
 def render_ea_comparison_delta_table(
     woodmac_data,
     ea_data,
@@ -1710,16 +1846,24 @@ def render_ea_comparison_delta_table(
     long_term_value,
     ea_upload_value,
 ):
-    baseline_raw_df = _filter_by_date_range(
-        _deserialize_dataframe(ea_data),
-        start_date,
-        end_date,
-    )
-    woodmac_filtered_df = _filter_by_date_range(
-        _deserialize_dataframe(woodmac_data),
-        start_date,
-        end_date,
-    )
+    try:
+        baseline_raw_df = _filter_by_date_range(
+            _deserialize_dataframe(ea_data),
+            start_date,
+            end_date,
+        )
+        woodmac_filtered_df = _filter_by_date_range(
+            _deserialize_dataframe(woodmac_data),
+            start_date,
+            end_date,
+        )
+    except _SnapshotUnavailable:
+        return (
+            _snapshot_recovery_notice(),
+            _create_empty_state(
+                DEMAND_SNAPSHOT_RECOVERY_MESSAGE
+            ),
+        )
 
     available_countries = get_available_countries([baseline_raw_df, woodmac_filtered_df])
     resolved_destination_columns = _resolve_destination_columns_selection(
@@ -1736,6 +1880,7 @@ def render_ea_comparison_delta_table(
         ea_upload_value,
         start_date,
         end_date,
+        base_reference=ea_data,
     )
 
     comparison_filtered_df = _filter_by_date_range(

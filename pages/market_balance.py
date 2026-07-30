@@ -21,14 +21,23 @@ from utils.snapshot_controls import (
     resolve_snapshot_control_values as _resolve_snapshot_control_values,
 )
 from utils.dashboard_snapshot_cache import (
+    SnapshotUnavailable as _SnapshotUnavailable,
     build_source_key as _build_source_key,
+    decode_snapshot_payload as _decode_snapshot_payload,
+    encode_snapshot_payload as _encode_snapshot_payload,
     get_or_build_snapshot as _get_or_build_snapshot,
+    is_snapshot_reference as _is_snapshot_reference,
     resolve_snapshot as _resolve_snapshot,
+    snapshot_is_resolvable as _snapshot_is_resolvable,
     snapshot_is_shared as _snapshot_is_shared,
     was_global_refresh_triggered as _was_global_refresh_triggered,
 )
 from utils.provider_flow_snapshot import fetch_provider_flow_source_state as _fetch_provider_flow_source_state
+from utils.historical_comparison_snapshot import (
+    get_historical_comparison_frame as _get_historical_comparison_frame,
+)
 from utils.ea_run_interface import normalize_ea_run_id
+from utils.performance import log_callback_timing
 from utils.market_balance_data import (
     COUNTRY_GROUP_LABELS,
     build_period_delta_table,
@@ -81,30 +90,113 @@ MARKET_BALANCE_STICKY_HEADER_STYLE = {
     "flexWrap": "wrap",
 }
 
+MARKET_BALANCE_REFERENCE_NAMESPACES = frozenset(
+    {
+        "market-balance-overview-v2",
+        "market-balance-trade-v1",
+        "market-balance-country-meta-v2",
+    }
+)
+MARKET_BALANCE_SNAPSHOT_FORMATS = {
+    namespace: f"{namespace}-zlib-json-v1"
+    for namespace in MARKET_BALANCE_REFERENCE_NAMESPACES
+}
+MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE = (
+    "Cached market-balance data is unavailable. Click the global Refresh "
+    "button to reload it."
+)
+
+
+def _prepare_market_store_payload(namespace, payload):
+    return {
+        "format": MARKET_BALANCE_SNAPSHOT_FORMATS[namespace],
+        "payload": _encode_snapshot_payload(payload),
+    }
+
+
+def _decode_market_store_payload(namespace, payload):
+    expected_format = MARKET_BALANCE_SNAPSHOT_FORMATS.get(namespace)
+    if not (
+        expected_format
+        and isinstance(payload, dict)
+        and payload.get("format") == expected_format
+    ):
+        if (
+            isinstance(payload, dict)
+            and payload.get("format") in MARKET_BALANCE_SNAPSHOT_FORMATS.values()
+        ):
+            raise _SnapshotUnavailable(
+                MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE
+            )
+        return payload
+
+    try:
+        encoded_payload = payload["payload"]
+        if not isinstance(encoded_payload, (bytes, bytearray, memoryview)):
+            raise TypeError("encoded market-balance payload is not bytes")
+        return _decode_snapshot_payload(encoded_payload)
+    except Exception as exc:
+        raise _SnapshotUnavailable(
+            MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+
 
 def _resolve_market_store(store_payload, namespace):
-    return _resolve_snapshot(
-        store_payload,
-        engine,
-        expected_namespace=namespace,
-    )
+    if store_payload is None:
+        raise _SnapshotUnavailable(
+            MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    if (
+        _is_snapshot_reference(store_payload)
+        and not _is_snapshot_reference(store_payload, namespace)
+    ):
+        raise _SnapshotUnavailable(
+            MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    try:
+        resolved = _resolve_snapshot(
+            store_payload,
+            engine,
+            expected_namespace=namespace,
+        )
+        if _is_snapshot_reference(resolved):
+            raise _SnapshotUnavailable(
+                MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE
+            )
+        return _decode_market_store_payload(namespace, resolved)
+    except _SnapshotUnavailable as exc:
+        raise _SnapshotUnavailable(
+            MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
 
 
 def _load_cached_market_store(namespace, key_parts, builder, source_state=None):
-    if source_state is None or _was_global_refresh_triggered():
+    force_refresh = _was_global_refresh_triggered()
+    if source_state is None or force_refresh:
         try:
             source_state = _fetch_provider_flow_source_state()
         except Exception:
             source_state = {"request_token": dt.datetime.now(dt.timezone.utc).isoformat()}
     source_key = _build_source_key(namespace, source_state, key_parts)
+    converted_namespace = namespace in MARKET_BALANCE_REFERENCE_NAMESPACES
     reference, payload = _get_or_build_snapshot(
         engine,
         namespace=namespace,
         source_key=source_key,
-        builder=builder,
-        force=_was_global_refresh_triggered(),
+        builder=(
+            lambda: _prepare_market_store_payload(namespace, builder())
+            if converted_namespace
+            else builder()
+        ),
+        force=force_refresh,
         manifest={"source_state": source_state, "filters": key_parts},
     )
+    if converted_namespace:
+        if not _snapshot_is_resolvable(reference):
+            raise _SnapshotUnavailable(
+                MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE
+            )
+        return reference
     return reference if _snapshot_is_shared(reference) else payload
 
 STICKY_RADIO_LABEL_STYLE = {
@@ -210,6 +302,58 @@ def _build_error_banner(error_message: str | None) -> html.Div:
             "borderRadius": "6px",
             "marginTop": "12px",
         },
+    )
+
+
+def _market_balance_snapshot_recovery_notice() -> html.Div:
+    return _build_error_banner(
+        MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE,
+    )
+
+
+def _market_balance_snapshot_recovery_option() -> list[dict]:
+    return [
+        {
+            "label": MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE,
+            "value": "__snapshot_unavailable__",
+            "disabled": True,
+        }
+    ]
+
+
+def _market_balance_comparison_recovery_result(
+    comparison_source,
+) -> tuple:
+    options = _market_balance_snapshot_recovery_option()
+    woodmac_style = (
+        {"display": "none"}
+        if comparison_source == "ea"
+        else {
+            "display": "flex",
+            "gap": "12px",
+            "flexWrap": "wrap",
+            "alignItems": "flex-end",
+        }
+    )
+    ea_style = (
+        {
+            "display": "flex",
+            "gap": "12px",
+            "flexWrap": "wrap",
+            "alignItems": "flex-end",
+        }
+        if comparison_source == "ea"
+        else {"display": "none"}
+    )
+    return (
+        options,
+        None,
+        options,
+        None,
+        options,
+        None,
+        woodmac_style,
+        ea_style,
     )
 
 
@@ -871,13 +1015,27 @@ def _fetch_net_balance_comparison_frame(
     unit: str,
     start_date: str | None,
     end_date: str | None,
+    base_reference=None,
 ) -> tuple[pd.DataFrame | None, str | None]:
     try:
         if comparison_source == "ea":
             if not ea_upload_value:
                 return None, "No Energy Aspects comparison run available."
-            return (
-                fetch_net_balance_for_ea_upload(
+            _, comparison_df = _get_historical_comparison_frame(
+                direction="net-balance",
+                base_reference=base_reference,
+                selection={
+                    "source": "ea",
+                    "run_id": normalize_ea_run_id(ea_upload_value),
+                },
+                query_dependencies={
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "country_group": country_group,
+                    "time_group": time_group,
+                    "unit": unit,
+                },
+                builder=lambda: fetch_net_balance_for_ea_upload(
                     ea_as_of_run_id=ea_upload_value,
                     country_group=country_group,
                     time_group=time_group,
@@ -885,16 +1043,41 @@ def _fetch_net_balance_comparison_frame(
                     start_date=start_date,
                     end_date=end_date,
                 ),
-                None,
             )
+            return comparison_df, None
 
         short_term_snapshot = _deserialize_snapshot_value(short_term_value)
         long_term_snapshot = _deserialize_snapshot_value(long_term_value)
         if not short_term_snapshot or not long_term_snapshot:
             return None, "No WoodMac comparison publications available."
 
-        return (
-            fetch_net_balance_for_woodmac_publications(
+        selection = {
+            "source": "woodmac",
+            "short_term_market_outlook": short_term_snapshot.get(
+                "market_outlook"
+            ),
+            "short_term_publication_timestamp": short_term_snapshot.get(
+                "publication_timestamp"
+            ),
+            "long_term_market_outlook": long_term_snapshot.get(
+                "market_outlook"
+            ),
+            "long_term_publication_timestamp": long_term_snapshot.get(
+                "publication_timestamp"
+            ),
+        }
+        _, comparison_df = _get_historical_comparison_frame(
+            direction="net-balance",
+            base_reference=base_reference,
+            selection=selection,
+            query_dependencies={
+                "start_date": start_date,
+                "end_date": end_date,
+                "country_group": country_group,
+                "time_group": time_group,
+                "unit": unit,
+            },
+            builder=lambda: fetch_net_balance_for_woodmac_publications(
                 short_term_market_outlook=short_term_snapshot.get("market_outlook"),
                 short_term_publication_timestamp=short_term_snapshot.get("publication_timestamp"),
                 long_term_market_outlook=long_term_snapshot.get("market_outlook"),
@@ -905,8 +1088,8 @@ def _fetch_net_balance_comparison_frame(
                 start_date=start_date,
                 end_date=end_date,
             ),
-            None,
         )
+        return comparison_df, None
     except Exception as exc:
         return None, f"Comparison load failed: {exc}"
 
@@ -930,10 +1113,19 @@ def _render_overview_net_delta(
     if active_tab != "overview":
         return html.Div(), html.Div()
 
-    store_payload = _resolve_market_store(
-        store_payload,
-        "market-balance-overview-v2",
-    )
+    overview_reference = store_payload
+    try:
+        store_payload = _resolve_market_store(
+            store_payload,
+            "market-balance-overview-v2",
+        )
+    except _SnapshotUnavailable:
+        return (
+            _market_balance_snapshot_recovery_notice(),
+            _create_empty_state(
+                MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE
+            ),
+        )
 
     error_message = (store_payload or {}).get("error")
     if error_message:
@@ -957,6 +1149,7 @@ def _render_overview_net_delta(
         unit=unit,
         start_date=start_date,
         end_date=end_date,
+        base_reference=overview_reference,
     )
 
     if comparison_error:
@@ -1733,6 +1926,7 @@ def load_market_balance_source_state(_):
     Input("market-balance-trade-country-group", "value"),
     State("market-balance-source-state-store", "data"),
 )
+@log_callback_timing("market_balance.overview_source_load")
 def load_overview_store(_, start_date, end_date, time_group, unit, country_group, source_state=None):
     key_parts = {
         "start_date": start_date,
@@ -1804,6 +1998,7 @@ def toggle_overview_top_row(active_tab):
     Input("market-balance-overview-store", "data"),
     Input("market-balance-maintenance-metric", "value"),
 )
+@log_callback_timing("market_balance.overview_render")
 def render_overview(active_tab, store_payload, maintenance_metric="Unplanned"):
     if active_tab != "overview":
         empty = _empty_figure("Overview unavailable")
@@ -1824,10 +2019,31 @@ def render_overview(active_tab, store_payload, maintenance_metric="Unplanned"):
             empty,
         )
 
-    store_payload = _resolve_market_store(
-        store_payload,
-        "market-balance-overview-v2",
-    )
+    try:
+        store_payload = _resolve_market_store(
+            store_payload,
+            "market-balance-overview-v2",
+        )
+    except _SnapshotUnavailable:
+        empty = _empty_figure(
+            MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE
+        )
+        return (
+            html.Div(),
+            _market_balance_snapshot_recovery_notice(),
+            html.Div(),
+            html.Div(),
+            html.Div(),
+            html.Div(),
+            empty,
+            empty,
+            html.Div(),
+            empty,
+            html.Div(),
+            html.Div(),
+            empty,
+            empty,
+        )
 
     error_message = (store_payload or {}).get("error")
     if error_message:
@@ -1964,10 +2180,15 @@ def sync_woodmac_overview_comparison_controls(
     current_lt_value,
     current_ea_upload_value,
 ):
-    store_payload = _resolve_market_store(
-        store_payload,
-        "market-balance-overview-v2",
-    )
+    try:
+        store_payload = _resolve_market_store(
+            store_payload,
+            "market-balance-overview-v2",
+        )
+    except _SnapshotUnavailable:
+        return _market_balance_comparison_recovery_result(
+            comparison_source
+        )
     comparison_options = ((store_payload or {}).get("metadata", {}) or {}).get(
         "comparison_options", {}
     )
@@ -2002,10 +2223,15 @@ def sync_ea_overview_comparison_controls(
     current_lt_value,
     current_ea_upload_value,
 ):
-    store_payload = _resolve_market_store(
-        store_payload,
-        "market-balance-overview-v2",
-    )
+    try:
+        store_payload = _resolve_market_store(
+            store_payload,
+            "market-balance-overview-v2",
+        )
+    except _SnapshotUnavailable:
+        return _market_balance_comparison_recovery_result(
+            comparison_source
+        )
     comparison_options = ((store_payload or {}).get("metadata", {}) or {}).get(
         "comparison_options", {}
     )
@@ -2129,6 +2355,7 @@ def _export_overview_net_section(
     if not n_clicks:
         return no_update
 
+    overview_reference = store_payload
     store_payload = _resolve_market_store(
         store_payload,
         "market-balance-overview-v2",
@@ -2152,6 +2379,7 @@ def _export_overview_net_section(
         unit=unit,
         start_date=start_date,
         end_date=end_date,
+        base_reference=overview_reference,
     )
 
     delta_df = (
@@ -2312,6 +2540,7 @@ def export_overview_workbook(n_clicks, store_payload):
     Input("market-balance-trade-unit", "value"),
     State("market-balance-source-state-store", "data"),
 )
+@log_callback_timing("market_balance.trade_source_load")
 def load_trade_store(_, start_date, end_date, time_group, diff_type, country_group, selected_years, unit, source_state=None):
     key_parts = {
         "start_date": start_date,
@@ -2345,10 +2574,13 @@ def load_trade_store(_, start_date, end_date, time_group, diff_type, country_gro
     Input("market-balance-trade-store", "data"),
 )
 def sync_trade_years(store_payload):
-    store_payload = _resolve_market_store(
-        store_payload,
-        "market-balance-trade-v1",
-    )
+    try:
+        store_payload = _resolve_market_store(
+            store_payload,
+            "market-balance-trade-v1",
+        )
+    except _SnapshotUnavailable:
+        return _market_balance_snapshot_recovery_option()
     metadata = (store_payload or {}).get("metadata", {})
     available_years = metadata.get("available_years") or []
     return [{"label": str(year), "value": year} for year in available_years]
@@ -2367,11 +2599,29 @@ def sync_trade_years(store_payload):
     Output("market-balance-trade-import-flex-table", "children"),
     Input("market-balance-trade-store", "data"),
 )
+@log_callback_timing("market_balance.trade_render")
 def render_trade_balance(store_payload):
-    store_payload = _resolve_market_store(
-        store_payload,
-        "market-balance-trade-v1",
-    )
+    try:
+        store_payload = _resolve_market_store(
+            store_payload,
+            "market-balance-trade-v1",
+        )
+    except _SnapshotUnavailable:
+        empty = _empty_figure(
+            MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE
+        )
+        return (
+            html.Div(),
+            _market_balance_snapshot_recovery_notice(),
+            empty,
+            empty,
+            html.Div(),
+            html.Div(),
+            html.Div(),
+            html.Div(),
+            html.Div(),
+            html.Div(),
+        )
     error_message = (store_payload or {}).get("error")
     if error_message:
         empty = _empty_figure("Trade balance unavailable")
@@ -2507,10 +2757,13 @@ def load_country_meta_store(_, source_state=None):
     State("market-balance-country-dropdown", "value"),
 )
 def sync_country_controls(store_payload, current_country):
-    store_payload = _resolve_market_store(
-        store_payload,
-        "market-balance-country-meta-v2",
-    )
+    try:
+        store_payload = _resolve_market_store(
+            store_payload,
+            "market-balance-country-meta-v2",
+        )
+    except _SnapshotUnavailable:
+        return _market_balance_snapshot_recovery_option(), None
     data = (store_payload or {}).get("data", {})
     metadata = (store_payload or {}).get("metadata", {})
     countries = data.get("countries") or []
@@ -2529,10 +2782,13 @@ def sync_country_controls(store_payload, current_country):
     State("market-balance-country-snapshot", "value"),
 )
 def sync_country_snapshot_control(store_payload, country, current_snapshot):
-    store_payload = _resolve_market_store(
-        store_payload,
-        "market-balance-country-meta-v2",
-    )
+    try:
+        store_payload = _resolve_market_store(
+            store_payload,
+            "market-balance-country-meta-v2",
+        )
+    except _SnapshotUnavailable:
+        return _market_balance_snapshot_recovery_option(), None
     data = (store_payload or {}).get("data", {})
     snapshots = _get_country_snapshot_values(data, country)
 
@@ -2590,10 +2846,22 @@ def load_country_store(_, country, level, time_group, start_date, end_date, comp
     Input("market-balance-country-store", "data"),
 )
 def render_country_balance(store_payload):
-    store_payload = _resolve_market_store(
-        store_payload,
-        "market-balance-country-v2",
-    )
+    try:
+        store_payload = _resolve_market_store(
+            store_payload,
+            "market-balance-country-v2",
+        )
+    except _SnapshotUnavailable:
+        return (
+            html.Div(),
+            _market_balance_snapshot_recovery_notice(),
+            html.Div(),
+            html.Div(),
+            _empty_figure(
+                MARKET_BALANCE_SNAPSHOT_RECOVERY_MESSAGE
+            ),
+            html.Div(),
+        )
     error_message = (store_payload or {}).get("error")
     if error_message:
         return (

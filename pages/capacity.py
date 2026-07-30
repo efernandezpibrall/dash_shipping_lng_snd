@@ -13,7 +13,17 @@ import uuid
 import pandas as pd
 import plotly.graph_objects as go
 import dash_ag_grid as dag
-from dash import dcc, html, callback, Input, Output, State, no_update, ctx
+from dash import (
+    Input,
+    Output,
+    State,
+    callback,
+    clientside_callback,
+    ctx,
+    dcc,
+    html,
+    no_update,
+)
 from dash.dash_table.Format import Format, Scheme
 from utils.ag_grid_tables import create_ag_grid_from_datatable
 from dash.exceptions import PreventUpdate
@@ -2273,6 +2283,141 @@ def _is_capacity_source_ref(payload: object) -> bool:
     return isinstance(payload, dict) and payload.get("format") == CAPACITY_SOURCE_REF_FORMAT
 
 
+def _capacity_source_revision_is_coherent(
+    revision,
+    woodmac_ref,
+    train_ref,
+    ea_ref,
+    metadata,
+) -> bool:
+    if not (
+        isinstance(revision, dict)
+        and revision.get("format")
+        == "capacity_source_render_revision_v1"
+        and revision.get("source_key")
+    ):
+        return False
+    expected_key = str(revision["source_key"])
+    expected_components = (
+        (woodmac_ref, "woodmac_store"),
+        (train_ref, "train_store"),
+        (ea_ref, "ea_store"),
+    )
+    if any(
+        not _is_capacity_source_ref(reference)
+        or str(reference.get("component") or "") != component
+        or str(reference.get("source_key") or "") != expected_key
+        or str(reference.get("snapshot_key") or "") != expected_key
+        for reference, component in expected_components
+    ):
+        return False
+    return (
+        isinstance(metadata, dict)
+        and str(metadata.get("snapshot_key") or "") == expected_key
+    )
+
+
+def _capacity_scenario_revision_is_coherent(
+    revision,
+    selected_scenario_id,
+    working_store,
+    dirty_store,
+    refresh_revision,
+    scenario_options,
+) -> bool:
+    if not (
+        isinstance(revision, dict)
+        and revision.get("format")
+        == "capacity_scenario_render_revision_v1"
+        and revision.get("source_key")
+    ):
+        return False
+    selected_value = pd.to_numeric(selected_scenario_id, errors="coerce")
+    dirty_payload = dirty_store if isinstance(dirty_store, dict) else {}
+    if revision.get("empty") is True:
+        return (
+            pd.isna(selected_value)
+            and working_store is None
+            and revision.get("scenario_id") is None
+            and bool(revision.get("dirty"))
+            == bool(dirty_payload.get("dirty"))
+            and str(revision.get("dirty_source") or "")
+            == str(dirty_payload.get("source") or "")
+            and str(revision.get("dirty_updated_at") or "")
+            == str(dirty_payload.get("updated_at") or "")
+            and str(revision.get("refresh_revision") or "")
+            == str(refresh_revision or "")
+        )
+    if not (
+        isinstance(working_store, dict)
+        and working_store.get("format")
+        == CAPACITY_SCENARIO_WORKING_FORMAT
+    ):
+        return False
+    working_value = pd.to_numeric(
+        working_store.get("scenario_id"),
+        errors="coerce",
+    )
+    if (
+        pd.isna(selected_value)
+        or pd.isna(working_value)
+        or int(selected_value) != int(working_value)
+        or str(revision.get("scenario_id")) != str(int(selected_value))
+    ):
+        return False
+    base_revision = str(working_store.get("base_revision") or "")
+    if (
+        not base_revision
+        or str(revision.get("base_revision") or "") != base_revision
+    ):
+        return False
+    option = _get_capacity_scenario_option_map(scenario_options).get(
+        int(selected_value),
+        {},
+    )
+    option_revision = str(
+        option.get("current_snapshot_timestamp_utc") or ""
+    )
+    return (
+        option_revision == base_revision
+        and str(revision.get("working_mode") or "")
+        == str(working_store.get("mode") or "")
+        and bool(revision.get("dirty"))
+        == bool(dirty_payload.get("dirty"))
+        and str(revision.get("dirty_source") or "")
+        == str(dirty_payload.get("source") or "")
+        and str(revision.get("dirty_updated_at") or "")
+        == str(dirty_payload.get("updated_at") or "")
+        and str(revision.get("refresh_revision") or "")
+        == str(refresh_revision or "")
+        and str(revision.get("option_name") or "")
+        == str(option.get("scenario_name") or "")
+        and str(revision.get("option_revision") or "")
+        == option_revision
+    )
+
+
+def _capacity_scenario_source_refs_are_coherent(
+    scenario_revision,
+    woodmac_ref,
+    train_ref,
+    ea_ref,
+    metadata,
+) -> bool:
+    if not isinstance(scenario_revision, dict):
+        return False
+    return _capacity_source_revision_is_coherent(
+        {
+            "format": "capacity_source_render_revision_v1",
+            "source_key": scenario_revision.get("source_key"),
+        },
+        woodmac_ref,
+        train_ref,
+        ea_ref,
+        metadata,
+    )
+
+
 def _capacity_events_to_woodmac_change_log(events: pd.DataFrame) -> pd.DataFrame:
     source = events[
         events["provider_name"].astype(str).str.casefold().eq("woodmac")
@@ -2446,6 +2591,7 @@ def _fetch_relational_capacity_source_snapshot(
     state = source_state or fetch_capacity_source_state(engine, source_key)
     min_month, max_month = capacity_source_event_bounds(events)
     metadata = {
+        "snapshot_key": source_key,
         "woodmac": {
             "monthly_upload_timestamp_utc": (watermarks or {}).get(
                 "monthly_upload_timestamp_utc"
@@ -12792,6 +12938,14 @@ layout = html.Div(
         dcc.Store(id="capacity-page-refresh-timestamp-store", storage_type="memory"),
         dcc.Store(id="capacity-page-load-error-store", storage_type="memory"),
         dcc.Store(id="capacity-page-metadata-store", storage_type="memory"),
+        dcc.Store(
+            id="capacity-page-source-render-revision-store",
+            storage_type="memory",
+        ),
+        dcc.Store(
+            id="capacity-page-scenario-render-revision-store",
+            storage_type="memory",
+        ),
         dcc.Store(id="capacity-page-train-mapping-save-trigger", storage_type="memory"),
         dcc.Store(id="capacity-page-capacity-scenario-options-store", storage_type="memory"),
         dcc.Store(id="capacity-page-capacity-scenario-selected-store", storage_type="memory"),
@@ -13088,6 +13242,156 @@ layout = html.Div(
             className="balance-page-shell",
         ),
     ]
+)
+
+
+clientside_callback(
+    """
+    function(woodmacRef, trainRef, eaRef, metadata, currentRevision) {
+        const noUpdate = window.dash_clientside.no_update;
+        const expected = [
+            [woodmacRef, "woodmac_store"],
+            [trainRef, "train_store"],
+            [eaRef, "ea_store"]
+        ];
+        let sourceKey = null;
+        for (const [reference, component] of expected) {
+            if (
+                !reference ||
+                reference.format !== "capacity_source_ref_v3" ||
+                reference.component !== component ||
+                !reference.source_key ||
+                reference.snapshot_key !== reference.source_key
+            ) {
+                return noUpdate;
+            }
+            if (sourceKey === null) {
+                sourceKey = String(reference.source_key);
+            } else if (sourceKey !== String(reference.source_key)) {
+                return noUpdate;
+            }
+        }
+        if (
+            !metadata ||
+            String(metadata.snapshot_key || "") !== sourceKey
+        ) {
+            return noUpdate;
+        }
+        const revision = {
+            format: "capacity_source_render_revision_v1",
+            source_key: sourceKey
+        };
+        if (JSON.stringify(currentRevision) === JSON.stringify(revision)) {
+            return noUpdate;
+        }
+        return revision;
+    }
+    """,
+    Output("capacity-page-source-render-revision-store", "data"),
+    Input("capacity-page-woodmac-data-store", "data"),
+    Input("capacity-page-train-capacity-data-store", "data"),
+    Input("capacity-page-ea-capacity-data-store", "data"),
+    Input("capacity-page-metadata-store", "data"),
+    State("capacity-page-source-render-revision-store", "data"),
+)
+
+
+clientside_callback(
+    """
+    function(
+        sourceRevision,
+        selectedScenario,
+        workingScenario,
+        dirtyState,
+        refreshRevision,
+        scenarioOptions,
+        currentRevision
+    ) {
+        const noUpdate = window.dash_clientside.no_update;
+        if (
+            !sourceRevision ||
+            sourceRevision.format !== "capacity_source_render_revision_v1" ||
+            !sourceRevision.source_key
+        ) {
+            return noUpdate;
+        }
+        const noSelection =
+            selectedScenario === null || selectedScenario === undefined;
+        if (noSelection && !workingScenario) {
+            const emptyRevision = {
+                format: "capacity_scenario_render_revision_v1",
+                source_key: String(sourceRevision.source_key),
+                scenario_id: null,
+                empty: true,
+                dirty: Boolean(dirtyState && dirtyState.dirty),
+                dirty_source: String(
+                    (dirtyState && dirtyState.source) || ""
+                ),
+                dirty_updated_at: String(
+                    (dirtyState && dirtyState.updated_at) || ""
+                ),
+                refresh_revision: String(refreshRevision || "")
+            };
+            if (
+                JSON.stringify(currentRevision) ===
+                JSON.stringify(emptyRevision)
+            ) {
+                return noUpdate;
+            }
+            return emptyRevision;
+        }
+        if (
+            noSelection ||
+            !workingScenario ||
+            workingScenario.format !== "capacity_scenario_working_v3" ||
+            String(workingScenario.scenario_id) !== String(selectedScenario) ||
+            !workingScenario.base_revision ||
+            !Array.isArray(scenarioOptions)
+        ) {
+            return noUpdate;
+        }
+        const selectedOption = scenarioOptions.find(
+            option => option &&
+                String(option.scenario_id) === String(selectedScenario)
+        );
+        if (
+            !selectedOption ||
+            String(selectedOption.current_snapshot_timestamp_utc || "") !==
+                String(workingScenario.base_revision)
+        ) {
+            return noUpdate;
+        }
+        const revision = {
+            format: "capacity_scenario_render_revision_v1",
+            source_key: String(sourceRevision.source_key),
+            scenario_id: String(selectedScenario),
+            base_revision: String(workingScenario.base_revision),
+            working_mode: String(workingScenario.mode || ""),
+            dirty: Boolean(dirtyState && dirtyState.dirty),
+            dirty_source: String((dirtyState && dirtyState.source) || ""),
+            dirty_updated_at: String(
+                (dirtyState && dirtyState.updated_at) || ""
+            ),
+            refresh_revision: String(refreshRevision || ""),
+            option_name: String(selectedOption.scenario_name || ""),
+            option_revision: String(
+                selectedOption.current_snapshot_timestamp_utc || ""
+            )
+        };
+        if (JSON.stringify(currentRevision) === JSON.stringify(revision)) {
+            return noUpdate;
+        }
+        return revision;
+    }
+    """,
+    Output("capacity-page-scenario-render-revision-store", "data"),
+    Input("capacity-page-source-render-revision-store", "data"),
+    Input("capacity-page-capacity-scenario-selected-store", "data"),
+    Input("capacity-page-capacity-scenario-working-store", "data"),
+    Input("capacity-page-capacity-scenario-dirty-store", "data"),
+    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+    Input("capacity-page-capacity-scenario-options-store", "data"),
+    State("capacity-page-scenario-render-revision-store", "data"),
 )
 
 
@@ -15240,26 +15544,49 @@ def upload_train_timeline_scenario_workbook(
 @callback(
     Output("capacity-page-yearly-capacity-comparison-chart", "figure"),
     Output("capacity-page-yearly-capacity-comparison-table-container", "children"),
-    Input("capacity-page-woodmac-data-store", "data"),
-    Input("capacity-page-ea-capacity-data-store", "data"),
-    Input("capacity-page-capacity-scenario-selected-store", "data"),
+    Input("capacity-page-scenario-render-revision-store", "data"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
-    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+    State("capacity-page-woodmac-data-store", "data"),
+    State("capacity-page-train-capacity-data-store", "data"),
+    State("capacity-page-ea-capacity-data-store", "data"),
+    State("capacity-page-metadata-store", "data"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-options-store", "data"),
     State("capacity-page-capacity-scenario-working-store", "data"),
     State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-capacity-scenario-refresh-store", "data"),
 )
 def render_yearly_capacity_comparison_section(
-    woodmac_data,
-    ea_capacity_data,
-    selected_scenario_id,
+    scenario_revision,
     start_date,
     end_date,
-    _scenario_refresh_timestamp,
+    woodmac_data,
+    train_capacity_data,
+    ea_capacity_data,
+    metadata,
+    selected_scenario_id,
+    scenario_options_data,
     working_store_data,
     dirty_store,
+    scenario_refresh_revision,
     timeline_row_data=None,
 ):
+    if not _capacity_scenario_revision_is_coherent(
+        scenario_revision,
+        selected_scenario_id,
+        working_store_data,
+        dirty_store,
+        scenario_refresh_revision,
+        scenario_options_data,
+    ) or not _capacity_scenario_source_refs_are_coherent(
+        scenario_revision,
+        woodmac_data,
+        train_capacity_data,
+        ea_capacity_data,
+        metadata,
+    ):
+        raise PreventUpdate
     selected_scenario_value = pd.to_numeric(selected_scenario_id, errors="coerce")
     if pd.isna(selected_scenario_value):
         return (
@@ -15325,30 +15652,53 @@ def render_yearly_capacity_comparison_section(
     Output("capacity-page-yearly-ea-capacity-discrepancy-table-container", "children"),
     Output("capacity-page-yearly-ea-timeline-discrepancy-table-container", "children"),
     Output("capacity-page-yearly-ea-missing-internal-table-container", "children"),
-    Input("capacity-page-train-capacity-data-store", "data"),
-    Input("capacity-page-ea-capacity-data-store", "data"),
-    Input("capacity-page-capacity-scenario-selected-store", "data"),
+    Input("capacity-page-scenario-render-revision-store", "data"),
     Input("capacity-page-country-dropdown", "value"),
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
-    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+    State("capacity-page-woodmac-data-store", "data"),
+    State("capacity-page-train-capacity-data-store", "data"),
+    State("capacity-page-ea-capacity-data-store", "data"),
+    State("capacity-page-metadata-store", "data"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-options-store", "data"),
     State("capacity-page-capacity-scenario-working-store", "data"),
     State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-capacity-scenario-refresh-store", "data"),
 )
 def render_yearly_capacity_discrepancy_section(
-    train_capacity_data,
-    ea_capacity_data,
-    selected_scenario_id,
+    scenario_revision,
     selected_countries,
     other_countries_mode,
     start_date,
     end_date,
-    _scenario_refresh_timestamp,
+    woodmac_data,
+    train_capacity_data,
+    ea_capacity_data,
+    metadata,
+    selected_scenario_id,
+    scenario_options_data,
     working_store_data,
     dirty_store,
+    scenario_refresh_revision,
     timeline_row_data=None,
 ):
+    if not _capacity_scenario_revision_is_coherent(
+        scenario_revision,
+        selected_scenario_id,
+        working_store_data,
+        dirty_store,
+        scenario_refresh_revision,
+        scenario_options_data,
+    ) or not _capacity_scenario_source_refs_are_coherent(
+        scenario_revision,
+        woodmac_data,
+        train_capacity_data,
+        ea_capacity_data,
+        metadata,
+    ):
+        raise PreventUpdate
     selected_scenario_value = pd.to_numeric(selected_scenario_id, errors="coerce")
     if pd.isna(selected_scenario_value):
         return (
@@ -15439,25 +15789,39 @@ def render_yearly_capacity_discrepancy_section(
     Output("capacity-page-woodmac-summary", "children"),
     Output("capacity-page-woodmac-chart", "figure"),
     Output("capacity-page-woodmac-table-container", "children"),
-    Input("capacity-page-woodmac-data-store", "data"),
-    Input("capacity-page-metadata-store", "data"),
+    Input("capacity-page-source-render-revision-store", "data"),
     Input("capacity-page-country-dropdown", "value"),
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
     Input("capacity-page-train-change-time-view", "value"),
     Input("capacity-page-top-table-view", "value"),
+    State("capacity-page-woodmac-data-store", "data"),
+    State("capacity-page-train-capacity-data-store", "data"),
+    State("capacity-page-ea-capacity-data-store", "data"),
+    State("capacity-page-metadata-store", "data"),
 )
 def render_capacity_table(
-    woodmac_data,
-    metadata,
+    source_revision,
     selected_countries,
     other_countries_mode,
     start_date,
     end_date,
     time_view,
     table_view,
+    woodmac_data,
+    train_capacity_data,
+    ea_capacity_data,
+    metadata,
 ):
+    if not _capacity_source_revision_is_coherent(
+        source_revision,
+        woodmac_data,
+        train_capacity_data,
+        ea_capacity_data,
+        metadata,
+    ):
+        raise PreventUpdate
     prepared_view = _get_prepared_country_capacity_view(
         "woodmac",
         woodmac_data,
@@ -15502,25 +15866,39 @@ def render_capacity_table(
     Output("capacity-page-ea-summary", "children"),
     Output("capacity-page-ea-chart", "figure"),
     Output("capacity-page-ea-table-container", "children"),
-    Input("capacity-page-ea-capacity-data-store", "data"),
-    Input("capacity-page-metadata-store", "data"),
+    Input("capacity-page-source-render-revision-store", "data"),
     Input("capacity-page-country-dropdown", "value"),
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
     Input("capacity-page-train-change-time-view", "value"),
     Input("capacity-page-top-table-view", "value"),
+    State("capacity-page-woodmac-data-store", "data"),
+    State("capacity-page-train-capacity-data-store", "data"),
+    State("capacity-page-ea-capacity-data-store", "data"),
+    State("capacity-page-metadata-store", "data"),
 )
 def render_ea_capacity_table(
-    ea_capacity_data,
-    metadata,
+    source_revision,
     selected_countries,
     other_countries_mode,
     start_date,
     end_date,
     time_view,
     table_view,
+    woodmac_data,
+    train_capacity_data,
+    ea_capacity_data,
+    metadata,
 ):
+    if not _capacity_source_revision_is_coherent(
+        source_revision,
+        woodmac_data,
+        train_capacity_data,
+        ea_capacity_data,
+        metadata,
+    ):
+        raise PreventUpdate
     prepared_view = _get_prepared_country_capacity_view(
         "energy_aspects",
         ea_capacity_data,
@@ -15566,32 +15944,57 @@ def render_ea_capacity_table(
     Output("capacity-page-internal-scenario-summary", "children"),
     Output("capacity-page-internal-scenario-chart", "figure"),
     Output("capacity-page-internal-scenario-table-container", "children"),
-    Input("capacity-page-capacity-scenario-selected-store", "data"),
-    Input("capacity-page-capacity-scenario-options-store", "data"),
+    Input("capacity-page-scenario-render-revision-store", "data"),
     Input("capacity-page-country-dropdown", "value"),
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
     Input("capacity-page-train-change-time-view", "value"),
     Input("capacity-page-top-table-view", "value"),
-    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+    State("capacity-page-woodmac-data-store", "data"),
+    State("capacity-page-train-capacity-data-store", "data"),
+    State("capacity-page-ea-capacity-data-store", "data"),
+    State("capacity-page-metadata-store", "data"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-options-store", "data"),
     State("capacity-page-capacity-scenario-working-store", "data"),
     State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-capacity-scenario-refresh-store", "data"),
 )
 def render_internal_capacity_table(
-    selected_scenario_id,
-    scenario_options_data,
+    scenario_revision,
     selected_countries,
     other_countries_mode,
     start_date,
     end_date,
     time_view,
     table_view,
-    _scenario_refresh_timestamp,
+    woodmac_data,
+    train_capacity_data,
+    ea_capacity_data,
+    metadata,
+    selected_scenario_id,
+    scenario_options_data,
     working_store_data,
     dirty_store,
+    scenario_refresh_revision,
     timeline_row_data=None,
 ):
+    if not _capacity_scenario_revision_is_coherent(
+        scenario_revision,
+        selected_scenario_id,
+        working_store_data,
+        dirty_store,
+        scenario_refresh_revision,
+        scenario_options_data,
+    ) or not _capacity_scenario_source_refs_are_coherent(
+        scenario_revision,
+        woodmac_data,
+        train_capacity_data,
+        ea_capacity_data,
+        metadata,
+    ):
+        raise PreventUpdate
     selected_scenario_value = pd.to_numeric(selected_scenario_id, errors="coerce")
     if pd.isna(selected_scenario_value):
         empty_message = _create_empty_state(INTERNAL_SCENARIO_EMPTY_MESSAGE)
@@ -15653,36 +16056,57 @@ def render_internal_capacity_table(
 @callback(
     Output("capacity-page-train-change-summary", "children"),
     Output("capacity-page-train-change-table-container", "children"),
-    Input("capacity-page-train-capacity-data-store", "data"),
-    Input("capacity-page-ea-capacity-data-store", "data"),
-    Input("capacity-page-capacity-scenario-selected-store", "data"),
-    Input("capacity-page-capacity-scenario-options-store", "data"),
+    Input("capacity-page-scenario-render-revision-store", "data"),
     Input("capacity-page-country-dropdown", "value"),
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
     Input("capacity-page-train-change-time-view", "value"),
     Input("capacity-page-train-change-view-mode", "value"),
-    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+    State("capacity-page-woodmac-data-store", "data"),
+    State("capacity-page-train-capacity-data-store", "data"),
+    State("capacity-page-ea-capacity-data-store", "data"),
+    State("capacity-page-metadata-store", "data"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-options-store", "data"),
     State("capacity-page-capacity-scenario-working-store", "data"),
     State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-capacity-scenario-refresh-store", "data"),
 )
 def render_train_capacity_change_table(
-    train_capacity_data,
-    ea_capacity_data,
-    selected_scenario_id,
-    scenario_options_data,
+    scenario_revision,
     selected_countries,
     other_countries_mode,
     start_date,
     end_date,
     time_view,
     detail_view,
-    _scenario_refresh_timestamp,
+    woodmac_data,
+    train_capacity_data,
+    ea_capacity_data,
+    metadata,
+    selected_scenario_id,
+    scenario_options_data,
     working_scenario_data,
     dirty_store,
+    scenario_refresh_revision,
     timeline_row_data=None,
 ):
+    if not _capacity_scenario_revision_is_coherent(
+        scenario_revision,
+        selected_scenario_id,
+        working_scenario_data,
+        dirty_store,
+        scenario_refresh_revision,
+        scenario_options_data,
+    ) or not _capacity_scenario_source_refs_are_coherent(
+        scenario_revision,
+        woodmac_data,
+        train_capacity_data,
+        ea_capacity_data,
+        metadata,
+    ):
+        raise PreventUpdate
     working_rows_df = _resolve_active_capacity_scenario_rows(
         working_scenario_data,
         dirty_store,
@@ -15750,32 +16174,55 @@ def render_train_capacity_change_table(
 
 @callback(
     Output("capacity-page-train-timeline-table-container", "children"),
-    Input("capacity-page-train-capacity-data-store", "data"),
-    Input("capacity-page-ea-capacity-data-store", "data"),
-    Input("capacity-page-capacity-scenario-selected-store", "data"),
+    Input("capacity-page-scenario-render-revision-store", "data"),
     Input("capacity-page-country-dropdown", "value"),
     Input("capacity-page-other-country-mode", "value"),
     Input("capacity-page-date-range", "start_date"),
     Input("capacity-page-date-range", "end_date"),
     Input("capacity-page-train-timeline-original-name-visibility", "value"),
-    Input("capacity-page-capacity-scenario-refresh-store", "data"),
+    State("capacity-page-woodmac-data-store", "data"),
+    State("capacity-page-train-capacity-data-store", "data"),
+    State("capacity-page-ea-capacity-data-store", "data"),
+    State("capacity-page-metadata-store", "data"),
+    State("capacity-page-capacity-scenario-selected-store", "data"),
+    State("capacity-page-capacity-scenario-options-store", "data"),
     State("capacity-page-capacity-scenario-working-store", "data"),
     State("capacity-page-capacity-scenario-dirty-store", "data"),
+    State("capacity-page-capacity-scenario-refresh-store", "data"),
 )
 def render_train_timeline_table(
-    train_capacity_data,
-    ea_capacity_data,
-    selected_scenario_id,
+    scenario_revision,
     selected_countries,
     other_countries_mode,
     start_date,
     end_date,
     original_name_visibility,
-    _scenario_refresh_timestamp,
+    woodmac_data,
+    train_capacity_data,
+    ea_capacity_data,
+    metadata,
+    selected_scenario_id,
+    scenario_options_data,
     working_scenario_data,
     dirty_store,
+    scenario_refresh_revision,
     current_timeline_row_data=None,
 ):
+    if not _capacity_scenario_revision_is_coherent(
+        scenario_revision,
+        selected_scenario_id,
+        working_scenario_data,
+        dirty_store,
+        scenario_refresh_revision,
+        scenario_options_data,
+    ) or not _capacity_scenario_source_refs_are_coherent(
+        scenario_revision,
+        woodmac_data,
+        train_capacity_data,
+        ea_capacity_data,
+        metadata,
+    ):
+        raise PreventUpdate
     show_original_names = original_name_visibility == "show"
     selected_scenario_value = pd.to_numeric(selected_scenario_id, errors="coerce")
     selected_scenario = int(selected_scenario_value) if pd.notna(selected_scenario_value) else None
@@ -15959,13 +16406,27 @@ def render_train_timeline_comparison_chart(
 @callback(
     Output("capacity-page-unmapped-train-summary", "children"),
     Output("capacity-page-unmapped-train-table", "rowData"),
-    Input("capacity-page-train-capacity-data-store", "data"),
-    Input("capacity-page-ea-capacity-data-store", "data"),
+    Input("capacity-page-source-render-revision-store", "data"),
+    State("capacity-page-woodmac-data-store", "data"),
+    State("capacity-page-train-capacity-data-store", "data"),
+    State("capacity-page-ea-capacity-data-store", "data"),
+    State("capacity-page-metadata-store", "data"),
 )
 def render_unmapped_train_mapping_table(
+    source_revision,
+    woodmac_data,
     train_capacity_data,
     ea_capacity_data,
+    metadata,
 ):
+    if not _capacity_source_revision_is_coherent(
+        source_revision,
+        woodmac_data,
+        train_capacity_data,
+        ea_capacity_data,
+        metadata,
+    ):
+        raise PreventUpdate
     train_raw_df = _deserialize_train_capacity_store(train_capacity_data)
     ea_raw_df = _deserialize_ea_capacity_store(ea_capacity_data)
 
