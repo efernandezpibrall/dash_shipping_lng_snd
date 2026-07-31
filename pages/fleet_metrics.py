@@ -72,24 +72,8 @@ _FLEET_REGION_OUTPUT_INDICES = frozenset({0, 1, 3, 5, 6, 13})
 def _fetch_fleet_metrics_source_state():
     query = text(f"""
         SELECT
-            (SELECT completed_at_utc
-             FROM {_table_ref('kpler_ingestion_runs')}
-             WHERE module = 'kpler_fleet_metrics' AND status = 'published'
-             ORDER BY completed_at_utc DESC LIMIT 1) AS fleet_checked_at,
-            (SELECT completed_at_utc
-             FROM {_table_ref('kpler_ingestion_runs')}
-             WHERE module = 'kpler_regional_signals' AND status = 'published'
-             ORDER BY completed_at_utc DESC LIMIT 1) AS signal_checked_at,
-            (SELECT MAX(run_id)
-             FROM {_table_ref('kpler_ingestion_runs')}
-             WHERE module = 'kpler_fleet_metrics' AND status = 'published'
-               AND inserted_rows + updated_rows > 0) AS fleet_revision,
-            (SELECT MAX(run_id)
-             FROM {_table_ref('kpler_ingestion_runs')}
-             WHERE module = 'kpler_regional_signals' AND status = 'published'
-               AND inserted_rows + updated_rows > 0) AS signal_revision,
-            (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_FLEET_METRICS_TABLE)}) AS fleet_changed_at,
-            (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_REGIONAL_SIGNAL_TABLE)}) AS signal_changed_at,
+            (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_FLEET_METRICS_TABLE)}) AS fleet_upload,
+            (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_REGIONAL_SIGNAL_TABLE)}) AS signal_upload,
             (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_DIVERSIONS_TABLE)}) AS diversion_upload,
             (SELECT MAX(cob) FROM {_table_ref(PRICE_CURVE_TABLE)}
              WHERE code IN ('ICE_JKM_MO', 'ICE_TFU_MO')) AS price_cob
@@ -97,28 +81,6 @@ def _fetch_fleet_metrics_source_state():
     with engine.connect() as connection:
         row = connection.execute(query).mappings().first()
     return dict(row or {})
-
-
-def _freshness_reference_payload(source_state):
-    """Keep live check timestamps in the browser ref, outside the data cache key."""
-
-    values = {
-        "fleet_checked_at": source_state.get("fleet_checked_at")
-        or source_state.get("fleet_upload"),
-        "signal_checked_at": source_state.get("signal_checked_at")
-        or source_state.get("signal_upload"),
-        "fleet_changed_at": source_state.get("fleet_changed_at"),
-        "signal_changed_at": source_state.get("signal_changed_at"),
-    }
-    payload = {}
-    for key, value in values.items():
-        if value is None or pd.isna(value):
-            payload[key] = None
-        elif hasattr(value, "isoformat"):
-            payload[key] = value.isoformat()
-        else:
-            payload[key] = str(value)
-    return payload
 KPLER_FLEET_ZONE_SHORT_LABELS = {option["value"]: option["label"] for option in KPLER_FLEET_ZONE_OPTIONS}
 KPLER_REGION_DEFINITION_SUMMARIES = {
     "asia_pacific_oceans": "Asian LNG demand basin plus Pacific waiting and approach areas.",
@@ -3242,37 +3204,20 @@ def build_price_card(price_context):
     )
 
 
-def build_status_strip(
-    fleet_checked_at,
-    signal_checked_at,
-    selected_region,
-    price_context,
-    fleet_changed_at=None,
-    signal_changed_at=None,
-):
-    fleet_checked_text = "FleetMetrics checked: unavailable"
-    if fleet_checked_at is not None and pd.notna(fleet_checked_at):
-        checked_dt = pd.to_datetime(fleet_checked_at)
-        fleet_checked_text = f"FleetMetrics checked: {checked_dt:%d %b %Y %H:%M UTC}"
-    signal_checked_text = "Signals checked: unavailable"
-    if signal_checked_at is not None and pd.notna(signal_checked_at):
-        checked_dt = pd.to_datetime(signal_checked_at)
-        signal_checked_text = f"Signals checked: {checked_dt:%d %b %Y %H:%M UTC}"
-    fleet_changed_text = "FleetMetrics changed: unavailable"
-    if fleet_changed_at is not None and pd.notna(fleet_changed_at):
-        changed_dt = pd.to_datetime(fleet_changed_at)
-        fleet_changed_text = f"FleetMetrics changed: {changed_dt:%d %b %Y %H:%M UTC}"
-    signal_changed_text = "Signals changed: unavailable"
-    if signal_changed_at is not None and pd.notna(signal_changed_at):
-        changed_dt = pd.to_datetime(signal_changed_at)
-        signal_changed_text = f"Signals changed: {changed_dt:%d %b %Y %H:%M UTC}"
+def build_status_strip(upload_timestamp, signal_upload_timestamp, selected_region, price_context):
+    upload_text = "FleetMetrics upload: unavailable"
+    if upload_timestamp is not None and pd.notna(upload_timestamp):
+        upload_dt = pd.to_datetime(upload_timestamp)
+        upload_text = f"FleetMetrics upload: {upload_dt:%d %b %Y %H:%M UTC}"
+    signal_upload_text = "Signal upload: unavailable"
+    if signal_upload_timestamp is not None and pd.notna(signal_upload_timestamp):
+        signal_upload_dt = pd.to_datetime(signal_upload_timestamp)
+        signal_upload_text = f"Signal upload: {signal_upload_dt:%d %b %Y %H:%M UTC}"
     price_status = price_context.get("status", "Unavailable")
     return html.Div(
         [
-            html.Span(fleet_checked_text),
-            html.Span(signal_checked_text),
-            html.Span(fleet_changed_text),
-            html.Span(signal_changed_text),
+            html.Span(upload_text),
+            html.Span(signal_upload_text),
             html.Span(f"Selected basin: {_region_label(selected_region)}"),
             html.Span("Basin presets overlap and are not additive"),
             html.Span(f"Price context: {price_status}"),
@@ -4291,14 +4236,8 @@ def _build_fleet_metrics_source_bundle(
         detail_matrix_all["zone_filter"] == "global"
     ].copy()
 
-    results["fleet_checked_at"] = (
-        source_state.get("fleet_checked_at") or source_state.get("fleet_upload")
-    )
-    results["signal_checked_at"] = (
-        source_state.get("signal_checked_at") or source_state.get("signal_upload")
-    )
-    results["fleet_changed_at"] = source_state.get("fleet_changed_at")
-    results["signal_changed_at"] = source_state.get("signal_changed_at")
+    results["upload_timestamp"] = source_state.get("fleet_upload")
+    results["signal_upload_timestamp"] = source_state.get("signal_upload")
     results["context"] = {
         "start_date": start_date_val.isoformat(),
         "end_date": end_date_val.isoformat(),
@@ -4494,18 +4433,9 @@ def load_fleet_metrics_source(
                     dt.timezone.utc
                 ).isoformat()
             }
-        cache_state = {
-            key: source_state.get(key)
-            for key in (
-                "fleet_revision",
-                "signal_revision",
-                "diversion_upload",
-                "price_cob",
-            )
-        }
         source_key = _build_source_key(
             FLEET_METRICS_SNAPSHOT_NAMESPACE,
-            cache_state,
+            source_state,
             split_dimension,
             start_date_val,
             end_date_val,
@@ -4535,11 +4465,7 @@ def load_fleet_metrics_source(
             raise RuntimeError(
                 "Fleet metrics source snapshot is unavailable"
             )
-        result_reference = dict(source_reference)
-        result_reference["kpler_freshness"] = _freshness_reference_payload(
-            source_state
-        )
-        return result_reference
+        return source_reference
     except Exception as exc:
         logger.exception("Error loading Kpler fleet metrics source")
         return {
@@ -4623,17 +4549,8 @@ def update_fleet_metrics_page(source_reference, zone_filter):
                 )
 
         price_context = source_bundle["price_context"]
-        freshness = (
-            source_reference.get("kpler_freshness")
-            if isinstance(source_reference, dict)
-            else None
-        ) or {}
-        fleet_checked_at = freshness.get("fleet_checked_at") or source_bundle.get(
-            "fleet_checked_at", source_bundle.get("upload_timestamp")
-        )
-        signal_checked_at = freshness.get("signal_checked_at") or source_bundle.get(
-            "signal_checked_at", source_bundle.get("signal_upload_timestamp")
-        )
+        upload_timestamp = source_bundle["upload_timestamp"]
+        signal_upload_timestamp = source_bundle["signal_upload_timestamp"]
         common_render = _get_fleet_metrics_common_render(
             render_source_key,
             source_bundle,
@@ -4643,16 +4560,7 @@ def update_fleet_metrics_page(source_reference, zone_filter):
         )
         summaries = common_render["summaries"]
         selected_summary = summaries.get(zone_filter)
-        status_strip = build_status_strip(
-            fleet_checked_at,
-            signal_checked_at,
-            zone_filter,
-            price_context,
-            freshness.get("fleet_changed_at")
-            or source_bundle.get("fleet_changed_at"),
-            freshness.get("signal_changed_at")
-            or source_bundle.get("signal_changed_at"),
-        )
+        status_strip = build_status_strip(upload_timestamp, signal_upload_timestamp, zone_filter, price_context)
         summary_cards = build_summary_cards(selected_summary)
         price_card = common_render["price_card"]
         comparison_rows = build_comparison_rows(summaries, zone_filter)
