@@ -309,8 +309,61 @@ def test_source_callback_publishes_only_small_reference(monkeypatch):
         0,
     )
 
-    assert result == reference
+    assert {
+        key: result[key]
+        for key in ("format", "namespace", "source_key", "revision", "shared")
+    } == reference
+    assert result["kpler_freshness"]["fleet_checked_at"] == (
+        "2026-07-25T00:00:00"
+    )
     assert len(str(result).encode("utf-8")) < 10_000
+
+
+def test_noop_check_refreshes_status_without_changing_data_cache_key(monkeypatch):
+    reference = _source_reference()
+    states = iter(
+        (
+            {
+                "fleet_revision": 12,
+                "signal_revision": 18,
+                "fleet_checked_at": "2026-07-31T10:00:00+00:00",
+                "signal_checked_at": "2026-07-31T10:01:00+00:00",
+            },
+            {
+                "fleet_revision": 12,
+                "signal_revision": 18,
+                "fleet_checked_at": "2026-07-31T11:00:00+00:00",
+                "signal_checked_at": "2026-07-31T11:01:00+00:00",
+            },
+        )
+    )
+    source_keys = []
+
+    monkeypatch.setattr(
+        fleet_metrics,
+        "_fetch_fleet_metrics_source_state",
+        lambda: next(states),
+    )
+
+    def snapshot(_engine, *, source_key, **_kwargs):
+        source_keys.append(source_key)
+        return reference, _source_bundle()
+
+    monkeypatch.setattr(fleet_metrics, "_get_or_build_snapshot", snapshot)
+    monkeypatch.setattr(fleet_metrics, "_snapshot_is_resolvable", lambda _value: True)
+    monkeypatch.setattr(fleet_metrics, "_was_global_refresh_triggered", lambda: False)
+
+    first = fleet_metrics.load_fleet_metrics_source(
+        "current_subcontinents", "2026-01-01", "2026-12-31", 0
+    )
+    second = fleet_metrics.load_fleet_metrics_source(
+        "current_subcontinents", "2026-01-01", "2026-12-31", 0
+    )
+
+    assert source_keys[0] == source_keys[1]
+    assert first["kpler_freshness"]["fleet_checked_at"] != (
+        second["kpler_freshness"]["fleet_checked_at"]
+    )
 
 
 def test_render_error_returns_all_outputs(monkeypatch):
