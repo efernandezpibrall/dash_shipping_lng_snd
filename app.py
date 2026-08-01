@@ -9,6 +9,10 @@ from sqlalchemy import text
 
 LOG_LEVEL_NAME = os.getenv("DASH_LOG_LEVEL", "WARNING").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.WARNING)
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 logging.getLogger().setLevel(LOG_LEVEL)
 
 
