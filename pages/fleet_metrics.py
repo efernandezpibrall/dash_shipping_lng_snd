@@ -5307,18 +5307,30 @@ def _fleet_figure_outputs_from_artifacts(
     signals_artifact,
     detail_artifact,
 ):
-    signal_figures = signals_artifact.get("figures") or {}
-    detail_figures = detail_artifact.get("figures") or {}
-    split_dimension = detail_artifact.get(
-        "split_dimension",
-        "current_subcontinents",
+    return (
+        *_fleet_signal_outputs_from_artifact(signals_artifact),
+        *_fleet_detail_outputs_from_artifact(detail_artifact),
     )
+
+
+def _fleet_signal_outputs_from_artifact(signals_artifact):
+    signal_figures = signals_artifact.get("figures") or {}
     return (
         _figure_from_snapshot(signal_figures["arrival_pipeline_fig"]),
         _figure_from_snapshot(signal_figures["utilization_fig"]),
         _figure_from_snapshot(signal_figures["congestion_signal_fig"]),
         _figure_from_snapshot(signal_figures["freight_signal_fig"]),
         _figure_from_snapshot(signal_figures["diversion_seasonal_fig"]),
+    )
+
+
+def _fleet_detail_outputs_from_artifact(detail_artifact):
+    detail_figures = detail_artifact.get("figures") or {}
+    split_dimension = detail_artifact.get(
+        "split_dimension",
+        "current_subcontinents",
+    )
+    return (
         _figure_from_snapshot(detail_figures["loaded_seasonal_fig"]),
         _figure_from_snapshot(detail_figures["floating_seasonal_fig"]),
         build_region_detail_matrix_legend_from_color_maps(
@@ -5375,6 +5387,14 @@ def _fleet_figure_error_outputs(exc):
         ),
         error_fig,
     )
+
+
+def _fleet_signal_error_outputs(exc):
+    return _fleet_figure_error_outputs(exc)[:5]
+
+
+def _fleet_detail_error_outputs(exc):
+    return _fleet_figure_error_outputs(exc)[5:]
 
 
 @log_callback_timing("fleet_metrics.summary_render")
@@ -5450,6 +5470,52 @@ def update_fleet_metrics_figures(bundle_reference):
     except Exception as exc:
         logger.exception("Error loading staged Fleet metrics figures")
         return _fleet_figure_error_outputs(exc)
+
+
+@log_callback_timing("fleet_metrics.signal_render")
+def update_fleet_metrics_signals(bundle_reference):
+    if not bundle_reference:
+        raise PreventUpdate
+    if (
+        isinstance(bundle_reference, dict)
+        and bundle_reference.get("format")
+        == "fleet-metrics-render-error-v1"
+    ):
+        return _fleet_signal_error_outputs(
+            bundle_reference.get("error") or "unavailable"
+        )
+    try:
+        signals_artifact = _resolve_fleet_render_artifact(
+            bundle_reference,
+            "signals",
+        )
+        return _fleet_signal_outputs_from_artifact(signals_artifact)
+    except Exception as exc:
+        logger.exception("Error loading staged Fleet signal figures")
+        return _fleet_signal_error_outputs(exc)
+
+
+@log_callback_timing("fleet_metrics.detail_render")
+def update_fleet_metrics_detail(bundle_reference):
+    if not bundle_reference:
+        raise PreventUpdate
+    if (
+        isinstance(bundle_reference, dict)
+        and bundle_reference.get("format")
+        == "fleet-metrics-render-error-v1"
+    ):
+        return _fleet_detail_error_outputs(
+            bundle_reference.get("error") or "unavailable"
+        )
+    try:
+        detail_artifact = _resolve_fleet_render_artifact(
+            bundle_reference,
+            "detail",
+        )
+        return _fleet_detail_outputs_from_artifact(detail_artifact)
+    except Exception as exc:
+        logger.exception("Error loading staged Fleet detail figures")
+        return _fleet_detail_error_outputs(exc)
 
 
 @log_callback_timing("fleet_metrics.render_snapshot_page")
@@ -5579,10 +5645,15 @@ if _fleet_staged_render_enabled() and _fleet_render_snapshot_enabled():
         prevent_initial_call=False,
     )(update_fleet_metrics_summary)
     callback(
-        *_FLEET_FIGURE_CALLBACK_OUTPUTS,
+        *_FLEET_FIGURE_CALLBACK_OUTPUTS[:5],
         Input("fleet-metrics-render-ready-store", "data"),
         prevent_initial_call=False,
-    )(update_fleet_metrics_figures)
+    )(update_fleet_metrics_signals)
+    callback(
+        *_FLEET_FIGURE_CALLBACK_OUTPUTS[5:],
+        Input("fleet-metrics-render-ready-store", "data"),
+        prevent_initial_call=False,
+    )(update_fleet_metrics_detail)
 elif _fleet_render_snapshot_enabled():
     callback(
         *_FLEET_SUMMARY_CALLBACK_OUTPUTS[:8],

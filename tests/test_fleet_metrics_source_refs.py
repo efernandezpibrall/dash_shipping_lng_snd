@@ -323,6 +323,43 @@ def test_staged_render_error_contract_preserves_all_outputs():
     assert all(value is not no_update for value in summary + figures)
 
 
+def test_staged_signal_and_detail_callbacks_resolve_independently(monkeypatch):
+    resolved_sections = []
+
+    def resolve(_bundle_reference, section):
+        resolved_sections.append(section)
+        return {"section": section}
+
+    monkeypatch.setattr(
+        fleet_metrics,
+        "_resolve_fleet_render_artifact",
+        resolve,
+    )
+    monkeypatch.setattr(
+        fleet_metrics,
+        "_fleet_signal_outputs_from_artifact",
+        lambda artifact: (artifact["section"],) * 5,
+    )
+    monkeypatch.setattr(
+        fleet_metrics,
+        "_fleet_detail_outputs_from_artifact",
+        lambda artifact: (artifact["section"],) * 4,
+    )
+
+    signals = fleet_metrics.update_fleet_metrics_signals(
+        {"bundle": "reference"}
+    )
+    assert signals == ("signals",) * 5
+    assert resolved_sections == ["signals"]
+
+    resolved_sections.clear()
+    detail = fleet_metrics.update_fleet_metrics_detail(
+        {"bundle": "reference"}
+    )
+    assert detail == ("detail",) * 4
+    assert resolved_sections == ["detail"]
+
+
 def test_render_snapshot_region_switch_preserves_exact_no_update_contract(
     monkeypatch,
 ):
