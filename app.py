@@ -1,8 +1,15 @@
 # app.py
+import logging
 import os
 
 from dash import Dash
 import dash_bootstrap_components as dbc
+from sqlalchemy import text
+
+
+LOG_LEVEL_NAME = os.getenv("DASH_LOG_LEVEL", "WARNING").upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.WARNING)
+logging.getLogger().setLevel(LOG_LEVEL)
 
 
 def _environment_flag(name: str, *, default: bool) -> bool:
@@ -40,3 +47,37 @@ app = Dash(
 )
 app.title = "LNG Shipping - Exporters"
 server = app.server
+
+
+@server.get("/health")
+def health():
+    """Process liveness endpoint for the local service manager."""
+
+    return {
+        "service": "dash_shipping_lng_snd",
+        "status": "ok",
+    }
+
+
+@server.get("/ready")
+def ready():
+    """Readiness endpoint proving the configured database is reachable."""
+
+    try:
+        from utils.database import get_database_engine
+
+        with get_database_engine().connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Dashboard readiness database check failed"
+        )
+        return {
+            "service": "dash_shipping_lng_snd",
+            "status": "unavailable",
+        }, 503
+    return {
+        "database": "reachable",
+        "service": "dash_shipping_lng_snd",
+        "status": "ready",
+    }
