@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import logging
 import math
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -8,21 +9,37 @@ import threading
 import dash_ag_grid as dag
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.io as pio
 from dash import callback, ctx, dcc, html, no_update
-from dash.dependencies import Input, Output
-from dash.exceptions import MissingCallbackContextException
+from dash.dependencies import Input, Output, State
+from dash.exceptions import MissingCallbackContextException, PreventUpdate
 from plotly.subplots import make_subplots
 from sqlalchemy import bindparam, text
 
 from utils.dashboard_snapshot_cache import (
     build_source_key as _build_source_key,
+    commit_snapshot_publication_stage as _commit_snapshot_publication_stage,
     get_or_build_snapshot as _get_or_build_snapshot,
+    get_snapshot_if_available as _get_snapshot_if_available,
     is_snapshot_reference as _is_snapshot_reference,
     resolve_snapshot as _resolve_snapshot,
+    resolve_snapshot_manifest as _resolve_snapshot_manifest,
+    snapshot_build_lock as _snapshot_build_lock,
     snapshot_is_resolvable as _snapshot_is_resolvable,
+    stage_snapshot_publication as _stage_snapshot_publication,
     was_global_refresh_triggered as _was_global_refresh_triggered,
 )
+from utils.arrow_payload import (
+    pack_dataframe_mapping as _pack_dataframe_mapping,
+    unpack_dataframe_mapping as _unpack_dataframe_mapping,
+)
 from utils.database import DB_SCHEMA, engine
+from utils.performance_flags import (
+    fleet_arrow_source_enabled as _fleet_arrow_source_enabled,
+    fleet_render_snapshot_enabled as _fleet_render_snapshot_enabled,
+    fleet_staged_render_enabled as _fleet_staged_render_enabled,
+    revision_aware_refresh_enabled as _revision_aware_refresh_enabled,
+)
 from utils.performance import log_callback_timing
 
 logger = logging.getLogger(__name__)
@@ -61,7 +78,39 @@ KPLER_FLEET_DIVERSION_REGION_ORDER = [
     zone_filter for zone_filter in KPLER_FLEET_REGION_ORDER if zone_filter != "global"
 ]
 
-FLEET_METRICS_SNAPSHOT_NAMESPACE = "fleet-metrics-source-v1"
+FLEET_METRICS_LEGACY_SNAPSHOT_NAMESPACE = "fleet-metrics-source-v1"
+FLEET_METRICS_ARROW_SNAPSHOT_NAMESPACE = "fleet-metrics-source-v2"
+FLEET_METRICS_SNAPSHOT_NAMESPACE = (
+    FLEET_METRICS_ARROW_SNAPSHOT_NAMESPACE
+    if _fleet_arrow_source_enabled()
+    else FLEET_METRICS_LEGACY_SNAPSHOT_NAMESPACE
+)
+FLEET_METRICS_SOURCE_NAMESPACES = frozenset({
+    FLEET_METRICS_LEGACY_SNAPSHOT_NAMESPACE,
+    FLEET_METRICS_ARROW_SNAPSHOT_NAMESPACE,
+})
+FLEET_METRICS_RENDER_BUNDLE_NAMESPACE = "fleet-metrics-render-v1"
+FLEET_METRICS_RENDER_SUMMARY_NAMESPACE = "fleet-metrics-render-summary-v1"
+FLEET_METRICS_RENDER_SIGNALS_NAMESPACE = "fleet-metrics-render-signals-v1"
+FLEET_METRICS_RENDER_DETAIL_NAMESPACE = "fleet-metrics-render-detail-v1"
+FLEET_METRICS_RENDER_BUNDLE_FORMAT = "fleet-metrics-render-bundle-v1"
+FLEET_METRICS_RENDER_SUMMARY_FORMAT = "fleet-metrics-render-summary-v1"
+FLEET_METRICS_RENDER_SIGNALS_FORMAT = "fleet-metrics-render-signals-v1"
+FLEET_METRICS_RENDER_DETAIL_FORMAT = "fleet-metrics-render-detail-v1"
+FLEET_METRICS_RENDER_SCHEMA_VERSION = 1
+FLEET_METRICS_SOURCE_FRAME_KEYS = (
+    "detail_matrix_floating_days",
+    "regional_signals",
+    "detail_matrix_weekly",
+    "summary_daily",
+    "signal_diversions",
+    "diversion_history",
+    "global_area_weekly",
+)
+
+
+class _FleetMetricsSourceChanged(RuntimeError):
+    """Raised before cache publication when Fleet inputs change mid-build."""
 _FLEET_RENDER_CACHE = OrderedDict()
 _FLEET_COMMON_RENDER_CACHE = OrderedDict()
 _FLEET_COMMON_RENDER_FLIGHTS: dict[tuple, Future] = {}
@@ -100,7 +149,7 @@ def _fetch_fleet_metrics_source_state():
 
 
 def _freshness_reference_payload(source_state):
-    """Keep live check timestamps in the browser ref, outside the data cache key."""
+    """Serialize operational source freshness outside semantic cache identity."""
 
     values = {
         "fleet_checked_at": source_state.get("fleet_checked_at")
@@ -119,6 +168,26 @@ def _freshness_reference_payload(source_state):
         else:
             payload[key] = str(value)
     return payload
+
+
+_FLEET_SEMANTIC_SOURCE_FIELDS = (
+    "fleet_revision",
+    "signal_revision",
+    "diversion_upload",
+    "price_cob",
+)
+
+
+def _fleet_semantic_source_state(source_state):
+    """Return only values whose change can alter rendered Fleet output."""
+
+    semantic_state = {
+        key: source_state.get(key)
+        for key in _FLEET_SEMANTIC_SOURCE_FIELDS
+    }
+    if "request_token" in source_state:
+        semantic_state["request_token"] = source_state["request_token"]
+    return semantic_state
 KPLER_FLEET_ZONE_SHORT_LABELS = {option["value"]: option["label"] for option in KPLER_FLEET_ZONE_OPTIONS}
 KPLER_REGION_DEFINITION_SUMMARIES = {
     "asia_pacific_oceans": "Asian LNG demand basin plus Pacific waiting and approach areas.",
@@ -2122,10 +2191,28 @@ def _detail_matrix_legend_item(label, color=None, line=False, muted=False):
 
 
 def build_region_detail_matrix_legend(weekly_df, split_dimension):
+    color_maps = {
+        zone_filter: _detail_matrix_area_color_map(
+            weekly_df,
+            zone_filter,
+            split_dimension,
+        )
+        for zone_filter in KPLER_FLEET_DIVERSION_REGION_ORDER
+    }
+    return build_region_detail_matrix_legend_from_color_maps(
+        color_maps,
+        split_dimension,
+    )
+
+
+def build_region_detail_matrix_legend_from_color_maps(
+    color_maps,
+    split_dimension,
+):
     split_label = KPLER_FLEET_SPLIT_TITLE_LABELS.get(split_dimension, split_dimension.replace("_", " "))
     region_cards = []
     for zone_filter in KPLER_FLEET_DIVERSION_REGION_ORDER:
-        color_map = _detail_matrix_area_color_map(weekly_df, zone_filter, split_dimension)
+        color_map = dict((color_maps or {}).get(zone_filter) or {})
         if not color_map:
             items = [_detail_matrix_legend_item("No split data", muted=True)]
         else:
@@ -3944,6 +4031,14 @@ layout = html.Div(
             id="fleet-metrics-source-ref-store",
             storage_type="memory",
         ),
+        dcc.Store(
+            id="fleet-metrics-refresh-status-store",
+            storage_type="memory",
+        ),
+        dcc.Store(
+            id="fleet-metrics-render-ready-store",
+            storage_type="memory",
+        ),
         html.Div(
             [
                 html.Div(
@@ -4140,17 +4235,45 @@ layout = html.Div(
 )
 
 
-def _resolve_fleet_metrics_source_bundle(source_reference):
-    if not _is_snapshot_reference(
-        source_reference,
-        FLEET_METRICS_SNAPSHOT_NAMESPACE,
-    ) or not _snapshot_is_resolvable(source_reference):
+def _pack_fleet_metrics_source_bundle(source_bundle):
+    if not _fleet_arrow_source_enabled():
+        return source_bundle
+    packed = _pack_dataframe_mapping(
+        source_bundle,
+        dataframe_keys=FLEET_METRICS_SOURCE_FRAME_KEYS,
+    )
+    packed["format"] = "fleet-metrics-source-arrow-v1"
+    return packed
+
+
+def _unpack_fleet_metrics_source_bundle(source_bundle):
+    if not isinstance(source_bundle, dict):
+        return source_bundle
+    return _unpack_dataframe_mapping(
+        source_bundle,
+        dataframe_keys=FLEET_METRICS_SOURCE_FRAME_KEYS,
+    )
+
+
+def _resolve_fleet_metrics_source_bundle(
+    source_reference,
+    *,
+    decode_frames=False,
+):
+    if not (
+        _is_snapshot_reference(source_reference)
+        and source_reference.get("namespace")
+        in FLEET_METRICS_SOURCE_NAMESPACES
+        and _snapshot_is_resolvable(source_reference)
+    ):
         raise RuntimeError("Fleet metrics source snapshot is unavailable")
     source_bundle = _resolve_snapshot(
         source_reference,
         engine,
-        expected_namespace=FLEET_METRICS_SNAPSHOT_NAMESPACE,
+        expected_namespace=source_reference["namespace"],
     )
+    if decode_frames:
+        source_bundle = _unpack_fleet_metrics_source_bundle(source_bundle)
     if (
         not isinstance(source_bundle, dict)
         or not isinstance(source_bundle.get("context"), dict)
@@ -4384,6 +4507,338 @@ def _build_fleet_metrics_common_render(
     }
 
 
+def _figure_to_snapshot(figure):
+    return json.loads(
+        pio.to_json(
+            figure,
+            validate=False,
+            pretty=False,
+            remove_uids=False,
+        )
+    )
+
+
+def _figure_from_snapshot(value):
+    if isinstance(value, go.Figure):
+        return value
+    if not isinstance(value, dict):
+        raise TypeError("Fleet render snapshot figure is invalid")
+    # Dash accepts the final Plotly mapping directly. Avoid reparsing the
+    # immutable artifact into graph objects in every web worker.
+    return value
+
+
+def _fleet_render_dependency(source_reference):
+    return {
+        "namespace": source_reference.get("namespace"),
+        "source_key": source_reference.get("source_key"),
+        "revision": source_reference.get("revision"),
+    }
+
+
+def _fleet_render_bundle_source_key(source_reference):
+    return _build_source_key(
+        FLEET_METRICS_RENDER_BUNDLE_NAMESPACE,
+        _fleet_render_dependency(source_reference),
+        FLEET_METRICS_RENDER_SCHEMA_VERSION,
+    )
+
+
+def _fleet_render_artifact_source_key(
+    bundle_source_key,
+    section,
+):
+    return _build_source_key(
+        f"fleet-metrics-render-{section}-v1",
+        bundle_source_key,
+        section,
+        FLEET_METRICS_RENDER_SCHEMA_VERSION,
+    )
+
+
+def _build_fleet_render_artifacts(source_reference, source_bundle):
+    context = dict(source_bundle.get("context") or {})
+    split_dimension = context.get(
+        "split_dimension",
+        "current_subcontinents",
+    )
+    start_date_val = pd.to_datetime(context["start_date"]).date()
+    end_date_val = pd.to_datetime(context["end_date"]).date()
+    common_render = _build_fleet_metrics_common_render(
+        source_bundle,
+        start_date_val=start_date_val,
+        end_date_val=end_date_val,
+        split_dimension=split_dimension,
+    )
+
+    detail_matrix_weekly = common_render["detail_matrix_weekly"]
+    movers_by_region = {}
+    for zone_filter in KPLER_FLEET_REGION_ORDER:
+        if zone_filter in KPLER_FLEET_DIVERSION_REGION_ORDER:
+            area_weekly = detail_matrix_weekly[
+                detail_matrix_weekly["zone_filter"] == zone_filter
+            ].copy()
+        else:
+            area_weekly = source_bundle["global_area_weekly"]
+        movers_by_region[zone_filter] = build_movers_rows(area_weekly)
+
+    summary_payload = {
+        "format": FLEET_METRICS_RENDER_SUMMARY_FORMAT,
+        "source_reference": _fleet_render_dependency(source_reference),
+        "context": context,
+        "fleet_checked_at": source_bundle.get(
+            "fleet_checked_at",
+            source_bundle.get("upload_timestamp"),
+        ),
+        "signal_checked_at": source_bundle.get(
+            "signal_checked_at",
+            source_bundle.get("signal_upload_timestamp"),
+        ),
+        "fleet_changed_at": source_bundle.get("fleet_changed_at"),
+        "signal_changed_at": source_bundle.get("signal_changed_at"),
+        "upload_timestamp": source_bundle.get("upload_timestamp"),
+        "signal_upload_timestamp": source_bundle.get(
+            "signal_upload_timestamp"
+        ),
+        "price_context": source_bundle.get("price_context") or {},
+        "summaries": common_render["summaries"],
+        "signal_summaries": common_render["signal_summaries"],
+        "movers_by_region": movers_by_region,
+    }
+    signals_payload = {
+        "format": FLEET_METRICS_RENDER_SIGNALS_FORMAT,
+        "source_reference": _fleet_render_dependency(source_reference),
+        "figures": {
+            name: _figure_to_snapshot(common_render[name])
+            for name in (
+                "arrival_pipeline_fig",
+                "utilization_fig",
+                "congestion_signal_fig",
+                "freight_signal_fig",
+                "diversion_seasonal_fig",
+            )
+        },
+    }
+    color_maps = {
+        zone_filter: _detail_matrix_area_color_map(
+            detail_matrix_weekly,
+            zone_filter,
+            split_dimension,
+        )
+        for zone_filter in KPLER_FLEET_DIVERSION_REGION_ORDER
+    }
+    detail_payload = {
+        "format": FLEET_METRICS_RENDER_DETAIL_FORMAT,
+        "source_reference": _fleet_render_dependency(source_reference),
+        "split_dimension": split_dimension,
+        "color_maps": color_maps,
+        "figures": {
+            name: _figure_to_snapshot(common_render[name])
+            for name in (
+                "loaded_seasonal_fig",
+                "floating_seasonal_fig",
+                "detail_matrix_fig",
+            )
+        },
+    }
+    return summary_payload, signals_payload, detail_payload
+
+
+def _require_fleet_render_artifact(
+    value,
+    *,
+    expected_format,
+):
+    if not isinstance(value, dict) or value.get("format") != expected_format:
+        raise TypeError("Fleet render snapshot artifact is invalid")
+    return value
+
+
+def _resolve_fleet_render_bundle(bundle_reference):
+    if not (
+        _is_snapshot_reference(
+            bundle_reference,
+            FLEET_METRICS_RENDER_BUNDLE_NAMESPACE,
+        )
+        and _snapshot_is_resolvable(bundle_reference)
+    ):
+        raise RuntimeError("Fleet render snapshot bundle is unavailable")
+    bundle = _resolve_snapshot(
+        bundle_reference,
+        engine,
+        expected_namespace=FLEET_METRICS_RENDER_BUNDLE_NAMESPACE,
+    )
+    if not (
+        isinstance(bundle, dict)
+        and bundle.get("format") == FLEET_METRICS_RENDER_BUNDLE_FORMAT
+        and isinstance(bundle.get("artifacts"), dict)
+    ):
+        raise TypeError("Fleet render snapshot bundle is invalid")
+    return bundle
+
+
+def _resolve_fleet_render_artifact(
+    bundle_reference,
+    section,
+):
+    bundle = _resolve_fleet_render_bundle(bundle_reference)
+    artifact_reference = bundle["artifacts"].get(section)
+    contracts = {
+        "summary": (
+            FLEET_METRICS_RENDER_SUMMARY_NAMESPACE,
+            FLEET_METRICS_RENDER_SUMMARY_FORMAT,
+        ),
+        "signals": (
+            FLEET_METRICS_RENDER_SIGNALS_NAMESPACE,
+            FLEET_METRICS_RENDER_SIGNALS_FORMAT,
+        ),
+        "detail": (
+            FLEET_METRICS_RENDER_DETAIL_NAMESPACE,
+            FLEET_METRICS_RENDER_DETAIL_FORMAT,
+        ),
+    }
+    try:
+        namespace, expected_format = contracts[section]
+    except KeyError as exc:
+        raise ValueError(f"Unknown Fleet render section {section!r}") from exc
+    if not (
+        _is_snapshot_reference(artifact_reference, namespace)
+        and _snapshot_is_resolvable(artifact_reference)
+    ):
+        raise RuntimeError(f"Fleet render {section} artifact is unavailable")
+    artifact = _resolve_snapshot(
+        artifact_reference,
+        engine,
+        expected_namespace=namespace,
+    )
+    return _require_fleet_render_artifact(
+        artifact,
+        expected_format=expected_format,
+    )
+
+
+def _get_or_build_fleet_render_bundle(source_reference):
+    if not _fleet_render_snapshot_enabled():
+        raise RuntimeError("Fleet render snapshots are disabled")
+    bundle_source_key = _fleet_render_bundle_source_key(source_reference)
+    available = _get_snapshot_if_available(
+        engine,
+        namespace=FLEET_METRICS_RENDER_BUNDLE_NAMESPACE,
+        source_key=bundle_source_key,
+    )
+    if available is not None:
+        return available[0]
+
+    with _snapshot_build_lock(
+        FLEET_METRICS_RENDER_BUNDLE_NAMESPACE,
+        bundle_source_key,
+    ):
+        available = _get_snapshot_if_available(
+            engine,
+            namespace=FLEET_METRICS_RENDER_BUNDLE_NAMESPACE,
+            source_key=bundle_source_key,
+        )
+        if available is not None:
+            return available[0]
+
+        source_manifest = _resolve_snapshot_manifest(
+            source_reference,
+            engine,
+            expected_namespace=source_reference["namespace"],
+        )
+        expected_source_state = source_manifest.get("source_state")
+        source_bundle = _unpack_fleet_metrics_source_bundle(
+            _resolve_fleet_metrics_source_bundle(source_reference)
+        )
+        with _stage_snapshot_publication(
+            f"fleet-render:{bundle_source_key}"
+        ) as publication_stage:
+            summary_payload, signals_payload, detail_payload = (
+                _build_fleet_render_artifacts(
+                    source_reference,
+                    source_bundle,
+                )
+            )
+            artifact_specs = {
+                "summary": (
+                    FLEET_METRICS_RENDER_SUMMARY_NAMESPACE,
+                    summary_payload,
+                ),
+                "signals": (
+                    FLEET_METRICS_RENDER_SIGNALS_NAMESPACE,
+                    signals_payload,
+                ),
+                "detail": (
+                    FLEET_METRICS_RENDER_DETAIL_NAMESPACE,
+                    detail_payload,
+                ),
+            }
+            artifact_references = {}
+            for section, (namespace, payload) in artifact_specs.items():
+                source_key = _fleet_render_artifact_source_key(
+                    bundle_source_key,
+                    section,
+                )
+                reference, _ = _get_or_build_snapshot(
+                    engine,
+                    namespace=namespace,
+                    source_key=source_key,
+                    builder=lambda payload=payload: payload,
+                    manifest={
+                        "section": section,
+                        "source_reference": _fleet_render_dependency(
+                            source_reference
+                        ),
+                        "render_schema_version": (
+                            FLEET_METRICS_RENDER_SCHEMA_VERSION
+                        ),
+                    },
+                )
+                artifact_references[section] = reference
+
+            if (
+                isinstance(expected_source_state, dict)
+                and _build_source_key(
+                    "fleet-metrics-source-state-validation",
+                    _fleet_semantic_source_state(
+                        _fetch_fleet_metrics_source_state()
+                    ),
+                )
+                != _build_source_key(
+                    "fleet-metrics-source-state-validation",
+                    expected_source_state,
+                )
+            ):
+                raise RuntimeError(
+                    "Fleet metrics sources changed during render precompute"
+                )
+
+            return _commit_snapshot_publication_stage(
+                publication_stage,
+                bundle_namespace=FLEET_METRICS_RENDER_BUNDLE_NAMESPACE,
+                bundle_source_key=bundle_source_key,
+                bundle_payload={
+                    "format": FLEET_METRICS_RENDER_BUNDLE_FORMAT,
+                    "source_reference": _fleet_render_dependency(
+                        source_reference
+                    ),
+                    "render_schema_version": (
+                        FLEET_METRICS_RENDER_SCHEMA_VERSION
+                    ),
+                    "artifacts": artifact_references,
+                },
+                bundle_manifest={
+                    "source_reference": _fleet_render_dependency(
+                        source_reference
+                    ),
+                    "source_state": expected_source_state,
+                    "render_schema_version": (
+                        FLEET_METRICS_RENDER_SCHEMA_VERSION
+                    ),
+                },
+            )
+
+
 def _get_fleet_metrics_common_render(
     source_key,
     source_bundle,
@@ -4457,10 +4912,12 @@ def _normalize_fleet_metrics_source_controls(
 
 @callback(
     Output("fleet-metrics-source-ref-store", "data"),
+    Output("fleet-metrics-refresh-status-store", "data"),
     Input("fleet-metrics-split-dropdown", "value"),
     Input("fleet-metrics-date-range", "start_date"),
     Input("fleet-metrics-date-range", "end_date"),
     Input("global-refresh-button", "n_clicks"),
+    State("fleet-metrics-source-ref-store", "data"),
     prevent_initial_call=False,
 )
 @log_callback_timing("fleet_metrics.source_load")
@@ -4468,7 +4925,8 @@ def load_fleet_metrics_source(
     split_dimension,
     start_date,
     end_date,
-    _global_refresh_clicks=None,
+    global_refresh_clicks=None,
+    current_source_reference=None,
 ):
     (
         split_dimension,
@@ -4480,7 +4938,13 @@ def load_fleet_metrics_source(
         start_date,
         end_date,
     )
+    refresh_status = {
+        "format": "dashboard-source-refresh-status-v1",
+        "refresh_generation": int(global_refresh_clicks or 0),
+        "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
     try:
+        source_lookup_available = True
         try:
             source_state = _fetch_fleet_metrics_source_state()
         except Exception:
@@ -4494,58 +4958,106 @@ def load_fleet_metrics_source(
                     dt.timezone.utc
                 ).isoformat()
             }
-        cache_state = {
-            key: source_state.get(key)
-            for key in (
-                "fleet_revision",
-                "signal_revision",
-                "diversion_upload",
-                "price_cob",
+            source_lookup_available = False
+        refresh_status["status"] = (
+            "checked" if source_lookup_available else "unavailable"
+        )
+        refresh_status["kpler_freshness"] = (
+            _freshness_reference_payload(source_state)
+        )
+
+        for _attempt in range(3):
+            semantic_source_state = _fleet_semantic_source_state(
+                source_state
             )
-        }
-        source_key = _build_source_key(
-            FLEET_METRICS_SNAPSHOT_NAMESPACE,
-            cache_state,
-            split_dimension,
-            start_date_val,
-            end_date_val,
-            today,
-        )
-        source_reference, _source_bundle = _get_or_build_snapshot(
-            engine,
-            namespace=FLEET_METRICS_SNAPSHOT_NAMESPACE,
-            source_key=source_key,
-            builder=lambda: _build_fleet_metrics_source_bundle(
-                start_date_val=start_date_val,
-                end_date_val=end_date_val,
-                split_dimension=split_dimension,
-                today=today,
-                source_state=source_state,
-            ),
-            force=_was_global_refresh_triggered(),
-            manifest={
-                "start_date": start_date_val.isoformat(),
-                "end_date": end_date_val.isoformat(),
-                "split_dimension": split_dimension,
-                "today": today.isoformat(),
-                "source_state": source_state,
-            },
-        )
-        if not _snapshot_is_resolvable(source_reference):
-            raise RuntimeError(
-                "Fleet metrics source snapshot is unavailable"
+            source_key = _build_source_key(
+                FLEET_METRICS_SNAPSHOT_NAMESPACE,
+                semantic_source_state,
+                split_dimension,
+                start_date_val,
+                end_date_val,
+                today,
             )
-        result_reference = dict(source_reference)
-        result_reference["kpler_freshness"] = _freshness_reference_payload(
-            source_state
+            if (
+                _revision_aware_refresh_enabled()
+                and _is_snapshot_reference(
+                    current_source_reference,
+                    FLEET_METRICS_SNAPSHOT_NAMESPACE,
+                )
+                and current_source_reference.get("source_key")
+                == source_key
+            ):
+                return no_update, refresh_status
+
+            def build_stable_source_bundle():
+                source_bundle = _build_fleet_metrics_source_bundle(
+                    start_date_val=start_date_val,
+                    end_date_val=end_date_val,
+                    split_dimension=split_dimension,
+                    today=today,
+                    source_state=source_state,
+                )
+                if (
+                    source_lookup_available
+                    and _build_source_key(
+                        "fleet-metrics-source-state-validation",
+                        _fleet_semantic_source_state(
+                            _fetch_fleet_metrics_source_state()
+                        ),
+                    )
+                    != _build_source_key(
+                        "fleet-metrics-source-state-validation",
+                        semantic_source_state,
+                    )
+                ):
+                    raise _FleetMetricsSourceChanged
+                return _pack_fleet_metrics_source_bundle(source_bundle)
+
+            try:
+                source_reference, _source_bundle = _get_or_build_snapshot(
+                    engine,
+                    namespace=FLEET_METRICS_SNAPSHOT_NAMESPACE,
+                    source_key=source_key,
+                    builder=build_stable_source_bundle,
+                    force=(
+                        not _revision_aware_refresh_enabled()
+                        and _was_global_refresh_triggered()
+                    ),
+                    manifest={
+                        "start_date": start_date_val.isoformat(),
+                        "end_date": end_date_val.isoformat(),
+                        "split_dimension": split_dimension,
+                        "today": today.isoformat(),
+                        "source_state": semantic_source_state,
+                        "source_freshness": (
+                            _freshness_reference_payload(source_state)
+                        ),
+                    },
+                )
+            except _FleetMetricsSourceChanged:
+                source_state = _fetch_fleet_metrics_source_state()
+                refresh_status["kpler_freshness"] = (
+                    _freshness_reference_payload(source_state)
+                )
+                continue
+            if not _snapshot_is_resolvable(source_reference):
+                raise RuntimeError(
+                    "Fleet metrics source snapshot is unavailable"
+                )
+            return source_reference, refresh_status
+        raise RuntimeError(
+            "Fleet metrics sources changed during snapshot construction"
         )
-        return result_reference
     except Exception as exc:
         logger.exception("Error loading Kpler fleet metrics source")
-        return {
-            "format": "fleet-metrics-source-error-v1",
-            "error": str(exc),
-        }
+        refresh_status["status"] = "error"
+        return (
+            {
+                "format": "fleet-metrics-source-error-v1",
+                "error": str(exc),
+            },
+            refresh_status,
+        )
 
 
 def _fleet_region_only_triggered():
@@ -4553,6 +5065,25 @@ def _fleet_region_only_triggered():
         return ctx.triggered_id == "fleet-metrics-region-tabs"
     except MissingCallbackContextException:
         return False
+
+
+def _fleet_refresh_status_only_triggered():
+    try:
+        triggered_ids = {
+            item["prop_id"].split(".", 1)[0]
+            for item in ctx.triggered
+            if item.get("prop_id")
+        }
+    except MissingCallbackContextException:
+        return False
+    return triggered_ids == {"fleet-metrics-refresh-status-store"}
+
+
+def _fleet_refresh_freshness(refresh_status):
+    if not isinstance(refresh_status, dict):
+        return {}
+    freshness = refresh_status.get("kpler_freshness")
+    return freshness if isinstance(freshness, dict) else {}
 
 
 def _fleet_render_response(result, *, region_only):
@@ -4564,38 +5095,21 @@ def _fleet_render_response(result, *, region_only):
     )
 
 
-@callback(
-    Output("fleet-metrics-status-strip", "children"),
-    Output("fleet-metrics-summary-cards", "children"),
-    Output("fleet-metrics-price-card", "children"),
-    Output("fleet-metrics-region-comparison-table", "rowData"),
-    Output("fleet-metrics-region-comparison-table", "columnDefs"),
-    Output("fleet-metrics-global-signal-cards", "children"),
-    Output("fleet-metrics-global-signals-table", "rowData"),
-    Output("fleet-metrics-global-signals-table", "columnDefs"),
-    Output("fleet-metrics-arrival-pipeline-chart", "figure"),
-    Output("fleet-metrics-utilization-chart", "figure"),
-    Output("fleet-metrics-congestion-signal-chart", "figure"),
-    Output("fleet-metrics-freight-signal-chart", "figure"),
-    Output("fleet-metrics-diversion-seasonal-chart", "figure"),
-    Output("fleet-metrics-movers-table", "rowData"),
-    Output("fleet-metrics-loaded-seasonal-chart", "figure"),
-    Output("fleet-metrics-floating-seasonal-chart", "figure"),
-    Output("fleet-metrics-region-detail-matrix-legend", "children"),
-    Output("fleet-metrics-region-detail-matrix-chart", "figure"),
-    Input("fleet-metrics-source-ref-store", "data"),
-    Input("fleet-metrics-region-tabs", "value"),
-    prevent_initial_call=False,
-)
 @log_callback_timing("fleet_metrics.page_render")
-def update_fleet_metrics_page(source_reference, zone_filter):
+def update_fleet_metrics_page(
+    source_reference,
+    zone_filter,
+    refresh_status=None,
+):
     zone_filter = zone_filter or KPLER_FLEET_DEFAULT_ZONE_FILTER
     if zone_filter not in KPLER_FLEET_REGION_ORDER:
         zone_filter = KPLER_FLEET_DEFAULT_ZONE_FILTER
+    if _fleet_refresh_status_only_triggered():
+        return (no_update,) * 18
 
     try:
-        source_bundle = _resolve_fleet_metrics_source_bundle(
-            source_reference
+        source_bundle = _unpack_fleet_metrics_source_bundle(
+            _resolve_fleet_metrics_source_bundle(source_reference)
         )
         context = source_bundle.get("context") or {}
         split_dimension = context.get(
@@ -4623,11 +5137,9 @@ def update_fleet_metrics_page(source_reference, zone_filter):
                 )
 
         price_context = source_bundle["price_context"]
-        freshness = (
-            source_reference.get("kpler_freshness")
-            if isinstance(source_reference, dict)
-            else None
-        ) or {}
+        freshness = _fleet_refresh_freshness(refresh_status)
+        if not freshness and isinstance(source_reference, dict):
+            freshness = source_reference.get("kpler_freshness") or {}
         fleet_checked_at = freshness.get("fleet_checked_at") or source_bundle.get(
             "fleet_checked_at", source_bundle.get("upload_timestamp")
         )
@@ -4741,3 +5253,355 @@ def update_fleet_metrics_page(source_reference, zone_filter):
             ),
             error_fig,
         )
+
+
+def _fleet_summary_outputs_from_artifact(
+    summary_artifact,
+    zone_filter,
+    refresh_status=None,
+):
+    summaries = summary_artifact.get("summaries") or {}
+    signal_summaries = summary_artifact.get("signal_summaries") or {}
+    price_context = summary_artifact.get("price_context") or {}
+    freshness = _fleet_refresh_freshness(refresh_status)
+    comparison_rows = build_comparison_rows(summaries, zone_filter)
+    signal_rows = build_global_signal_rows(signal_summaries, zone_filter)
+    return (
+        build_status_strip(
+            freshness.get("fleet_checked_at")
+            or summary_artifact.get("fleet_checked_at")
+            or summary_artifact.get("upload_timestamp"),
+            freshness.get("signal_checked_at")
+            or summary_artifact.get("signal_checked_at")
+            or summary_artifact.get("signal_upload_timestamp"),
+            zone_filter,
+            price_context,
+            freshness.get("fleet_changed_at")
+            or summary_artifact.get("fleet_changed_at"),
+            freshness.get("signal_changed_at")
+            or summary_artifact.get("signal_changed_at"),
+        ),
+        build_summary_cards(summaries.get(zone_filter)),
+        build_price_card(price_context),
+        comparison_rows,
+        build_compact_column_defs(
+            FLEET_METRICS_REGION_COMPARISON_COLUMN_DEFS,
+            comparison_rows,
+        ),
+        build_global_signal_cards(signal_summaries.get(zone_filter)),
+        signal_rows,
+        build_compact_column_defs(
+            FLEET_METRICS_GLOBAL_SIGNALS_COLUMN_DEFS,
+            signal_rows,
+        ),
+        list(
+            (summary_artifact.get("movers_by_region") or {}).get(
+                zone_filter
+            )
+            or []
+        ),
+    )
+
+
+def _fleet_figure_outputs_from_artifacts(
+    signals_artifact,
+    detail_artifact,
+):
+    signal_figures = signals_artifact.get("figures") or {}
+    detail_figures = detail_artifact.get("figures") or {}
+    split_dimension = detail_artifact.get(
+        "split_dimension",
+        "current_subcontinents",
+    )
+    return (
+        _figure_from_snapshot(signal_figures["arrival_pipeline_fig"]),
+        _figure_from_snapshot(signal_figures["utilization_fig"]),
+        _figure_from_snapshot(signal_figures["congestion_signal_fig"]),
+        _figure_from_snapshot(signal_figures["freight_signal_fig"]),
+        _figure_from_snapshot(signal_figures["diversion_seasonal_fig"]),
+        _figure_from_snapshot(detail_figures["loaded_seasonal_fig"]),
+        _figure_from_snapshot(detail_figures["floating_seasonal_fig"]),
+        build_region_detail_matrix_legend_from_color_maps(
+            detail_artifact.get("color_maps") or {},
+            split_dimension,
+        ),
+        _figure_from_snapshot(detail_figures["detail_matrix_fig"]),
+    )
+
+
+def _fleet_summary_error_outputs(exc):
+    return (
+        html.Div(
+            f"Error loading FleetMetrics page: {exc}",
+            style={"color": "#b91c1c"},
+        ),
+        build_summary_cards(None),
+        _build_kpi_card(
+            "JKM-TTF prompt spread",
+            "-",
+            "Unavailable",
+            "warning",
+        ),
+        [],
+        build_compact_column_defs(
+            FLEET_METRICS_REGION_COMPARISON_COLUMN_DEFS,
+            [],
+        ),
+        build_global_signal_cards(None),
+        [],
+        build_compact_column_defs(
+            FLEET_METRICS_GLOBAL_SIGNALS_COLUMN_DEFS,
+            [],
+        ),
+        [],
+    )
+
+
+def _fleet_figure_error_outputs(exc):
+    error_fig = _empty_figure(
+        f"Error loading Kpler fleet metrics: {exc}"
+    )
+    return (
+        error_fig,
+        error_fig,
+        error_fig,
+        error_fig,
+        error_fig,
+        error_fig,
+        error_fig,
+        build_region_detail_matrix_legend_from_color_maps(
+            {},
+            "current_subcontinents",
+        ),
+        error_fig,
+    )
+
+
+@log_callback_timing("fleet_metrics.summary_render")
+def update_fleet_metrics_summary(
+    source_reference,
+    zone_filter,
+    refresh_status=None,
+):
+    zone_filter = zone_filter or KPLER_FLEET_DEFAULT_ZONE_FILTER
+    if zone_filter not in KPLER_FLEET_REGION_ORDER:
+        zone_filter = KPLER_FLEET_DEFAULT_ZONE_FILTER
+    try:
+        bundle_reference = _get_or_build_fleet_render_bundle(
+            source_reference
+        )
+        summary_artifact = _resolve_fleet_render_artifact(
+            bundle_reference,
+            "summary",
+        )
+        summary_outputs = _fleet_summary_outputs_from_artifact(
+            summary_artifact,
+            zone_filter,
+            refresh_status,
+        )
+        if _fleet_refresh_status_only_triggered():
+            return (
+                summary_outputs[0],
+                *((no_update,) * 9),
+            )
+        if _fleet_region_only_triggered():
+            summary_outputs = tuple(
+                no_update if index in {2, 4, 7} else value
+                for index, value in enumerate(summary_outputs)
+            )
+            return (*summary_outputs, no_update)
+        return (*summary_outputs, bundle_reference)
+    except Exception as exc:
+        logger.exception("Error loading staged Fleet metrics summary")
+        return (
+            *_fleet_summary_error_outputs(exc),
+            {
+                "format": "fleet-metrics-render-error-v1",
+                "error": str(exc),
+            },
+        )
+
+
+@log_callback_timing("fleet_metrics.figure_render")
+def update_fleet_metrics_figures(bundle_reference):
+    if not bundle_reference:
+        raise PreventUpdate
+    if (
+        isinstance(bundle_reference, dict)
+        and bundle_reference.get("format")
+        == "fleet-metrics-render-error-v1"
+    ):
+        return _fleet_figure_error_outputs(
+            bundle_reference.get("error") or "unavailable"
+        )
+    try:
+        signals_artifact = _resolve_fleet_render_artifact(
+            bundle_reference,
+            "signals",
+        )
+        detail_artifact = _resolve_fleet_render_artifact(
+            bundle_reference,
+            "detail",
+        )
+        return _fleet_figure_outputs_from_artifacts(
+            signals_artifact,
+            detail_artifact,
+        )
+    except Exception as exc:
+        logger.exception("Error loading staged Fleet metrics figures")
+        return _fleet_figure_error_outputs(exc)
+
+
+@log_callback_timing("fleet_metrics.render_snapshot_page")
+def update_fleet_metrics_page_from_render_snapshot(
+    source_reference,
+    zone_filter,
+    refresh_status=None,
+):
+    """Serve the legacy 18-output contract from immutable render artifacts."""
+
+    zone_filter = zone_filter or KPLER_FLEET_DEFAULT_ZONE_FILTER
+    if zone_filter not in KPLER_FLEET_REGION_ORDER:
+        zone_filter = KPLER_FLEET_DEFAULT_ZONE_FILTER
+    try:
+        bundle_reference = _get_or_build_fleet_render_bundle(
+            source_reference
+        )
+        summary_artifact = _resolve_fleet_render_artifact(
+            bundle_reference,
+            "summary",
+        )
+        summary_outputs = _fleet_summary_outputs_from_artifact(
+            summary_artifact,
+            zone_filter,
+            refresh_status,
+        )
+        if _fleet_refresh_status_only_triggered():
+            return (
+                summary_outputs[0],
+                *((no_update,) * 17),
+            )
+        signals_artifact = _resolve_fleet_render_artifact(
+            bundle_reference,
+            "signals",
+        )
+        detail_artifact = _resolve_fleet_render_artifact(
+            bundle_reference,
+            "detail",
+        )
+        figure_outputs = _fleet_figure_outputs_from_artifacts(
+            signals_artifact,
+            detail_artifact,
+        )
+        result = (
+            *summary_outputs[:8],
+            *figure_outputs[:5],
+            summary_outputs[8],
+            *figure_outputs[5:],
+        )
+        return _fleet_render_response(
+            result,
+            region_only=_fleet_region_only_triggered(),
+        )
+    except Exception as exc:
+        logger.exception("Error loading Fleet render snapshot page")
+        summary_outputs = _fleet_summary_error_outputs(exc)
+        figure_outputs = _fleet_figure_error_outputs(exc)
+        return (
+            *summary_outputs[:8],
+            *figure_outputs[:5],
+            summary_outputs[8],
+            *figure_outputs[5:],
+        )
+
+
+def precompute_default_fleet_metrics():
+    """Build the exact default-navigation source and render snapshots."""
+
+    today = dt.date.today()
+    source_reference, refresh_status = load_fleet_metrics_source(
+        "current_subcontinents",
+        KPLER_FLEET_DEFAULT_START_DATE.isoformat(),
+        today.isoformat(),
+        0,
+        None,
+    )
+    if not (
+        _is_snapshot_reference(source_reference)
+        and _snapshot_is_resolvable(source_reference)
+    ):
+        raise RuntimeError("Default Fleet source snapshot could not be prepared")
+    bundle_reference = _get_or_build_fleet_render_bundle(source_reference)
+    bundle = _resolve_fleet_render_bundle(bundle_reference)
+    for section in ("summary", "signals", "detail"):
+        _resolve_fleet_render_artifact(bundle_reference, section)
+    return {
+        "format": "fleet-metrics-precompute-result-v1",
+        "status": "ready",
+        "source_reference": source_reference,
+        "bundle_reference": bundle_reference,
+        "artifact_references": dict(bundle["artifacts"]),
+        "refresh_status": refresh_status,
+    }
+
+
+_FLEET_SUMMARY_CALLBACK_OUTPUTS = (
+    Output("fleet-metrics-status-strip", "children"),
+    Output("fleet-metrics-summary-cards", "children"),
+    Output("fleet-metrics-price-card", "children"),
+    Output("fleet-metrics-region-comparison-table", "rowData"),
+    Output("fleet-metrics-region-comparison-table", "columnDefs"),
+    Output("fleet-metrics-global-signal-cards", "children"),
+    Output("fleet-metrics-global-signals-table", "rowData"),
+    Output("fleet-metrics-global-signals-table", "columnDefs"),
+    Output("fleet-metrics-movers-table", "rowData"),
+)
+_FLEET_FIGURE_CALLBACK_OUTPUTS = (
+    Output("fleet-metrics-arrival-pipeline-chart", "figure"),
+    Output("fleet-metrics-utilization-chart", "figure"),
+    Output("fleet-metrics-congestion-signal-chart", "figure"),
+    Output("fleet-metrics-freight-signal-chart", "figure"),
+    Output("fleet-metrics-diversion-seasonal-chart", "figure"),
+    Output("fleet-metrics-loaded-seasonal-chart", "figure"),
+    Output("fleet-metrics-floating-seasonal-chart", "figure"),
+    Output("fleet-metrics-region-detail-matrix-legend", "children"),
+    Output("fleet-metrics-region-detail-matrix-chart", "figure"),
+)
+
+
+if _fleet_staged_render_enabled() and _fleet_render_snapshot_enabled():
+    callback(
+        *_FLEET_SUMMARY_CALLBACK_OUTPUTS,
+        Output("fleet-metrics-render-ready-store", "data"),
+        Input("fleet-metrics-source-ref-store", "data"),
+        Input("fleet-metrics-region-tabs", "value"),
+        Input("fleet-metrics-refresh-status-store", "data"),
+        prevent_initial_call=False,
+    )(update_fleet_metrics_summary)
+    callback(
+        *_FLEET_FIGURE_CALLBACK_OUTPUTS,
+        Input("fleet-metrics-render-ready-store", "data"),
+        prevent_initial_call=False,
+    )(update_fleet_metrics_figures)
+elif _fleet_render_snapshot_enabled():
+    callback(
+        *_FLEET_SUMMARY_CALLBACK_OUTPUTS[:8],
+        *_FLEET_FIGURE_CALLBACK_OUTPUTS[:5],
+        _FLEET_SUMMARY_CALLBACK_OUTPUTS[8],
+        *_FLEET_FIGURE_CALLBACK_OUTPUTS[5:],
+        Input("fleet-metrics-source-ref-store", "data"),
+        Input("fleet-metrics-region-tabs", "value"),
+        Input("fleet-metrics-refresh-status-store", "data"),
+        prevent_initial_call=False,
+    )(update_fleet_metrics_page_from_render_snapshot)
+else:
+    callback(
+        *_FLEET_SUMMARY_CALLBACK_OUTPUTS[:8],
+        *_FLEET_FIGURE_CALLBACK_OUTPUTS[:5],
+        _FLEET_SUMMARY_CALLBACK_OUTPUTS[8],
+        *_FLEET_FIGURE_CALLBACK_OUTPUTS[5:],
+        Input("fleet-metrics-source-ref-store", "data"),
+        Input("fleet-metrics-region-tabs", "value"),
+        Input("fleet-metrics-refresh-status-store", "data"),
+        prevent_initial_call=False,
+    )(update_fleet_metrics_page)

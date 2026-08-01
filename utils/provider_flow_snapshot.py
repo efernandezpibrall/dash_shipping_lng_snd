@@ -11,6 +11,7 @@ from sqlalchemy import text
 from utils.dashboard_snapshot_cache import (
     build_source_key,
     get_or_build_snapshot,
+    get_snapshot_if_available,
     resolve_snapshot,
 )
 from utils.ea_balance_catalog import build_resolved_ea_lng_balance_ctes
@@ -25,7 +26,6 @@ from utils.export_flow_data import (
 from utils.ea_run_interface import fetch_current_ea_run
 from utils.import_flow_data import (
     fetch_ea_import_flow_raw_data,
-    fetch_ea_upload_options as fetch_ea_import_upload_options,
     fetch_woodmac_import_flow_raw_data,
     fetch_woodmac_publication_options as fetch_woodmac_import_publication_options,
 )
@@ -34,6 +34,10 @@ from utils.import_flow_data import (
 LOGGER = logging.getLogger(__name__)
 NAMESPACE = "provider-flow-source-v2"
 MAX_SOURCE_STATE_RETRIES = 3
+
+
+class _ProviderFlowSourceChanged(RuntimeError):
+    """Raised before publication when provider inputs changed mid-build."""
 
 _SOURCE_STATE_QUERIES = {
     "woodmac_publication": text(f"""
@@ -221,19 +225,35 @@ def get_provider_flow_snapshot(*, force: bool = False):
     for _attempt in range(MAX_SOURCE_STATE_RETRIES):
         source_state = fetch_provider_flow_source_state()
         source_key = build_source_key(NAMESPACE, source_state)
-        reference, payload = get_or_build_snapshot(
-            engine,
-            namespace=NAMESPACE,
-            source_key=source_key,
-            builder=lambda: _build_provider_payload(source_state["current_ea"]),
-            force=force,
-            manifest={
-                "source_state": source_state,
-                "current_ea": source_state["current_ea"],
-            },
-        )
-        if fetch_provider_flow_source_state() == source_state:
-            return reference, payload
+        if not force:
+            available = get_snapshot_if_available(
+                engine,
+                namespace=NAMESPACE,
+                source_key=source_key,
+            )
+            if available is not None:
+                return available
+
+        def build_stable_payload():
+            payload = _build_provider_payload(source_state["current_ea"])
+            if fetch_provider_flow_source_state() != source_state:
+                raise _ProviderFlowSourceChanged
+            return payload
+
+        try:
+            return get_or_build_snapshot(
+                engine,
+                namespace=NAMESPACE,
+                source_key=source_key,
+                builder=build_stable_payload,
+                force=force,
+                manifest={
+                    "source_state": source_state,
+                    "current_ea": source_state["current_ea"],
+                },
+            )
+        except _ProviderFlowSourceChanged:
+            continue
     raise RuntimeError("Provider flow sources changed during snapshot construction")
 
 
@@ -246,17 +266,34 @@ def get_provider_flow_snapshot_for_state(
     if not isinstance(current_ea, dict) or "run_id" not in current_ea:
         raise ValueError("A captured current_ea state is required")
     source_key = build_source_key(NAMESPACE, source_state)
-    reference, payload = get_or_build_snapshot(
-        engine,
-        namespace=NAMESPACE,
-        source_key=source_key,
-        builder=lambda: _build_provider_payload(current_ea),
-        force=force,
-        manifest={"source_state": source_state, "current_ea": current_ea},
-    )
-    if fetch_provider_flow_source_state() != source_state:
-        raise RuntimeError("Provider flow sources changed from the captured page state")
-    return reference, payload
+    if not force:
+        available = get_snapshot_if_available(
+            engine,
+            namespace=NAMESPACE,
+            source_key=source_key,
+        )
+        if available is not None:
+            return available
+
+    def build_stable_payload():
+        payload = _build_provider_payload(current_ea)
+        if fetch_provider_flow_source_state() != source_state:
+            raise _ProviderFlowSourceChanged(
+                "Provider flow sources changed from the captured page state"
+            )
+        return payload
+
+    try:
+        return get_or_build_snapshot(
+            engine,
+            namespace=NAMESPACE,
+            source_key=source_key,
+            builder=build_stable_payload,
+            force=force,
+            manifest={"source_state": source_state, "current_ea": current_ea},
+        )
+    except _ProviderFlowSourceChanged as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def resolve_provider_flow_snapshot(value):

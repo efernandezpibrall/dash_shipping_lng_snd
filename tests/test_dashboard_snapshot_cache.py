@@ -1281,7 +1281,7 @@ def test_cross_process_single_flight_builds_once_and_reuses_exact_revision(
                 result_queue,
             ),
         )
-        for _ in range(2)
+        for _ in range(4)
     ]
     for process in processes:
         process.start()
@@ -1291,7 +1291,7 @@ def test_cross_process_single_flight_builds_once_and_reuses_exact_revision(
         process.join(timeout=15)
         assert process.exitcode == 0
 
-    assert [result[0] for result in results] == ["ok", "ok"]
+    assert [result[0] for result in results] == ["ok"] * 4
     references = [result[1] for result in results]
     assert references[0] == references[1]
     assert isinstance(references[0]["revision"], str)
@@ -1301,8 +1301,7 @@ def test_cross_process_single_flight_builds_once_and_reuses_exact_revision(
     assert builder_calls.value == 1
     assert [result[2] for result in results] == [
         {"rows": [1, 2, 3]},
-        {"rows": [1, 2, 3]},
-    ]
+    ] * 4
 
 
 def test_atomic_cache_initialization_spawn_stress_uses_shared_disk(
@@ -1347,3 +1346,254 @@ def test_atomic_cache_initialization_spawn_stress_uses_shared_disk(
         assert builder_calls.value == 1
         marker = cache_directory / snapshots._CACHE_MARKER_NAME
         assert marker.read_bytes() == snapshots._CACHE_MARKER_CONTENT
+
+
+def test_snapshot_result_reports_compatible_detailed_outcomes(
+    monkeypatch,
+    tmp_path,
+):
+    _enable_persistence(monkeypatch, tmp_path)
+    builder_calls = 0
+
+    def builder():
+        nonlocal builder_calls
+        builder_calls += 1
+        return {"rows": [1, 2, 3]}
+
+    built = snapshots.get_or_build_snapshot_result(
+        _UnavailableEngine(),
+        namespace="detailed-result-test",
+        source_key="source",
+        builder=builder,
+    )
+    snapshots.clear_local_snapshots()
+    hit = snapshots.get_or_build_snapshot_result(
+        _UnavailableEngine(),
+        namespace="detailed-result-test",
+        source_key="source",
+        builder=builder,
+    )
+
+    assert built.status == "built"
+    assert hit.status == "hit"
+    assert built.backend == hit.backend == "disk"
+    assert built.reference == hit.reference
+    assert built.payload == hit.payload == {"rows": [1, 2, 3]}
+    assert builder_calls == 1
+    assert built.build_ms >= 0
+    assert hit.build_ms == 0
+    assert built.encoded_bytes and built.encoded_bytes > 0
+    assert built.decoded_bytes > 0
+
+
+def test_structured_events_distinguish_memory_disk_build_and_decode(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    _enable_persistence(monkeypatch, tmp_path)
+    caplog.set_level("INFO", logger=snapshots.LOGGER.name)
+    snapshots.get_or_build_snapshot(
+        _UnavailableEngine(),
+        namespace="structured-event-test",
+        source_key="source",
+        builder=lambda: {"rows": [1, 2, 3]},
+    )
+    snapshots.get_or_build_snapshot(
+        _UnavailableEngine(),
+        namespace="structured-event-test",
+        source_key="source",
+        builder=lambda: (_ for _ in ()).throw(AssertionError),
+    )
+    snapshots.clear_local_snapshots()
+    snapshots.get_or_build_snapshot(
+        _UnavailableEngine(),
+        namespace="structured-event-test",
+        source_key="source",
+        builder=lambda: (_ for _ in ()).throw(AssertionError),
+    )
+
+    events = []
+    for record in caplog.records:
+        marker = "dashboard_snapshot_event "
+        message = record.getMessage()
+        if marker not in message:
+            continue
+        events.append(json.loads(message.split(marker, 1)[1]))
+    namespace_events = {
+        event["event"]
+        for event in events
+        if event.get("namespace") == "structured-event-test"
+    }
+    assert {
+        "miss",
+        "built",
+        "memory_hit",
+        "disk_hit",
+        "decoding",
+        "lock_wait",
+    } <= namespace_events
+
+
+def test_staged_publication_advances_all_latest_pointers_only_on_commit(
+    monkeypatch,
+    tmp_path,
+):
+    _enable_persistence(monkeypatch, tmp_path)
+    old_reference, _ = snapshots.get_or_build_snapshot(
+        _UnavailableEngine(),
+        namespace="atomic-artifact-test",
+        source_key="source",
+        builder=lambda: {"generation": "old"},
+    )
+
+    with snapshots.stage_snapshot_publication("atomic-test") as stage:
+        new_reference, _ = snapshots.get_or_build_snapshot(
+            _UnavailableEngine(),
+            namespace="atomic-artifact-test",
+            source_key="source",
+            builder=lambda: {"generation": "new"},
+            force=True,
+        )
+        snapshots.clear_local_snapshots()
+        before_commit = snapshots.get_snapshot_if_available(
+            _UnavailableEngine(),
+            namespace="atomic-artifact-test",
+            source_key="source",
+        )
+        assert before_commit[0] == old_reference
+        assert before_commit[1] == {"generation": "old"}
+
+        bundle_reference = snapshots.commit_snapshot_publication_stage(
+            stage,
+            bundle_namespace="atomic-bundle-test",
+            bundle_source_key="bundle-source",
+            bundle_payload={"artifact": new_reference},
+        )
+
+    snapshots.clear_local_snapshots()
+    after_commit = snapshots.get_snapshot_if_available(
+        _UnavailableEngine(),
+        namespace="atomic-artifact-test",
+        source_key="source",
+    )
+    assert after_commit[0] == new_reference
+    assert after_commit[1] == {"generation": "new"}
+    assert snapshots.resolve_snapshot(
+        bundle_reference,
+        _UnavailableEngine(),
+    )["artifact"] == new_reference
+
+
+def test_abandoned_stage_keeps_prior_generation_and_pruning_is_safe(
+    monkeypatch,
+    tmp_path,
+):
+    _enable_persistence(monkeypatch, tmp_path)
+    old_reference, _ = snapshots.get_or_build_snapshot(
+        _UnavailableEngine(),
+        namespace="prune-artifact-test",
+        source_key="source",
+        builder=lambda: {"generation": "old"},
+    )
+
+    real_datetime = dt.datetime
+
+    class _OldDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = real_datetime.now(tz) - dt.timedelta(days=8)
+            return cls.fromtimestamp(value.timestamp(), tz=tz)
+
+    monkeypatch.setattr(snapshots.dt, "datetime", _OldDateTime)
+    with snapshots.stage_snapshot_publication("abandoned-test"):
+        abandoned_reference, _ = snapshots.get_or_build_snapshot(
+            _UnavailableEngine(),
+            namespace="prune-artifact-test",
+            source_key="source",
+            builder=lambda: {"generation": "abandoned"},
+            force=True,
+        )
+    monkeypatch.setattr(snapshots.dt, "datetime", real_datetime)
+
+    inspection = snapshots.inspect_persistent_snapshot_cache()
+    assert any(
+        record
+        for record in inspection["records"]
+        if record["revision"] == abandoned_reference["revision"]
+    )
+    dry_run = snapshots.prune_persistent_snapshot_cache(apply=False)
+    assert dry_run["candidate_count"] == 1
+    assert dry_run["deleted_count"] == 0
+    assert snapshots.resolve_snapshot(
+        abandoned_reference,
+        _UnavailableEngine(),
+    ) == {"generation": "abandoned"}
+
+    applied = snapshots.prune_persistent_snapshot_cache(apply=True)
+    assert applied["candidate_count"] == 1
+    assert applied["deleted_count"] == 1
+    snapshots.clear_local_snapshots()
+    latest = snapshots.get_snapshot_if_available(
+        _UnavailableEngine(),
+        namespace="prune-artifact-test",
+        source_key="source",
+    )
+    assert latest[0] == old_reference
+    assert latest[1] == {"generation": "old"}
+    with pytest.raises(snapshots.SnapshotUnavailable):
+        snapshots.resolve_snapshot(
+            abandoned_reference,
+            _UnavailableEngine(),
+        )
+
+
+def test_cache_inspection_does_not_refresh_record_access_time(
+    monkeypatch,
+    tmp_path,
+):
+    _enable_persistence(monkeypatch, tmp_path)
+    reference, _ = snapshots.get_or_build_snapshot(
+        _UnavailableEngine(),
+        namespace="inspection-read-only-test",
+        source_key="source",
+        builder=lambda: {"ok": True},
+    )
+    inspection = snapshots.inspect_persistent_snapshot_cache()
+    record = next(
+        item
+        for item in inspection["records"]
+        if item["revision"] == reference["revision"]
+    )
+    stores = snapshots._get_persistent_stores()
+    before = stores.cache._sql(
+        "SELECT access_time FROM Cache WHERE key = ?",
+        (record["_record_key"],),
+    ).fetchone()[0]
+
+    snapshots.inspect_persistent_snapshot_cache()
+
+    after = stores.cache._sql(
+        "SELECT access_time FROM Cache WHERE key = ?",
+        (record["_record_key"],),
+    ).fetchone()[0]
+    assert after == before
+
+
+def test_retired_namespace_apply_requires_coordinated_restart(
+    monkeypatch,
+    tmp_path,
+):
+    _enable_persistence(monkeypatch, tmp_path)
+    snapshots.get_or_build_snapshot(
+        _UnavailableEngine(),
+        namespace="retired-test",
+        source_key="source",
+        builder=lambda: {"ok": True},
+    )
+
+    with pytest.raises(ValueError, match="coordinated worker restart"):
+        snapshots.prune_persistent_snapshot_cache(
+            apply=True,
+            retired_namespaces=["retired-test"],
+        )

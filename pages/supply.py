@@ -43,6 +43,9 @@ from utils.historical_comparison_snapshot import (
     get_historical_comparison_frame as _get_historical_comparison_frame,
 )
 from utils.performance import log_callback_timing
+from utils.performance_flags import (
+    revision_aware_refresh_enabled as _revision_aware_refresh_enabled,
+)
 from utils.snapshot_controls import (
     build_ea_metadata_lines as _build_ea_metadata_lines,
     build_woodmac_metadata_lines as _build_woodmac_metadata_lines,
@@ -1265,10 +1268,12 @@ def load_balance_source_data(_):
     }
     errors = []
 
-    force_refresh = _was_global_refresh_triggered()
     try:
         provider_reference, provider_payload = _get_provider_flow_snapshot(
-            force=force_refresh,
+            force=(
+                not _revision_aware_refresh_enabled()
+                and _was_global_refresh_triggered()
+            )
         )
         if not _snapshot_is_resolvable(provider_reference):
             raise _SnapshotUnavailable(

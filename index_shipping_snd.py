@@ -24,6 +24,9 @@ import pages.supply
 import pages.terminal_adjustments
 import pages.train_names_mapping
 
+# Gunicorn imports this module-level WSGI object in the four-worker profile.
+server = app.server
+
 
 @dataclass(frozen=True)
 class PageSpec:

@@ -18,6 +18,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager, suppress
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 import base64
 import datetime as dt
 import fcntl
@@ -33,7 +35,7 @@ import threading
 import time
 import uuid
 import zlib
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -61,6 +63,8 @@ DISK_MAX_BYTES_ENV = "DASHBOARD_SNAPSHOT_DISK_MAX_BYTES"
 DEFAULT_MEMORY_MAX_BYTES = 512 * 1024 * 1024
 DEFAULT_DISK_MAX_BYTES = 2 * 1024 * 1024 * 1024
 DISK_RECORD_FORMAT = "dashboard_snapshot_disk_record_v2"
+SNAPSHOT_EVENT_FORMAT = "dashboard_snapshot_event_v1"
+PUBLICATION_BUNDLE_FORMAT = "dashboard_snapshot_bundle_v1"
 _DISK_HEADER_LENGTH_BYTES = 8
 _DISK_RECORD_CHECKSUM_BYTES = 32
 _CACHE_MARKER_NAME = ".dashboard-snapshot-cache-v1"
@@ -83,6 +87,17 @@ _SHARED_SCHEMA_STATE: dict[int, bool] = {}
 _PERSISTENT_STORES = None
 _PERSISTENT_STORES_CONFIG: tuple[str, int] | None = None
 _PERSISTENT_STORES_LOCK = threading.RLock()
+_ACTIVE_PUBLICATION_STAGE: ContextVar["SnapshotPublicationStage | None"] = (
+    ContextVar("dashboard_snapshot_publication_stage", default=None)
+)
+_SNAPSHOT_LOCK_WAIT_MS: ContextVar[float] = ContextVar(
+    "dashboard_snapshot_lock_wait_ms",
+    default=0.0,
+)
+_SNAPSHOT_READ_BACKEND: ContextVar[str | None] = ContextVar(
+    "dashboard_snapshot_read_backend",
+    default=None,
+)
 
 
 class SnapshotUnavailable(RuntimeError):
@@ -91,6 +106,76 @@ class SnapshotUnavailable(RuntimeError):
 
 class _PersistentStorageError(SnapshotUnavailable):
     """Raised when local persistence itself is unavailable."""
+
+
+@dataclass(frozen=True)
+class SnapshotResult:
+    """Detailed outcome for one immutable snapshot lookup or build."""
+
+    reference: dict[str, Any]
+    payload: Any
+    status: str
+    backend: str
+    read_ms: float
+    build_ms: float
+    lock_wait_ms: float
+    encoded_bytes: int | None
+    decoded_bytes: int
+
+
+@dataclass(frozen=True)
+class _StagedPublicationRecord:
+    namespace: str
+    source_key: str
+    revision: str
+
+
+@dataclass
+class SnapshotPublicationStage:
+    """Collect immutable records before atomically advancing their pointers."""
+
+    name: str
+    stage_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    records: dict[tuple[str, str], _StagedPublicationRecord] = field(
+        default_factory=dict
+    )
+    committed: bool = False
+
+    def register(
+        self,
+        namespace: str,
+        source_key: str,
+        revision: str,
+    ) -> None:
+        identity = (namespace, source_key)
+        existing = self.records.get(identity)
+        if existing is not None and existing.revision != revision:
+            raise SnapshotUnavailable(
+                "A publication stage cannot contain two revisions for the "
+                f"same snapshot identity: {namespace}/{source_key}"
+            )
+        self.records[identity] = _StagedPublicationRecord(
+            namespace=namespace,
+            source_key=source_key,
+            revision=revision,
+        )
+
+
+def _emit_snapshot_event(event: str, **fields: Any) -> None:
+    payload = {
+        "format": SNAPSHOT_EVENT_FORMAT,
+        "event": event,
+        **fields,
+    }
+    LOGGER.info(
+        "dashboard_snapshot_event %s",
+        json.dumps(
+            _normalize_key_value(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
 
 
 def _validate_cache_marker(root: Path, marker: Path) -> None:
@@ -759,7 +844,8 @@ def _cache_local(
             _LOCAL_LATEST[(namespace, source_key)] = revision
         while _LOCAL_TOTAL_BYTES > max_bytes and _LOCAL_PAYLOADS:
             oldest_key, _ = _LOCAL_PAYLOADS.popitem(last=False)
-            _LOCAL_TOTAL_BYTES -= _LOCAL_SIZES.pop(oldest_key, 0)
+            evicted_bytes = _LOCAL_SIZES.pop(oldest_key, 0)
+            _LOCAL_TOTAL_BYTES -= evicted_bytes
             _LOCAL_MANIFESTS.pop(oldest_key, None)
             _LOCAL_SHARED.pop(oldest_key, None)
             _LOCAL_BACKENDS.pop(oldest_key, None)
@@ -767,6 +853,15 @@ def _cache_local(
             latest_key = (oldest_namespace, oldest_source_key)
             if _LOCAL_LATEST.get(latest_key) == oldest_revision:
                 _LOCAL_LATEST.pop(latest_key, None)
+            _emit_snapshot_event(
+                "memory_eviction",
+                namespace=oldest_namespace,
+                source_key=oldest_source_key,
+                revision=oldest_revision,
+                decoded_bytes=evicted_bytes,
+                memory_bytes=_LOCAL_TOTAL_BYTES,
+                memory_limit_bytes=max_bytes,
+            )
 
 
 def _get_local(
@@ -873,10 +968,13 @@ def _encode_disk_record(
     revision: str,
     payload: Any,
     manifest: Mapping[str, Any] | None,
+    *,
+    publication_stage: str | None = None,
 ) -> bytes:
     encoded_payload = encode_snapshot_payload(payload)
     header = {
         "codec": PAYLOAD_CODEC,
+        "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "format": DISK_RECORD_FORMAT,
         "manifest": dict(manifest or {}),
         "namespace": namespace,
@@ -885,6 +983,8 @@ def _encode_disk_record(
         "revision": _validate_disk_revision_token(revision),
         "source_key": source_key,
     }
+    if publication_stage is not None:
+        header["publication_stage"] = str(publication_stage)
     header_bytes = json.dumps(
         header,
         ensure_ascii=False,
@@ -903,6 +1003,45 @@ def _encode_disk_record(
     )
 
 
+def _decode_disk_record_header(
+    raw_record: Any,
+    *,
+    verify_checksum: bool = True,
+) -> tuple[dict[str, Any], bytes]:
+    if not isinstance(raw_record, bytes):
+        raise TypeError("record is not raw bytes")
+    minimum_record_bytes = (
+        _DISK_HEADER_LENGTH_BYTES + _DISK_RECORD_CHECKSUM_BYTES
+    )
+    if len(raw_record) < minimum_record_bytes:
+        raise ValueError("record header is truncated")
+    header_size = int.from_bytes(
+        raw_record[:_DISK_HEADER_LENGTH_BYTES],
+        "big",
+    )
+    checksum_start = _DISK_HEADER_LENGTH_BYTES
+    checksum_end = checksum_start + _DISK_RECORD_CHECKSUM_BYTES
+    expected_checksum = raw_record[checksum_start:checksum_end]
+    header_start = checksum_end
+    header_end = header_start + header_size
+    if header_size <= 0 or header_end > len(raw_record):
+        raise ValueError("record header length is invalid")
+    header_bytes = raw_record[header_start:header_end]
+    encoded_payload = raw_record[header_end:]
+    if verify_checksum:
+        actual_checksum = hashlib.sha256(
+            header_bytes + encoded_payload
+        ).digest()
+        if expected_checksum != actual_checksum:
+            raise ValueError(
+                "record header or payload checksum does not match"
+            )
+    header = json.loads(header_bytes.decode("utf-8"))
+    if not isinstance(header, Mapping):
+        raise ValueError("record header is invalid")
+    return dict(header), encoded_payload
+
+
 def _decode_disk_record(
     raw_record: Any,
     *,
@@ -913,32 +1052,7 @@ def _decode_disk_record(
     revision = _validate_disk_revision_token(revision)
     identity = f"{namespace}/{source_key}/{revision}"
     try:
-        if not isinstance(raw_record, bytes):
-            raise TypeError("record is not raw bytes")
-        minimum_record_bytes = (
-            _DISK_HEADER_LENGTH_BYTES + _DISK_RECORD_CHECKSUM_BYTES
-        )
-        if len(raw_record) < minimum_record_bytes:
-            raise ValueError("record header is truncated")
-        header_size = int.from_bytes(
-            raw_record[:_DISK_HEADER_LENGTH_BYTES],
-            "big",
-        )
-        checksum_start = _DISK_HEADER_LENGTH_BYTES
-        checksum_end = checksum_start + _DISK_RECORD_CHECKSUM_BYTES
-        expected_checksum = raw_record[checksum_start:checksum_end]
-        header_start = checksum_end
-        header_end = header_start + header_size
-        if header_size <= 0 or header_end > len(raw_record):
-            raise ValueError("record header length is invalid")
-        header_bytes = raw_record[header_start:header_end]
-        encoded_payload = raw_record[header_end:]
-        actual_checksum = hashlib.sha256(
-            header_bytes + encoded_payload
-        ).digest()
-        if expected_checksum != actual_checksum:
-            raise ValueError("record header or payload checksum does not match")
-        header = json.loads(header_bytes.decode("utf-8"))
+        header, encoded_payload = _decode_disk_record_header(raw_record)
         if header.get("format") != DISK_RECORD_FORMAT:
             raise ValueError("record format is unsupported")
         if header.get("codec") != PAYLOAD_CODEC:
@@ -994,6 +1108,13 @@ def _disk_latest_revision(
         TypeError,
         UnicodeDecodeError,
     ) as exc:
+        _emit_snapshot_event(
+            "corruption",
+            namespace=namespace,
+            source_key=source_key,
+            backend="disk",
+            target="latest_pointer",
+        )
         raise SnapshotUnavailable(
             f"Snapshot {namespace}/{source_key} has a corrupt latest pointer"
         ) from exc
@@ -1020,11 +1141,38 @@ def _disk_read_exact(
         ) from exc
     if raw_record is _MISSING:
         return None
-    payload, manifest = _decode_disk_record(
-        raw_record,
+    decode_started = time.perf_counter()
+    try:
+        payload, manifest = _decode_disk_record(
+            raw_record,
+            namespace=namespace,
+            source_key=source_key,
+            revision=revision,
+        )
+    except SnapshotUnavailable:
+        _emit_snapshot_event(
+            "corruption",
+            namespace=namespace,
+            source_key=source_key,
+            revision=revision,
+            backend="disk",
+            encoded_bytes=(
+                len(raw_record) if isinstance(raw_record, bytes) else None
+            ),
+        )
+        raise
+    _emit_snapshot_event(
+        "decoding",
         namespace=namespace,
         source_key=source_key,
         revision=revision,
+        backend="disk",
+        decode_ms=round(
+            (time.perf_counter() - decode_started) * 1000,
+            3,
+        ),
+        encoded_bytes=len(raw_record),
+        decoded_bytes=_estimate_decoded_bytes(payload),
     )
     _cache_local(
         namespace,
@@ -1076,12 +1224,18 @@ def _disk_publish(
     payload: Any,
     manifest: Mapping[str, Any] | None,
 ) -> int:
+    publication_stage = _ACTIVE_PUBLICATION_STAGE.get()
     raw_record = _encode_disk_record(
         namespace,
         source_key,
         revision,
         payload,
         manifest,
+        publication_stage=(
+            publication_stage.stage_id
+            if publication_stage is not None
+            else None
+        ),
     )
     record_key = _disk_record_key(namespace, source_key, revision)
     try:
@@ -1105,13 +1259,14 @@ def _disk_publish(
                 raise OSError(
                     "diskcache rejected duplicate snapshot revision"
                 )
-            published = stores.cache.set(
-                _disk_latest_key(namespace, source_key),
-                revision.encode("ascii"),
-                retry=True,
-            )
-            if not published:
-                raise OSError("diskcache rejected the latest pointer")
+            if publication_stage is None:
+                published = stores.cache.set(
+                    _disk_latest_key(namespace, source_key),
+                    revision.encode("ascii"),
+                    retry=True,
+                )
+                if not published:
+                    raise OSError("diskcache rejected the latest pointer")
             persisted = stores.cache.get(
                 record_key,
                 default=_MISSING,
@@ -1121,20 +1276,194 @@ def _disk_publish(
                 raise OSError(
                     "snapshot record was evicted before publication"
                 )
-            persisted_revision = stores.cache.get(
-                _disk_latest_key(namespace, source_key),
-                default=_MISSING,
-                retry=True,
-            )
-            if persisted_revision != revision.encode("ascii"):
-                raise OSError(
-                    "latest pointer was evicted before publication"
+            if publication_stage is None:
+                persisted_revision = stores.cache.get(
+                    _disk_latest_key(namespace, source_key),
+                    default=_MISSING,
+                    retry=True,
                 )
+                if persisted_revision != revision.encode("ascii"):
+                    raise OSError(
+                        "latest pointer was evicted before publication"
+                    )
     except Exception as exc:
         raise _PersistentStorageError(
             f"Snapshot {namespace}/{source_key}/{revision} could not be persisted"
         ) from exc
+    if publication_stage is not None:
+        publication_stage.register(namespace, source_key, revision)
     return len(raw_record)
+
+
+@contextmanager
+def stage_snapshot_publication(name: str):
+    """Stage immutable records until a bundle commit advances all pointers."""
+
+    if not local_snapshot_persistence_enabled():
+        raise SnapshotUnavailable(
+            "Atomic snapshot publication requires local persistent storage"
+        )
+    if _ACTIVE_PUBLICATION_STAGE.get() is not None:
+        raise SnapshotUnavailable("Nested snapshot publication stages are unsupported")
+    _get_persistent_stores()
+    stage = SnapshotPublicationStage(name=str(name))
+    token = _ACTIVE_PUBLICATION_STAGE.set(stage)
+    try:
+        yield stage
+    finally:
+        _ACTIVE_PUBLICATION_STAGE.reset(token)
+        if not stage.committed and stage.records:
+            _emit_snapshot_event(
+                "publication_abandoned",
+                stage_id=stage.stage_id,
+                stage_name=stage.name,
+                record_count=len(stage.records),
+            )
+
+
+def _advance_local_latest(
+    namespace: str,
+    source_key: str,
+    revision: int | str,
+) -> None:
+    with _LOCAL_LOCK:
+        if (namespace, source_key, revision) in _LOCAL_PAYLOADS:
+            _LOCAL_LATEST[(namespace, source_key)] = revision
+
+
+def commit_snapshot_publication_stage(
+    stage: SnapshotPublicationStage,
+    *,
+    bundle_namespace: str,
+    bundle_source_key: str,
+    bundle_payload: Mapping[str, Any],
+    bundle_manifest: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically publish staged records and one immutable bundle manifest."""
+
+    if stage is not _ACTIVE_PUBLICATION_STAGE.get():
+        raise SnapshotUnavailable(
+            "The snapshot publication stage is not active in this context"
+        )
+    if stage.committed:
+        raise SnapshotUnavailable("The snapshot publication stage is already committed")
+
+    stores = _get_persistent_stores()
+    bundle_revision = _new_local_revision_token()
+    normalized_bundle = {
+        "format": PUBLICATION_BUNDLE_FORMAT,
+        **dict(bundle_payload),
+    }
+    normalized_manifest = _prepare_manifest(
+        bundle_manifest,
+        normalized_bundle,
+    )
+    raw_bundle_record = _encode_disk_record(
+        bundle_namespace,
+        bundle_source_key,
+        bundle_revision,
+        normalized_bundle,
+        normalized_manifest,
+        publication_stage=stage.stage_id,
+    )
+    bundle_record_key = _disk_record_key(
+        bundle_namespace,
+        bundle_source_key,
+        bundle_revision,
+    )
+    staged_records = list(stage.records.values())
+    try:
+        with stores.cache.transact(retry=True):
+            for record in staged_records:
+                persisted = stores.cache.get(
+                    _disk_record_key(
+                        record.namespace,
+                        record.source_key,
+                        record.revision,
+                    ),
+                    default=_MISSING,
+                    retry=True,
+                )
+                if persisted is _MISSING:
+                    raise OSError(
+                        "staged snapshot record was evicted before bundle commit"
+                    )
+
+            stored = stores.cache.add(
+                bundle_record_key,
+                raw_bundle_record,
+                retry=True,
+            )
+            if not stored:
+                raise OSError("diskcache rejected the bundle record")
+
+            for record in staged_records:
+                if not stores.cache.set(
+                    _disk_latest_key(record.namespace, record.source_key),
+                    record.revision.encode("ascii"),
+                    retry=True,
+                ):
+                    raise OSError(
+                        "diskcache rejected a staged latest pointer"
+                    )
+            if not stores.cache.set(
+                _disk_latest_key(bundle_namespace, bundle_source_key),
+                bundle_revision.encode("ascii"),
+                retry=True,
+            ):
+                raise OSError("diskcache rejected the bundle latest pointer")
+
+            if stores.cache.get(
+                bundle_record_key,
+                default=_MISSING,
+                retry=True,
+            ) != raw_bundle_record:
+                raise OSError("bundle record was evicted before publication")
+            for record in staged_records:
+                if stores.cache.get(
+                    _disk_latest_key(record.namespace, record.source_key),
+                    default=_MISSING,
+                    retry=True,
+                ) != record.revision.encode("ascii"):
+                    raise OSError("staged latest pointer verification failed")
+    except Exception as exc:
+        raise _PersistentStorageError(
+            f"Snapshot bundle {bundle_namespace}/{bundle_source_key} "
+            "could not be committed"
+        ) from exc
+
+    _cache_local(
+        bundle_namespace,
+        bundle_source_key,
+        bundle_revision,
+        normalized_bundle,
+        normalized_manifest,
+        shared=True,
+        backend="disk",
+    )
+    for record in staged_records:
+        _advance_local_latest(
+            record.namespace,
+            record.source_key,
+            record.revision,
+        )
+    stage.committed = True
+    _emit_snapshot_event(
+        "publication_committed",
+        stage_id=stage.stage_id,
+        stage_name=stage.name,
+        bundle_namespace=bundle_namespace,
+        bundle_source_key=bundle_source_key,
+        bundle_revision=bundle_revision,
+        record_count=len(staged_records),
+        encoded_bytes=len(raw_bundle_record),
+    )
+    return _snapshot_ref(
+        bundle_namespace,
+        bundle_source_key,
+        bundle_revision,
+        shared=True,
+    )
 
 
 @contextmanager
@@ -1169,7 +1498,20 @@ def _disk_source_lock(
         with os.fdopen(file_descriptor, "a+b", buffering=0) as lock_file:
             file_descriptor = -1
             try:
+                wait_started = time.perf_counter()
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                lock_wait_ms = (
+                    time.perf_counter() - wait_started
+                ) * 1000
+                _SNAPSHOT_LOCK_WAIT_MS.set(
+                    _SNAPSHOT_LOCK_WAIT_MS.get() + lock_wait_ms
+                )
+                _emit_snapshot_event(
+                    "lock_wait",
+                    namespace=namespace,
+                    source_key=source_key,
+                    lock_wait_ms=round(lock_wait_ms, 3),
+                )
             except OSError as exc:
                 raise _PersistentStorageError(
                     f"Dashboard snapshot lock acquisition failed at {lock_path}"
@@ -1182,6 +1524,18 @@ def _disk_source_lock(
     finally:
         if file_descriptor >= 0:
             os.close(file_descriptor)
+
+
+@contextmanager
+def snapshot_build_lock(namespace: str, source_key: str):
+    """Acquire the shared same-host build lock for a compound artifact."""
+
+    if not local_snapshot_persistence_enabled():
+        yield
+        return
+    stores = _get_persistent_stores()
+    with _disk_source_lock(stores, namespace, source_key):
+        yield
 
 
 def shared_snapshot_schema_available(engine) -> bool:
@@ -1250,7 +1604,33 @@ def _decode_shared_row(row, namespace: str, source_key: str):
     if codec != PAYLOAD_CODEC:
         raise SnapshotUnavailable(f"Unsupported dashboard snapshot codec: {codec}")
     revision = int(mapping["revision"])
-    payload = decode_snapshot_payload(mapping["payload_bytea"])
+    encoded_payload = mapping["payload_bytea"]
+    decode_started = time.perf_counter()
+    try:
+        payload = decode_snapshot_payload(encoded_payload)
+    except Exception:
+        _emit_snapshot_event(
+            "corruption",
+            namespace=namespace,
+            source_key=source_key,
+            revision=revision,
+            backend="postgres",
+            encoded_bytes=len(encoded_payload),
+        )
+        raise
+    _emit_snapshot_event(
+        "decoding",
+        namespace=namespace,
+        source_key=source_key,
+        revision=revision,
+        backend="postgres",
+        decode_ms=round(
+            (time.perf_counter() - decode_started) * 1000,
+            3,
+        ),
+        encoded_bytes=len(encoded_payload),
+        decoded_bytes=_estimate_decoded_bytes(payload),
+    )
     manifest = dict(mapping["manifest_jsonb"] or {})
     _cache_local(
         namespace,
@@ -1324,7 +1704,23 @@ def _run_single_flight(key: tuple[str, str, bool], builder: Callable[[], Any]) -
         else:
             leader = False
     if not leader:
-        return future.result()
+        wait_started = time.perf_counter()
+        try:
+            return future.result()
+        finally:
+            lock_wait_ms = (
+                time.perf_counter() - wait_started
+            ) * 1000
+            _SNAPSHOT_LOCK_WAIT_MS.set(
+                _SNAPSHOT_LOCK_WAIT_MS.get() + lock_wait_ms
+            )
+            _emit_snapshot_event(
+                "lock_wait",
+                namespace=key[0],
+                source_key=key[1],
+                backend="memory_single_flight",
+                lock_wait_ms=round(lock_wait_ms, 3),
+            )
     try:
         result = builder()
         future.set_result(result)
@@ -1410,6 +1806,14 @@ def _get_or_build_legacy_snapshot(
                     "Shared dashboard snapshot read failed; using local fallback",
                     exc_info=True,
                 )
+                _emit_snapshot_event(
+                    "fallback",
+                    namespace=namespace,
+                    source_key=source_key,
+                    from_backend="postgres",
+                    to_backend="memory",
+                    reason="read_failed",
+                )
                 return build_local()
             if shared is not None:
                 revision, payload, _ = shared
@@ -1494,10 +1898,26 @@ def _get_or_build_legacy_snapshot(
                     "Shared dashboard snapshot storage unavailable; using local fallback",
                     exc_info=True,
                 )
+                _emit_snapshot_event(
+                    "fallback",
+                    namespace=namespace,
+                    source_key=source_key,
+                    from_backend="postgres",
+                    to_backend="memory",
+                    reason="storage_failed",
+                )
                 return build_local()
             LOGGER.warning(
                 "Shared dashboard snapshot publish failed; retaining prepared data locally",
                 exc_info=True,
+            )
+            _emit_snapshot_event(
+                "fallback",
+                namespace=namespace,
+                source_key=source_key,
+                from_backend="postgres",
+                to_backend="memory",
+                reason="publish_failed",
             )
             return build_local(payload, has_prebuilt=True)
 
@@ -1601,6 +2021,27 @@ def _get_or_build_persistent_snapshot(
 ) -> tuple[dict[str, Any], Any]:
     request_started = time.perf_counter()
     _memory_max_bytes()
+    publication_stage = _ACTIVE_PUBLICATION_STAGE.get()
+    if publication_stage is not None:
+        staged_record = publication_stage.records.get(
+            (namespace, source_key)
+        )
+        if staged_record is not None:
+            staged_local = _get_local(
+                namespace,
+                source_key,
+                staged_record.revision,
+            )
+            if staged_local is not None:
+                return (
+                    _snapshot_ref(
+                        namespace,
+                        source_key,
+                        staged_record.revision,
+                        shared=True,
+                    ),
+                    staged_local[1],
+                )
     if not force:
         local = _get_local(namespace, source_key)
         if local is not None:
@@ -1628,6 +2069,14 @@ def _get_or_build_persistent_snapshot(
             "Local dashboard snapshot persistence is unavailable; "
             "using process memory without probing Postgres",
             exc_info=True,
+        )
+        _emit_snapshot_event(
+            "fallback",
+            namespace=namespace,
+            source_key=source_key,
+            from_backend="disk",
+            to_backend="memory",
+            reason="initialization_failed",
         )
         return _get_or_build_memory_only_snapshot(
             namespace=namespace,
@@ -1673,6 +2122,14 @@ def _get_or_build_persistent_snapshot(
             "Local dashboard snapshot read failed; using process memory "
             "without probing Postgres",
             exc_info=True,
+        )
+        _emit_snapshot_event(
+            "fallback",
+            namespace=namespace,
+            source_key=source_key,
+            from_backend="disk",
+            to_backend="memory",
+            reason="read_failed",
         )
         return _get_or_build_memory_only_snapshot(
             namespace=namespace,
@@ -1748,6 +2205,14 @@ def _get_or_build_persistent_snapshot(
                     "memory without probing Postgres",
                     exc_info=True,
                 )
+                _emit_snapshot_event(
+                    "fallback",
+                    namespace=namespace,
+                    source_key=source_key,
+                    from_backend="disk",
+                    to_backend="memory",
+                    reason="lock_or_storage_failed",
+                )
                 return _build_memory_snapshot_result(
                     namespace=namespace,
                     source_key=source_key,
@@ -1775,6 +2240,14 @@ def _get_or_build_persistent_snapshot(
                     "Local dashboard snapshot publish failed; "
                     "retaining prepared data in process memory",
                     exc_info=True,
+                )
+                _emit_snapshot_event(
+                    "fallback",
+                    namespace=namespace,
+                    source_key=source_key,
+                    from_backend="disk",
+                    to_backend="memory",
+                    reason="publish_failed",
                 )
                 local_revision = _new_local_revision_token()
                 _cache_local(
@@ -1804,6 +2277,7 @@ def _get_or_build_persistent_snapshot(
                 payload_manifest,
                 shared=True,
                 backend="disk",
+                advance_latest=publication_stage is None,
             )
             LOGGER.info(
                 "dashboard_snapshot build namespace=%s source_key=%s "
@@ -1833,7 +2307,7 @@ def _get_or_build_persistent_snapshot(
     )
 
 
-def get_or_build_snapshot(
+def _get_or_build_snapshot_tuple(
     engine,
     *,
     namespace: str,
@@ -1861,7 +2335,7 @@ def get_or_build_snapshot(
     )
 
 
-def get_snapshot_if_available(
+def _get_snapshot_if_available_tuple(
     engine,
     *,
     namespace: str,
@@ -1875,6 +2349,7 @@ def get_snapshot_if_available(
         if (persistent and isinstance(revision, str)) or (
             not persistent and isinstance(revision, int)
         ):
+            _SNAPSHOT_READ_BACKEND.set("memory")
             return (
                 _snapshot_ref(
                     namespace,
@@ -1894,6 +2369,7 @@ def get_snapshot_if_available(
         if persisted is None:
             return None
         revision, payload, _ = persisted
+        _SNAPSHOT_READ_BACKEND.set("disk")
         return (
             _snapshot_ref(
                 namespace,
@@ -1917,6 +2393,7 @@ def get_snapshot_if_available(
     if shared is None:
         return None
     revision, payload, _ = shared
+    _SNAPSHOT_READ_BACKEND.set("postgres")
     return (
         _snapshot_ref(
             namespace,
@@ -1926,6 +2403,220 @@ def get_snapshot_if_available(
         ),
         payload,
     )
+
+
+def _snapshot_result_backend(reference: Mapping[str, Any]) -> str:
+    namespace = str(reference.get("namespace") or "")
+    source_key = str(reference.get("source_key") or "")
+    revision = reference.get("revision")
+    backend = _get_local_backend(namespace, source_key, revision)
+    if backend:
+        return backend
+    if not reference.get("shared"):
+        return "memory"
+    if local_snapshot_persistence_enabled() and isinstance(revision, str):
+        return "disk"
+    return "postgres"
+
+
+def _snapshot_encoded_bytes(
+    reference: Mapping[str, Any],
+) -> int | None:
+    if not local_snapshot_persistence_enabled():
+        return None
+    revision = reference.get("revision")
+    if not isinstance(revision, str):
+        return None
+    try:
+        stores = _get_persistent_stores()
+        raw_record = stores.cache.get(
+            _disk_record_key(
+                str(reference["namespace"]),
+                str(reference["source_key"]),
+                revision,
+            ),
+            default=_MISSING,
+            retry=True,
+        )
+        if raw_record is _MISSING:
+            return None
+        header, _encoded_payload = _decode_disk_record_header(
+            raw_record,
+            verify_checksum=False,
+        )
+        return int(header.get("payload_bytes"))
+    except Exception:
+        return None
+
+
+def get_snapshot_if_available_result(
+    engine,
+    *,
+    namespace: str,
+    source_key: str,
+) -> SnapshotResult | None:
+    """Return a detailed immutable hit without invoking a builder."""
+
+    started = time.perf_counter()
+    backend_token = _SNAPSHOT_READ_BACKEND.set(None)
+    try:
+        resolved = _get_snapshot_if_available_tuple(
+            engine,
+            namespace=namespace,
+            source_key=source_key,
+        )
+        backend = _SNAPSHOT_READ_BACKEND.get()
+    finally:
+        _SNAPSHOT_READ_BACKEND.reset(backend_token)
+    read_ms = (time.perf_counter() - started) * 1000
+    if resolved is None:
+        _emit_snapshot_event(
+            "miss",
+            namespace=namespace,
+            source_key=source_key,
+            read_ms=round(read_ms, 3),
+        )
+        return None
+    reference, payload = resolved
+    backend = backend or _snapshot_result_backend(reference)
+    result = SnapshotResult(
+        reference=reference,
+        payload=payload,
+        status="hit",
+        backend=backend,
+        read_ms=read_ms,
+        build_ms=0.0,
+        lock_wait_ms=0.0,
+        encoded_bytes=_snapshot_encoded_bytes(reference),
+        decoded_bytes=_estimate_decoded_bytes(payload),
+    )
+    _emit_snapshot_event(
+        f"{backend}_hit",
+        namespace=namespace,
+        source_key=source_key,
+        revision=reference.get("revision"),
+        backend=backend,
+        read_ms=round(read_ms, 3),
+        encoded_bytes=result.encoded_bytes,
+        decoded_bytes=result.decoded_bytes,
+    )
+    return result
+
+
+def get_snapshot_if_available(
+    engine,
+    *,
+    namespace: str,
+    source_key: str,
+) -> tuple[dict[str, Any], Any] | None:
+    """Return an existing immutable snapshot without invoking a builder."""
+
+    result = get_snapshot_if_available_result(
+        engine,
+        namespace=namespace,
+        source_key=source_key,
+    )
+    if result is None:
+        return None
+    return result.reference, result.payload
+
+
+def get_or_build_snapshot_result(
+    engine,
+    *,
+    namespace: str,
+    source_key: str,
+    builder: Callable[[], Any],
+    manifest: Mapping[str, Any] | Callable[[Any], Mapping[str, Any]] | None = None,
+    force: bool = False,
+) -> SnapshotResult:
+    """Resolve or build a snapshot and return detailed cache telemetry."""
+
+    request_started = time.perf_counter()
+    lock_wait_token = _SNAPSHOT_LOCK_WAIT_MS.set(0.0)
+    try:
+        if not force:
+            available = get_snapshot_if_available_result(
+                engine,
+                namespace=namespace,
+                source_key=source_key,
+            )
+            if available is not None:
+                return available
+
+        builder_called = False
+        build_ms = 0.0
+
+        def measured_builder():
+            nonlocal builder_called, build_ms
+            builder_called = True
+            build_started = time.perf_counter()
+            try:
+                return builder()
+            finally:
+                build_ms = (time.perf_counter() - build_started) * 1000
+
+        reference, payload = _get_or_build_snapshot_tuple(
+            engine,
+            namespace=namespace,
+            source_key=source_key,
+            builder=measured_builder,
+            manifest=manifest,
+            force=force,
+        )
+        duration_ms = (time.perf_counter() - request_started) * 1000
+        status = "built" if builder_called else "hit_after_wait"
+        backend = _snapshot_result_backend(reference)
+        lock_wait_ms = _SNAPSHOT_LOCK_WAIT_MS.get()
+        read_ms = max(0.0, duration_ms - build_ms - lock_wait_ms)
+        result = SnapshotResult(
+            reference=reference,
+            payload=payload,
+            status=status,
+            backend=backend,
+            read_ms=read_ms,
+            build_ms=build_ms,
+            lock_wait_ms=lock_wait_ms,
+            encoded_bytes=_snapshot_encoded_bytes(reference),
+            decoded_bytes=_estimate_decoded_bytes(payload),
+        )
+        _emit_snapshot_event(
+            status,
+            namespace=namespace,
+            source_key=source_key,
+            revision=reference.get("revision"),
+            backend=backend,
+            read_ms=round(result.read_ms, 3),
+            build_ms=round(result.build_ms, 3),
+            lock_wait_ms=round(result.lock_wait_ms, 3),
+            encoded_bytes=result.encoded_bytes,
+            decoded_bytes=result.decoded_bytes,
+        )
+        return result
+    finally:
+        _SNAPSHOT_LOCK_WAIT_MS.reset(lock_wait_token)
+
+
+def get_or_build_snapshot(
+    engine,
+    *,
+    namespace: str,
+    source_key: str,
+    builder: Callable[[], Any],
+    manifest: Mapping[str, Any] | Callable[[Any], Mapping[str, Any]] | None = None,
+    force: bool = False,
+) -> tuple[dict[str, Any], Any]:
+    """Resolve or build an immutable snapshot and return ``(reference, payload)``."""
+
+    result = get_or_build_snapshot_result(
+        engine,
+        namespace=namespace,
+        source_key=source_key,
+        builder=builder,
+        manifest=manifest,
+        force=force,
+    )
+    return result.reference, result.payload
 
 
 def resolve_snapshot(
@@ -2059,6 +2750,285 @@ def resolve_snapshot_manifest(
             "has an invalid manifest"
         )
     return dict(manifest)
+
+
+def _timestamp_to_utc_iso(value: Any) -> str | None:
+    try:
+        return dt.datetime.fromtimestamp(
+            float(value),
+            tz=dt.timezone.utc,
+        ).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def inspect_persistent_snapshot_cache() -> dict[str, Any]:
+    """Return read-only operator diagnostics for the shared DiskCache."""
+
+    stores = _get_persistent_stores()
+    rows = list(
+        stores.cache._sql(
+            "SELECT key, store_time, access_time, mode, filename, value "
+            "FROM Cache"
+        )
+    )
+    raw_values: dict[str, Any] = {}
+    row_metadata: dict[str, tuple[float, float]] = {}
+    invalid_values: list[dict[str, Any]] = []
+    for key, store_time, access_time, mode, filename, value in rows:
+        if not isinstance(key, str):
+            continue
+        try:
+            raw_values[key] = stores.cache.disk.fetch(
+                mode,
+                filename,
+                value,
+                read=False,
+            )
+            row_metadata[key] = (store_time, access_time)
+        except Exception as exc:
+            invalid_values.append({
+                "record_key": key,
+                "error": type(exc).__name__,
+            })
+    records: list[dict[str, Any]] = []
+    invalid_records: list[dict[str, Any]] = list(invalid_values)
+    latest_pointer_count = 0
+    inspected_at = dt.datetime.now(dt.timezone.utc)
+    for key, raw_record in raw_values.items():
+        if key.startswith("latest:"):
+            latest_pointer_count += 1
+            continue
+        if not key.startswith("record:"):
+            continue
+        try:
+            store_time, access_time = row_metadata[key]
+            header, _encoded_payload = _decode_disk_record_header(
+                raw_record
+            )
+            namespace = str(header["namespace"])
+            source_key = str(header["source_key"])
+            revision = _validate_disk_revision_token(header["revision"])
+            raw_latest_revision = raw_values.get(
+                _disk_latest_key(namespace, source_key)
+            )
+            latest_revision = None
+            if isinstance(raw_latest_revision, bytes):
+                latest_revision = _validate_disk_revision_token(
+                    raw_latest_revision.decode("ascii")
+                )
+            is_latest = latest_revision == revision
+            publication_stage = header.get("publication_stage")
+            created_at_utc = (
+                header.get("created_at_utc")
+                or _timestamp_to_utc_iso(store_time)
+            )
+            last_access_at_utc = _timestamp_to_utc_iso(access_time)
+            created_at = _parse_utc_datetime(created_at_utc)
+            last_access_at = _parse_utc_datetime(last_access_at_utc)
+            records.append({
+                "namespace": namespace,
+                "source_key": source_key,
+                "revision": revision,
+                "record_bytes": len(raw_record),
+                "payload_bytes": int(header.get("payload_bytes") or 0),
+                "created_at_utc": created_at_utc,
+                "age_seconds": (
+                    max(0.0, (inspected_at - created_at).total_seconds())
+                    if created_at is not None
+                    else None
+                ),
+                "last_access_at_utc": last_access_at_utc,
+                "last_access_age_seconds": (
+                    max(
+                        0.0,
+                        (inspected_at - last_access_at).total_seconds(),
+                    )
+                    if last_access_at is not None
+                    else None
+                ),
+                "is_latest": is_latest,
+                "publication_stage": publication_stage,
+                "orphaned_staging": bool(
+                    publication_stage and not is_latest
+                ),
+                "_record_key": key,
+            })
+        except Exception as exc:
+            invalid_records.append({
+                "record_key": key,
+                "error": type(exc).__name__,
+            })
+
+    records.sort(key=lambda item: (
+        item["namespace"],
+        item["source_key"],
+        item["created_at_utc"] or "",
+        item["revision"],
+    ))
+    namespace_summaries: dict[str, dict[str, Any]] = {}
+    for record in records:
+        summary = namespace_summaries.setdefault(
+            record["namespace"],
+            {
+                "namespace": record["namespace"],
+                "record_count": 0,
+                "latest_count": 0,
+                "record_bytes": 0,
+                "payload_bytes": 0,
+                "orphaned_staging_count": 0,
+            },
+        )
+        summary["record_count"] += 1
+        summary["latest_count"] += int(record["is_latest"])
+        summary["record_bytes"] += int(record["record_bytes"])
+        summary["payload_bytes"] += int(record["payload_bytes"])
+        summary["orphaned_staging_count"] += int(
+            record["orphaned_staging"]
+        )
+
+    return {
+        "format": "dashboard_snapshot_cache_inspection_v1",
+        "cache_root": str(stores.root),
+        "volume_bytes": int(stores.cache.volume()),
+        "size_limit_bytes": int(stores.cache.size_limit),
+        "latest_pointer_count": latest_pointer_count,
+        "latest_pointers": [
+            {
+                "namespace": record["namespace"],
+                "source_key": record["source_key"],
+                "revision": record["revision"],
+            }
+            for record in records
+            if record["is_latest"]
+        ],
+        "record_count": len(records),
+        "invalid_record_count": len(invalid_records),
+        "orphaned_staging_count": sum(
+            int(record["orphaned_staging"])
+            for record in records
+        ),
+        "namespaces": sorted(
+            namespace_summaries.values(),
+            key=lambda item: (-item["record_bytes"], item["namespace"]),
+        ),
+        "records": records,
+        "invalid_records": invalid_records,
+    }
+
+
+def _parse_utc_datetime(value: Any) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def prune_persistent_snapshot_cache(
+    *,
+    apply: bool = False,
+    staged_older_than_days: int = 7,
+    retired_namespaces: Sequence[str] = (),
+    retired_older_than_days: int = 30,
+    coordinated_restart_confirmed: bool = False,
+) -> dict[str, Any]:
+    """Safely prune abandoned staging or retired, non-latest records."""
+
+    if staged_older_than_days < 1 or retired_older_than_days < 1:
+        raise ValueError("Cache retention windows must be at least one day")
+    inspection = inspect_persistent_snapshot_cache()
+    now = dt.datetime.now(dt.timezone.utc)
+    staged_cutoff = now - dt.timedelta(days=staged_older_than_days)
+    retired_cutoff = now - dt.timedelta(days=retired_older_than_days)
+    retired = {str(namespace) for namespace in retired_namespaces}
+    if apply and retired and not coordinated_restart_confirmed:
+        raise ValueError(
+            "Retired-namespace pruning requires a coordinated worker "
+            "restart confirmation"
+        )
+    candidates: list[dict[str, Any]] = []
+    for record in inspection["records"]:
+        if record["is_latest"]:
+            continue
+        created_at = _parse_utc_datetime(record.get("created_at_utc"))
+        accessed_at = _parse_utc_datetime(record.get("last_access_at_utc"))
+        reason = None
+        if (
+            record.get("orphaned_staging")
+            and created_at is not None
+            and created_at < staged_cutoff
+        ):
+            reason = "abandoned_staging"
+        elif (
+            record["namespace"] in retired
+            and accessed_at is not None
+            and accessed_at < retired_cutoff
+        ):
+            reason = "retired_namespace"
+        if reason is not None:
+            candidates.append({
+                **record,
+                "reason": reason,
+            })
+
+    deleted: list[dict[str, Any]] = []
+    if apply and candidates:
+        stores = _get_persistent_stores()
+        for candidate in candidates:
+            latest_revision = _disk_latest_revision(
+                stores,
+                candidate["namespace"],
+                candidate["source_key"],
+            )
+            if latest_revision == candidate["revision"]:
+                continue
+            if stores.cache.delete(
+                candidate["_record_key"],
+                retry=True,
+            ):
+                deleted.append(candidate)
+                _emit_snapshot_event(
+                    "pruned",
+                    namespace=candidate["namespace"],
+                    source_key=candidate["source_key"],
+                    revision=candidate["revision"],
+                    reason=candidate["reason"],
+                    encoded_bytes=candidate["record_bytes"],
+                )
+
+    public_candidates = [
+        {
+            key: value
+            for key, value in candidate.items()
+            if not key.startswith("_")
+        }
+        for candidate in candidates
+    ]
+    public_deleted = [
+        {
+            key: value
+            for key, value in candidate.items()
+            if not key.startswith("_")
+        }
+        for candidate in deleted
+    ]
+    return {
+        "format": "dashboard_snapshot_cache_prune_v1",
+        "apply": bool(apply),
+        "staged_older_than_days": staged_older_than_days,
+        "retired_older_than_days": retired_older_than_days,
+        "retired_namespaces": sorted(retired),
+        "coordinated_restart_confirmed": bool(
+            coordinated_restart_confirmed
+        ),
+        "candidate_count": len(public_candidates),
+        "deleted_count": len(public_deleted),
+        "candidates": public_candidates,
+        "deleted": public_deleted,
+    }
 
 
 def _clear_persistent_snapshots(namespace: str | None) -> None:

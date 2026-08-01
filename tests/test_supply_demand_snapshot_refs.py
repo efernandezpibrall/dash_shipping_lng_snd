@@ -695,7 +695,7 @@ def test_missing_or_corrupt_page_ref_has_explicit_recovery_and_blocks_exports(
     "page_name,page_module,woodmac_slot,ea_slot,recovery_message",
     PAGES,
 )
-def test_page_global_refresh_is_checked_once_and_forces_one_rebuild(
+def test_page_global_refresh_reuses_unchanged_snapshot(
     page_name,
     page_module,
     woodmac_slot,
@@ -738,11 +738,10 @@ def test_page_global_refresh_is_checked_once_and_forces_one_rebuild(
     )
     refreshed_result = page_module.load_balance_source_data(1)
 
-    assert refresh_checks == 1
-    assert force_calls == [False, True]
-    assert build_counter["count"] == 2
-    assert refreshed_result[0] != old_result[0]
-    assert refreshed_result[1] != old_result[1]
+    assert refresh_checks == 0
+    assert force_calls == [False, False]
+    assert build_counter["count"] == 1
+    assert refreshed_result == old_result
 
 
 @pytest.mark.parametrize(

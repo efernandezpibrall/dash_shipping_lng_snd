@@ -562,90 +562,135 @@ def precompute_detail_snapshots(
             else None
         )
 
-        for country in exporter_countries:
-            built_references, built_results = (
-                precompute_exporter_selection(
-                    exporter_page,
-                    country,
-                    exporter_before["source_context"],
-                )
-            )
-            for reference, result in zip(
-                built_references,
-                built_results,
-                strict=True,
-            ):
-                reference["_precompute_page"] = "exporter"
-                reference["_precompute_section"] = result.section
-                reference["_precompute_selection"] = result.selection
-            references.extend(built_references)
-            results.extend(built_results)
-
-        for aggregation, selected_value in importer_targets:
-            built_references, built_results = (
-                precompute_importer_selection(
-                    importer_page,
-                    aggregation,
-                    selected_value,
-                    importer_catalog,
-                    importer_before["source_context"],
-                )
-            )
-            for reference, result in zip(
-                built_references,
-                built_results,
-                strict=True,
-            ):
-                reference["_precompute_page"] = "importer"
-                reference["_precompute_section"] = result.section
-                reference["_precompute_selection"] = result.selection
-            references.extend(built_references)
-            results.extend(built_results)
-
-        exporter_after = (
-            _exporter_source_sentinel(exporter_page)
-            if exporter_countries
-            else None
+        bundle_identity = {
+            "exporter_countries": list(exporter_countries),
+            "importer_targets": [list(target) for target in importer_targets],
+            "exporter_source": exporter_before,
+            "importer_source": importer_before,
+        }
+        bundle_source_key = _stable_token(
+            "detail-snapshot-precompute-bundle-v1",
+            bundle_identity,
         )
-        importer_after = (
-            _importer_source_sentinel(importer_page)
-            if importer_targets
-            else None
-        )
-        if (
-            exporter_before is not None
-            and _stable_token(
-                "exporter-precompute-source-audit",
-                exporter_before,
+        with snapshots.stage_snapshot_publication(
+            f"detail-precompute:{bundle_source_key}"
+        ) as publication_stage:
+            for country in exporter_countries:
+                built_references, built_results = (
+                    precompute_exporter_selection(
+                        exporter_page,
+                        country,
+                        exporter_before["source_context"],
+                    )
+                )
+                for reference, result in zip(
+                    built_references,
+                    built_results,
+                    strict=True,
+                ):
+                    reference["_precompute_page"] = "exporter"
+                    reference["_precompute_section"] = result.section
+                    reference["_precompute_selection"] = result.selection
+                references.extend(built_references)
+                results.extend(built_results)
+
+            for aggregation, selected_value in importer_targets:
+                built_references, built_results = (
+                    precompute_importer_selection(
+                        importer_page,
+                        aggregation,
+                        selected_value,
+                        importer_catalog,
+                        importer_before["source_context"],
+                    )
+                )
+                for reference, result in zip(
+                    built_references,
+                    built_results,
+                    strict=True,
+                ):
+                    reference["_precompute_page"] = "importer"
+                    reference["_precompute_section"] = result.section
+                    reference["_precompute_selection"] = result.selection
+                references.extend(built_references)
+                results.extend(built_results)
+
+            exporter_after = (
+                _exporter_source_sentinel(exporter_page)
+                if exporter_countries
+                else None
             )
-            != _stable_token(
-                "exporter-precompute-source-audit",
-                exporter_after,
+            importer_after = (
+                _importer_source_sentinel(importer_page)
+                if importer_targets
+                else None
             )
-        ):
-            raise DetailSnapshotPrecomputeError(
-                "Exporter source versions changed during precompute; "
-                "discard this run and retry"
-            )
-        if (
-            importer_before is not None
-            and _stable_token(
-                "importer-precompute-source-audit",
-                importer_before,
-            )
-            != _stable_token(
-                "importer-precompute-source-audit",
-                importer_after,
-            )
-        ):
-            raise DetailSnapshotPrecomputeError(
-                "Importer source versions changed during precompute; "
-                "discard this run and retry"
+            if (
+                exporter_before is not None
+                and _stable_token(
+                    "exporter-precompute-source-audit",
+                    exporter_before,
+                )
+                != _stable_token(
+                    "exporter-precompute-source-audit",
+                    exporter_after,
+                )
+            ):
+                raise DetailSnapshotPrecomputeError(
+                    "Exporter source versions changed during precompute; "
+                    "discard this run and retry"
+                )
+            if (
+                importer_before is not None
+                and _stable_token(
+                    "importer-precompute-source-audit",
+                    importer_before,
+                )
+                != _stable_token(
+                    "importer-precompute-source-audit",
+                    importer_after,
+                )
+            ):
+                raise DetailSnapshotPrecomputeError(
+                    "Importer source versions changed during precompute; "
+                    "discard this run and retry"
+                )
+
+            clean_references = [
+                {
+                    key: value
+                    for key, value in reference.items()
+                    if not key.startswith("_precompute_")
+                }
+                for reference in references
+            ]
+            bundle_reference = (
+                snapshots.commit_snapshot_publication_stage(
+                    publication_stage,
+                    bundle_namespace=(
+                        "detail-snapshot-precompute-bundle-v1"
+                    ),
+                    bundle_source_key=bundle_source_key,
+                    bundle_payload={
+                        "format": "detail-snapshot-precompute-bundle-v1",
+                        "identity": bundle_identity,
+                        "snapshots": clean_references,
+                    },
+                    bundle_manifest={
+                        "identity": bundle_identity,
+                        "snapshot_count": len(clean_references),
+                    },
+                )
             )
 
         _validate_reopened_persistence(
             references,
             [exporter_page.engine, importer_page.engine],
+        )
+        snapshots.resolve_snapshot(
+            bundle_reference,
+            exporter_page.engine,
+            expected_namespace="detail-snapshot-precompute-bundle-v1",
         )
         cache_metrics = _cache_metrics()
 
@@ -662,5 +707,6 @@ def precompute_detail_snapshots(
             ),
         },
         "cache": cache_metrics,
+        "bundle_reference": bundle_reference,
         "snapshots": [result.as_dict() for result in results],
     }

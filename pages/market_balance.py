@@ -30,7 +30,7 @@ from utils.dashboard_snapshot_cache import (
     resolve_snapshot as _resolve_snapshot,
     snapshot_is_resolvable as _snapshot_is_resolvable,
     snapshot_is_shared as _snapshot_is_shared,
-    was_global_refresh_triggered as _was_global_refresh_triggered,
+    was_global_refresh_triggered as _was_global_refresh_triggered,  # noqa: F401 - compatibility hook
 )
 from utils.provider_flow_snapshot import fetch_provider_flow_source_state as _fetch_provider_flow_source_state
 from utils.historical_comparison_snapshot import (
@@ -38,6 +38,9 @@ from utils.historical_comparison_snapshot import (
 )
 from utils.ea_run_interface import normalize_ea_run_id
 from utils.performance import log_callback_timing
+from utils.performance_flags import (
+    revision_aware_refresh_enabled as _revision_aware_refresh_enabled,
+)
 from utils.market_balance_data import (
     COUNTRY_GROUP_LABELS,
     build_period_delta_table,
@@ -171,8 +174,7 @@ def _resolve_market_store(store_payload, namespace):
 
 
 def _load_cached_market_store(namespace, key_parts, builder, source_state=None):
-    force_refresh = _was_global_refresh_triggered()
-    if source_state is None or force_refresh:
+    if source_state is None:
         try:
             source_state = _fetch_provider_flow_source_state()
         except Exception:
@@ -188,7 +190,6 @@ def _load_cached_market_store(namespace, key_parts, builder, source_state=None):
             if converted_namespace
             else builder()
         ),
-        force=force_refresh,
         manifest={"source_state": source_state, "filters": key_parts},
     )
     if converted_namespace:
@@ -1471,6 +1472,7 @@ def _build_country_category_figure(df: pd.DataFrame, *, title: str, chart_type: 
 layout = html.Div(
     [
         dcc.Store(id="market-balance-source-state-store", storage_type="memory"),
+        dcc.Store(id="market-balance-refresh-status-store", storage_type="memory"),
         dcc.Store(id="market-balance-overview-store", storage_type="memory"),
         dcc.Store(id="market-balance-trade-store", storage_type="memory"),
         dcc.Store(id="market-balance-country-meta-store", storage_type="memory"),
@@ -1907,27 +1909,49 @@ layout = html.Div(
 
 @callback(
     Output("market-balance-source-state-store", "data"),
+    Output("market-balance-refresh-status-store", "data"),
     Input("global-refresh-button", "n_clicks"),
+    State("market-balance-source-state-store", "data"),
 )
-def load_market_balance_source_state(_):
+def load_market_balance_source_state(n_clicks, current_source_state=None):
+    refresh_status = {
+        "format": "dashboard-source-refresh-status-v1",
+        "refresh_generation": int(n_clicks or 0),
+        "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
     try:
-        return _fetch_provider_flow_source_state()
+        source_state = _fetch_provider_flow_source_state()
     except Exception:
-        return {"request_token": dt.datetime.now(dt.timezone.utc).isoformat()}
+        source_state = {
+            "request_token": dt.datetime.now(dt.timezone.utc).isoformat()
+        }
+        refresh_status["status"] = "unavailable"
+    else:
+        refresh_status["status"] = "checked"
+    if not _revision_aware_refresh_enabled():
+        source_state = {
+            **source_state,
+            "refresh_generation": int(n_clicks or 0),
+        }
+    if (
+        _revision_aware_refresh_enabled()
+        and source_state == current_source_state
+    ):
+        return no_update, refresh_status
+    return source_state, refresh_status
 
 
 @callback(
     Output("market-balance-overview-store", "data"),
-    Input("global-refresh-button", "n_clicks"),
+    Input("market-balance-source-state-store", "data"),
     Input("market-balance-date-range", "start_date"),
     Input("market-balance-date-range", "end_date"),
     Input("market-balance-trade-time-group", "value"),
     Input("market-balance-trade-unit", "value"),
     Input("market-balance-trade-country-group", "value"),
-    State("market-balance-source-state-store", "data"),
 )
 @log_callback_timing("market_balance.overview_source_load")
-def load_overview_store(_, start_date, end_date, time_group, unit, country_group, source_state=None):
+def load_overview_store(source_state, start_date, end_date, time_group, unit, country_group):
     key_parts = {
         "start_date": start_date,
         "end_date": end_date,
@@ -1944,7 +1968,7 @@ def load_overview_store(_, start_date, end_date, time_group, unit, country_group
             time_group=time_group,
             unit=unit,
             country_group=country_group,
-            force_source_refresh=_was_global_refresh_triggered(),
+            force_source_refresh=False,
             source_state=source_state,
         ),
         source_state=source_state,
@@ -2530,7 +2554,7 @@ def export_overview_workbook(n_clicks, store_payload):
 
 @callback(
     Output("market-balance-trade-store", "data"),
-    Input("global-refresh-button", "n_clicks"),
+    Input("market-balance-source-state-store", "data"),
     Input("market-balance-date-range", "start_date"),
     Input("market-balance-date-range", "end_date"),
     Input("market-balance-trade-time-group", "value"),
@@ -2538,10 +2562,9 @@ def export_overview_workbook(n_clicks, store_payload):
     Input("market-balance-trade-country-group", "value"),
     Input("market-balance-trade-years", "value"),
     Input("market-balance-trade-unit", "value"),
-    State("market-balance-source-state-store", "data"),
 )
 @log_callback_timing("market_balance.trade_source_load")
-def load_trade_store(_, start_date, end_date, time_group, diff_type, country_group, selected_years, unit, source_state=None):
+def load_trade_store(source_state, start_date, end_date, time_group, diff_type, country_group, selected_years, unit):
     key_parts = {
         "start_date": start_date,
         "end_date": end_date,
@@ -2562,7 +2585,7 @@ def load_trade_store(_, start_date, end_date, time_group, diff_type, country_gro
             country_group=country_group,
             selected_years=selected_years,
             unit=unit,
-            force_source_refresh=_was_global_refresh_triggered(),
+            force_source_refresh=False,
             source_state=source_state,
         ),
         source_state=source_state,
@@ -2736,10 +2759,9 @@ def export_trade_workbook(n_clicks, store_payload):
 
 @callback(
     Output("market-balance-country-meta-store", "data"),
-    Input("global-refresh-button", "n_clicks"),
-    State("market-balance-source-state-store", "data"),
+    Input("market-balance-source-state-store", "data"),
 )
-def load_country_meta_store(_, source_state=None):
+def load_country_meta_store(source_state=None):
     return _load_cached_market_store(
         "market-balance-country-meta-v2",
         {},
@@ -2802,16 +2824,15 @@ def sync_country_snapshot_control(store_payload, country, current_snapshot):
 
 @callback(
     Output("market-balance-country-store", "data"),
-    Input("global-refresh-button", "n_clicks"),
+    Input("market-balance-source-state-store", "data"),
     Input("market-balance-country-dropdown", "value"),
     Input("market-balance-country-level", "value"),
     Input("market-balance-trade-time-group", "value"),
     Input("market-balance-date-range", "start_date"),
     Input("market-balance-date-range", "end_date"),
     Input("market-balance-country-snapshot", "value"),
-    State("market-balance-source-state-store", "data"),
 )
-def load_country_store(_, country, level, time_group, start_date, end_date, comparison_snapshot, source_state=None):
+def load_country_store(source_state, country, level, time_group, start_date, end_date, comparison_snapshot):
     key_parts = {
         "country": country,
         "level": level,

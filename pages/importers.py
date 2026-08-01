@@ -6,6 +6,7 @@ from dash import (
     Input,
     State,
     callback_context,
+    no_update,
 )
 from dash.dash_table.Format import Format, Scheme
 from utils.ag_grid_tables import ag_grid_cell_clicked_to_active_cell, create_ag_grid_from_datatable
@@ -30,10 +31,17 @@ from utils.dashboard_snapshot_cache import (
     snapshot_is_resolvable as _snapshot_is_resolvable,
     snapshot_is_shared as _snapshot_is_shared,
     unpack_record_mapping as _unpack_record_mapping,
-    was_global_refresh_triggered as _was_global_refresh_triggered,
+    was_global_refresh_triggered as _was_global_refresh_triggered,  # noqa: F401 - compatibility hook
     with_snapshot_slot as _with_snapshot_slot,
 )
 from utils.performance import log_callback_timing
+from utils.performance_flags import (
+    revision_aware_refresh_enabled as _revision_aware_refresh_enabled,
+)
+from utils.arrow_payload import (
+    ARROW_RECORD_CUBE_FORMAT,
+    decode_arrow_record_cube as _decode_arrow_record_cube,
+)
 
 from pages.importer_detail import (
     engine,
@@ -132,7 +140,13 @@ ORIGIN_CONTINENT_CHART_TYPE_OPTIONS = [
 ]
 
 IMPORTERS_SOURCE_NAMESPACE = 'importers-source-v3'
-IMPORTERS_OVERVIEW_NAMESPACE = 'importers-overview-v3'
+IMPORTERS_LEGACY_OVERVIEW_NAMESPACE = 'importers-overview-v3'
+IMPORTERS_ARROW_OVERVIEW_NAMESPACE = 'importers-overview-v4'
+IMPORTERS_OVERVIEW_NAMESPACE = IMPORTERS_LEGACY_OVERVIEW_NAMESPACE
+IMPORTERS_OVERVIEW_NAMESPACES = frozenset({
+    IMPORTERS_LEGACY_OVERVIEW_NAMESPACE,
+    IMPORTERS_ARROW_OVERVIEW_NAMESPACE,
+})
 IMPORTERS_PERIOD_NAMESPACE = 'importers-period-v3'
 IMPORTERS_SOURCE_STATE_FORMAT = 'importers-source-state-v3'
 IMPORTERS_PERIOD_PAYLOAD_FORMAT = 'importers-period-summary-v3'
@@ -140,7 +154,8 @@ IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE = (
     'Cached importer data is unavailable. Click the global Refresh button '
     'to reload it.'
 )
-IMPORTERS_RECORD_CUBE_FORMAT = 'importers-record-cube-zlib-json-v1'
+IMPORTERS_LEGACY_RECORD_CUBE_FORMAT = 'importers-record-cube-zlib-json-v1'
+IMPORTERS_RECORD_CUBE_FORMAT = IMPORTERS_LEGACY_RECORD_CUBE_FORMAT
 IMPORTERS_SCALAR_TAG = '__importers_scalar_v1__'
 
 
@@ -271,6 +286,16 @@ def _encode_importers_json_payload(value, payload_format):
 
 
 def _decode_importers_json_payload(value, payload_format):
+    if (
+        isinstance(value, dict)
+        and value.get('format') == ARROW_RECORD_CUBE_FORMAT
+    ):
+        try:
+            return _decode_arrow_record_cube(value)
+        except Exception as exc:
+            raise _SnapshotUnavailable(
+                IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+            ) from exc
     if not (
         isinstance(value, dict)
         and value.get('format') == payload_format
@@ -302,11 +327,11 @@ def _prepare_importers_overview_snapshot_payload(payload):
         )
     prepared['demand_cube'] = _encode_importers_json_payload(
         payload['demand_cube'],
-        IMPORTERS_RECORD_CUBE_FORMAT,
+        IMPORTERS_LEGACY_RECORD_CUBE_FORMAT,
     )
     prepared['origin_cube'] = _encode_importers_json_payload(
         payload['origin_cube'],
-        IMPORTERS_RECORD_CUBE_FORMAT,
+        IMPORTERS_LEGACY_RECORD_CUBE_FORMAT,
     )
     return prepared
 
@@ -508,10 +533,7 @@ def _resolve_importers_source_store(source_data):
 def _reject_noncurrent_importers_overview_reference(value):
     if (
         _is_snapshot_reference(value)
-        and not _is_snapshot_reference(
-            value,
-            IMPORTERS_OVERVIEW_NAMESPACE,
-        )
+        and value.get('namespace') not in IMPORTERS_OVERVIEW_NAMESPACES
     ):
         raise _SnapshotUnavailable(
             IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
@@ -520,30 +542,41 @@ def _reject_noncurrent_importers_overview_reference(value):
 
 def _resolve_importers_chart_store(charts_data):
     _reject_noncurrent_importers_overview_reference(charts_data)
+    expected_namespace = (
+        charts_data.get('namespace')
+        if _is_snapshot_reference(charts_data)
+        else IMPORTERS_OVERVIEW_NAMESPACE
+    )
     try:
         resolved = _resolve_snapshot(
             charts_data,
             engine,
-            expected_namespace=IMPORTERS_OVERVIEW_NAMESPACE,
+            expected_namespace=expected_namespace,
         )
     except _SnapshotUnavailable as exc:
         raise _SnapshotUnavailable(
             IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE
         ) from exc
+    resolved = _decode_arrow_record_cube(resolved)
     resolved = _decode_importers_json_payload(
         resolved,
-        IMPORTERS_RECORD_CUBE_FORMAT,
+        IMPORTERS_LEGACY_RECORD_CUBE_FORMAT,
     )
     return _unpack_record_mapping(resolved)
 
 
 def _resolve_importers_entities_store(entities_data, slot):
     _reject_noncurrent_importers_overview_reference(entities_data)
+    expected_namespace = (
+        entities_data.get('namespace')
+        if _is_snapshot_reference(entities_data)
+        else IMPORTERS_OVERVIEW_NAMESPACE
+    )
     try:
         return _resolve_snapshot(
             entities_data,
             engine,
-            expected_namespace=IMPORTERS_OVERVIEW_NAMESPACE,
+            expected_namespace=expected_namespace,
             slot=slot,
         )
     except _SnapshotUnavailable as exc:
@@ -554,11 +587,16 @@ def _resolve_importers_entities_store(entities_data, slot):
 
 def _resolve_importers_years_store(charts_data, slot):
     _reject_noncurrent_importers_overview_reference(charts_data)
+    expected_namespace = (
+        charts_data.get('namespace')
+        if _is_snapshot_reference(charts_data)
+        else IMPORTERS_OVERVIEW_NAMESPACE
+    )
     try:
         years = _resolve_snapshot(
             charts_data,
             engine,
-            expected_namespace=IMPORTERS_OVERVIEW_NAMESPACE,
+            expected_namespace=expected_namespace,
             slot=slot,
         )
     except _SnapshotUnavailable as exc:
@@ -4473,6 +4511,7 @@ def _build_period_table_footnote(
 
 layout = html.Div([
     dcc.Store(id='imp-overview-source-state-store', storage_type='memory'),
+    dcc.Store(id='imp-overview-refresh-status-store', storage_type='memory'),
     dcc.Store(id='imp-overview-chart-entities-store', storage_type='memory'),
     dcc.Store(id='imp-overview-table-entities-store', storage_type='memory'),
     dcc.Store(id='imp-overview-demand-data-store', storage_type='memory'),
@@ -4925,6 +4964,13 @@ def _normalize_importers_source_state(source_state):
         ),
     }
     if (
+        not _revision_aware_refresh_enabled()
+        and source_state.get('refresh_generation') is not None
+    ):
+        normalized['refresh_generation'] = int(
+            source_state['refresh_generation']
+        )
+    if (
         source_state.get('format') == IMPORTERS_SOURCE_STATE_FORMAT
     ):
         normalized.update({
@@ -4965,27 +5011,38 @@ def _importers_source_snapshot_key(source_state):
 
 
 def _load_importers_source_snapshot(source_state):
-    force_refresh = bool(
-        isinstance(source_state, dict)
-        and source_state.get('refresh_token')
-    )
     source_state = _normalize_importers_source_state(source_state)
-    source_builder = (
-        (
-            lambda: _build_importers_source_payload(
-                source_state
-            )
+
+    def source_builder():
+        payload = (
+            _build_importers_source_payload(source_state)
+            if source_state.get('format')
+            == IMPORTERS_SOURCE_STATE_FORMAT
+            else _build_importers_source_payload()
         )
-        if source_state.get('format') == IMPORTERS_SOURCE_STATE_FORMAT
-        else _build_importers_source_payload
-    )
+        if (
+            _revision_aware_refresh_enabled()
+            and isinstance(source_state.get('current_snapshot'), dict)
+        ):
+            current_state = _normalize_importers_source_state(
+                _build_importers_source_state(
+                    _fetch_importers_source_watermark(),
+                    refresh_token=None,
+                )
+            )
+            if current_state != source_state:
+                raise _SnapshotUnavailable(
+                    'Importer sources changed during snapshot construction. '
+                    'Refresh and retry.'
+                )
+        return payload
+
     return _get_or_build_snapshot(
         engine,
         namespace=IMPORTERS_SOURCE_NAMESPACE,
         source_key=_importers_source_snapshot_key(source_state),
         builder=source_builder,
         manifest={'source_state': source_state},
-        force=force_refresh,
     )
 
 
@@ -5009,23 +5066,43 @@ def _importers_overview_snapshot_key(
 
 @callback(
     Output('imp-overview-source-state-store', 'data'),
+    Output('imp-overview-refresh-status-store', 'data'),
     Input('global-refresh-button', 'n_clicks'),
+    State('imp-overview-source-state-store', 'data'),
 )
-def load_importers_overview_source_state(_n_clicks):
-    refresh_token = (
-        uuid.uuid4().hex
-        if _was_global_refresh_triggered()
-        else None
-    )
+def load_importers_overview_source_state(
+    n_clicks,
+    current_source_state=None,
+):
+    refresh_status = {
+        'format': 'dashboard-source-refresh-status-v1',
+        'refresh_generation': int(n_clicks or 0),
+        'checked_at': datetime.now().astimezone().isoformat(),
+    }
     try:
         source_pair = _fetch_importers_source_watermark()
     except Exception:
         source_pair = None
-        refresh_token = uuid.uuid4().hex
-    return _build_importers_source_state(
+        refresh_status['status'] = 'unavailable'
+    else:
+        refresh_status['status'] = 'checked'
+    source_state = _build_importers_source_state(
         source_pair,
-        refresh_token=refresh_token,
+        refresh_token=None,
     )
+    if source_pair is None:
+        source_state['request_token'] = uuid.uuid4().hex
+    if not _revision_aware_refresh_enabled():
+        source_state['refresh_generation'] = int(n_clicks or 0)
+    if (
+        _revision_aware_refresh_enabled()
+        and
+        isinstance(current_source_state, dict)
+        and _normalize_importers_source_state(current_source_state)
+        == _normalize_importers_source_state(source_state)
+    ):
+        return no_update, refresh_status
+    return source_state, refresh_status
 
 
 def _importers_overview_triggered_id():
@@ -5397,13 +5474,12 @@ def reset_period_expansion_state(_origin_level, _classification_mode, _importer_
     Input('imp-overview-origin-level-dropdown', 'value'),
     Input('imp-overview-rolling-window-days-input', 'value'),
     Input('imp-overview-origin-country-grouping-dropdown', 'value'),
-    Input('global-refresh-button', 'n_clicks'),
     State('imp-overview-source-state-store', 'data'),
     prevent_initial_call=False
 )
 @log_callback_timing("importers.period_source_load")
 def refresh_period_data(importer_entities, classification_mode, origin_level, rolling_avg_days,
-                        origin_country_grouping_mode, global_refresh_clicks, source_state=None):
+                        origin_country_grouping_mode, source_state=None):
     """Load the raw period-analysis payload for the overview importers."""
     if not importer_entities:
         return _empty_importer_period_payload(origin_country_grouping_mode)

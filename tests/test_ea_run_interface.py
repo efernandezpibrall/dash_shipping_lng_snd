@@ -104,7 +104,7 @@ def test_current_metadata_is_not_derived_from_changed_comparison_runs():
     }
 
 
-def test_captured_provider_state_fails_closed_if_sources_change(monkeypatch):
+def test_new_provider_snapshot_fails_closed_if_sources_change(monkeypatch):
     captured = {
         "current_ea": {"run_id": 20, "snapshot_at": "2026-07-16T12:00:00Z"},
         "mapping_hash": "before",
@@ -112,7 +112,10 @@ def test_captured_provider_state_fails_closed_if_sources_change(monkeypatch):
     monkeypatch.setattr(
         provider_flow_snapshot,
         "get_or_build_snapshot",
-        lambda *args, **kwargs: ("reference", {"current_ea": captured["current_ea"]}),
+        lambda *args, **kwargs: (
+            "reference",
+            kwargs["builder"](),
+        ),
     )
     monkeypatch.setattr(
         provider_flow_snapshot,
@@ -122,6 +125,45 @@ def test_captured_provider_state_fails_closed_if_sources_change(monkeypatch):
 
     with pytest.raises(RuntimeError, match="captured page state"):
         provider_flow_snapshot.get_provider_flow_snapshot_for_state(captured)
+
+
+def test_provider_snapshot_hit_reuses_captured_state_without_requery(
+    monkeypatch,
+):
+    captured = {
+        "current_ea": {
+            "run_id": 20,
+            "snapshot_at": "2026-07-16T12:00:00Z",
+        },
+        "mapping_hash": "before",
+    }
+    expected = (
+        "reference",
+        {"current_ea": captured["current_ea"]},
+    )
+    monkeypatch.setattr(
+        provider_flow_snapshot,
+        "get_snapshot_if_available",
+        lambda *args, **kwargs: expected,
+    )
+    source_state_calls = 0
+
+    def fail_if_called():
+        nonlocal source_state_calls
+        source_state_calls += 1
+        raise AssertionError("cache hit must not requery source state")
+
+    monkeypatch.setattr(
+        provider_flow_snapshot,
+        "fetch_provider_flow_source_state",
+        fail_if_called,
+    )
+
+    assert (
+        provider_flow_snapshot.get_provider_flow_snapshot_for_state(captured)
+        == expected
+    )
+    assert source_state_calls == 0
 
 
 def test_provider_source_state_hashes_effective_ea_catalog_and_selection(monkeypatch):

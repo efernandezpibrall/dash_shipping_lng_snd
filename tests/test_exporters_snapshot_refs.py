@@ -6,7 +6,7 @@ import statistics
 import threading
 import time
 
-from dash import html
+from dash import html, no_update
 from dash._utils import to_json
 from flask import Flask, Response
 import numpy as np
@@ -1336,8 +1336,11 @@ def test_exporters_source_watermark_only_runs_on_initial_or_global_refresh(
         lambda: global_refresh,
     )
 
-    initial_state = exporters.refresh_exporters_source_state(0, 0)
+    initial_state, initial_status = (
+        exporters.refresh_exporters_source_state(0, 0)
+    )
     assert initial_state["refresh_token"] is None
+    assert initial_status["status"] == "checked"
     assert watermark_calls == ["read"]
 
     payload = _make_exporters_payload()
@@ -1357,8 +1360,15 @@ def test_exporters_source_watermark_only_runs_on_initial_or_global_refresh(
     assert watermark_calls == ["read"]
 
     global_refresh = True
-    refreshed_state = exporters.refresh_exporters_source_state(0, 1)
-    assert refreshed_state["refresh_token"]
+    refreshed_state, refreshed_status = (
+        exporters.refresh_exporters_source_state(
+            0,
+            1,
+            initial_state,
+        )
+    )
+    assert refreshed_state is no_update
+    assert refreshed_status["refresh_generation"] == 1
     assert watermark_calls == ["read", "read"]
 
 
@@ -1373,7 +1383,7 @@ def test_exporters_source_keys_follow_only_their_dependencies():
     assert destination_key == (
         exporters._exporters_destination_base_source_key(source_state)
     )
-    assert destination_key != (
+    assert destination_key == (
         exporters._exporters_destination_base_source_key(
             changed_source_state
         )
@@ -1454,7 +1464,7 @@ def test_exporters_source_keys_follow_only_their_dependencies():
     )
 
 
-def test_exporters_global_refresh_token_forces_all_snapshot_rebuilds(
+def test_exporters_global_refresh_token_reuses_all_snapshot_builds(
     monkeypatch,
     persistent_exporters_cache,
 ):
@@ -1536,16 +1546,96 @@ def test_exporters_global_refresh_token_forces_all_snapshot_rebuilds(
     )
 
     assert call_counts == {
-        "supply": 2,
-        "destination": 2,
-        "continent": 2,
-        "summary": 2,
+        "supply": 1,
+        "destination": 1,
+        "continent": 1,
+        "summary": 1,
     }
     assert warm == original
-    assert all(
-        current["revision"] != previous["revision"]
-        for current, previous in zip(rebuilt, original)
+    assert rebuilt == original
+
+
+def test_exporters_source_drift_keeps_prior_atomic_bundle_active(
+    monkeypatch,
+    persistent_exporters_cache,
+):
+    payload = _make_exporters_payload()
+    _install_exporters_data_sources(monkeypatch, payload)
+
+    def source_pair(snapshot_id, timestamp):
+        return {
+            "current_snapshot_id": snapshot_id,
+            "current_snapshot_date_utc": "2026-07-25",
+            "current_snapshot_timestamp_utc": timestamp,
+            "current_facts_retained": True,
+        }
+
+    pair_a = source_pair(101, "2026-07-25T12:00:00Z")
+    state_a = exporters._build_exporters_source_state(pair_a)
+    monkeypatch.setattr(
+        exporters,
+        "_fetch_exporters_source_watermark",
+        lambda: pair_a,
     )
+    exporters.refresh_all_data(
+        state_a,
+        "Country",
+        "Installation",
+        30,
+    )
+    entities = list(payload["continent_entities"])
+    bundle_key_a = exporters._build_source_key(
+        exporters.EXPORTERS_REFRESH_BUNDLE_NAMESPACE,
+        exporters._exporters_semantic_source_state(state_a),
+        "Country",
+        "Installation",
+        30,
+        entities,
+    )
+    prior_bundle = snapshots.get_snapshot_if_available(
+        exporters.engine,
+        namespace=exporters.EXPORTERS_REFRESH_BUNDLE_NAMESPACE,
+        source_key=bundle_key_a,
+    )
+    assert prior_bundle is not None
+
+    pair_b = source_pair(102, "2026-07-25T13:00:00Z")
+    state_b = exporters._build_exporters_source_state(pair_b)
+    pair_c = source_pair(103, "2026-07-25T14:00:00Z")
+    monkeypatch.setattr(
+        exporters,
+        "_fetch_exporters_source_watermark",
+        lambda: pair_c,
+    )
+    with pytest.raises(
+        snapshots.SnapshotUnavailable,
+        match="changed during snapshot construction",
+    ):
+        exporters.refresh_all_data(
+            state_b,
+            "Country",
+            "Installation",
+            30,
+        )
+
+    assert snapshots.get_snapshot_if_available(
+        exporters.engine,
+        namespace=exporters.EXPORTERS_REFRESH_BUNDLE_NAMESPACE,
+        source_key=bundle_key_a,
+    ) == prior_bundle
+    bundle_key_b = exporters._build_source_key(
+        exporters.EXPORTERS_REFRESH_BUNDLE_NAMESPACE,
+        exporters._exporters_semantic_source_state(state_b),
+        "Country",
+        "Installation",
+        30,
+        entities,
+    )
+    assert snapshots.get_snapshot_if_available(
+        exporters.engine,
+        namespace=exporters.EXPORTERS_REFRESH_BUNDLE_NAMESPACE,
+        source_key=bundle_key_b,
+    ) is None
 
 
 @pytest.mark.parametrize("pool_size", [1, 2, 4])

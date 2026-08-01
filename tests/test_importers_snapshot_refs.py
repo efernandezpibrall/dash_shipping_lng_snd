@@ -7,7 +7,7 @@ import statistics
 import threading
 import time
 
-from dash import html
+from dash import html, no_update
 from dash._callback import GLOBAL_CALLBACK_MAP
 from dash._utils import to_json
 from flask import Flask, Response
@@ -972,17 +972,10 @@ def test_explicit_refresh_forces_source_and_derived_once_per_new_state(
         "Country",
         30,
     )
-    assert source_calls == 3
-    assert derived_calls == [
-        ("Country", 30),
-        ("Country", 30),
-        ("Country", 30),
-    ]
-    assert first_refresh[2]["source_key"] != initial[2]["source_key"]
-    assert (
-        second_refresh[2]["source_key"]
-        != first_refresh[2]["source_key"]
-    )
+    assert source_calls == 1
+    assert derived_calls == [("Country", 30)]
+    assert first_refresh == initial
+    assert second_refresh == initial
     assert all(
         store["namespace"] == importers.IMPORTERS_OVERVIEW_NAMESPACE
         for store in first_refresh + second_refresh
@@ -994,7 +987,7 @@ def test_explicit_refresh_forces_source_and_derived_once_per_new_state(
         "Classification Level 1",
         30,
     )
-    assert source_calls == 3
+    assert source_calls == 1
     assert derived_calls[-1] == ("Classification Level 1", 30)
 
     triggered_id = "imp-overview-rolling-window-days-input"
@@ -1003,7 +996,7 @@ def test_explicit_refresh_forces_source_and_derived_once_per_new_state(
         "Classification Level 1",
         45,
     )
-    assert source_calls == 3
+    assert source_calls == 1
     assert derived_calls[-1] == ("Classification Level 1", 45)
 
     replay = importers.refresh_overview_data(
@@ -1012,15 +1005,15 @@ def test_explicit_refresh_forces_source_and_derived_once_per_new_state(
         45,
     )
     assert replay == rolling
-    assert source_calls == 3
-    assert len(derived_calls) == 5
+    assert source_calls == 1
+    assert len(derived_calls) == 3
     assert all(
         snapshots.snapshot_is_resolvable(store)
         for store in classification
     )
 
 
-def test_source_state_refresh_token_is_unique_and_excluded_from_key(
+def test_source_state_refresh_status_is_operational_only(
     monkeypatch,
 ):
     monkeypatch.setattr(
@@ -1035,20 +1028,118 @@ def test_source_state_refresh_token_is_unique_and_excluded_from_key(
         lambda: is_refresh,
     )
 
-    initial = importers.load_importers_overview_source_state(0)
+    initial, initial_status = (
+        importers.load_importers_overview_source_state(0)
+    )
     assert initial["refresh_token"] is None
+    assert initial_status["refresh_generation"] == 0
 
     is_refresh = True
-    first = importers.load_importers_overview_source_state(1)
-    second = importers.load_importers_overview_source_state(2)
-    assert first["refresh_token"]
-    assert second["refresh_token"]
-    assert first["refresh_token"] != second["refresh_token"]
+    first, first_status = importers.load_importers_overview_source_state(
+        1,
+        initial,
+    )
+    second, second_status = importers.load_importers_overview_source_state(
+        2,
+        initial,
+    )
+    assert first is no_update
+    assert second is no_update
+    assert first_status["refresh_generation"] == 1
+    assert second_status["refresh_generation"] == 2
     assert (
         importers._importers_source_snapshot_key(initial)
-        == importers._importers_source_snapshot_key(first)
-        == importers._importers_source_snapshot_key(second)
+        == importers._importers_source_snapshot_key(initial)
     )
+
+
+def test_importer_source_miss_revalidates_once_and_hit_does_not_requery(
+    monkeypatch,
+    persistent_importer_cache,
+):
+    source_pair = {
+        "current_snapshot_id": 101,
+        "current_snapshot_date_utc": "2026-07-25",
+        "current_snapshot_timestamp_utc": "2026-07-25T12:00:00Z",
+        "current_facts_retained": True,
+    }
+    source_state = importers._build_importers_source_state(
+        source_pair,
+        refresh_token=None,
+    )
+    source_calls = 0
+    validation_calls = 0
+
+    def build_source(_source_state):
+        nonlocal source_calls
+        source_calls += 1
+        return copy.deepcopy(_make_source_payload())
+
+    def fetch_state():
+        nonlocal validation_calls
+        validation_calls += 1
+        return dict(source_pair)
+
+    monkeypatch.setattr(
+        importers,
+        "_build_importers_source_payload",
+        build_source,
+    )
+    monkeypatch.setattr(
+        importers,
+        "_fetch_importers_source_watermark",
+        fetch_state,
+    )
+
+    first = importers._load_importers_source_snapshot(source_state)
+    second = importers._load_importers_source_snapshot(source_state)
+
+    assert first == second
+    assert source_calls == 1
+    assert validation_calls == 1
+
+
+def test_importer_source_drift_does_not_publish_partial_snapshot(
+    monkeypatch,
+    persistent_importer_cache,
+):
+    source_pair = {
+        "current_snapshot_id": 101,
+        "current_snapshot_date_utc": "2026-07-25",
+        "current_snapshot_timestamp_utc": "2026-07-25T12:00:00Z",
+        "current_facts_retained": True,
+    }
+    source_state = importers._build_importers_source_state(
+        source_pair,
+        refresh_token=None,
+    )
+    changed_pair = {
+        **source_pair,
+        "current_snapshot_id": 102,
+        "current_snapshot_timestamp_utc": "2026-07-25T13:00:00Z",
+    }
+    monkeypatch.setattr(
+        importers,
+        "_build_importers_source_payload",
+        lambda _state: copy.deepcopy(_make_source_payload()),
+    )
+    monkeypatch.setattr(
+        importers,
+        "_fetch_importers_source_watermark",
+        lambda: changed_pair,
+    )
+
+    with pytest.raises(
+        snapshots.SnapshotUnavailable,
+        match="changed during snapshot construction",
+    ):
+        importers._load_importers_source_snapshot(source_state)
+
+    assert snapshots.get_snapshot_if_available(
+        importers.engine,
+        namespace=importers.IMPORTERS_SOURCE_NAMESPACE,
+        source_key=importers._importers_source_snapshot_key(source_state),
+    ) is None
 
 
 def test_period_callback_builds_renders_and_exports_populated_payload(
@@ -1069,7 +1160,7 @@ def test_period_callback_builds_renders_and_exports_populated_payload(
     assert (
         "global-refresh-button",
         "n_clicks",
-    ) in period_inputs
+    ) not in period_inputs
     assert period_callback["state"] == [{
         "id": "imp-overview-source-state-store",
         "property": "data",
@@ -1113,11 +1204,10 @@ def test_period_callback_builds_renders_and_exports_populated_payload(
         overview_stores[1],
         "Country",
         "origin_shipping_region",
-        30,
-        "show_all",
-        0,
-        {"watermark": "2026-07-24T00:00:00"},
-    )
+            30,
+            "show_all",
+            {"watermark": "2026-07-24T00:00:00"},
+        )
     assert snapshots.is_snapshot_reference(current_payload)
     resolved_payload = snapshots.resolve_snapshot(
         current_payload,

@@ -1,4 +1,4 @@
-from dash import html, dcc, callback, Output, Input, State, ALL, callback_context
+from dash import html, dcc, callback, Output, Input, State, ALL, callback_context, no_update
 from dash.dash_table.Format import Format, Scheme
 from dash.exceptions import PreventUpdate
 from utils.ag_grid_tables import (
@@ -15,6 +15,7 @@ from io import BytesIO
 import json
 import zlib
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from sqlalchemy import text, bindparam
 import calendar
 import uuid
@@ -24,16 +25,23 @@ from utils.dashboard_snapshot_cache import (
     SnapshotUnavailable as _SnapshotUnavailable,
     build_source_key as _build_source_key,
     get_or_build_snapshot as _get_or_build_snapshot,
+    commit_snapshot_publication_stage as _commit_snapshot_publication_stage,
     is_snapshot_reference as _is_snapshot_reference,
+    local_snapshot_persistence_enabled as _local_snapshot_persistence_enabled,
     pack_record_mapping as _pack_record_mapping,
     resolve_snapshot as _resolve_snapshot,
     snapshot_is_resolvable as _snapshot_is_resolvable,
+    snapshot_build_lock as _snapshot_build_lock,
+    stage_snapshot_publication as _stage_snapshot_publication,
     unpack_record_mapping as _unpack_record_mapping,
-    was_global_refresh_triggered as _was_global_refresh_triggered,
+    was_global_refresh_triggered as _was_global_refresh_triggered,  # noqa: F401 - compatibility hook
     with_snapshot_slot as _with_snapshot_slot,
 )
 from utils.database import DB_SCHEMA, engine
 from utils.performance import log_callback_timing
+from utils.performance_flags import (
+    revision_aware_refresh_enabled as _revision_aware_refresh_enabled,
+)
 
 # Month order constant for sorting (used in multiple functions)
 MONTH_ORDER = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
@@ -845,6 +853,7 @@ EXPORTERS_REFERENCE_NAMESPACES = frozenset({
     EXPORTERS_CONTINENT_EXPORT_NAMESPACE,
 })
 EXPORTERS_SOURCE_STATE_FORMAT = 'exporters-source-state-v2'
+EXPORTERS_REFRESH_BUNDLE_NAMESPACE = 'exporters-refresh-bundle-v1'
 EXPORTERS_SUPPLY_DEST_SUMMARY_FORMAT = 'exporters-supply-dest-summary-v2'
 EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE = (
     'Cached exporter data is unavailable. Click the global Refresh button '
@@ -5767,6 +5776,7 @@ layout = html.Div([
 
     # Store components for caching data (memory is faster than local storage)
     dcc.Store(id='exporters-source-state-store', storage_type='memory'),
+    dcc.Store(id='exporters-refresh-status-store', storage_type='memory'),
     dcc.Store(id='supply-charts-data', storage_type='memory'),  # Single store for all supply chart data
     dcc.Store(id='continent-charts-data', storage_type='memory'),  # Store for continent charts data
     dcc.Store(id='supply-dest-data-store', storage_type='memory'),  # Store for supply-destination data
@@ -6257,34 +6267,66 @@ def _validate_exporters_source_state(source_state):
     return dict(source_state)
 
 
+def _exporters_semantic_source_state(source_state):
+    normalized = _validate_exporters_source_state(source_state)
+    normalized.pop('refresh_token', None)
+    if _revision_aware_refresh_enabled():
+        normalized.pop('refresh_generation', None)
+    normalized.pop('checked_at', None)
+    return normalized
+
+
 @callback(
     Output('exporters-source-state-store', 'data'),
+    Output('exporters-refresh-status-store', 'data'),
     [Input('initial-load-trigger', 'n_intervals'),
      Input('global-refresh-button', 'n_clicks')],
+    State('exporters-source-state-store', 'data'),
     prevent_initial_call=False
 )
-def refresh_exporters_source_state(_n_intervals, _global_refresh_clicks):
+def refresh_exporters_source_state(
+    _n_intervals,
+    global_refresh_clicks,
+    current_source_state=None,
+):
     """Capture one coherent current/PBD snapshot pair on refresh."""
-    refresh_token = (
-        uuid.uuid4().hex
-        if _was_global_refresh_triggered()
-        else None
-    )
+    refresh_status = {
+        'format': 'dashboard-source-refresh-status-v1',
+        'refresh_generation': int(global_refresh_clicks or 0),
+        'checked_at': datetime.now().astimezone().isoformat(),
+    }
     try:
         source_pair = _fetch_exporters_source_watermark()
     except Exception:
         source_pair = None
-        refresh_token = uuid.uuid4().hex
-    return _build_exporters_source_state(
+        refresh_status['status'] = 'unavailable'
+    else:
+        refresh_status['status'] = 'checked'
+    source_state = _build_exporters_source_state(
         source_pair,
-        refresh_token,
+        refresh_token=None,
     )
+    if source_pair is None:
+        source_state['request_token'] = uuid.uuid4().hex
+    if not _revision_aware_refresh_enabled():
+        source_state['refresh_generation'] = int(
+            global_refresh_clicks or 0
+        )
+    if (
+        _revision_aware_refresh_enabled()
+        and
+        isinstance(current_source_state, dict)
+        and _exporters_semantic_source_state(current_source_state)
+        == _exporters_semantic_source_state(source_state)
+    ):
+        return no_update, refresh_status
+    return source_state, refresh_status
 
 
 def _exporters_destination_base_source_key(source_state):
     return _build_source_key(
         EXPORTERS_DESTINATION_BASE_NAMESPACE,
-        _validate_exporters_source_state(source_state),
+        _exporters_semantic_source_state(source_state),
     )
 
 
@@ -6304,7 +6346,7 @@ def _exporters_supply_charts_source_key(
 ):
     return _build_source_key(
         EXPORTERS_SUPPLY_CHARTS_NAMESPACE,
-        _validate_exporters_source_state(source_state),
+        _exporters_semantic_source_state(source_state),
         classification_mode,
         rolling_avg_days,
         list(entity_names),
@@ -6323,7 +6365,7 @@ def _exporters_continent_data_source_key(
     )
     return _build_source_key(
         EXPORTERS_CONTINENT_DATA_NAMESPACE,
-        _validate_exporters_source_state(source_state),
+        _exporters_semantic_source_state(source_state),
         classification_mode,
         rolling_avg_days,
         list(entity_names),
@@ -6339,7 +6381,7 @@ def _exporters_continent_export_source_key(
 ):
     return _build_source_key(
         EXPORTERS_CONTINENT_EXPORT_NAMESPACE,
-        _validate_exporters_source_state(source_state),
+        _exporters_semantic_source_state(source_state),
         classification_mode,
         rolling_avg_days,
         list(entity_names),
@@ -6821,6 +6863,67 @@ def _load_exporters_independent_snapshots(
         }
 
 
+def _load_exporters_refresh_batch(
+    engine_inst,
+    schema,
+    source_state,
+    classification_mode,
+    demand_aggregation_mode,
+    rolling_avg_days,
+    entity_names,
+):
+    loaded = _load_exporters_independent_snapshots(
+        engine_inst,
+        schema,
+        source_state,
+        classification_mode,
+        rolling_avg_days,
+        entity_names,
+    )
+    destination_base_reference, destination_base_df = (
+        loaded['destination_base']
+    )
+    destination_pbd_reference, destination_pbd_df = loaded.get(
+        'destination_pbd',
+        (None, pd.DataFrame()),
+    )
+    charts_reference, _charts_payload = loaded['supply_charts']
+    continent_reference, _continent_payload = loaded['continent_data']
+    summary_reference, _summary_payload = (
+        _load_exporters_destination_summary_snapshot(
+            engine_inst,
+            schema,
+            destination_base_reference,
+            destination_base_df,
+            destination_pbd_reference,
+            destination_pbd_df,
+            source_state,
+            classification_mode,
+            demand_aggregation_mode,
+        )
+    )
+    references = {
+        'destination_base': destination_base_reference,
+        'destination_pbd': destination_pbd_reference,
+        'supply_charts': charts_reference,
+        'continent_data': continent_reference,
+        'destination_summary': summary_reference,
+    }
+    if not all(
+        _snapshot_is_resolvable(reference)
+        for reference in references.values()
+        if reference is not None
+    ):
+        raise _SnapshotUnavailable(
+            EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        )
+    return (
+        _with_snapshot_slot(charts_reference, 'charts_cube'),
+        continent_reference,
+        summary_reference,
+    ), references
+
+
 @callback(
     [Output('supply-charts-data', 'data'),
      Output('continent-charts-data', 'data'),
@@ -6855,61 +6958,84 @@ def refresh_all_data(
             schema,
             classification_mode,
         )
-        loaded = _load_exporters_independent_snapshots(
-            engine_inst,
-            schema,
-            source_state,
+        atomic_refresh = (
+            _revision_aware_refresh_enabled()
+            and _local_snapshot_persistence_enabled()
+            and isinstance(source_state.get('current_snapshot'), dict)
+            and not source_state.get('request_token')
+        )
+        bundle_source_key = _build_source_key(
+            EXPORTERS_REFRESH_BUNDLE_NAMESPACE,
+            _exporters_semantic_source_state(source_state),
             classification_mode,
+            demand_aggregation_mode,
             rolling_avg_days,
-            entity_names,
+            list(entity_names),
         )
-        destination_base_reference, destination_base_df = (
-            loaded['destination_base']
-        )
-        destination_pbd_reference, destination_pbd_df = loaded.get(
-            'destination_pbd',
-            (None, pd.DataFrame()),
-        )
-        charts_reference, charts_payload = loaded['supply_charts']
-        continent_reference, _continent_payload = (
-            loaded['continent_data']
-        )
-        summary_reference, _summary_payload = (
-            _load_exporters_destination_summary_snapshot(
-                engine_inst,
-                schema,
-                destination_base_reference,
-                destination_base_df,
-                destination_pbd_reference,
-                destination_pbd_df,
-                source_state,
-                classification_mode,
-                demand_aggregation_mode,
+        lock_context = (
+            _snapshot_build_lock(
+                EXPORTERS_REFRESH_BUNDLE_NAMESPACE,
+                bundle_source_key,
             )
+            if atomic_refresh
+            else nullcontext()
         )
-        references = (
-            destination_base_reference,
-            destination_pbd_reference,
-            charts_reference,
-            continent_reference,
-            summary_reference,
-        )
-        if not all(
-            _snapshot_is_resolvable(reference)
-            for reference in references
-            if reference is not None
-        ):
-            raise _SnapshotUnavailable(
-                EXPORTERS_SNAPSHOT_RECOVERY_MESSAGE
+        with lock_context:
+            publication_context = (
+                _stage_snapshot_publication(
+                    f'exporters-refresh:{bundle_source_key}'
+                )
+                if atomic_refresh
+                else nullcontext(None)
             )
-        return (
-            _with_snapshot_slot(
-                charts_reference,
-                'charts_cube',
-            ),
-            continent_reference,
-            summary_reference,
-        )
+            with publication_context as publication_stage:
+                result, references = _load_exporters_refresh_batch(
+                    engine_inst,
+                    schema,
+                    source_state,
+                    classification_mode,
+                    demand_aggregation_mode,
+                    rolling_avg_days,
+                    entity_names,
+                )
+                if (
+                    publication_stage is not None
+                    and publication_stage.records
+                ):
+                    current_source_state = _build_exporters_source_state(
+                        _fetch_exporters_source_watermark(),
+                        refresh_token=None,
+                    )
+                    if (
+                        _exporters_semantic_source_state(
+                            current_source_state
+                        )
+                        != _exporters_semantic_source_state(source_state)
+                    ):
+                        raise _SnapshotUnavailable(
+                            'Exporter sources changed during snapshot '
+                            'construction. Refresh and retry.'
+                        )
+                    _commit_snapshot_publication_stage(
+                        publication_stage,
+                        bundle_namespace=(
+                            EXPORTERS_REFRESH_BUNDLE_NAMESPACE
+                        ),
+                        bundle_source_key=bundle_source_key,
+                        bundle_payload={
+                            'artifacts': references,
+                            'source_state': source_state,
+                        },
+                        bundle_manifest={
+                            'source_state': source_state,
+                            'classification_mode': classification_mode,
+                            'demand_aggregation_mode': (
+                                demand_aggregation_mode
+                            ),
+                            'rolling_avg_days': rolling_avg_days,
+                        },
+                    )
+        return result
 
     except _SnapshotUnavailable:
         raise
