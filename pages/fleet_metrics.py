@@ -48,10 +48,8 @@ logger = logging.getLogger(__name__)
 KPLER_FLEET_METRICS_TABLE = "kpler_lng_fleet_metrics_series"
 KPLER_REGIONAL_SIGNAL_TABLE = "kpler_lng_regional_signal_series"
 KPLER_DIVERSIONS_TABLE = "kpler_lng_diversions"
-PRICE_CURVE_TABLE = "curve"
 KPLER_FLEET_DEFAULT_ZONE_FILTER = "asia_pacific_oceans"
 KPLER_FLEET_DEFAULT_START_DATE = dt.date(2021, 1, 1)
-PRICE_FRESHNESS_DAYS = 7
 RELATION_EXISTS_CACHE_SECONDS = 300
 CHART_HEIGHT = 500
 SIGNAL_REGION_ROW_CHART_HEIGHT = 430
@@ -97,7 +95,7 @@ FLEET_METRICS_RENDER_BUNDLE_FORMAT = "fleet-metrics-render-bundle-v1"
 FLEET_METRICS_RENDER_SUMMARY_FORMAT = "fleet-metrics-render-summary-v1"
 FLEET_METRICS_RENDER_SIGNALS_FORMAT = "fleet-metrics-render-signals-v1"
 FLEET_METRICS_RENDER_DETAIL_FORMAT = "fleet-metrics-render-detail-v1"
-FLEET_METRICS_RENDER_SCHEMA_VERSION = 1
+FLEET_METRICS_RENDER_SCHEMA_VERSION = 2
 FLEET_METRICS_SOURCE_FRAME_KEYS = (
     "detail_matrix_floating_days",
     "regional_signals",
@@ -115,7 +113,7 @@ _FLEET_RENDER_CACHE = OrderedDict()
 _FLEET_COMMON_RENDER_CACHE = OrderedDict()
 _FLEET_COMMON_RENDER_FLIGHTS: dict[tuple, Future] = {}
 _FLEET_RENDER_CACHE_LOCK = threading.Lock()
-_FLEET_REGION_OUTPUT_INDICES = frozenset({0, 1, 3, 5, 6, 13})
+_FLEET_REGION_OUTPUT_INDICES = frozenset({0, 1, 2, 4, 5, 12})
 
 
 def _fetch_fleet_metrics_source_state():
@@ -139,9 +137,7 @@ def _fetch_fleet_metrics_source_state():
                AND inserted_rows + updated_rows > 0) AS signal_revision,
             (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_FLEET_METRICS_TABLE)}) AS fleet_changed_at,
             (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_REGIONAL_SIGNAL_TABLE)}) AS signal_changed_at,
-            (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_DIVERSIONS_TABLE)}) AS diversion_upload,
-            (SELECT MAX(cob) FROM {_table_ref(PRICE_CURVE_TABLE)}
-             WHERE code IN ('ICE_JKM_MO', 'ICE_TFU_MO')) AS price_cob
+            (SELECT MAX(upload_timestamp_utc) FROM {_table_ref(KPLER_DIVERSIONS_TABLE)}) AS diversion_upload
     """)
     with engine.connect() as connection:
         row = connection.execute(query).mappings().first()
@@ -174,7 +170,6 @@ _FLEET_SEMANTIC_SOURCE_FIELDS = (
     "fleet_revision",
     "signal_revision",
     "diversion_upload",
-    "price_cob",
 )
 
 
@@ -1371,69 +1366,6 @@ def compute_global_signal_summaries(signals_df, diversions_df, end_date):
         }
 
     return summaries
-
-
-def fetch_price_context():
-    if not _relation_exists(PRICE_CURVE_TABLE):
-        return {"status": "No curve table"}
-
-    try:
-        query = text(f"""
-            WITH latest_cob AS (
-                SELECT MAX(cob) AS cob
-                FROM {_table_ref(PRICE_CURVE_TABLE)}
-                WHERE code IN ('ICE_JKM_MO', 'ICE_TFU_MO')
-            ),
-            ranked AS (
-                SELECT
-                    curve.code,
-                    curve.cob,
-                    curve.contract,
-                    curve.expiry,
-                    curve.value,
-                    curve.currency,
-                    curve.units,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY curve.code
-                        ORDER BY curve.expiry
-                    ) AS row_number
-                FROM {_table_ref(PRICE_CURVE_TABLE)} AS curve
-                JOIN latest_cob ON curve.cob = latest_cob.cob
-                WHERE curve.code IN ('ICE_JKM_MO', 'ICE_TFU_MO')
-                  AND curve.expiry >= curve.cob
-            )
-            SELECT code, cob, contract, value, currency, units
-            FROM ranked
-            WHERE row_number = 1
-            ORDER BY code
-        """)
-        df = pd.read_sql(query, engine)
-    except Exception as exc:
-        return {"status": f"Price error: {exc}"}
-
-    if df.empty:
-        return {"status": "No price rows"}
-
-    latest_cob = pd.to_datetime(df["cob"].max()).date()
-    today = dt.date.today()
-    is_fresh = latest_cob >= today - dt.timedelta(days=PRICE_FRESHNESS_DAYS)
-    values = {row["code"]: row for _, row in df.iterrows()}
-    jkm = values.get("ICE_JKM_MO")
-    ttf = values.get("ICE_TFU_MO")
-    spread = None
-    if jkm is not None and ttf is not None:
-        spread = float(jkm["value"]) - float(ttf["value"])
-
-    return {
-        "status": "Fresh" if is_fresh else "Stale",
-        "cob": latest_cob,
-        "jkm": float(jkm["value"]) if jkm is not None else None,
-        "ttf": float(ttf["value"]) if ttf is not None else None,
-        "spread": spread,
-        "contract": jkm["contract"] if jkm is not None else None,
-        "currency": jkm["currency"] if jkm is not None else None,
-        "units": jkm["units"] if jkm is not None else None,
-    }
 
 
 def _build_weekly_5y_envelope(metric_df, current_year, value_column="quantity_mtonnes"):
@@ -3311,29 +3243,10 @@ def build_global_signal_cards(signal_row):
     ]
 
 
-def build_price_card(price_context):
-    status = price_context.get("status")
-    if status != "Fresh":
-        cob = price_context.get("cob")
-        subtitle = f"Latest COB {cob:%d %b %Y}" if cob else status
-        return _build_kpi_card("JKM-TTF prompt spread", "Stale", subtitle, "warning")
-
-    spread = price_context.get("spread")
-    contract = price_context.get("contract") or "prompt"
-    units = price_context.get("units") or "MMBtu"
-    return _build_kpi_card(
-        "JKM-TTF prompt spread",
-        f"{_format_delta(spread, 2)} $/{units}",
-        f"{contract}; price context only",
-        "good" if spread and spread > 0 else "warning",
-    )
-
-
 def build_status_strip(
     fleet_checked_at,
     signal_checked_at,
     selected_region,
-    price_context,
     fleet_changed_at=None,
     signal_changed_at=None,
 ):
@@ -3353,7 +3266,6 @@ def build_status_strip(
     if signal_changed_at is not None and pd.notna(signal_changed_at):
         changed_dt = pd.to_datetime(signal_changed_at)
         signal_changed_text = f"Signals changed: {changed_dt:%d %b %Y %H:%M UTC}"
-    price_status = price_context.get("status", "Unavailable")
     return html.Div(
         [
             html.Span(fleet_checked_text),
@@ -3362,7 +3274,6 @@ def build_status_strip(
             html.Span(signal_changed_text),
             html.Span(f"Selected basin: {_region_label(selected_region)}"),
             html.Span("Basin presets overlap and are not additive"),
-            html.Span(f"Price context: {price_status}"),
         ],
         style={
             "display": "flex",
@@ -4124,19 +4035,11 @@ layout = html.Div(
             [
                 html.Div(id="fleet-metrics-status-strip", style={"marginBottom": "12px"}),
                 html.Div(
-                    [
-                        html.Div(id="fleet-metrics-summary-cards", style={
-                            "display": "grid",
-                            "gridTemplateColumns": "repeat(auto-fit, minmax(145px, 1fr))",
-                            "gap": "12px",
-                        }),
-                        html.Div(id="fleet-metrics-price-card"),
-                    ],
+                    id="fleet-metrics-summary-cards",
                     style={
                         "display": "grid",
-                        "gridTemplateColumns": "minmax(0, 5fr) minmax(190px, 1fr)",
+                        "gridTemplateColumns": "repeat(auto-fit, minmax(145px, 1fr))",
                         "gap": "12px",
-                        "alignItems": "stretch",
                     },
                 ),
             ],
@@ -4383,7 +4286,6 @@ def _build_fleet_metrics_source_bundle(
         "area_options_by_region": lambda: fetch_all_area_options(
             split_dimension
         ),
-        "price_context": fetch_price_context,
         **diversion_tasks,
     }
 
@@ -4502,7 +4404,6 @@ def _build_fleet_metrics_common_render(
         "regional_signals": regional_signals,
         "signal_summaries": signal_summaries,
         "detail_matrix_weekly": detail_matrix_weekly,
-        "price_card": build_price_card(source_bundle["price_context"]),
         **figures,
     }
 
@@ -4600,7 +4501,6 @@ def _build_fleet_render_artifacts(source_reference, source_bundle):
         "signal_upload_timestamp": source_bundle.get(
             "signal_upload_timestamp"
         ),
-        "price_context": source_bundle.get("price_context") or {},
         "summaries": common_render["summaries"],
         "signal_summaries": common_render["signal_summaries"],
         "movers_by_region": movers_by_region,
@@ -5105,7 +5005,7 @@ def update_fleet_metrics_page(
     if zone_filter not in KPLER_FLEET_REGION_ORDER:
         zone_filter = KPLER_FLEET_DEFAULT_ZONE_FILTER
     if _fleet_refresh_status_only_triggered():
-        return (no_update,) * 18
+        return (no_update,) * 17
 
     try:
         source_bundle = _unpack_fleet_metrics_source_bundle(
@@ -5136,7 +5036,6 @@ def update_fleet_metrics_page(
                     region_only=region_only,
                 )
 
-        price_context = source_bundle["price_context"]
         freshness = _fleet_refresh_freshness(refresh_status)
         if not freshness and isinstance(source_reference, dict):
             freshness = source_reference.get("kpler_freshness") or {}
@@ -5159,14 +5058,12 @@ def update_fleet_metrics_page(
             fleet_checked_at,
             signal_checked_at,
             zone_filter,
-            price_context,
             freshness.get("fleet_changed_at")
             or source_bundle.get("fleet_changed_at"),
             freshness.get("signal_changed_at")
             or source_bundle.get("signal_changed_at"),
         )
         summary_cards = build_summary_cards(selected_summary)
-        price_card = common_render["price_card"]
         comparison_rows = build_comparison_rows(summaries, zone_filter)
         comparison_column_defs = build_compact_column_defs(
             FLEET_METRICS_REGION_COMPARISON_COLUMN_DEFS,
@@ -5201,7 +5098,6 @@ def update_fleet_metrics_page(
         result = (
             status_strip,
             summary_cards,
-            price_card,
             comparison_rows,
             comparison_column_defs,
             signal_cards,
@@ -5233,7 +5129,6 @@ def update_fleet_metrics_page(
         return (
             html.Div(f"Error loading FleetMetrics page: {exc}", style={"color": "#b91c1c"}),
             build_summary_cards(None),
-            _build_kpi_card("JKM-TTF prompt spread", "-", "Unavailable", "warning"),
             [],
             build_compact_column_defs(FLEET_METRICS_REGION_COMPARISON_COLUMN_DEFS, []),
             build_global_signal_cards(None),
@@ -5262,7 +5157,6 @@ def _fleet_summary_outputs_from_artifact(
 ):
     summaries = summary_artifact.get("summaries") or {}
     signal_summaries = summary_artifact.get("signal_summaries") or {}
-    price_context = summary_artifact.get("price_context") or {}
     freshness = _fleet_refresh_freshness(refresh_status)
     comparison_rows = build_comparison_rows(summaries, zone_filter)
     signal_rows = build_global_signal_rows(signal_summaries, zone_filter)
@@ -5275,14 +5169,12 @@ def _fleet_summary_outputs_from_artifact(
             or summary_artifact.get("signal_checked_at")
             or summary_artifact.get("signal_upload_timestamp"),
             zone_filter,
-            price_context,
             freshness.get("fleet_changed_at")
             or summary_artifact.get("fleet_changed_at"),
             freshness.get("signal_changed_at")
             or summary_artifact.get("signal_changed_at"),
         ),
         build_summary_cards(summaries.get(zone_filter)),
-        build_price_card(price_context),
         comparison_rows,
         build_compact_column_defs(
             FLEET_METRICS_REGION_COMPARISON_COLUMN_DEFS,
@@ -5348,12 +5240,6 @@ def _fleet_summary_error_outputs(exc):
             style={"color": "#b91c1c"},
         ),
         build_summary_cards(None),
-        _build_kpi_card(
-            "JKM-TTF prompt spread",
-            "-",
-            "Unavailable",
-            "warning",
-        ),
         [],
         build_compact_column_defs(
             FLEET_METRICS_REGION_COMPARISON_COLUMN_DEFS,
@@ -5422,11 +5308,11 @@ def update_fleet_metrics_summary(
         if _fleet_refresh_status_only_triggered():
             return (
                 summary_outputs[0],
-                *((no_update,) * 9),
+                *((no_update,) * 8),
             )
         if _fleet_region_only_triggered():
             summary_outputs = tuple(
-                no_update if index in {2, 4, 7} else value
+                no_update if index in {3, 6} else value
                 for index, value in enumerate(summary_outputs)
             )
             return (*summary_outputs, no_update)
@@ -5524,7 +5410,7 @@ def update_fleet_metrics_page_from_render_snapshot(
     zone_filter,
     refresh_status=None,
 ):
-    """Serve the legacy 18-output contract from immutable render artifacts."""
+    """Serve the 17-output Fleet contract from immutable render artifacts."""
 
     zone_filter = zone_filter or KPLER_FLEET_DEFAULT_ZONE_FILTER
     if zone_filter not in KPLER_FLEET_REGION_ORDER:
@@ -5545,7 +5431,7 @@ def update_fleet_metrics_page_from_render_snapshot(
         if _fleet_refresh_status_only_triggered():
             return (
                 summary_outputs[0],
-                *((no_update,) * 17),
+                *((no_update,) * 16),
             )
         signals_artifact = _resolve_fleet_render_artifact(
             bundle_reference,
@@ -5560,9 +5446,9 @@ def update_fleet_metrics_page_from_render_snapshot(
             detail_artifact,
         )
         result = (
-            *summary_outputs[:8],
+            *summary_outputs[:7],
             *figure_outputs[:5],
-            summary_outputs[8],
+            summary_outputs[7],
             *figure_outputs[5:],
         )
         return _fleet_render_response(
@@ -5574,9 +5460,9 @@ def update_fleet_metrics_page_from_render_snapshot(
         summary_outputs = _fleet_summary_error_outputs(exc)
         figure_outputs = _fleet_figure_error_outputs(exc)
         return (
-            *summary_outputs[:8],
+            *summary_outputs[:7],
             *figure_outputs[:5],
-            summary_outputs[8],
+            summary_outputs[7],
             *figure_outputs[5:],
         )
 
@@ -5614,7 +5500,6 @@ def precompute_default_fleet_metrics():
 _FLEET_SUMMARY_CALLBACK_OUTPUTS = (
     Output("fleet-metrics-status-strip", "children"),
     Output("fleet-metrics-summary-cards", "children"),
-    Output("fleet-metrics-price-card", "children"),
     Output("fleet-metrics-region-comparison-table", "rowData"),
     Output("fleet-metrics-region-comparison-table", "columnDefs"),
     Output("fleet-metrics-global-signal-cards", "children"),
@@ -5656,9 +5541,9 @@ if _fleet_staged_render_enabled() and _fleet_render_snapshot_enabled():
     )(update_fleet_metrics_detail)
 elif _fleet_render_snapshot_enabled():
     callback(
-        *_FLEET_SUMMARY_CALLBACK_OUTPUTS[:8],
+        *_FLEET_SUMMARY_CALLBACK_OUTPUTS[:7],
         *_FLEET_FIGURE_CALLBACK_OUTPUTS[:5],
-        _FLEET_SUMMARY_CALLBACK_OUTPUTS[8],
+        _FLEET_SUMMARY_CALLBACK_OUTPUTS[7],
         *_FLEET_FIGURE_CALLBACK_OUTPUTS[5:],
         Input("fleet-metrics-source-ref-store", "data"),
         Input("fleet-metrics-region-tabs", "value"),
@@ -5667,9 +5552,9 @@ elif _fleet_render_snapshot_enabled():
     )(update_fleet_metrics_page_from_render_snapshot)
 else:
     callback(
-        *_FLEET_SUMMARY_CALLBACK_OUTPUTS[:8],
+        *_FLEET_SUMMARY_CALLBACK_OUTPUTS[:7],
         *_FLEET_FIGURE_CALLBACK_OUTPUTS[:5],
-        _FLEET_SUMMARY_CALLBACK_OUTPUTS[8],
+        _FLEET_SUMMARY_CALLBACK_OUTPUTS[7],
         *_FLEET_FIGURE_CALLBACK_OUTPUTS[5:],
         Input("fleet-metrics-source-ref-store", "data"),
         Input("fleet-metrics-region-tabs", "value"),

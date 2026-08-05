@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import inspect
 import json
 import threading
 import time
@@ -11,6 +12,20 @@ import plotly.graph_objects as go
 import pytest
 
 from pages import fleet_metrics
+
+
+def test_fleet_page_has_no_price_curve_dependency():
+    source = inspect.getsource(fleet_metrics)
+
+    for forbidden in (
+        "PRICE_CURVE_TABLE",
+        "price_cob",
+        "ICE_JKM_MO",
+        "ICE_TFU_MO",
+        "JKM-TTF",
+        "fleet-metrics-price-card",
+    ):
+        assert forbidden not in source
 
 
 def _source_reference(revision="opaque-revision-token"):
@@ -35,7 +50,6 @@ def _source_bundle():
             zone_filter: [f"{zone_filter}-area"]
             for zone_filter in fleet_metrics.KPLER_FLEET_REGION_ORDER
         },
-        "price_context": {},
         "upload_timestamp": "2026-07-25T00:00:00",
         "signal_upload_timestamp": "2026-07-25T00:00:00",
         "global_area_weekly": pd.DataFrame(),
@@ -53,7 +67,6 @@ def _common_render():
             zone_filter: {"zone_filter": zone_filter}
             for zone_filter in fleet_metrics.KPLER_FLEET_REGION_ORDER
         },
-        "price_card": marker,
         "loaded_seasonal_fig": marker,
         "floating_seasonal_fig": marker,
         "arrival_pipeline_fig": marker,
@@ -206,7 +219,6 @@ def test_staged_render_has_exact_legacy_semantic_fingerprint(
     common_render = {
         **_common_render(),
         **figures,
-        "price_card": ("price", source_bundle["price_context"]),
         "detail_matrix_legend": ("legend", split_dimension),
     }
     monkeypatch.setattr(
@@ -223,11 +235,6 @@ def test_staged_render_has_exact_legacy_semantic_fingerprint(
         fleet_metrics,
         "_build_fleet_metrics_common_render",
         lambda *_args, **_kwargs: common_render,
-    )
-    monkeypatch.setattr(
-        fleet_metrics,
-        "build_price_card",
-        lambda context: ("price", context),
     )
     monkeypatch.setattr(
         fleet_metrics,
@@ -271,9 +278,9 @@ def test_staged_render_has_exact_legacy_semantic_fingerprint(
         detail,
     )
     staged = (
-        *summary_outputs[:8],
+        *summary_outputs[:7],
         *figure_outputs[:5],
-        summary_outputs[8],
+        summary_outputs[7],
         *figure_outputs[5:],
     )
     artifacts = {
@@ -298,7 +305,7 @@ def test_staged_render_has_exact_legacy_semantic_fingerprint(
         )
     )
 
-    assert len(legacy) == len(staged) == len(render_snapshot) == 18
+    assert len(legacy) == len(staged) == len(render_snapshot) == 17
     legacy_fingerprints = [
         _semantic_fingerprint(value) for value in legacy
     ]
@@ -318,7 +325,7 @@ def test_staged_render_error_contract_preserves_all_outputs():
         RuntimeError("stale source")
     )
 
-    assert len(summary) == 9
+    assert len(summary) == 8
     assert len(figures) == 9
     assert all(value is not no_update for value in summary + figures)
 
@@ -366,7 +373,6 @@ def test_render_snapshot_region_switch_preserves_exact_no_update_contract(
     summary_artifact = {
         "summaries": {},
         "signal_summaries": {},
-        "price_context": {},
         "movers_by_region": {},
     }
     monkeypatch.setattr(
@@ -382,12 +388,12 @@ def test_render_snapshot_region_switch_preserves_exact_no_update_contract(
     monkeypatch.setattr(
         fleet_metrics,
         "_fleet_summary_outputs_from_artifact",
-        lambda *_args: tuple(range(9)),
+        lambda *_args: tuple(range(8)),
     )
     monkeypatch.setattr(
         fleet_metrics,
         "_fleet_figure_outputs_from_artifacts",
-        lambda *_args: tuple(range(9, 18)),
+        lambda *_args: tuple(range(8, 17)),
     )
     monkeypatch.setattr(
         fleet_metrics,
@@ -421,7 +427,7 @@ def test_region_only_render_updates_exact_six_outputs_including_cache_hit(
         reference,
         "europe_basin",
     )
-    assert len(full_result) == 18
+    assert len(full_result) == 17
     assert all(value is not no_update for value in full_result)
 
     monkeypatch.setattr(
@@ -433,7 +439,7 @@ def test_region_only_render_updates_exact_six_outputs_including_cache_hit(
         reference,
         "europe_basin",
     )
-    assert len(cached_result) == 18
+    assert len(cached_result) == 17
     assert {
         index
         for index, value in enumerate(cached_result)
@@ -729,7 +735,7 @@ def test_render_error_returns_all_outputs(monkeypatch):
         "europe_basin",
     )
 
-    assert len(result) == 18
+    assert len(result) == 17
     assert all(value is not no_update for value in result)
 
 
