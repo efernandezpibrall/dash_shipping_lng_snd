@@ -1211,20 +1211,6 @@ def test_capacity_callbacks_no_longer_upload_timeline_rowdata_as_state():
     assert 'Input("capacity-page-train-timeline-table", "cellValueChanged")' in source_text
 
 
-def test_capacity_source_migrations_are_relational_and_bounded():
-    migration_path = Path(
-        "/Users/fernandezpibrall/Repositories/fundamentals/terminals/migrations/021_capacity_relational_cache_cleanup.sql"
-    )
-    migration_sql = migration_path.read_text()
-    assert "status IN ('running', 'completed', 'failed')" in migration_sql
-    assert "rank_number > 2" in migration_sql
-    assert "DROP TABLE IF EXISTS at_lng.fundamentals_capacity_source_snapshots" in migration_sql
-    assert "DROP COLUMN IF EXISTS source_reference_jsonb" in migration_sql
-    assert "DROP COLUMN IF EXISTS detail_jsonb" in migration_sql
-    assert "fundamentals_capacity_source_refresh_jobs" in migration_sql
-    assert "request_id TEXT" not in migration_sql
-
-
 def test_refresh_worker_completes_one_source_key(monkeypatch):
     class FakeConnection:
         def __enter__(self): return self

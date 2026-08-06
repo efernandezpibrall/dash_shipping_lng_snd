@@ -30,7 +30,7 @@ from dash.exceptions import PreventUpdate
 from openpyxl.styles import Border, Side
 from sqlalchemy import text
 
-from fundamentals.terminals.capacity_source_cache_utils import (
+from fundamentals.lng.terminals.capacity_source_cache_utils import (
     capacity_events_to_monthly_country,
     capacity_source_event_bounds,
     compile_capacity_source_events,
@@ -41,14 +41,14 @@ from fundamentals.terminals.capacity_source_cache_utils import (
     mark_capacity_source_running,
     read_capacity_refresh_job,
 )
-from fundamentals.terminals.capacity_scenario_utils import (
+from fundamentals.lng.terminals.capacity_scenario_utils import (
     create_capacity_scenario_from_source,
     delete_capacity_scenario,
     fetch_capacity_scenario_rows,
     get_available_capacity_scenarios,
     save_capacity_scenario_rows,
 )
-from fundamentals.terminals.ramp_forecast_utils import (
+from fundamentals.lng.terminals.ramp_forecast_utils import (
     generate_ramp_forecast_for_capacity_scenario,
     get_active_ramp_profile_catalog,
     get_active_seasonal_profile_options,
@@ -56,7 +56,7 @@ from fundamentals.terminals.ramp_forecast_utils import (
     get_latest_ramp_forecast_status,
     publish_ramp_forecast_run,
 )
-from fundamentals.terminals.terminal_registry_utils import (
+from fundamentals.lng.terminals.terminal_registry_utils import (
     assign_terminal_train_profiles,
     attach_registry_keys_to_capacity_rows,
     backfill_terminal_keys,

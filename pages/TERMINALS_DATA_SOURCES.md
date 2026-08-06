@@ -199,7 +199,7 @@ Creates stacked area chart showing cumulative monthly output.
 
 ## External Dependencies
 
-- **scenario_utils.py** (`fundamentals/terminals/scenario_utils.py`): Provides `get_available_scenarios()` function to populate scenario dropdown
+- **scenario_utils.py** (`fundamentals/lng/terminals/scenario_utils.py`): Provides `get_available_scenarios()` function to populate scenario dropdown
 - **config.ini**: Database connection string and schema name
 - **SQLAlchemy Engine**: Database connectivity layer
 

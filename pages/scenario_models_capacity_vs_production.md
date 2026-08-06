@@ -403,8 +403,8 @@ Current implementation:
 - `dash_shipping_lng_snd/pages/capacity.py`
 - `dash_shipping_lng_snd/pages/production.py`
 - `dash_shipping_lng_snd/pages/terminals.py`
-- `fundamentals/terminals/capacity_scenario_utils.py`
-- `fundamentals/terminals/scenario_utils.py`
+- `fundamentals/lng/terminals/capacity_scenario_utils.py`
+- `fundamentals/lng/terminals/scenario_utils.py`
 
 Current documentation:
 

@@ -5,7 +5,7 @@ This document explains how the `Train Timeline - Monthly` section on the Capacit
 The implementation lives mainly in:
 
 - `dash_shipping_lng_snd/pages/capacity.py`
-- `fundamentals/terminals/capacity_scenario_utils.py`
+- `fundamentals/lng/terminals/capacity_scenario_utils.py`
 
 ## 1. What the section is for
 
@@ -171,7 +171,7 @@ The two persistence tables are:
 - `at_lng.fundamentals_capacity_scenarios`
 - `at_lng.fundamentals_capacity_scenario_rows`
 
-They are managed through `fundamentals/terminals/capacity_scenario_utils.py`.
+They are managed through `fundamentals/lng/terminals/capacity_scenario_utils.py`.
 
 ### One scenario row represents
 

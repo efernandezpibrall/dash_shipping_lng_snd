@@ -21,7 +21,7 @@ from utils.dashboard_snapshot_cache import (
 )
 from utils.database import engine
 
-from fundamentals.shipping_balance_calculator import global_shipping_balance as calc_global_shipping_balance, kpler_analysis
+from fundamentals.lng.shipping.shipping_balance_calculator import global_shipping_balance as calc_global_shipping_balance, kpler_analysis
 
 logger = logging.getLogger(__name__)
 

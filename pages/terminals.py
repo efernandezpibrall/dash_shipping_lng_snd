@@ -1,5 +1,5 @@
 import pandas as pd
-from fundamentals.terminals.terminal_output_utils import (
+from fundamentals.lng.terminals.terminal_output_utils import (
     fetch_keyed_terminal_monthly_output,
     fetch_keyed_terminal_train_summary,
 )
