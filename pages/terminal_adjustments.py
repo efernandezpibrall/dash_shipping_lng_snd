@@ -30,18 +30,18 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
 sys.path.insert(0, project_root)
 
-from fundamentals.terminals.scenario_utils import (
+from fundamentals.lng.terminals.scenario_utils import (
     get_available_scenarios,
     duplicate_scenario,
     save_adjustments_bulk,
     get_scenario_summary,
     delete_scenario
 )
-from fundamentals.terminals.terminal_output_utils import (
+from fundamentals.lng.terminals.terminal_output_utils import (
     fetch_keyed_terminal_adjustment_rows,
     fetch_keyed_terminal_monthly_output,
 )
-from fundamentals.terminals.terminal_registry_utils import find_terminal_train_candidates
+from fundamentals.lng.terminals.terminal_registry_utils import find_terminal_train_candidates
 
 ###############################################################################
 # Data Fetching Functions

@@ -16,7 +16,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
 sys.path.insert(0, project_root)
 
-from fundamentals.terminals.terminal_output_utils import (
+from fundamentals.lng.terminals.terminal_output_utils import (
     fetch_capacity_ramp_production_monthly,
     get_capacity_ramp_production_catalog,
 )

@@ -4,7 +4,7 @@ import pandas as pd
 from dash import Input, Output, State, callback, dcc, html, no_update
 from dash.exceptions import PreventUpdate
 
-from fundamentals.terminals.terminal_registry_utils import (
+from fundamentals.lng.terminals.terminal_registry_utils import (
     find_terminal_train_candidates,
     replace_provider_source_allocations,
 )
