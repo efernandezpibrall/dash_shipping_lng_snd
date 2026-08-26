@@ -27,7 +27,6 @@ from dash import (
 from dash.dash_table.Format import Format, Scheme
 from utils.ag_grid_tables import create_ag_grid_from_datatable
 from dash.exceptions import PreventUpdate
-from openpyxl.styles import Border, Side
 from sqlalchemy import text
 
 from fundamentals.lng.terminals.capacity_source_cache_utils import (
@@ -12406,6 +12405,8 @@ def _apply_train_timeline_excel_mismatch_borders(
     worksheet,
     export_df: pd.DataFrame,
 ) -> None:
+    from openpyxl.styles import Border, Side
+
     required_columns = {"Woodmac First Date", "Scenario First Date"}
     if export_df.empty or not required_columns.issubset(export_df.columns):
         return

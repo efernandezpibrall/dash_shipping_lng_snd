@@ -17,6 +17,7 @@ import pandas as pd
 import json
 import uuid
 import zlib
+import calendar
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from datetime import datetime, timedelta
@@ -59,7 +60,6 @@ from pages.importer_detail import (
     DESTINATION_AGGREGATION_LABELS,
     IMPORTER_MAPPING_RENAME,
     IMPORTER_ORIGIN_LEVEL_TO_SCOPE,
-    VOLUME_METRIC_OPTIONS,
     get_volume_metric_info,
     convert_volume_metric_dataframe,
 )
@@ -68,6 +68,15 @@ from pages.importer_detail import (
 DEFAULT_IMPORTER_ROLLING_AVG_DAYS = 30
 MIN_IMPORTER_ROLLING_AVG_DAYS = 1
 MAX_IMPORTER_ROLLING_AVG_DAYS = 180
+VOLUME_METRIC_OPTIONS = [
+    {'label': 'mcm/d', 'value': 'mcm_d'},
+    {'label': 'bcm', 'value': 'bcm'},
+    {'label': 'MT', 'value': 'mt'},
+    {'label': 'MMTPA', 'value': 'mtpa'},
+]
+IMPORTER_VOLUME_METRIC_VALUES = frozenset(
+    option['value'] for option in VOLUME_METRIC_OPTIONS
+)
 TOP_IMPORTER_CHART_COUNT = 12
 MONTH_ORDER = {
     'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
@@ -87,7 +96,6 @@ IMPORTER_CHART_COLOR_SEQUENCE = [
 ]
 IMPORTER_CHART_FORECAST_DASH = 'dot'
 IMPORTER_CHART_ANCHOR_YEAR = 2024
-IMPORTER_CHART_QUERY_START_DATE = '2020-11-01'
 IMPORTER_CHART_DISPLAY_START_DATE = '2021-01-01'
 IMPORTER_CHART_DEFAULT_SELECTED_YEAR_COUNT = 2
 IMPORTER_CHART_DEFAULT_DESELECTED_YEARS = {'2024'}
@@ -97,7 +105,7 @@ IMPORTER_PERIOD_DEFAULT_QUARTER_COUNT = 5
 IMPORTER_PERIOD_DEFAULT_MONTH_COUNT = 3
 IMPORTER_PERIOD_DEFAULT_WEEK_COUNT = 3
 IMPORTER_PERIOD_MAX_QUARTER_COUNT = 8
-IMPORTER_PERIOD_MAX_MONTH_COUNT = 12
+IMPORTER_PERIOD_MAX_MONTH_COUNT = 48
 IMPORTER_PERIOD_MAX_WEEK_COUNT = 12
 IMPORTER_PERIOD_ORIGIN_GROUPING_OPTIONS = [
     {'label': 'Yes', 'value': 'group_small_countries'},
@@ -113,6 +121,7 @@ IMPORTER_PERIOD_COMPARISON_BASIS_OPTIONS = [
     {'label': 'vs Previous Year', 'value': 'same_period_last_year'}
 ]
 IMPORTER_PERIOD_TEXT_COLUMNS = ['Importer', 'Aggregation']
+IMPORTER_PERIOD_PERCENTAGE_DISPLAY_PRECISION = 1
 IMPORTER_PERIOD_DELTA_RAW_FIELD_PREFIX = '__importer_period_delta_raw_'
 IMPORTER_PERIOD_PBD_CURRENT_COLUMNS = (
     '30D_PBD_CURRENT',
@@ -139,15 +148,15 @@ ORIGIN_CONTINENT_CHART_TYPE_OPTIONS = [
     {'label': 'Market Share (%)', 'value': 'percentage'},
 ]
 
-IMPORTERS_SOURCE_NAMESPACE = 'importers-source-v3'
-IMPORTERS_LEGACY_OVERVIEW_NAMESPACE = 'importers-overview-v3'
-IMPORTERS_ARROW_OVERVIEW_NAMESPACE = 'importers-overview-v4'
+IMPORTERS_SOURCE_NAMESPACE = 'importers-source-v4'
+IMPORTERS_LEGACY_OVERVIEW_NAMESPACE = 'importers-overview-v5'
+IMPORTERS_ARROW_OVERVIEW_NAMESPACE = 'importers-overview-v6'
 IMPORTERS_OVERVIEW_NAMESPACE = IMPORTERS_LEGACY_OVERVIEW_NAMESPACE
 IMPORTERS_OVERVIEW_NAMESPACES = frozenset({
     IMPORTERS_LEGACY_OVERVIEW_NAMESPACE,
     IMPORTERS_ARROW_OVERVIEW_NAMESPACE,
 })
-IMPORTERS_PERIOD_NAMESPACE = 'importers-period-v3'
+IMPORTERS_PERIOD_NAMESPACE = 'importers-period-v4'
 IMPORTERS_SOURCE_STATE_FORMAT = 'importers-source-state-v3'
 IMPORTERS_PERIOD_PAYLOAD_FORMAT = 'importers-period-summary-v3'
 IMPORTERS_SNAPSHOT_RECOVERY_MESSAGE = (
@@ -666,13 +675,88 @@ def normalize_importer_rolling_avg_days(value):
     return max(MIN_IMPORTER_ROLLING_AVG_DAYS, min(MAX_IMPORTER_ROLLING_AVG_DAYS, days))
 
 
-def _format_importer_rolling_average_section_title(title_prefix, rolling_avg_days):
+def _get_importer_volume_metric_info(volume_metric):
+    """Return normalized metadata for an Importers overview metric."""
+    normalized_metric = (
+        volume_metric
+        if volume_metric in IMPORTER_VOLUME_METRIC_VALUES
+        else 'mcm_d'
+    )
+    return get_volume_metric_info(normalized_metric)
+
+
+def _get_importer_volume_metric_display_precision(volume_metric):
+    return int(
+        _get_importer_volume_metric_info(volume_metric).get(
+            'display_precision',
+            0,
+        )
+    )
+
+
+def _get_importer_volume_metric_plotly_number_format(volume_metric):
+    return f',.{_get_importer_volume_metric_display_precision(volume_metric)}f'
+
+
+def _round_importer_volume_metric_display_value(value, volume_metric):
+    precision = _get_importer_volume_metric_display_precision(volume_metric)
+    rounded_value = round(float(value), precision)
+    return 0.0 if rounded_value == 0 else rounded_value
+
+
+def _is_importer_period_volume_metric(volume_metric):
+    return (
+        _get_importer_volume_metric_info(volume_metric).get('quantity_kind')
+        == 'period_volume'
+    )
+
+
+def _get_importer_chart_query_start_date(rolling_avg_days):
+    """Return the exact warm-up boundary for the first visible chart point."""
+    display_start = pd.Timestamp(IMPORTER_CHART_DISPLAY_START_DATE).normalize()
+    preceding_days = normalize_importer_rolling_avg_days(rolling_avg_days) - 1
+    return (display_start - pd.Timedelta(days=preceding_days)).strftime('%Y-%m-%d')
+
+
+def _get_importer_chart_query_end_date(current_date):
+    """Include the same 14-day forecast horizon rendered by the chart builders."""
+    if current_date is None:
+        return None
+    return (
+        pd.Timestamp(current_date).normalize() + pd.Timedelta(days=14)
+    ).strftime('%Y-%m-%d')
+
+
+def _format_importer_rolling_average_section_title(
+    title_prefix,
+    rolling_avg_days,
+    volume_metric='mcm_d',
+):
     days = normalize_importer_rolling_avg_days(rolling_avg_days)
-    return f'{title_prefix} - {days}-Day Rolling Average'
+    measure = (
+        'Rolling Volume'
+        if _is_importer_period_volume_metric(volume_metric)
+        else 'Rolling Average'
+    )
+    return f'{title_prefix} - {days}-Day {measure}'
 
 
 def _format_importer_rolling_window_label(rolling_avg_days):
     return f'{normalize_importer_rolling_avg_days(rolling_avg_days)}D'
+
+
+def _get_importer_rolling_metric_export_column_name(
+    rolling_avg_days,
+    volume_metric,
+):
+    days = normalize_importer_rolling_avg_days(rolling_avg_days)
+    measure = (
+        'rolling_volume'
+        if _is_importer_period_volume_metric(volume_metric)
+        else 'rolling_avg'
+    )
+    vol_label = _get_importer_volume_metric_info(volume_metric)['label']
+    return f'{measure}_{days}d ({vol_label})'
 
 
 def _build_importer_period_count_options(max_count, min_count=1):
@@ -823,12 +907,18 @@ def _send_export_dataframe(export_df, filename_prefix, sheet_name):
     return dcc.send_bytes(output.getvalue(), f'{filename_prefix}_{timestamp}.xlsx')
 
 
-def _build_chart_export_df(charts_data, volume_metric='mcm_d', selected_years=None, chart_type='absolute'):
+def _build_chart_export_df(
+    charts_data,
+    volume_metric='mcm_d',
+    selected_years=None,
+    chart_type='absolute',
+    rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS,
+):
     """Flatten the chart-data store into a single export dataframe."""
     if not charts_data:
         return pd.DataFrame()
 
-    vol_label = get_volume_metric_info(volume_metric)['label']
+    rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
     available_years = _get_importer_chart_available_years(charts_data)
     active_years = set(_normalize_importer_chart_selected_years(selected_years, available_years))
     all_frames = []
@@ -847,10 +937,21 @@ def _build_chart_export_df(charts_data, volume_metric='mcm_d', selected_years=No
 
         if chart_type == 'percentage' and 'percentage' in entity_df.columns:
             entity_df = entity_df.rename(columns={'percentage': 'market_share (%)'})
+            entity_df = entity_df.drop(columns=['rolling_avg'], errors='ignore')
         else:
-            entity_df = convert_volume_metric_dataframe(entity_df, volume_metric, columns=['rolling_avg'])
+            entity_df = convert_volume_metric_dataframe(
+                entity_df,
+                volume_metric,
+                columns=['rolling_avg'],
+                period_days=rolling_avg_days,
+            )
             if 'rolling_avg' in entity_df.columns:
-                entity_df = entity_df.rename(columns={'rolling_avg': f'rolling_avg ({vol_label})'})
+                entity_df = entity_df.rename(columns={
+                    'rolling_avg': _get_importer_rolling_metric_export_column_name(
+                        rolling_avg_days,
+                        volume_metric,
+                    )
+                })
         entity_df.insert(0, 'entity', entity_name)
         all_frames.append(entity_df)
 
@@ -1394,7 +1495,9 @@ def _filter_scoped_trades_for_entity(scoped_trades_df, entity, classification_mo
 def _build_chart_data_payload(importer_entities, classification_mode='Country',
                               rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS,
                               scoped_trades_df=None,
-                              global_scoped_trades_df=None):
+                              global_scoped_trades_df=None,
+                              current_date=None,
+                              snapshot_timestamp_utc=None):
     """Build the demand and origin-continent chart payloads for overview importers."""
     demand_charts_data = {}
     origin_continent_charts_data = {}
@@ -1406,6 +1509,21 @@ def _build_chart_data_payload(importer_entities, classification_mode='Country',
     if not all_destination_countries:
         return demand_charts_data, origin_continent_charts_data
 
+    rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
+    chart_query_start_date = _get_importer_chart_query_start_date(
+        rolling_avg_days
+    )
+    query_kwargs = {
+        'min_end_date': chart_query_start_date,
+        'include_destination_context': True,
+    }
+    if snapshot_timestamp_utc is not None:
+        query_kwargs['snapshot_timestamp_utc'] = snapshot_timestamp_utc
+    if current_date is not None:
+        query_kwargs['max_end_date'] = _get_importer_chart_query_end_date(
+            current_date
+        )
+
     if scoped_trades_df is None:
         selected_aggregation = (
             _classification_mode_to_destination_aggregation(
@@ -1415,17 +1533,15 @@ def _build_chart_data_payload(importer_entities, classification_mode='Country',
         scoped_trades_df = _fetch_importer_scoped_trades(
             engine,
             all_destination_countries,
-            min_end_date=IMPORTER_CHART_QUERY_START_DATE,
-            include_destination_context=True,
             selected_destination_aggregation=selected_aggregation,
+            **query_kwargs,
         )
         if selected_aggregation != 'country':
             global_scoped_trades_df = _fetch_importer_scoped_trades(
                 engine,
                 all_destination_countries,
-                min_end_date=IMPORTER_CHART_QUERY_START_DATE,
-                include_destination_context=True,
                 selected_destination_aggregation='country',
+                **query_kwargs,
             )
     if global_scoped_trades_df is None:
         global_scoped_trades_df = scoped_trades_df
@@ -1446,8 +1562,9 @@ def _build_chart_data_payload(importer_entities, classification_mode='Country',
             demand_df = _build_importer_total_import_df(
                 filtered_df,
                 rolling_window_days=rolling_avg_days,
-                chart_start_date=IMPORTER_CHART_QUERY_START_DATE,
-                display_start_date=IMPORTER_CHART_DISPLAY_START_DATE
+                chart_start_date=chart_query_start_date,
+                display_start_date=IMPORTER_CHART_DISPLAY_START_DATE,
+                current_date=current_date,
             )
             demand_charts_data[entity_label] = demand_df.to_dict('records') if not demand_df.empty else []
 
@@ -1455,8 +1572,9 @@ def _build_chart_data_payload(importer_entities, classification_mode='Country',
                 filtered_df,
                 rolling_window_days=rolling_avg_days,
                 include_percentage=True,
-                chart_start_date=IMPORTER_CHART_QUERY_START_DATE,
-                display_start_date=IMPORTER_CHART_DISPLAY_START_DATE
+                chart_start_date=chart_query_start_date,
+                display_start_date=IMPORTER_CHART_DISPLAY_START_DATE,
+                current_date=current_date,
             )
             origin_continent_charts_data[entity_label] = (
                 origin_continent_df.to_dict('records') if not origin_continent_df.empty else []
@@ -2237,7 +2355,14 @@ def _get_importer_chart_range_years(focus_year, available_years):
     return previous_years[-IMPORTER_CHART_RANGE_LOOKBACK_YEARS:]
 
 
-def _add_importer_chart_range_band(fig, df, focus_year, available_years, vol_label):
+def _add_importer_chart_range_band(
+    fig,
+    df,
+    focus_year,
+    available_years,
+    vol_label,
+    volume_metric='mcm_d',
+):
     range_years = _get_importer_chart_range_years(focus_year, available_years)
     if not range_years:
         return
@@ -2269,6 +2394,9 @@ def _add_importer_chart_range_band(fig, df, focus_year, available_years, vol_lab
         return
 
     years_label = f"{range_years[0]}-{range_years[-1]}" if len(range_years) > 1 else range_years[0]
+    plotly_number_format = _get_importer_volume_metric_plotly_number_format(
+        volume_metric
+    )
     fig.add_trace(go.Scatter(
         x=range_df['plot_date'],
         y=range_df['range_min'],
@@ -2290,7 +2418,8 @@ def _add_importer_chart_range_band(fig, df, focus_year, available_years, vol_lab
         hovertemplate=(
             f'<b>{years_label} range</b> | '
             '%{text} | '
-            f'%{{customdata[0]:,.0f}}-%{{y:,.0f}} {vol_label}<extra></extra>'
+            f'%{{customdata[0]:{plotly_number_format}}}-'
+            f'%{{y:{plotly_number_format}}} {vol_label}<extra></extra>'
         ),
         showlegend=False
     ))
@@ -2309,7 +2438,12 @@ def _prepare_importer_demand_chart_dataframe(
         return pd.DataFrame()
 
     rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
-    df = convert_volume_metric_dataframe(df, volume_metric, columns=['rolling_avg'])
+    df = convert_volume_metric_dataframe(
+        df,
+        volume_metric,
+        columns=['rolling_avg'],
+        period_days=rolling_avg_days,
+    )
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     df = df[df['date'].notna()].copy()
     if df.empty:
@@ -2331,7 +2465,8 @@ def _prepare_importer_demand_chart_dataframe(
 def _prepare_importer_origin_chart_dataframe(
     data,
     chart_type,
-    volume_metric
+    volume_metric,
+    rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS,
 ):
     if not data:
         return pd.DataFrame(), 'rolling_avg'
@@ -2342,7 +2477,12 @@ def _prepare_importer_origin_chart_dataframe(
 
     metric_column = 'percentage' if chart_type == 'percentage' and 'percentage' in df.columns else 'rolling_avg'
     if metric_column == 'rolling_avg':
-        df = convert_volume_metric_dataframe(df, volume_metric, columns=['rolling_avg'])
+        df = convert_volume_metric_dataframe(
+            df,
+            volume_metric,
+            columns=['rolling_avg'],
+            period_days=normalize_importer_rolling_avg_days(rolling_avg_days),
+        )
 
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     df = df[df['date'].notna()].copy()
@@ -2383,7 +2523,13 @@ def _empty_importer_chart_figure(message, height=328):
     return fig
 
 
-def _apply_importer_chart_layout(fig, y_title, yaxis_range=None, show_legend=False):
+def _apply_importer_chart_layout(
+    fig,
+    y_title,
+    yaxis_range=None,
+    show_legend=False,
+    yaxis_tickformat=None,
+):
     yaxis_config = dict(
         title=dict(text=y_title, font=dict(size=11, color='#475569')),
         showgrid=True,
@@ -2400,6 +2546,8 @@ def _apply_importer_chart_layout(fig, y_title, yaxis_range=None, show_legend=Fal
         yaxis_config['range'] = yaxis_range
     else:
         yaxis_config['autorange'] = True
+    if yaxis_tickformat is not None:
+        yaxis_config['tickformat'] = yaxis_tickformat
 
     fig.update_layout(
         xaxis=dict(
@@ -2573,6 +2721,7 @@ def create_importer_demand_chart(
         df,
         vol_label,
         selected_years,
+        volume_metric,
     )
 
 
@@ -2580,6 +2729,7 @@ def _create_importer_demand_chart_from_df(
     df,
     vol_label,
     selected_years=None,
+    volume_metric='mcm_d',
 ):
     if df.empty:
         return _empty_importer_chart_figure('No data available.')
@@ -2604,7 +2754,17 @@ def _create_importer_demand_chart_from_df(
     years = sorted(active_years, key=_importer_chart_year_sort_key)
     focus_year = years[-1]
     color_by_year = _get_importer_chart_color_map(available_years)
-    _add_importer_chart_range_band(fig, df, focus_year, available_years, vol_label)
+    plotly_number_format = _get_importer_volume_metric_plotly_number_format(
+        volume_metric
+    )
+    _add_importer_chart_range_band(
+        fig,
+        df,
+        focus_year,
+        available_years,
+        vol_label,
+        volume_metric,
+    )
 
     for year in years:
         year_data = active_df[active_df['_year_token'] == year].dropna(subset=['plot_date']).sort_values('plot_date')
@@ -2634,7 +2794,7 @@ def _create_importer_demand_chart_from_df(
                 hovertemplate=(
                     f'<b>{year}</b> | '
                     '%{text} | '
-                    f'%{{y:,.0f}} {vol_label}<extra></extra>'
+                    f'%{{y:{plotly_number_format}}} {vol_label}<extra></extra>'
                 ),
                 text=historical_data['month_day'],
                 showlegend=False
@@ -2652,7 +2812,7 @@ def _create_importer_demand_chart_from_df(
                 hovertemplate=(
                     f'<b>{year} forecast</b> | '
                     '%{text} | '
-                    f'%{{y:,.0f}} {vol_label}<extra></extra>'
+                    f'%{{y:{plotly_number_format}}} {vol_label}<extra></extra>'
                 ),
                 text=connect_data['month_day'],
                 showlegend=False
@@ -2672,7 +2832,12 @@ def _create_importer_demand_chart_from_df(
                     showlegend=False
                 ))
 
-    return _apply_importer_chart_layout(fig, vol_label, show_legend=False)
+    return _apply_importer_chart_layout(
+        fig,
+        vol_label,
+        show_legend=False,
+        yaxis_tickformat=plotly_number_format,
+    )
 
 
 def _origin_chart_line_style(year, current_year, is_forecast=False):
@@ -2692,19 +2857,22 @@ def create_importer_origin_continent_chart(
     data,
     chart_type='absolute',
     volume_metric='mcm_d',
-    selected_years=None
+    selected_years=None,
+    rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS,
 ):
     vol_label = get_volume_metric_info(volume_metric)['label']
     df, metric_column = _prepare_importer_origin_chart_dataframe(
         data,
         chart_type,
-        volume_metric
+        volume_metric,
+        rolling_avg_days,
     )
     return _create_importer_origin_continent_chart_from_df(
         df,
         metric_column,
         vol_label,
         selected_years,
+        volume_metric,
     )
 
 
@@ -2713,6 +2881,7 @@ def _create_importer_origin_continent_chart_from_df(
     metric_column,
     vol_label,
     selected_years=None,
+    volume_metric='mcm_d',
 ):
     if df.empty:
         return _empty_importer_chart_figure('No data available.')
@@ -2737,6 +2906,11 @@ def _create_importer_origin_continent_chart_from_df(
     years = sorted(active_years, key=_importer_chart_year_sort_key)
     current_year = int(years[-1])
     legend_shown = set()
+    plotly_number_format = (
+        ',.1f'
+        if metric_column == 'percentage'
+        else _get_importer_volume_metric_plotly_number_format(volume_metric)
+    )
 
     for continent in sorted(df['continent_origin'].dropna().unique()):
         continent_df = df[df['continent_origin'] == continent]
@@ -2769,7 +2943,11 @@ def _create_importer_origin_continent_chart_from_df(
                     hovertemplate=(
                         f'<b>{continent}</b> | {year} | '
                         '%{text} | '
-                        + ('%{y:.1f}%<extra></extra>' if metric_column == 'percentage' else f'%{{y:,.0f}} {vol_label}<extra></extra>')
+                        + (
+                            f'%{{y:{plotly_number_format}}}%<extra></extra>'
+                            if metric_column == 'percentage'
+                            else f'%{{y:{plotly_number_format}}} {vol_label}<extra></extra>'
+                        )
                     ),
                     text=historical_data['month_day'],
                     showlegend=show_legend
@@ -2789,7 +2967,11 @@ def _create_importer_origin_continent_chart_from_df(
                     hovertemplate=(
                         f'<b>{continent}</b> | {year} forecast | '
                         '%{text} | '
-                        + ('%{y:.1f}%<extra></extra>' if metric_column == 'percentage' else f'%{{y:,.0f}} {vol_label}<extra></extra>')
+                        + (
+                            f'%{{y:{plotly_number_format}}}%<extra></extra>'
+                            if metric_column == 'percentage'
+                            else f'%{{y:{plotly_number_format}}} {vol_label}<extra></extra>'
+                        )
                     ),
                     text=connect_data['month_day'],
                     showlegend=False
@@ -2797,105 +2979,180 @@ def _create_importer_origin_continent_chart_from_df(
 
     y_title = '%' if metric_column == 'percentage' else vol_label
     yaxis_range = [0, 100] if metric_column == 'percentage' else None
-    return _apply_importer_chart_layout(fig, y_title, yaxis_range=yaxis_range, show_legend=True)
+    return _apply_importer_chart_layout(
+        fig,
+        y_title,
+        yaxis_range=yaxis_range,
+        show_legend=True,
+        yaxis_tickformat=plotly_number_format,
+    )
 
 
-def _format_importer_chart_current_value(metrics, vol_label):
+def _format_importer_chart_current_value(
+    metrics,
+    vol_label,
+    volume_metric='mcm_d',
+):
     if not metrics or metrics.get('latest_value') is None:
         return None
 
     latest_label = metrics.get('latest_label') or metrics.get('focus_year') or ''
-    return f"{latest_label}: {metrics['latest_value']:,.0f} {vol_label}"
+    precision = _get_importer_volume_metric_display_precision(volume_metric)
+    latest_value = _round_importer_volume_metric_display_value(
+        metrics['latest_value'],
+        volume_metric,
+    )
+    return f"{latest_label}: {latest_value:,.{precision}f} {vol_label}"
 
 
-def _build_importer_chart_delta_pill(label, delta_value, delta_pct):
+def _build_importer_chart_delta_pill(
+    label,
+    delta_value,
+    delta_pct,
+    volume_metric='mcm_d',
+):
     if delta_value is None or pd.isna(delta_value):
         return html.Span(f'{label} n/a', className='importer-rolling-delta-pill importer-rolling-delta-neutral')
 
+    precision = _get_importer_volume_metric_display_precision(volume_metric)
+    rounded_delta = _round_importer_volume_metric_display_value(
+        delta_value,
+        volume_metric,
+    )
     direction_class = 'importer-rolling-delta-neutral'
-    if delta_value > 0:
+    if rounded_delta > 0:
         direction_class = 'importer-rolling-delta-positive'
-    elif delta_value < 0:
+    elif rounded_delta < 0:
         direction_class = 'importer-rolling-delta-negative'
 
-    sign = '+' if delta_value > 0 else ''
+    sign = '+' if rounded_delta > 0 else ''
     pct_text = ''
     if delta_pct is not None and pd.notna(delta_pct):
-        pct_text = f" ({sign}{delta_pct:.0f}%)"
+        rounded_pct = int(round(float(delta_pct)))
+        rounded_pct = 0 if rounded_pct == 0 else rounded_pct
+        pct_sign = '+' if rounded_pct > 0 else ''
+        pct_text = f" ({pct_sign}{rounded_pct}%)"
 
     return html.Span(
         [
             html.Span(label, className='importer-rolling-delta-label'),
-            html.Span(f"{sign}{delta_value:,.0f}{pct_text}")
+            html.Span(
+                f"{sign}{rounded_delta:,.{precision}f}{pct_text}"
+            )
         ],
         className=f'importer-rolling-delta-pill {direction_class}'
     )
 
 
-def _build_importer_chart_delta_indicators(metrics):
+def _build_importer_chart_delta_indicators(
+    metrics,
+    volume_metric='mcm_d',
+):
     return html.Div(
         [
             _build_importer_chart_delta_pill(
                 'MoM',
                 metrics.get('mom_delta_value') if metrics else None,
-                metrics.get('mom_delta_pct') if metrics else None
+                metrics.get('mom_delta_pct') if metrics else None,
+                volume_metric,
             ),
             _build_importer_chart_delta_pill(
                 'YoY',
                 metrics.get('delta_value') if metrics else None,
-                metrics.get('delta_pct') if metrics else None
+                metrics.get('delta_pct') if metrics else None,
+                volume_metric,
             )
         ],
         className='importer-rolling-delta-group'
     )
 
 
-def _format_origin_kpi_value(value, chart_type, is_delta=False):
+def _format_origin_kpi_value(
+    value,
+    chart_type,
+    volume_metric='mcm_d',
+    is_delta=False,
+):
     if value is None or pd.isna(value):
         return 'n/a'
 
-    rounded_value = int(round(float(value)))
+    precision = (
+        1
+        if chart_type == 'percentage'
+        else _get_importer_volume_metric_display_precision(volume_metric)
+    )
+    rounded_value = round(float(value), precision)
+    rounded_value = 0.0 if rounded_value == 0 else rounded_value
     sign = '+' if is_delta and rounded_value > 0 else ''
     if chart_type == 'percentage':
-        return f'{sign}{rounded_value}pp' if is_delta else f'{rounded_value}%'
-    return f'{sign}{rounded_value:,}'
+        suffix = 'pp' if is_delta else '%'
+        return f'{sign}{rounded_value:.1f}{suffix}'
+    return f'{sign}{rounded_value:,.{precision}f}'
 
 
 def _format_origin_kpi_pct(delta_pct):
     if delta_pct is None or pd.isna(delta_pct):
         return ''
-    sign = '+' if delta_pct > 0 else ''
-    return f' ({sign}{delta_pct:.0f}%)'
+    rounded_pct = int(round(float(delta_pct)))
+    rounded_pct = 0 if rounded_pct == 0 else rounded_pct
+    sign = '+' if rounded_pct > 0 else ''
+    return f' ({sign}{rounded_pct}%)'
 
 
 def _format_origin_kpi_pct_compact(delta_pct):
     if delta_pct is None or pd.isna(delta_pct):
         return None
     rounded_pct = int(round(float(delta_pct)))
+    rounded_pct = 0 if rounded_pct == 0 else rounded_pct
     sign = '+' if rounded_pct > 0 else ''
     return f'({sign}{rounded_pct}%)'
 
 
-def _origin_kpi_direction_class(value):
+def _origin_kpi_direction_class(
+    value,
+    chart_type='absolute',
+    volume_metric='mcm_d',
+    is_delta_pct=False,
+):
     if value is None or pd.isna(value):
         return 'importer-origin-kpi-delta-neutral continent-kpi-delta-neutral'
-    if value > 0:
+    precision = (
+        0
+        if is_delta_pct
+        else 1
+        if chart_type == 'percentage'
+        else _get_importer_volume_metric_display_precision(volume_metric)
+    )
+    rounded_value = round(float(value), precision)
+    if rounded_value > 0:
         return 'importer-origin-kpi-delta-positive continent-kpi-delta-positive'
-    if value < 0:
+    if rounded_value < 0:
         return 'importer-origin-kpi-delta-negative continent-kpi-delta-negative'
     return 'importer-origin-kpi-delta-neutral continent-kpi-delta-neutral'
 
 
-def _origin_kpi_value_displays_zero(value, chart_type, is_delta_pct=False):
+def _origin_kpi_value_displays_zero(
+    value,
+    chart_type,
+    volume_metric='mcm_d',
+    is_delta_pct=False,
+):
     if value is None or pd.isna(value):
         return True
 
-    display_tolerance = 0.05 if chart_type == 'percentage' and not is_delta_pct else 0.5
-    return abs(float(value)) < display_tolerance
+    precision = (
+        0
+        if is_delta_pct
+        else 1
+        if chart_type == 'percentage'
+        else _get_importer_volume_metric_display_precision(volume_metric)
+    )
+    return round(float(value), precision) == 0
 
 
 def _origin_kpi_all_displayed_values_zero(
     chart_type,
+    volume_metric,
     show_deltas,
     latest_value,
     mom_delta_value,
@@ -2917,7 +3174,12 @@ def _origin_kpi_all_displayed_values_zero(
             ])
 
     return all(
-        _origin_kpi_value_displays_zero(value, chart_type, is_delta_pct)
+        _origin_kpi_value_displays_zero(
+            value,
+            chart_type,
+            volume_metric,
+            is_delta_pct,
+        )
         for value, is_delta_pct in values_to_check
     )
 
@@ -2926,13 +3188,15 @@ def _calculate_origin_continent_kpis(
     data,
     chart_type='absolute',
     volume_metric='mcm_d',
-    selected_years=None
+    selected_years=None,
+    rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS,
 ):
     vol_label = get_volume_metric_info(volume_metric)['label']
     df, metric_column = _prepare_importer_origin_chart_dataframe(
         data,
         chart_type,
-        volume_metric
+        volume_metric,
+        rolling_avg_days,
     )
     return _calculate_origin_continent_kpis_from_df(
         df,
@@ -2940,6 +3204,7 @@ def _calculate_origin_continent_kpis(
         vol_label,
         chart_type,
         selected_years,
+        volume_metric,
     )
 
 
@@ -2949,6 +3214,7 @@ def _calculate_origin_continent_kpis_from_df(
     vol_label,
     chart_type='absolute',
     selected_years=None,
+    volume_metric='mcm_d',
 ):
     if df.empty:
         return []
@@ -3032,6 +3298,7 @@ def _calculate_origin_continent_kpis_from_df(
 
         if _origin_kpi_all_displayed_values_zero(
             chart_type,
+            volume_metric,
             show_deltas,
             latest_numeric,
             mom_delta_numeric,
@@ -3048,30 +3315,62 @@ def _calculate_origin_continent_kpis_from_df(
             'chart_type': chart_type,
             'unit_label': vol_label,
             'latest_value': latest_numeric,
-            'latest_text': _format_origin_kpi_value(latest_value, chart_type),
+            'latest_text': _format_origin_kpi_value(
+                latest_value,
+                chart_type,
+                volume_metric,
+            ),
             'latest_label': latest_point.get('month_day', ''),
             'mom_delta_value': mom_delta_numeric,
             'mom_value_text': (
-                _format_origin_kpi_value(mom_delta_value, chart_type, is_delta=True)
+                _format_origin_kpi_value(
+                    mom_delta_value,
+                    chart_type,
+                    volume_metric,
+                    is_delta=True,
+                )
             ) if mom_delta_value is not None and pd.notna(mom_delta_value) else 'n/a',
             'mom_pct_text': _format_origin_kpi_pct_compact(mom_delta_pct),
             'mom_text': (
-                _format_origin_kpi_value(mom_delta_value, chart_type, is_delta=True)
+                _format_origin_kpi_value(
+                    mom_delta_value,
+                    chart_type,
+                    volume_metric,
+                    is_delta=True,
+                )
                 + _format_origin_kpi_pct(mom_delta_pct)
             ) if mom_delta_value is not None and pd.notna(mom_delta_value) else 'n/a',
-            'mom_class': _origin_kpi_direction_class(mom_delta_value),
+            'mom_class': _origin_kpi_direction_class(
+                mom_delta_value,
+                chart_type,
+                volume_metric,
+            ),
             'mom_delta_pct': mom_pct_numeric,
             'yoy_delta_value': yoy_delta_numeric,
             'yoy_value_text': (
-                _format_origin_kpi_value(yoy_delta_value, chart_type, is_delta=True)
+                _format_origin_kpi_value(
+                    yoy_delta_value,
+                    chart_type,
+                    volume_metric,
+                    is_delta=True,
+                )
             ) if yoy_delta_value is not None and pd.notna(yoy_delta_value) else 'n/a',
             'yoy_pct_text': _format_origin_kpi_pct_compact(yoy_delta_pct),
             'yoy_text': (
-                _format_origin_kpi_value(yoy_delta_value, chart_type, is_delta=True)
+                _format_origin_kpi_value(
+                    yoy_delta_value,
+                    chart_type,
+                    volume_metric,
+                    is_delta=True,
+                )
                 + _format_origin_kpi_pct(yoy_delta_pct)
             ) if yoy_delta_value is not None and pd.notna(yoy_delta_value) else 'n/a',
             'yoy_delta_pct': yoy_pct_numeric,
-            'yoy_class': _origin_kpi_direction_class(yoy_delta_value),
+            'yoy_class': _origin_kpi_direction_class(
+                yoy_delta_value,
+                chart_type,
+                volume_metric,
+            ),
         })
 
     return sorted(metrics, key=lambda item: item['latest_value'] or 0, reverse=True)
@@ -3662,7 +3961,7 @@ def _get_period_numeric_columns(
         numeric_cols.append(rolling_window_label)
     numeric_cols.extend(week_cols)
 
-    if '7D' in available_cols:
+    if '7D' in available_cols and '7D' not in numeric_cols:
         numeric_cols.append('7D')
 
     visible_period_cols = quarter_cols + month_cols + week_cols
@@ -3971,40 +4270,194 @@ def _build_importer_period_delta_styles(display_df, columns, delta_like_cols=Non
     return styles
 
 
+def _strip_importer_period_reference_suffix(column_name):
+    column_name = str(column_name)
+    for suffix in ('_PBD_CURRENT', '_PBD', '_PP', '_Y1'):
+        if column_name.endswith(suffix):
+            return column_name[:-len(suffix)]
+    return column_name
+
+
+def _get_importer_period_column_days(
+    column_name,
+    rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS,
+):
+    """Return the day basis used to derive a period's average mcm/d."""
+    base_column = _strip_importer_period_reference_suffix(column_name)
+    if base_column == '7D':
+        return 7
+    if base_column.endswith('D') and base_column[:-1].isdigit():
+        return int(base_column[:-1])
+    if base_column.startswith('Q') and "'" in base_column:
+        # The shared importer period builder divides every quarter by 91.25.
+        return 91.25
+    if base_column.startswith('W') and "'" in base_column:
+        return 7
+    if "'" in base_column:
+        try:
+            month_label, year_suffix = base_column.split("'")
+        except ValueError:
+            return None
+        month = MONTH_ORDER.get(month_label)
+        year = _parse_importer_period_year_suffix(year_suffix)
+        if month is not None and year is not None:
+            return calendar.monthrange(year, month)[1]
+    normalized_days = normalize_importer_rolling_avg_days(rolling_avg_days)
+    return normalized_days if base_column == f'{normalized_days}D' else None
+
+
+def _build_importer_period_days_map(
+    columns,
+    rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS,
+):
+    period_days_by_column = {}
+    for column_name in ([] if columns is None else columns):
+        period_days = _get_importer_period_column_days(
+            column_name,
+            rolling_avg_days,
+        )
+        if period_days is not None:
+            period_days_by_column[column_name] = period_days
+    return period_days_by_column
+
+
+def _recalculate_importer_period_absolute_deltas(
+    display_df,
+    volume_metric,
+    rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS,
+):
+    recalculated_df = display_df.copy()
+    period_days = _build_importer_period_days_map(
+        recalculated_df.columns,
+        rolling_avg_days,
+    )
+    for delta_column in [
+        column for column in recalculated_df.columns
+        if str(column).startswith('Δ 7D-')
+    ]:
+        comparison_column = str(delta_column).replace('Δ 7D-', '', 1)
+        if {'7D', comparison_column}.issubset(recalculated_df.columns):
+            if (
+                _is_importer_period_volume_metric(volume_metric)
+                and period_days.get('7D') != period_days.get(comparison_column)
+            ):
+                recalculated_df[delta_column] = pd.NA
+            else:
+                recalculated_df[delta_column] = (
+                    pd.to_numeric(recalculated_df['7D'], errors='coerce')
+                    - pd.to_numeric(
+                        recalculated_df[comparison_column],
+                        errors='coerce',
+                    )
+                ).round(1)
+
+    for delta_column in [
+        column for column in recalculated_df.columns
+        if str(column).startswith('Δ ') and str(column).endswith(' Y/Y')
+    ]:
+        base_column = str(delta_column).replace('Δ ', '', 1)[:-4]
+        reference_column = f'{base_column}_Y1'
+        if {base_column, reference_column}.issubset(recalculated_df.columns):
+            recalculated_df[delta_column] = (
+                pd.to_numeric(recalculated_df[base_column], errors='coerce')
+                - pd.to_numeric(
+                    recalculated_df[reference_column],
+                    errors='coerce',
+                )
+            ).round(1)
+        elif delta_column in recalculated_df.columns:
+            # Levels views do not carry the hidden Y-1 column. Convert the
+            # already-computed mcm/d delta using the base horizon instead.
+            recalculated_df = convert_volume_metric_dataframe(
+                recalculated_df,
+                volume_metric,
+                columns=[delta_column],
+                precision=None,
+                period_days=period_days.get(base_column),
+            )
+
+    return _recalculate_importer_period_pbd_deltas(recalculated_df)
+
+
+def _convert_importer_period_absolute_volume_metric(
+    display_df,
+    volume_metric,
+    rolling_avg_days=DEFAULT_IMPORTER_ROLLING_AVG_DAYS,
+):
+    delta_columns = {
+        column for column in display_df.columns
+        if str(column).startswith('Δ ')
+    }
+    converted_df = convert_volume_metric_dataframe(
+        display_df,
+        volume_metric,
+        exclude_columns=set(IMPORTER_PERIOD_TEXT_COLUMNS) | delta_columns,
+        precision=None,
+        period_days_by_column=_build_importer_period_days_map(
+            display_df.columns,
+            rolling_avg_days,
+        ),
+    )
+    return _recalculate_importer_period_absolute_deltas(
+        converted_df,
+        volume_metric,
+        rolling_avg_days,
+    )
+
+
+def _get_importer_period_display_precision(view_type, volume_metric):
+    if view_type == 'percentage':
+        return IMPORTER_PERIOD_PERCENTAGE_DISPLAY_PRECISION
+    return _get_importer_volume_metric_display_precision(volume_metric)
+
+
 def _format_importer_period_grid_value(
     value,
     view_type='absolute',
     is_delta=False,
     is_pbd_delta=False,
+    volume_metric='mcm_d',
 ):
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return '—' if is_pbd_delta else ''
+    if value is None or value is pd.NA:
+        return '—' if is_delta or is_pbd_delta else ''
+    try:
+        if pd.isna(value):
+            return '—' if is_delta or is_pbd_delta else ''
+    except (TypeError, ValueError):
+        pass
 
     try:
         numeric_value = float(value)
     except (TypeError, ValueError):
         return str(value)
 
+    precision = _get_importer_period_display_precision(
+        view_type,
+        volume_metric,
+    )
+    numeric_value = round(numeric_value, precision)
+    numeric_value = 0.0 if numeric_value == 0 else numeric_value
     if view_type == 'percentage' and is_delta:
-        if abs(numeric_value) < 0.5:
-            numeric_value = 0
         sign = '+' if numeric_value > 0 else ''
-        return f'{sign}{numeric_value:,.0f} pp'
+        return f'{sign}{numeric_value:,.{precision}f} pp'
     if view_type == 'percentage':
-        return f'{numeric_value:.0f}%'
-    if is_delta and abs(numeric_value) < 0.05:
-        numeric_value = 0
+        return f'{numeric_value:.{precision}f}%'
     if is_pbd_delta and numeric_value > 0:
-        return f'+{numeric_value:,.1f}'
-    return f'{numeric_value:,.1f}'
+        return f'+{numeric_value:,.{precision}f}'
+    return f'{numeric_value:,.{precision}f}'
 
 
 def _build_importer_period_grid_display(display_df, columns, view_type='absolute',
-                                        delta_like_cols=None, raw_field_map=None):
+                                        delta_like_cols=None, raw_field_map=None,
+                                        volume_metric='mcm_d'):
     grid_df = display_df.copy()
     grid_columns = [dict(column) for column in columns]
     delta_like_cols = set(delta_like_cols or [])
     raw_field_map = raw_field_map or {}
+    display_precision = _get_importer_period_display_precision(
+        view_type,
+        volume_metric,
+    )
     numeric_ids = {
         column.get('id')
         for column in grid_columns
@@ -4017,7 +4470,11 @@ def _build_importer_period_grid_display(display_df, columns, view_type='absolute
 
     for column_id, raw_field in raw_field_map.items():
         if column_id in grid_df.columns:
-            grid_df[raw_field] = pd.to_numeric(grid_df[column_id], errors='coerce')
+            raw_values = pd.to_numeric(
+                grid_df[column_id],
+                errors='coerce',
+            ).round(display_precision)
+            grid_df[raw_field] = raw_values.where(raw_values != 0, 0.0)
 
     for column_id in numeric_ids:
         if column_id not in grid_df.columns:
@@ -4031,6 +4488,7 @@ def _build_importer_period_grid_display(display_df, columns, view_type='absolute
                 view_type=view_type,
                 is_delta=delta,
                 is_pbd_delta=pbd_delta,
+                volume_metric=volume_metric,
             )
         )
 
@@ -4279,7 +4737,12 @@ def _build_period_display_df(period_payload, expanded_importers=None,
     return (display_df, comparison_metadata) if return_metadata else display_df
 
 
-def _create_period_analysis_table(display_df, delta_like_cols=None, view_type='absolute'):
+def _create_period_analysis_table(
+    display_df,
+    delta_like_cols=None,
+    view_type='absolute',
+    volume_metric='mcm_d',
+):
     """Create the combined overview period-analysis table."""
     delta_like_cols = set(delta_like_cols or [])
     delta_columns = {
@@ -4296,6 +4759,10 @@ def _create_period_analysis_table(display_df, delta_like_cols=None, view_type='a
         column_id: _get_importer_period_delta_raw_field(column_id)
         for column_id in delta_columns
     }
+    display_precision = _get_importer_period_display_precision(
+        view_type,
+        volume_metric,
+    )
     columns = []
     for col in display_df.columns:
         if col in IMPORTER_PERIOD_TEXT_COLUMNS:
@@ -4310,7 +4777,10 @@ def _create_period_analysis_table(display_df, delta_like_cols=None, view_type='a
                 'name': col,
                 'id': col,
                 'type': 'numeric',
-                'format': Format(precision=1, scheme=Scheme.fixed),
+                'format': Format(
+                    precision=display_precision,
+                    scheme=Scheme.fixed,
+                ),
                 'cellClass': 'importer-period-number-cell'
             })
 
@@ -4318,7 +4788,7 @@ def _create_period_analysis_table(display_df, delta_like_cols=None, view_type='a
         columns,
         display_df,
         delta_like_cols=delta_like_cols,
-        raw_field_map=raw_field_map
+        raw_field_map=raw_field_map,
     )
     column_width_styles = _build_importer_period_column_width_styles(display_df, columns)
     delta_styles = _build_importer_period_delta_styles(
@@ -4332,7 +4802,8 @@ def _create_period_analysis_table(display_df, delta_like_cols=None, view_type='a
         columns,
         view_type=view_type,
         delta_like_cols=delta_like_cols,
-        raw_field_map=raw_field_map
+        raw_field_map=raw_field_map,
+        volume_metric=volume_metric,
     )
 
     page_size = max(len(display_df), 1)
@@ -4386,6 +4857,7 @@ def _build_period_table_footnote(
     vol_label,
     comparison_basis='levels',
     snapshot_comparison=None,
+    volume_metric='mcm_d',
 ):
     rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
     comparison_basis = _normalize_importer_period_comparison_basis(comparison_basis)
@@ -4416,6 +4888,15 @@ def _build_period_table_footnote(
         comparison_note = ' | Comparison: vs previous period'
     elif comparison_basis == 'same_period_last_year':
         comparison_note = ' | Comparison: vs previous year'
+    unequal_window_note = (
+        f' | Δ 7D-{rolling_label} is unavailable because period totals '
+        'cover different horizons.'
+        if (
+            _is_importer_period_volume_metric(volume_metric)
+            and rolling_avg_days != 7
+        )
+        else ''
+    )
 
     def _format_snapshot_lineage(snapshot):
         if not isinstance(snapshot, dict):
@@ -4491,7 +4972,10 @@ def _build_period_table_footnote(
                     html.Span(f'{rolling_label}: {date_window_start} to {date_today} | '),
                     html.Span(f'7D: {date_7d_start} to {date_today} | '),
                     html.Span(f'{rolling_label} Y-1: {date_window_y1_start} to {date_window_y1_end} | '),
-                    html.Span(f'Values shown in {vol_label}{comparison_note}')
+                    html.Span(
+                        f'Values shown in {vol_label}{comparison_note}'
+                        f'{unequal_window_note}'
+                    )
                 ],
                 className='importer-period-table-footnote-text'
             ),
@@ -4771,12 +5255,21 @@ layout = html.Div([
     Output('imp-overview-demand-rolling-section-title', 'children'),
     Output('imp-overview-origin-rolling-section-title', 'children'),
     Input('imp-overview-rolling-window-days-input', 'value'),
+    Input('imp-overview-volume-metric-dropdown', 'value'),
     prevent_initial_call=False
 )
-def update_importer_rolling_section_titles(rolling_avg_days):
+def update_importer_rolling_section_titles(rolling_avg_days, volume_metric):
     return (
-        _format_importer_rolling_average_section_title('LNG Demand', rolling_avg_days),
-        _format_importer_rolling_average_section_title('LNG Demand by Origin Continent', rolling_avg_days),
+        _format_importer_rolling_average_section_title(
+            'LNG Demand',
+            rolling_avg_days,
+            volume_metric,
+        ),
+        _format_importer_rolling_average_section_title(
+            'LNG Demand by Origin Continent',
+            rolling_avg_days,
+            volume_metric,
+        ),
     )
 
 
@@ -4826,6 +5319,7 @@ def _build_importers_source_payload(source_state=None):
         'catalog_df': catalog_df,
         'ranking_df': ranking_df,
         'scoped_trades_df': pd.DataFrame(),
+        'source_state': source_state,
     }
 
 
@@ -4835,6 +5329,20 @@ def _build_importers_overview_payload_from_source(
     rolling_avg_days,
 ):
     rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
+    chart_query_start_date = _get_importer_chart_query_start_date(
+        rolling_avg_days
+    )
+    normalized_source_state = _normalize_importers_source_state(
+        source_payload.get('source_state')
+        if isinstance(source_payload, dict)
+        else None
+    )
+    current_snapshot = normalized_source_state.get('current_snapshot') or {}
+    snapshot_timestamp_utc = current_snapshot.get('snapshot_timestamp_utc')
+    current_date = (
+        current_snapshot.get('snapshot_date_utc')
+        or normalized_source_state.get('as_of_date')
+    )
     catalog_df = source_payload['catalog_df']
     ranking_df = source_payload['ranking_df']
     scoped_trades_df = source_payload.get('scoped_trades_df')
@@ -4853,6 +5361,16 @@ def _build_importers_overview_payload_from_source(
         scoped_trades_df = pd.DataFrame()
     source_scoped_trades_provided = not scoped_trades_df.empty
     if scoped_trades_df.empty and destination_countries:
+        query_kwargs = {
+            'min_end_date': chart_query_start_date,
+            'include_destination_context': True,
+        }
+        if snapshot_timestamp_utc is not None:
+            query_kwargs['snapshot_timestamp_utc'] = snapshot_timestamp_utc
+        if current_date is not None:
+            query_kwargs['max_end_date'] = _get_importer_chart_query_end_date(
+                current_date
+            )
         net_scopes = [selected_aggregation]
         if selected_aggregation != 'country':
             net_scopes.append('country')
@@ -4865,9 +5383,8 @@ def _build_importers_overview_payload_from_source(
                     _fetch_importer_scoped_trades,
                     engine,
                     destination_countries,
-                    min_end_date=IMPORTER_CHART_QUERY_START_DATE,
-                    include_destination_context=True,
                     selected_destination_aggregation=net_scope,
+                    **query_kwargs,
                 )
                 for net_scope in net_scopes
             }
@@ -4894,9 +5411,8 @@ def _build_importers_overview_payload_from_source(
         global_scoped_trades_df = _fetch_importer_scoped_trades(
             engine,
             destination_countries,
-            min_end_date=IMPORTER_CHART_QUERY_START_DATE,
-            include_destination_context=True,
             selected_destination_aggregation='country',
+            **query_kwargs,
         )
     table_entities = _build_destination_entities(
         classification_mode,
@@ -4919,6 +5435,8 @@ def _build_importers_overview_payload_from_source(
         rolling_avg_days,
         scoped_trades_df=scoped_trades_df,
         global_scoped_trades_df=global_scoped_trades_df,
+        current_date=current_date,
+        snapshot_timestamp_utc=snapshot_timestamp_utc,
     )
     demand_cube = _pack_record_mapping(demand_charts_data)
     origin_cube = _pack_record_mapping(
@@ -5284,12 +5802,17 @@ def update_demand_charts(charts_data, importer_entities, volume_metric, selected
             prepared_df,
             vol_label,
             selected_years,
+            volume_metric,
         )
         metrics = _get_importer_demand_chart_header_metrics_from_df(
             prepared_df,
             selected_years,
         )
-        current_value = _format_importer_chart_current_value(metrics, vol_label)
+        current_value = _format_importer_chart_current_value(
+            metrics,
+            vol_label,
+            volume_metric,
+        )
         card_class_name = (
             'importer-rolling-card importer-rolling-card-primary'
             if entity.get('is_global')
@@ -5307,7 +5830,10 @@ def update_demand_charts(charts_data, importer_entities, volume_metric, selected
                             ],
                             className='importer-rolling-card-title-group'
                         ),
-                        _build_importer_chart_delta_indicators(metrics)
+                        _build_importer_chart_delta_indicators(
+                            metrics,
+                            volume_metric,
+                        )
                     ],
                     className='importer-rolling-card-header'
                 ),
@@ -5368,7 +5894,7 @@ def update_origin_year_selector_options(charts_data, selected_years):
 )
 @log_callback_timing("importers.origin_charts_render")
 def update_origin_continent_charts(charts_data, importer_entities, volume_metric, selected_years,
-                                   chart_type, _rolling_avg_days):
+                                   chart_type, rolling_avg_days):
     """Render the origin-continent chart grid using the upgraded exporter-page pattern."""
     try:
         charts_data = _resolve_importers_chart_store(charts_data)
@@ -5387,6 +5913,7 @@ def update_origin_continent_charts(charts_data, importer_entities, volume_metric
     charts = []
     kpi_rows = []
     vol_label = get_volume_metric_info(volume_metric)['label']
+    rolling_avg_days = normalize_importer_rolling_avg_days(rolling_avg_days)
     for entity in importer_entities:
         entity_name = entity['label']
         entity_data = charts_data.get(entity_name, [])
@@ -5395,6 +5922,7 @@ def update_origin_continent_charts(charts_data, importer_entities, volume_metric
                 entity_data,
                 chart_type,
                 volume_metric,
+                rolling_avg_days,
             )
         )
         fig = _create_importer_origin_continent_chart_from_df(
@@ -5402,6 +5930,7 @@ def update_origin_continent_charts(charts_data, importer_entities, volume_metric
             metric_column,
             vol_label,
             selected_years,
+            volume_metric,
         )
         kpi_rows.append({
             'entity': entity_name,
@@ -5411,6 +5940,7 @@ def update_origin_continent_charts(charts_data, importer_entities, volume_metric
                 vol_label,
                 chart_type=chart_type,
                 selected_years=selected_years,
+                volume_metric=volume_metric,
             )
         })
         card_class_name = (
@@ -5526,6 +6056,8 @@ def refresh_period_data(importer_entities, classification_mode, origin_level, ro
             },
         )
         return reference if _snapshot_is_shared(reference) else payload
+    except _SnapshotUnavailable:
+        raise
     except Exception:
         return _empty_importer_period_payload(origin_country_grouping_mode)
 
@@ -5637,16 +6169,11 @@ def update_period_analysis_table(period_payload, expanded_importers, importer_en
         vol_label = 'market share (%)'
     else:
         vol_label = get_volume_metric_info(volume_metric)['label']
-        display_df = convert_volume_metric_dataframe(
+        display_df = _convert_importer_period_absolute_volume_metric(
             display_df,
             volume_metric,
-            exclude_columns=IMPORTER_PERIOD_TEXT_COLUMNS,
-            precision=1
+            rolling_avg_days,
         )
-        if pbd_available:
-            display_df = _recalculate_importer_period_pbd_deltas(
-                display_df
-            )
 
     if not pbd_available:
         for column_name in (
@@ -5695,13 +6222,15 @@ def update_period_analysis_table(period_payload, expanded_importers, importer_en
             _create_period_analysis_table(
                 display_df,
                 delta_like_cols=all_delta_cols,
-                view_type=view_type
+                view_type=view_type,
+                volume_metric=volume_metric,
             ),
             _build_period_table_footnote(
                 rolling_avg_days,
                 vol_label,
                 comparison_basis,
                 snapshot_comparison,
+                volume_metric if view_type == 'absolute' else 'mcm_d',
             )
         ],
         className='importer-period-table-shell'
@@ -5762,7 +6291,12 @@ def export_demand_to_excel(n_clicks, charts_data, volume_metric, selected_years,
     charts_data = _resolve_importers_chart_store(charts_data)
 
     rolling_label = _format_importer_rolling_window_label(rolling_avg_days)
-    export_df = _build_chart_export_df(charts_data, volume_metric, selected_years)
+    export_df = _build_chart_export_df(
+        charts_data,
+        volume_metric,
+        selected_years,
+        rolling_avg_days=rolling_avg_days,
+    )
     if export_df.empty:
         raise PreventUpdate
 
@@ -5792,7 +6326,13 @@ def export_origin_continent_to_excel(n_clicks, charts_data, volume_metric, selec
     charts_data = _resolve_importers_chart_store(charts_data)
 
     rolling_label = _format_importer_rolling_window_label(rolling_avg_days)
-    export_df = _build_chart_export_df(charts_data, volume_metric, selected_years, chart_type)
+    export_df = _build_chart_export_df(
+        charts_data,
+        volume_metric,
+        selected_years,
+        chart_type,
+        rolling_avg_days,
+    )
     if export_df.empty:
         raise PreventUpdate
 
@@ -5811,10 +6351,18 @@ def export_origin_continent_to_excel(n_clicks, charts_data, volume_metric, selec
     State('imp-overview-rolling-window-days-input', 'value'),
     State('imp-overview-period-view-type', 'value'),
     State('imp-overview-period-comparison-basis', 'value'),
+    State('imp-overview-volume-metric-dropdown', 'value'),
     prevent_initial_call=True
 )
-def export_period_analysis_to_excel(n_clicks, period_display_data, origin_level, rolling_avg_days,
-                                    view_type, comparison_basis):
+def export_period_analysis_to_excel(
+    n_clicks,
+    period_display_data,
+    origin_level,
+    rolling_avg_days,
+    view_type,
+    comparison_basis,
+    volume_metric='mcm_d',
+):
     """Export the currently rendered period-analysis table."""
     if not n_clicks or not period_display_data:
         raise PreventUpdate
@@ -5823,10 +6371,34 @@ def export_period_analysis_to_excel(n_clicks, period_display_data, origin_level,
     if export_df.empty:
         raise PreventUpdate
 
+    comparison_basis = _normalize_importer_period_comparison_basis(
+        comparison_basis
+    )
+    for column_name in [
+        column for column in export_df.columns
+        if column not in IMPORTER_PERIOD_TEXT_COLUMNS
+    ]:
+        family = _get_importer_period_column_family(column_name)
+        is_delta = (
+            comparison_basis in {'previous_period', 'same_period_last_year'}
+            or family in {'delta-mom', 'delta-yoy', 'delta-pbd'}
+        )
+        export_df[column_name] = export_df[column_name].apply(
+            lambda value, delta=is_delta, pbd=(
+                column_name in IMPORTER_PERIOD_PBD_DELTA_COLUMNS
+            ): _format_importer_period_grid_value(
+                value,
+                view_type=view_type,
+                is_delta=delta,
+                is_pbd_delta=pbd,
+                volume_metric=volume_metric,
+            )
+        )
+
     safe_origin_level = _slugify_filename_label(ORIGIN_LEVEL_LABELS.get(origin_level, 'origin'))
     rolling_label = _format_importer_rolling_window_label(rolling_avg_days)
     safe_view_type = _slugify_filename_label(_normalize_importer_period_view_type(view_type))
-    safe_comparison = _slugify_filename_label(_normalize_importer_period_comparison_basis(comparison_basis))
+    safe_comparison = _slugify_filename_label(comparison_basis)
     return _send_export_dataframe(
         export_df,
         (

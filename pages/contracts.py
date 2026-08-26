@@ -1,18 +1,27 @@
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 import logging
 from threading import Lock
 
-from dash import html, dcc, callback, Output, Input, State, ALL, MATCH
+from dash import html, dcc, callback, Output, Input, State, ALL, MATCH, no_update
 import dash_ag_grid as dag
 import plotly.graph_objects as go
-import plotly.express as px
 import pandas as pd
 from datetime import datetime
 from dash.exceptions import PreventUpdate
 from sqlalchemy import text
 
-from utils.database import engine
+from utils.database import DB_SCHEMA, engine
+from utils.dashboard_snapshot_cache import (
+    SnapshotUnavailable as _SnapshotUnavailable,
+    build_source_key as _build_source_key,
+    get_or_build_snapshot as _get_or_build_snapshot,
+    is_snapshot_reference as _is_snapshot_reference,
+    resolve_snapshot as _resolve_snapshot,
+    snapshot_reference_is_available as _snapshot_reference_is_available,
+    snapshot_is_resolvable as _snapshot_is_resolvable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +118,7 @@ PRICE_FORMULA_COLUMNS = [
 
 def load_contracts_data():
     """Load main contracts data from WoodMac tables"""
-    query = """
+    query = f"""
     SELECT 
         id_contract,
         contract_name,
@@ -145,7 +154,7 @@ def load_contracts_data():
         destination_flexible_vs_end_users,
         indexation_category,
         indexation_point
-    FROM at_lng.woodmac_lng_contract
+    FROM {DB_SCHEMA}.woodmac_lng_contract
     WHERE id_contract IS NOT NULL
     """
     try:
@@ -172,7 +181,7 @@ def load_contracts_data():
 
 def load_annual_demand_data():
     """Load annual contracted demand data with contract details"""
-    query = """
+    query = f"""
     SELECT 
         d.id_contract,
         d.contract_name,
@@ -188,8 +197,8 @@ def load_annual_demand_data():
         COALESCE(c.cargo_basis, 'Unknown') as cargo_basis,
         COALESCE(c.contract_type, 'Unknown') as contract_type,
         COALESCE(c.contract_pricing_type, 'Unknown') as contract_pricing_type
-    FROM at_lng.woodmac_lng_contract_annual_contracted_demand_mta d
-    LEFT JOIN at_lng.woodmac_lng_contract c ON d.id_contract = c.id_contract
+    FROM {DB_SCHEMA}.woodmac_lng_contract_annual_contracted_demand_mta d
+    LEFT JOIN {DB_SCHEMA}.woodmac_lng_contract c ON d.id_contract = c.id_contract
     WHERE d.id_contract IS NOT NULL
     """
     try:
@@ -210,7 +219,7 @@ def load_annual_demand_data():
 
 def load_price_assumptions_data():
     """Load price assumptions data"""
-    query = """
+    query = f"""
     SELECT 
         id_contract,
         contract_name,
@@ -236,7 +245,7 @@ def load_price_assumptions_data():
         oil_indexed_shipping_cost,
         gas_indexed_shipping_cost,
         other_costs
-    FROM at_lng.woodmac_lng_contract_price_assumptions
+    FROM {DB_SCHEMA}.woodmac_lng_contract_price_assumptions
     WHERE id_contract IS NOT NULL
     """
     try:
@@ -247,7 +256,7 @@ def load_price_assumptions_data():
 
 def load_price_formula_data():
     """Load price formula data"""
-    query = """
+    query = f"""
     SELECT 
         id_contract,
         contract_name,
@@ -262,7 +271,7 @@ def load_price_formula_data():
         lag_months,
         average_months,
         weighting
-    FROM at_lng.woodmac_lng_contract_price_formula
+    FROM {DB_SCHEMA}.woodmac_lng_contract_price_formula
     WHERE id_contract IS NOT NULL
     """
     try:
@@ -957,6 +966,8 @@ def create_contracts_table():
 
 def create_volume_analysis_content(contracts_df, demand_df, volume_view='both', expanded_countries=None, expanded_sellers=None, expanded_destinations=None, expanded_buyers=None, year_range=None):
     """Create volume analysis tab content with country and seller breakdowns"""
+    import plotly.express as px
+
     if demand_df.empty:
         return html.Div("No volume data available", className="text-center p-4")
     
@@ -1642,26 +1653,32 @@ CONTRACTS_SOURCE_LABELS = {
     'price_assumptions': 'Assumptions',
     'price_formula': 'Formula',
 }
-CONTRACTS_REVISION_QUERY = text("""
+CONTRACTS_SNAPSHOT_NAMESPACE = 'contracts-overview-v1'
+CONTRACTS_SNAPSHOT_PAYLOAD_FORMAT = 'contracts-overview-payload-v1'
+CONTRACTS_SNAPSHOT_RECOVERY_MESSAGE = (
+    'Cached contracts data is unavailable. Click the global Refresh button '
+    'to reload it.'
+)
+CONTRACTS_REVISION_QUERY = text(f"""
     SELECT 'contracts' AS source_name,
            COUNT(*) AS row_count,
            MAX(upload_timestamp_utc) AS watermark
-    FROM at_lng.woodmac_lng_contract
+    FROM {DB_SCHEMA}.woodmac_lng_contract
     UNION ALL
     SELECT 'demand',
            COUNT(*),
            MAX(upload_timestamp_utc)
-    FROM at_lng.woodmac_lng_contract_annual_contracted_demand_mta
+    FROM {DB_SCHEMA}.woodmac_lng_contract_annual_contracted_demand_mta
     UNION ALL
     SELECT 'price_assumptions',
            COUNT(*),
            MAX(upload_timestamp_utc)
-    FROM at_lng.woodmac_lng_contract_price_assumptions
+    FROM {DB_SCHEMA}.woodmac_lng_contract_price_assumptions
     UNION ALL
     SELECT 'price_formula',
            COUNT(*),
            MAX(upload_timestamp_utc)
-    FROM at_lng.woodmac_lng_contract_price_formula
+    FROM {DB_SCHEMA}.woodmac_lng_contract_price_formula
 """)
 
 
@@ -1673,12 +1690,16 @@ class ContractsSnapshot:
     price_assumptions: pd.DataFrame
     price_formula: pd.DataFrame
     year_settings: dict
+    reference: dict | None = None
+    status: str = 'fresh'
+    message: str = ''
 
 
 _contracts_snapshot: ContractsSnapshot | None = None
 _contracts_snapshot_status = 'unavailable'
 _contracts_snapshot_message = 'Contracts data has not been loaded.'
 _contracts_snapshot_lock = Lock()
+_NO_CONTRACTS_REFERENCE = object()
 
 
 def _default_year_settings():
@@ -1783,6 +1804,76 @@ def _empty_contracts_snapshot():
     )
 
 
+def _contracts_snapshot_source_key(revision_key):
+    return _build_source_key(
+        CONTRACTS_SNAPSHOT_NAMESPACE,
+        revision_key,
+    )
+
+
+def _contracts_snapshot_to_payload(snapshot):
+    return {
+        'format': CONTRACTS_SNAPSHOT_PAYLOAD_FORMAT,
+        'revision_key': snapshot.revision_key,
+        'contracts': snapshot.contracts,
+        'demand': snapshot.demand,
+        'price_assumptions': snapshot.price_assumptions,
+        'price_formula': snapshot.price_formula,
+        'year_settings': snapshot.year_settings,
+    }
+
+
+def _contracts_snapshot_from_payload(payload, reference):
+    try:
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get('format') != CONTRACTS_SNAPSHOT_PAYLOAD_FORMAT
+        ):
+            raise ValueError('invalid contracts payload format')
+        revision_key = tuple(
+            tuple(item) for item in payload['revision_key']
+        )
+        if any(len(item) != 3 for item in revision_key):
+            raise ValueError('invalid contracts revision key')
+        frame_names = (
+            'contracts',
+            'demand',
+            'price_assumptions',
+            'price_formula',
+        )
+        if any(
+            not isinstance(payload.get(name), pd.DataFrame)
+            for name in frame_names
+        ):
+            raise ValueError('invalid contracts frame payload')
+        year_settings = payload.get('year_settings')
+        if not isinstance(year_settings, Mapping):
+            raise ValueError('invalid contracts year settings')
+        if reference is not None:
+            if (
+                not _is_snapshot_reference(
+                    reference,
+                    CONTRACTS_SNAPSHOT_NAMESPACE,
+                )
+                or reference.get('source_key')
+                != _contracts_snapshot_source_key(revision_key)
+            ):
+                raise ValueError('contracts reference does not match payload')
+        return ContractsSnapshot(
+            revision_key=revision_key,
+            contracts=payload['contracts'],
+            demand=payload['demand'],
+            price_assumptions=payload['price_assumptions'],
+            price_formula=payload['price_formula'],
+            year_settings=dict(year_settings),
+            reference=dict(reference) if reference is not None else None,
+        )
+    except Exception as exc:
+        raise _SnapshotUnavailable(
+            CONTRACTS_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+
+
 def _normalize_contracts_revision_value(value):
     if value is None or pd.isna(value):
         return None
@@ -1862,10 +1953,55 @@ def _build_contracts_snapshot(revision_key):
     )
 
 
-def _ensure_contracts_snapshot(*, force=False):
+def _ensure_contracts_snapshot(
+    *,
+    force=False,
+    fallback_reference=_NO_CONTRACTS_REFERENCE,
+):
     global _contracts_snapshot
     global _contracts_snapshot_status
     global _contracts_snapshot_message
+
+    fallback_was_supplied = (
+        fallback_reference is not _NO_CONTRACTS_REFERENCE
+    )
+
+    def last_good_snapshot():
+        if not fallback_was_supplied:
+            return _contracts_snapshot
+        if fallback_reference is None:
+            return None
+        try:
+            fallback = _current_contracts_snapshot(fallback_reference)
+            return fallback if fallback.reference is not None else None
+        except _SnapshotUnavailable:
+            return None
+
+    def failed_snapshot(*, unavailable_message):
+        global _contracts_snapshot
+        global _contracts_snapshot_status
+        global _contracts_snapshot_message
+
+        fallback = last_good_snapshot()
+        if fallback is None:
+            fallback = replace(
+                _empty_contracts_snapshot(),
+                status='unavailable',
+                message=unavailable_message,
+            )
+        else:
+            fallback = replace(
+                fallback,
+                status='stale',
+                message=(
+                    'Source refresh failed. Showing the last verified '
+                    'contracts snapshot.'
+                ),
+            )
+        _contracts_snapshot_status = fallback.status
+        _contracts_snapshot_message = fallback.message
+        _contracts_snapshot = fallback
+        return fallback
 
     try:
         revision_key = fetch_contracts_revision_key()
@@ -1875,52 +2011,82 @@ def _ensure_contracts_snapshot(*, force=False):
             exc_info=True,
         )
         with _contracts_snapshot_lock:
-            if _contracts_snapshot is None:
-                _contracts_snapshot = _empty_contracts_snapshot()
-                _contracts_snapshot_status = 'unavailable'
-                _contracts_snapshot_message = (
+            return failed_snapshot(
+                unavailable_message=(
                     'Contracts data is unavailable because source revisions '
                     'could not be verified.'
-                )
-            else:
-                _contracts_snapshot_status = 'stale'
-                _contracts_snapshot_message = (
-                    'Source refresh failed. Showing the last verified '
-                    'contracts snapshot.'
-                )
-            return _contracts_snapshot
+                ),
+            )
 
     with _contracts_snapshot_lock:
+        reusable_reference = (
+            _contracts_snapshot.reference
+            if _contracts_snapshot is not None
+            else None
+        )
+        reference_is_available = (
+            reusable_reference is not None
+            and _snapshot_reference_is_available(
+                reusable_reference,
+                engine,
+            )
+        )
         if (
             not force
             and _contracts_snapshot is not None
             and _contracts_snapshot.revision_key == revision_key
+            and reference_is_available
         ):
+            _contracts_snapshot = replace(
+                _contracts_snapshot,
+                status='fresh',
+                message='',
+            )
             _contracts_snapshot_status = 'fresh'
             _contracts_snapshot_message = ''
             return _contracts_snapshot
 
         try:
-            candidate = _build_contracts_snapshot(revision_key)
+            source_key = _contracts_snapshot_source_key(revision_key)
+
+            def build_payload():
+                snapshot = _build_contracts_snapshot(revision_key)
+                if fetch_contracts_revision_key() != revision_key:
+                    raise RuntimeError(
+                        'Contracts sources changed during snapshot construction'
+                    )
+                return _contracts_snapshot_to_payload(snapshot)
+
+            reference, payload = _get_or_build_snapshot(
+                engine,
+                namespace=CONTRACTS_SNAPSHOT_NAMESPACE,
+                source_key=source_key,
+                builder=build_payload,
+                manifest={
+                    'format': CONTRACTS_SNAPSHOT_PAYLOAD_FORMAT,
+                    'revision_key': revision_key,
+                },
+                force=force or not reference_is_available,
+            )
+            if not _snapshot_is_resolvable(reference):
+                raise _SnapshotUnavailable(
+                    CONTRACTS_SNAPSHOT_RECOVERY_MESSAGE
+                )
+            candidate = _contracts_snapshot_from_payload(
+                payload,
+                reference,
+            )
         except Exception:
             logger.warning(
                 'Contracts snapshot refresh failed',
                 exc_info=True,
             )
-            if _contracts_snapshot is None:
-                _contracts_snapshot = _empty_contracts_snapshot()
-                _contracts_snapshot_status = 'unavailable'
-                _contracts_snapshot_message = (
+            return failed_snapshot(
+                unavailable_message=(
                     'Contracts data is unavailable because a complete '
                     'snapshot could not be loaded.'
-                )
-            else:
-                _contracts_snapshot_status = 'stale'
-                _contracts_snapshot_message = (
-                    'Source refresh failed. Showing the last verified '
-                    'contracts snapshot.'
-                )
-            return _contracts_snapshot
+                ),
+            )
 
         _contracts_snapshot = candidate
         _contracts_snapshot_status = 'fresh'
@@ -1928,17 +2094,10 @@ def _ensure_contracts_snapshot(*, force=False):
         return _contracts_snapshot
 
 
-def _contracts_snapshot_token(snapshot, refresh_generation=None):
-    token = repr(snapshot.revision_key)
-    if refresh_generation is not None:
-        token = f"{token}|refresh:{refresh_generation}"
-    return token
-
-
 def _contracts_source_status(snapshot):
-    if _contracts_snapshot_status == 'unavailable':
+    if snapshot.status == 'unavailable':
         return (
-            _contracts_snapshot_message,
+            snapshot.message,
             'contracts-source-status contracts-source-status-unavailable',
         )
 
@@ -1949,9 +2108,9 @@ def _contracts_source_status(snapshot):
             f"{label} {watermark or '—'} ({row_count:,} rows)"
         )
     revision_text = ' | '.join(revision_labels)
-    if _contracts_snapshot_status == 'stale':
+    if snapshot.status == 'stale':
         return (
-            f"{_contracts_snapshot_message} Source revisions (UTC): "
+            f"{snapshot.message} Source revisions (UTC): "
             f"{revision_text}",
             'contracts-source-status contracts-source-status-stale',
         )
@@ -1961,8 +2120,57 @@ def _contracts_source_status(snapshot):
     )
 
 
-def _current_contracts_snapshot():
-    return _contracts_snapshot or _empty_contracts_snapshot()
+def _current_contracts_snapshot(
+    reference=_NO_CONTRACTS_REFERENCE,
+):
+    if reference is _NO_CONTRACTS_REFERENCE:
+        return _contracts_snapshot or _empty_contracts_snapshot()
+    if reference is None:
+        return _empty_contracts_snapshot()
+    if (
+        not _is_snapshot_reference(
+            reference,
+            CONTRACTS_SNAPSHOT_NAMESPACE,
+        )
+        or not _snapshot_is_resolvable(reference)
+        or any(
+            key not in reference
+            for key in ('namespace', 'source_key', 'revision', 'shared')
+        )
+    ):
+        raise _SnapshotUnavailable(CONTRACTS_SNAPSHOT_RECOVERY_MESSAGE)
+    try:
+        payload = _resolve_snapshot(
+            reference,
+            engine,
+            expected_namespace=CONTRACTS_SNAPSHOT_NAMESPACE,
+        )
+        return _contracts_snapshot_from_payload(payload, reference)
+    except Exception as exc:
+        raise _SnapshotUnavailable(
+            CONTRACTS_SNAPSHOT_RECOVERY_MESSAGE
+        ) from exc
+
+
+def _contracts_snapshot_recovery_notice():
+    return html.Div(
+        CONTRACTS_SNAPSHOT_RECOVERY_MESSAGE,
+        className='contracts-snapshot-recovery',
+    )
+
+
+def _contracts_snapshot_recovery_figure():
+    figure = go.Figure()
+    figure.add_annotation(
+        text=CONTRACTS_SNAPSHOT_RECOVERY_MESSAGE,
+        showarrow=False,
+    )
+    figure.update_layout(
+        template='plotly_white',
+        xaxis={'visible': False},
+        yaxis={'visible': False},
+    )
+    return figure
 
 
 def _ensure_contracts_data_loaded():
@@ -1999,10 +2207,10 @@ def layout():
                 ],
                 className="contracts-content-stack",
             ),
-            html.Div(
-                _contracts_snapshot_token(snapshot),
+            dcc.Store(
                 id='contracts-data-store',
-                style={'display': 'none'},
+                data=snapshot.reference,
+                storage_type='memory',
             ),
             dcc.Store(id='volume-country-expanded-store', data=[]),
             dcc.Store(id='volume-seller-expanded-store', data=[]),
@@ -2016,19 +2224,23 @@ def layout():
 
 
 @callback(
-    Output('contracts-data-store', 'children'),
+    Output('contracts-data-store', 'data'),
     Output('contracts-source-status', 'children'),
     Output('contracts-source-status', 'className'),
     Input('global-refresh-button', 'n_clicks'),
+    State('contracts-data-store', 'data'),
     prevent_initial_call=True,
 )
-def refresh_contracts_snapshot(n_clicks):
-    snapshot = _ensure_contracts_snapshot(force=True)
+def refresh_contracts_snapshot(_n_clicks, current_reference):
+    snapshot = _ensure_contracts_snapshot(
+        force=True,
+        fallback_reference=current_reference,
+    )
     source_status_text, source_status_class = _contracts_source_status(
         snapshot
     )
     return (
-        _contracts_snapshot_token(snapshot, n_clicks),
+        snapshot.reference or no_update,
         source_status_text,
         source_status_class,
     )
@@ -2040,11 +2252,19 @@ def refresh_contracts_snapshot(n_clicks):
      Output('pricing-type-dropdown', 'options'),
      Output('seller-company-dropdown', 'options'),
      Output('cargo-basis-dropdown', 'options')],
-    [Input('contracts-data-store', 'children')]
+    [Input('contracts-data-store', 'data')]
 )
-def update_filter_options(_):
+def update_filter_options(snapshot_reference):
     """Update filter dropdown options based on available data"""
-    snapshot = _current_contracts_snapshot()
+    try:
+        snapshot = _current_contracts_snapshot(snapshot_reference)
+    except _SnapshotUnavailable:
+        recovery_option = [{
+            'label': CONTRACTS_SNAPSHOT_RECOVERY_MESSAGE,
+            'value': '',
+            'disabled': True,
+        }]
+        return [recovery_option] * 5
     contracts_df = snapshot.contracts
     demand_df = snapshot.demand
     if contracts_df.empty and demand_df.empty:
@@ -2090,7 +2310,7 @@ def update_filter_options(_):
      Input('volume-seller-expanded-store', 'data'),
      Input('volume-destination-expanded-store', 'data'),
      Input('volume-buyer-expanded-store', 'data'),
-     Input('contracts-data-store', 'children')]
+     Input('contracts-data-store', 'data')]
 )
 def update_volume_analysis_section(dest_countries, contract_types, 
                                   pricing_types, sellers, year_range, cargo_basis, 
@@ -2098,7 +2318,14 @@ def update_volume_analysis_section(dest_countries, contract_types,
                                   expanded_countries, expanded_sellers, expanded_destinations, expanded_buyers,
                                   _snapshot_token):
     """Update volume analysis section content"""
-    snapshot = _current_contracts_snapshot()
+    try:
+        snapshot = _current_contracts_snapshot(_snapshot_token)
+    except _SnapshotUnavailable:
+        return (
+            _contracts_snapshot_recovery_notice(),
+            _contracts_snapshot_recovery_notice(),
+            _contracts_snapshot_recovery_notice(),
+        )
     contracts_df = snapshot.contracts
     demand_df = snapshot.demand
     
@@ -2170,11 +2397,19 @@ def update_volume_analysis_section(dest_countries, contract_types,
      Input('source-flexible-dropdown', 'value'),
      Input('dest-flexible-dropdown', 'value'),
      Input('timeline-metric-dropdown', 'value'),
-     Input('contracts-data-store', 'children')]
+     Input('contracts-data-store', 'data')]
 )
 def update_timeline_charts(dest_countries, contract_types, pricing_types, sellers, source_flexible, dest_flexible, timeline_metric, _snapshot_token):
     """Update contract signing timeline charts"""
-    snapshot = _current_contracts_snapshot()
+    import plotly.express as px
+
+    try:
+        snapshot = _current_contracts_snapshot(_snapshot_token)
+    except _SnapshotUnavailable:
+        return (
+            _contracts_snapshot_recovery_figure(),
+            _contracts_snapshot_recovery_figure(),
+        )
     contracts_df = snapshot.contracts
     demand_df = snapshot.demand
     price_assumptions_df = snapshot.price_assumptions
@@ -2574,13 +2809,24 @@ def update_timeline_charts(dest_countries, contract_types, pricing_types, seller
      Input('year-range-slider', 'value'),
      Input('source-flexible-dropdown', 'value'),
      Input('dest-flexible-dropdown', 'value'),
-     Input('contracts-data-store', 'children')]
+     Input('contracts-data-store', 'data')]
 )
 def update_contracts_table(dest_countries, contract_types, 
                           pricing_types, sellers, year_range, source_flexible,
                           dest_flexible, _snapshot_token):
     """Update contracts table based on filters"""
-    snapshot = _current_contracts_snapshot()
+    try:
+        snapshot = _current_contracts_snapshot(_snapshot_token)
+    except _SnapshotUnavailable:
+        return (
+            [{
+                'headerName': 'Status',
+                'field': 'snapshot_status',
+            }],
+            [{
+                'snapshot_status': CONTRACTS_SNAPSHOT_RECOVERY_MESSAGE,
+            }],
+        )
     contracts_df = snapshot.contracts
     price_assumptions_df = snapshot.price_assumptions
     price_formula_df = snapshot.price_formula

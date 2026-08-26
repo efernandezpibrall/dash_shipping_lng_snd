@@ -5,7 +5,6 @@ from io import BytesIO
 from typing import TYPE_CHECKING
 
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 from dash import Input, Output, State, callback, dcc, html, no_update
 from dash.dash_table.Format import Format, Scheme
@@ -1247,6 +1246,8 @@ def _build_trade_stacked_figure(
     title: str,
     yaxis_title: str,
 ) -> go.Figure:
+    import plotly.express as px
+
     if df.empty or len(df.columns) <= 2:
         return _empty_figure(title)
 
@@ -1366,6 +1367,8 @@ def _build_maintenance_figure(df: pd.DataFrame) -> go.Figure:
 
 
 def _build_pacific_supply_figure(df: pd.DataFrame) -> go.Figure:
+    import plotly.express as px
+
     if df.empty:
         return _empty_figure("Pacific Locked Supply")
 
@@ -1390,6 +1393,8 @@ def _build_pacific_supply_figure(df: pd.DataFrame) -> go.Figure:
 
 
 def _build_pacific_total_figure(df: pd.DataFrame) -> go.Figure:
+    import plotly.express as px
+
     if df.empty:
         return _empty_figure("Pacific Supply Equivalent (mcm/d)")
 
@@ -1446,6 +1451,8 @@ def _build_country_balance_figure(df: pd.DataFrame, country: str | None) -> go.F
 
 
 def _build_country_category_figure(df: pd.DataFrame, *, title: str, chart_type: str) -> go.Figure:
+    import plotly.express as px
+
     if df.empty:
         return _empty_figure(title)
 

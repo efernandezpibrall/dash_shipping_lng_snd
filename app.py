@@ -4,6 +4,7 @@ import os
 
 from dash import Dash
 import dash_bootstrap_components as dbc
+from flask import request
 from sqlalchemy import text
 
 
@@ -51,6 +52,21 @@ app = Dash(
 )
 app.title = "LNG Shipping - Exporters"
 server = app.server
+
+
+@server.after_request
+def optimize_static_asset_delivery(response):
+    """Compress and cache Dash assets whose URL carries a version token."""
+
+    if request.path.startswith("/assets/") and response.status_code == 200:
+        if HTTP_COMPRESSION_ENABLED:
+            response.direct_passthrough = False
+            response.set_data(response.get_data())
+        if "m" in request.args:
+            response.headers["Cache-Control"] = (
+                "public, max-age=31536000, immutable"
+            )
+    return response
 
 
 @server.get("/health")

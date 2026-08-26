@@ -1,3 +1,7 @@
+from copy import deepcopy
+from functools import lru_cache
+from threading import Lock
+
 from dash import html, dcc, callback, Output, Input
 from utils.ag_grid_tables import create_ag_grid_from_datatable
 import dash_bootstrap_components as dbc
@@ -7,8 +11,34 @@ from utils.database import engine
 from utils.mappings_section import create_mappings_section_header
 from utils.mapping_page_figures import build_summary_card_row as _build_summary_card_row
 from utils.table_styles import StandardTableStyleManager
-import dash_leaflet as dl
-import requests
+
+
+WORLD_GEOJSON_URL = (
+    "https://raw.githubusercontent.com/nvkelso/"
+    "natural-earth-vector/ca96624a56bd078437bca8184e78163e5039ad19/"
+    "geojson/ne_110m_admin_0_countries.geojson"
+)
+_WORLD_GEOJSON_LOCK = Lock()
+
+
+@lru_cache(maxsize=1)
+def _fetch_world_geojson():
+    """Load the pinned country geometry once per worker."""
+
+    import requests
+
+    response = requests.get(WORLD_GEOJSON_URL, timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def _load_world_geojson():
+    with _WORLD_GEOJSON_LOCK:
+        return _fetch_world_geojson()
+
+
+def _world_geojson_copy():
+    return deepcopy(_load_world_geojson())
 
 def fetch_country_mappings_data(engine, schema='at_lng'):
     """Fetch distinct country mappings data from the database"""
@@ -63,6 +93,8 @@ def create_summary_cards(df):
 
 def create_world_map(df, category='continent'):
     """Create a choropleth world map using dash-leaflet with iso3 codes"""
+    import dash_leaflet as dl
+
     if df.empty:
         return html.Div("No data available for map", style={'padding': '20px', 'textAlign': 'center'})
     
@@ -139,9 +171,7 @@ def create_world_map(df, category='continent'):
     
     try:
         # Use Natural Earth GeoJSON which has proper country boundaries
-        geojson_url = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_110m_admin_0_countries.geojson"
-        response = requests.get(geojson_url, timeout=10)
-        geojson_data = response.json()
+        geojson_data = _world_geojson_copy()
         
         # Create ISO3 to data mapping
         iso3_to_data = {}

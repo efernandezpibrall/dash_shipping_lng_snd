@@ -5,14 +5,15 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, exc
 from sqlalchemy.engine import Engine
 
 
-DEFAULT_POOL_SIZE = 5
-DEFAULT_MAX_OVERFLOW = 5
+DEFAULT_POOL_SIZE = 2
+DEFAULT_MAX_OVERFLOW = 0
 DEFAULT_POOL_TIMEOUT_SECONDS = 30
 DEFAULT_POOL_RECYCLE_SECONDS = 1800
+DEFAULT_APPLICATION_NAME = "dash_shipping_lng_snd"
 
 
 def _read_positive_int(name: str, default: int, *, allow_zero: bool = False) -> int:
@@ -58,7 +59,7 @@ def get_database_engine() -> Engine:
             f"Missing DATABASE CONNECTION_STRING in {CONFIG_FILE_PATH}"
         )
 
-    return create_engine(
+    engine = create_engine(
         DB_CONNECTION_STRING,
         pool_size=_read_positive_int(
             "DASH_DB_POOL_SIZE",
@@ -78,7 +79,32 @@ def get_database_engine() -> Engine:
             DEFAULT_POOL_RECYCLE_SECONDS,
         ),
         pool_pre_ping=True,
+        pool_use_lifo=True,
+        connect_args={
+            "connect_timeout": _read_positive_int(
+                "DASH_DB_CONNECT_TIMEOUT_SECONDS",
+                10,
+            ),
+            "application_name": os.getenv(
+                "DASH_DB_APPLICATION_NAME",
+                DEFAULT_APPLICATION_NAME,
+            ),
+        },
     )
+
+    @event.listens_for(engine, "connect")
+    def remember_process(_connection, record):
+        record.info["pid"] = os.getpid()
+
+    @event.listens_for(engine, "checkout")
+    def reject_forked_connection(_connection, record, proxy):
+        if record.info.get("pid") != os.getpid():
+            record.dbapi_connection = proxy.dbapi_connection = None
+            raise exc.DisconnectionError(
+                "Database connection belongs to another process"
+            )
+
+    return engine
 
 
 engine = get_database_engine()

@@ -2,7 +2,6 @@
 
 from dash import html
 import dash_bootstrap_components as dbc
-import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 
@@ -143,6 +142,8 @@ def build_empty_figure(message: str) -> go.Figure:
 
 
 def build_bar_figure(series: pd.Series, title: str, color: str) -> go.Figure:
+    import plotly.express as px
+
     if series.empty:
         return build_empty_figure("No data available for the current selection.")
 

@@ -48,12 +48,14 @@ except ImportError:  # pragma: no cover - exercised through the disabled fallbac
 from sqlalchemy import bindparam, text
 from sqlalchemy.dialects.postgresql import BYTEA, JSONB
 
+from utils.database import DB_SCHEMA
+
 
 LOGGER = logging.getLogger(__name__)
 
 REFERENCE_FORMAT = "dashboard_source_ref_v1"
 PAYLOAD_CODEC = "zlib-json-v1"
-SNAPSHOT_TABLE = "at_lng.dashboard_prepared_snapshots"
+SNAPSHOT_TABLE = f"{DB_SCHEMA}.dashboard_prepared_snapshots"
 
 LOCAL_PERSISTENCE_ENV = "DASHBOARD_SNAPSHOT_LOCAL_PERSISTENCE_ENABLED"
 LOCAL_CACHE_DIR_ENV = "DASHBOARD_SNAPSHOT_CACHE_DIR"
@@ -70,6 +72,7 @@ _DISK_RECORD_CHECKSUM_BYTES = 32
 _CACHE_MARKER_NAME = ".dashboard-snapshot-cache-v1"
 _CACHE_MARKER_CONTENT = b"dash_shipping_lng_snd dashboard snapshot cache v1\n"
 _CACHE_INIT_LOCK_NAME = ".dashboard-snapshot-init.lock"
+_COMPOUND_LOCK_NAME = "compound.lock"
 _LOCK_STRIPE_COUNT = 64
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _MISSING = object()
@@ -87,6 +90,9 @@ _SHARED_SCHEMA_STATE: dict[int, bool] = {}
 _PERSISTENT_STORES = None
 _PERSISTENT_STORES_CONFIG: tuple[str, int] | None = None
 _PERSISTENT_STORES_LOCK = threading.RLock()
+_DISK_STORES: set[Any] = set()
+_DISK_STORES_LOCK = threading.RLock()
+_FORK_GUARD_STORES: tuple[Any, ...] = ()
 _ACTIVE_PUBLICATION_STAGE: ContextVar["SnapshotPublicationStage | None"] = (
     ContextVar("dashboard_snapshot_publication_stage", default=None)
 )
@@ -390,6 +396,10 @@ class _DiskStores:
 
         self.root = root
         self.locks_directory = locks_directory
+        self.process_id = os.getpid()
+        self.active_lock_fds: set[int] = set()
+        self.active_lock_fds_guard = threading.RLock()
+        self.closed = False
         # Records and latest pointers share one bounded cache, so the
         # configured limit covers the complete DiskCache footprint.
         self.cache = DiskCache(
@@ -397,9 +407,109 @@ class _DiskStores:
             size_limit=int(size_limit),
             eviction_policy="least-recently-used",
         )
+        with _DISK_STORES_LOCK:
+            prior_generation = next(
+                (
+                    stores
+                    for stores in _DISK_STORES
+                    if stores.process_id == self.process_id
+                    and stores.locks_directory == self.locks_directory
+                ),
+                None,
+            )
+            if prior_generation is None:
+                self.compound_lock = threading.RLock()
+                self.source_locks = tuple(
+                    threading.RLock()
+                    for _ in range(_LOCK_STRIPE_COUNT)
+                )
+                self.lock_depths = threading.local()
+            else:
+                self.compound_lock = prior_generation.compound_lock
+                self.source_locks = prior_generation.source_locks
+                self.lock_depths = prior_generation.lock_depths
+            _DISK_STORES.add(self)
 
     def close(self) -> None:
-        self.cache.close()
+        with _DISK_STORES_LOCK:
+            with self.active_lock_fds_guard:
+                self.closed = True
+        try:
+            self.cache.close()
+        finally:
+            _forget_disk_store_if_quiescent(self)
+
+
+def _forget_disk_store_if_quiescent(stores: _DiskStores) -> None:
+    with _DISK_STORES_LOCK:
+        with stores.active_lock_fds_guard:
+            if stores.closed and not stores.active_lock_fds:
+                _DISK_STORES.discard(stores)
+
+
+def _prepare_snapshot_state_for_fork() -> None:
+    global _FORK_GUARD_STORES
+
+    _DISK_STORES_LOCK.acquire()
+    _FORK_GUARD_STORES = tuple(sorted(_DISK_STORES, key=id))
+    for stores in _FORK_GUARD_STORES:
+        stores.active_lock_fds_guard.acquire()
+
+
+def _release_snapshot_state_after_fork() -> None:
+    global _FORK_GUARD_STORES
+
+    for stores in reversed(_FORK_GUARD_STORES):
+        stores.active_lock_fds_guard.release()
+    _FORK_GUARD_STORES = ()
+    _DISK_STORES_LOCK.release()
+
+
+def _reset_snapshot_state_after_fork() -> None:
+    """Discard inherited locks and handles in a newly forked process."""
+
+    global _ACTIVE_PUBLICATION_STAGE
+    global _DISK_STORES
+    global _DISK_STORES_LOCK
+    global _FORK_GUARD_STORES
+    global _LOCAL_LOCK
+    global _PERSISTENT_STORES
+    global _PERSISTENT_STORES_CONFIG
+    global _PERSISTENT_STORES_LOCK
+    global _SNAPSHOT_LOCK_WAIT_MS
+    global _SNAPSHOT_READ_BACKEND
+
+    for inherited_stores in _FORK_GUARD_STORES:
+        for file_descriptor in tuple(inherited_stores.active_lock_fds):
+            with suppress(OSError):
+                os.close(file_descriptor)
+    _PERSISTENT_STORES = None
+    _PERSISTENT_STORES_CONFIG = None
+    _PERSISTENT_STORES_LOCK = threading.RLock()
+    _LOCAL_LOCK = threading.RLock()
+    _SINGLE_FLIGHTS.clear()
+    _ACTIVE_PUBLICATION_STAGE = ContextVar(
+        "dashboard_snapshot_publication_stage",
+        default=None,
+    )
+    _SNAPSHOT_LOCK_WAIT_MS = ContextVar(
+        "dashboard_snapshot_lock_wait_ms",
+        default=0.0,
+    )
+    _SNAPSHOT_READ_BACKEND = ContextVar(
+        "dashboard_snapshot_read_backend",
+        default=None,
+    )
+    _DISK_STORES = set()
+    _DISK_STORES_LOCK = threading.RLock()
+    _FORK_GUARD_STORES = ()
+
+
+os.register_at_fork(
+    before=_prepare_snapshot_state_for_fork,
+    after_in_parent=_release_snapshot_state_after_fork,
+    after_in_child=_reset_snapshot_state_after_fork,
+)
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
@@ -484,6 +594,11 @@ def _get_persistent_stores() -> _DiskStores:
         raise _PersistentStorageError(
             "Local dashboard snapshot persistence requires diskcache"
         )
+    if (
+        _PERSISTENT_STORES is not None
+        and _PERSISTENT_STORES.process_id != os.getpid()
+    ):
+        _reset_snapshot_state_after_fork()
 
     root = _persistent_cache_root()
     size_limit = _disk_max_bytes()
@@ -771,6 +886,51 @@ def snapshot_is_shared(reference: Mapping[str, Any] | None) -> bool:
 def snapshot_is_resolvable(reference: Mapping[str, Any] | None) -> bool:
     """Return whether a browser reference is safe to resolve server-side."""
     return snapshot_is_shared(reference)
+
+
+def snapshot_reference_is_available(
+    reference: Mapping[str, Any] | None,
+    engine,
+) -> bool:
+    """Verify that an exact shared reference still exists in its backend."""
+
+    if not is_snapshot_reference(reference) or not snapshot_is_shared(reference):
+        return False
+    try:
+        namespace = str(reference["namespace"])
+        source_key = str(reference["source_key"])
+        if local_snapshot_persistence_enabled():
+            revision = _validate_disk_revision_token(reference.get("revision"))
+            stores = _get_persistent_stores()
+            raw_record = stores.cache.get(
+                _disk_record_key(namespace, source_key, revision),
+                default=_MISSING,
+                retry=True,
+            )
+            if raw_record is _MISSING:
+                return False
+            header, encoded_payload = _decode_disk_record_header(raw_record)
+            return (
+                header.get("format") == DISK_RECORD_FORMAT
+                and header.get("codec") == PAYLOAD_CODEC
+                and header.get("namespace") == namespace
+                and header.get("source_key") == source_key
+                and header.get("revision") == revision
+                and int(header.get("payload_bytes"))
+                == len(encoded_payload)
+            )
+        revision = int(reference["revision"])
+        with engine.connect() as connection:
+            return bool(connection.execute(
+                _SHARED_REFERENCE_EXISTS_SQL,
+                {
+                    "namespace": namespace,
+                    "source_key": source_key,
+                    "revision": revision,
+                },
+            ).scalar())
+    except Exception:
+        return False
 
 
 def _estimate_decoded_bytes(
@@ -1467,38 +1627,63 @@ def commit_snapshot_publication_stage(
 
 
 @contextmanager
-def _disk_source_lock(
+def _disk_reentrant_lock(
     stores: _DiskStores,
+    *,
+    lock_name: str,
+    process_lock: threading.RLock,
+    depth_key: str | int,
     namespace: str,
     source_key: str,
 ):
-    stripe = (
-        int(_disk_source_token(namespace, source_key)[:16], 16)
-        % _LOCK_STRIPE_COUNT
-    )
-    lock_name = f"stripe-{stripe:02d}.lock"
-    lock_path = stores.locks_directory / lock_name
-    try:
-        file_descriptor = os.open(
-            lock_path,
-            os.O_CREAT | os.O_RDWR,
-            0o600,
-        )
-    except OSError as exc:
+    if stores.process_id != os.getpid():
         raise _PersistentStorageError(
-            f"Dashboard snapshot lock is unavailable at {lock_path}"
-        ) from exc
-    try:
+            "Dashboard snapshot store was inherited across a process fork"
+        )
+    lock_path = stores.locks_directory / lock_name
+    wait_started = time.perf_counter()
+    with process_lock:
+        depths = getattr(stores.lock_depths, "values", None)
+        if depths is None:
+            depths = {}
+            stores.lock_depths.values = depths
+        depth = depths.get(depth_key, 0)
+        if depth:
+            depths[depth_key] = depth + 1
+            try:
+                yield
+            finally:
+                depths[depth_key] = depth
+            return
+
+        with stores.active_lock_fds_guard:
+            if stores.closed:
+                raise _PersistentStorageError(
+                    "Dashboard snapshot store is already closed"
+                )
+            try:
+                file_descriptor = os.open(
+                    lock_path,
+                    os.O_CREAT | os.O_RDWR,
+                    0o600,
+                )
+            except OSError as exc:
+                raise _PersistentStorageError(
+                    f"Dashboard snapshot lock is unavailable at {lock_path}"
+                ) from exc
+            tracked_file_descriptor = file_descriptor
+            stores.active_lock_fds.add(tracked_file_descriptor)
+        lock_file = None
         try:
-            os.fchmod(file_descriptor, 0o600)
-        except OSError as exc:
-            raise _PersistentStorageError(
-                f"Dashboard snapshot lock permissions failed at {lock_path}"
-            ) from exc
-        with os.fdopen(file_descriptor, "a+b", buffering=0) as lock_file:
+            try:
+                os.fchmod(file_descriptor, 0o600)
+            except OSError as exc:
+                raise _PersistentStorageError(
+                    f"Dashboard snapshot lock permissions failed at {lock_path}"
+                ) from exc
+            lock_file = os.fdopen(file_descriptor, "a+b", buffering=0)
             file_descriptor = -1
             try:
-                wait_started = time.perf_counter()
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
                 lock_wait_ms = (
                     time.perf_counter() - wait_started
@@ -1514,16 +1699,84 @@ def _disk_source_lock(
                 )
             except OSError as exc:
                 raise _PersistentStorageError(
-                    f"Dashboard snapshot lock acquisition failed at {lock_path}"
+                    "Dashboard snapshot lock acquisition failed at "
+                    f"{lock_path}"
                 ) from exc
+            depths[depth_key] = 1
             try:
                 yield
             finally:
+                depths.pop(depth_key, None)
                 with suppress(OSError):
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-    finally:
-        if file_descriptor >= 0:
-            os.close(file_descriptor)
+        finally:
+            with stores.active_lock_fds_guard:
+                stores.active_lock_fds.discard(tracked_file_descriptor)
+                if lock_file is not None:
+                    lock_file.close()
+                elif file_descriptor >= 0:
+                    os.close(file_descriptor)
+            _forget_disk_store_if_quiescent(stores)
+
+
+@contextmanager
+def _disk_source_lock(
+    stores: _DiskStores,
+    namespace: str,
+    source_key: str,
+):
+    stripe = (
+        int(_disk_source_token(namespace, source_key)[:16], 16)
+        % _LOCK_STRIPE_COUNT
+    )
+    depths = getattr(stores.lock_depths, "values", {})
+    held_stripes = {
+        key
+        for key, depth in depths.items()
+        if isinstance(key, int) and depth
+    }
+    if (
+        held_stripes
+        and stripe not in held_stripes
+        and not depths.get("compound")
+    ):
+        raise _PersistentStorageError(
+            "Nested dashboard snapshot stripes require snapshot_build_lock"
+        )
+    with _disk_reentrant_lock(
+        stores,
+        lock_name=f"stripe-{stripe:02d}.lock",
+        process_lock=stores.source_locks[stripe],
+        depth_key=stripe,
+        namespace=namespace,
+        source_key=source_key,
+    ):
+        yield
+
+
+@contextmanager
+def _disk_compound_lock(
+    stores: _DiskStores,
+    namespace: str,
+    source_key: str,
+):
+    depths = getattr(stores.lock_depths, "values", {})
+    if not depths.get("compound") and any(
+        isinstance(key, int) and depth
+        for key, depth in depths.items()
+    ):
+        raise _PersistentStorageError(
+            "snapshot_build_lock must be acquired before snapshot source locks"
+        )
+    with _disk_reentrant_lock(
+        stores,
+        lock_name=_COMPOUND_LOCK_NAME,
+        process_lock=stores.compound_lock,
+        depth_key="compound",
+        namespace=namespace,
+        source_key=source_key,
+    ):
+        yield
 
 
 @contextmanager
@@ -1534,7 +1787,7 @@ def snapshot_build_lock(namespace: str, source_key: str):
         yield
         return
     stores = _get_persistent_stores()
-    with _disk_source_lock(stores, namespace, source_key):
+    with _disk_compound_lock(stores, namespace, source_key):
         yield
 
 
@@ -1569,6 +1822,16 @@ _READ_EXACT_SQL = text(f"""
     WHERE namespace = :namespace
       AND source_key = :source_key
       AND revision = :revision
+""")
+
+_SHARED_REFERENCE_EXISTS_SQL = text(f"""
+    SELECT EXISTS (
+        SELECT 1
+        FROM {SNAPSHOT_TABLE}
+        WHERE namespace = :namespace
+          AND source_key = :source_key
+          AND revision = :revision
+    )
 """)
 
 _MAX_REVISION_SQL = text(f"""

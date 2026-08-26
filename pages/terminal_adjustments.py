@@ -21,6 +21,7 @@ from dash import html, dcc, callback, Input, Output, State
 import dash_bootstrap_components as dbc
 import os
 import sys
+from sqlalchemy import text
 
 from utils.ag_grid_tables import create_ag_grid_from_datatable
 from utils.database import DB_SCHEMA, engine
@@ -64,26 +65,6 @@ def fetch_woodmac_baseline():
         ]
     ]
 
-    # Legacy provider-ID query retained temporarily for rollback comparison.
-    query = f"""
-        SELECT
-            id_plant,
-            id_lng_train,
-            plant_name,
-            lng_train_name_short,
-            country_name,
-            year,
-            month,
-            metric_value as baseline_output
-        FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_output_mta
-        WHERE metric_value IS NOT NULL
-        ORDER BY plant_name, lng_train_name_short, year, month
-    """
-
-    with engine.connect() as conn:
-        df = pd.read_sql(query, conn)
-
-    return df
 
 
 def fetch_adjustments_with_baseline(scenario_name):
@@ -105,61 +86,6 @@ def fetch_adjustments_with_baseline(scenario_name):
     df['final_output'] = df['total_output']
     return df
 
-    # Legacy provider-ID query retained temporarily for rollback comparison.
-    query = f"""
-        WITH woodmac_baseline AS (
-            SELECT
-                id_plant,
-                id_lng_train,
-                plant_name,
-                lng_train_name_short,
-                country_name,
-                year,
-                month,
-                metric_value as baseline_output
-            FROM {DB_SCHEMA}.woodmac_lng_plant_train_monthly_output_mta
-            WHERE metric_value IS NOT NULL
-        ),
-        latest_adjustments AS (
-            SELECT DISTINCT ON (id_plant, id_lng_train, year, month)
-                id_plant,
-                id_lng_train,
-                year,
-                month,
-                adjusted_output,
-                comments,
-                upload_timestamp_utc
-            FROM {DB_SCHEMA}.fundamentals_terminals_output_adjustments
-            WHERE scenario_name = %(scenario_name)s
-            ORDER BY id_plant, id_lng_train, year, month, upload_timestamp_utc DESC
-        )
-        SELECT
-            wb.id_plant,
-            wb.id_lng_train,
-            wb.plant_name,
-            wb.lng_train_name_short,
-            wb.country_name,
-            wb.year,
-            wb.month,
-            wb.baseline_output,
-            la.adjusted_output,
-            COALESCE(la.adjusted_output, wb.baseline_output) as final_output,
-            'adjusted' as data_source,
-            la.comments,
-            %(scenario_name)s as scenario_name
-        FROM woodmac_baseline wb
-        INNER JOIN latest_adjustments la
-            ON wb.id_plant = la.id_plant
-            AND wb.id_lng_train = la.id_lng_train
-            AND wb.year = la.year
-            AND wb.month = la.month
-        ORDER BY wb.plant_name, wb.lng_train_name_short, wb.year, wb.month
-    """
-
-    with engine.connect() as conn:
-        df = pd.read_sql(query, conn, params={'scenario_name': scenario_name})
-
-    return df
 
 
 def get_plants_list():
@@ -218,6 +144,47 @@ def get_trains_list():
         df = pd.read_sql(query, conn)
 
     return df
+
+
+def _validated_copy_train_filters(values):
+    """Return authoritative plant/train pairs from an untrusted selection."""
+
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError("Invalid train selection")
+
+    selected_pairs = []
+    for value in values:
+        if (
+            not isinstance(value, str)
+            or value.count('|') != 1
+        ):
+            raise ValueError("Invalid train selection")
+        plant_name, train_name = value.split('|', 1)
+        if not plant_name or not train_name:
+            raise ValueError("Invalid train selection")
+        selected_pairs.append((plant_name, train_name))
+
+    trains_df = get_trains_list()
+    required_columns = {
+        'plant_name', 'lng_train_name_short', 'id_plant', 'id_lng_train'
+    }
+    if not required_columns.issubset(trains_df.columns):
+        raise ValueError("Invalid train selection")
+    copyable = trains_df[
+        trains_df['id_plant'].notna()
+        & trains_df['id_lng_train'].notna()
+    ]
+    allowed_pairs = {
+        (str(row.plant_name), str(row.lng_train_name_short))
+        for row in copyable.itertuples(index=False)
+    }
+    if (
+        len(selected_pairs) > len(allowed_pairs)
+        or len(set(selected_pairs)) != len(selected_pairs)
+        or any(pair not in allowed_pairs for pair in selected_pairs)
+    ):
+        raise ValueError("Invalid train selection")
+    return selected_pairs
 
 
 ###############################################################################
@@ -801,11 +768,7 @@ def copy_trains_to_scenario(_n_clicks, trains_to_copy, destination_scenario):
         return "Please select trains and destination scenario", "alert alert-warning"
 
     try:
-        # Parse train selections (format: "plant_name|train_name")
-        train_filters = []
-        for train_val in trains_to_copy:
-            plant_name, train_name = train_val.split('|')
-            train_filters.append((plant_name, train_name))
+        train_filters = _validated_copy_train_filters(trains_to_copy)
 
         # Fetch baseline data for selected trains
         # Get latest baseline data from Woodmac
@@ -838,17 +801,28 @@ def copy_trains_to_scenario(_n_clicks, trains_to_copy, destination_scenario):
 
         # Add train filters to query
         train_conditions = []
-        for plant_name, train_name in train_filters:
-            train_conditions.append(f"(plant_name = '{plant_name}' AND lng_train_name_short = '{train_name}')")
+        query_params = {}
+        for index, (plant_name, train_name) in enumerate(train_filters):
+            plant_param = f"plant_name_{index}"
+            train_param = f"train_name_{index}"
+            train_conditions.append(
+                f"(plant_name = :{plant_param} "
+                f"AND lng_train_name_short = :{train_param})"
+            )
+            query_params[plant_param] = plant_name
+            query_params[train_param] = train_name
 
-        if train_conditions:
-            query += " AND (" + " OR ".join(train_conditions) + ")"
+        query += " AND (" + " OR ".join(train_conditions) + ")"
 
         query += " ORDER BY plant_name, lng_train_name_short, year, month"
 
         # Fetch data
         with engine.connect() as conn:
-            df_baseline = pd.read_sql(query, conn)
+            df_baseline = pd.read_sql(
+                text(query),
+                conn,
+                params=query_params,
+            )
 
         if df_baseline.empty:
             return "No baseline data found for selected trains", "alert alert-warning"

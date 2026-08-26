@@ -1,4 +1,4 @@
-from dash import html, dcc, callback, clientside_callback, Output, Input, State, ALL, ctx, no_update
+from dash import html, dcc, callback, Output, Input, State, ALL, ctx, no_update
 from utils.ag_grid_tables import (
     ag_grid_cell_clicked_to_active_cell,
     ag_grid_column_defs_to_datatable_columns,
@@ -9,8 +9,38 @@ from utils.detail_controls import (
     coerce_detail_count as _coerce_detail_count,
     detail_count_options as _detail_count_options,
     format_rolling_window_label,
-    format_rolling_window_title,
+)
+from utils.detail_volume_metrics import (
+    BCM_PER_MMTPA,
+    DAYS_PER_YEAR,
+    DETAIL_MAX_ROLLING_WINDOW_DAYS,
+    MCM_PER_BCM,
+    MCM_PER_MONTH_PER_MMTPA,
+    MCM_PER_MT,
+    MMTPA_PER_MCM_D,
+    VOLUME_CONVERSIONS,
+    VOLUME_METRIC_OPTIONS,
+    apply_excel_metric_format as _apply_detail_excel_metric_format,
+    convert_volume_metric_dataframe,
+    convert_volume_metric_dataframe as _convert_detail_volume_dataframe,
+    convert_volume_metric_series as _convert_detail_volume_series,
+    format_metric_value as _format_detail_metric_value,
+    format_rolling_title as _format_detail_rolling_title,
+    format_table_metric_value as _format_detail_table_metric_value,
+    get_excel_number_format as _get_detail_excel_number_format,
+    get_rolling_metric_export_column_name as _get_detail_rolling_metric_export_column_name,
+    get_volume_metric_display_precision as _get_detail_volume_metric_display_precision,
+    get_volume_metric_factor as _get_detail_volume_metric_factor,
+    get_volume_metric_info,
+    get_volume_metric_info as _get_detail_volume_metric_info,
+    get_volume_metric_plotly_format as _get_detail_volume_metric_plotly_format,
+    get_volume_metric_zero_tolerance as _get_detail_volume_metric_zero_tolerance,
+    is_period_volume_metric as _is_detail_period_volume_metric,
+    maintenance_raw_mcmd_field as _maintenance_raw_mcmd_field,
     normalize_rolling_window_days,
+    normalize_volume_metric as _normalize_detail_volume_metric,
+    rolling_measure_name as _detail_rolling_measure_name,
+    round_volume_metric_display_value as _round_detail_volume_metric_display_value,
 )
 from utils.detail_table_formatting import (
     format_table_value_max_one_decimal as _format_table_value_max_one_decimal,
@@ -53,7 +83,7 @@ from utils.performance import log_callback_timing
 
 logger = logging.getLogger(__name__)
 
-IMPORTER_DETAIL_BASE_NAMESPACE = 'importer-detail-base-v3'
+IMPORTER_DETAIL_BASE_NAMESPACE = 'importer-detail-base-v4'
 IMPORTER_MAINTENANCE_SOURCE_NAMESPACE = (
     'importer-maintenance-source-v1'
 )
@@ -264,32 +294,26 @@ def _importer_detail_forecast_month_token():
     return dt.date.today().replace(day=1).isoformat()
 
 MCM_PER_CUBIC_METER = 0.6 / 1000
-BCM_PER_MMTPA = 1.36
-DAYS_PER_YEAR = 365.25
-MCM_PER_BCM = 1000
-MCM_PER_MT = BCM_PER_MMTPA * MCM_PER_BCM
-MCM_PER_MONTH_PER_MMTPA = BCM_PER_MMTPA * MCM_PER_BCM / 12
-MMTPA_PER_MCM_D = DAYS_PER_YEAR / MCM_PER_MT
 
-# Volume unit conversion factors from the page's base mcm/d series.
-# Annualized conversions use 1 MMTPA = 1.36 BCM/year.
-# MT is period-aware: mcm/d x represented days / 1,360 MCM per MT.
-VOLUME_CONVERSIONS = {
-    'mcm_d': {'factor': 1.0, 'label': 'mcm/d'},
-    'mt': {'factor': None, 'label': 'MT'},
-    'mtpa': {'factor': MMTPA_PER_MCM_D, 'label': 'MMTPA'},
-}
-
-VOLUME_METRIC_OPTIONS = [
-    {'label': 'mcm/d', 'value': 'mcm_d'},
-    {'label': 'MT', 'value': 'mt'},
-    {'label': 'MMTPA', 'value': 'mtpa'},
+DETAIL_CONVERSION_NOTE_LINES = [
+    (
+        f"Annualized standard: 1 MMTPA = {BCM_PER_MMTPA:.2f} BCM/year; "
+        f"BCM/MT use the represented period ({MCM_PER_BCM:.0f} MCM per BCM, "
+        f"{MCM_PER_MT:.0f} MCM per MT)."
+    ),
+    (
+        "BCM/MT comparisons across different horizons are shown as —; "
+        "same-horizon period and year comparisons remain available."
+    ),
 ]
 
 SUPPLY_CHART_FORECAST_DASH = 'dot'
 SUPPLY_CHART_RANGE_FILL = 'rgba(148, 163, 184, 0.20)'
 SUPPLY_CHART_RANGE_LOOKBACK_YEARS = 5
 DETAIL_CHART_DATA_START_DATE = '2021-01-01'
+DETAIL_CHART_QUERY_START_DATE = '2020-07-06'
+
+
 SUPPLY_CHART_COLOR_SEQUENCE = [
     '#8fb3d9',
     '#5f8fbe',
@@ -422,92 +446,6 @@ IMPORTER_DETAIL_PERIOD_DEFAULT_COL_DEF = {
 }
 
 
-def _normalize_detail_volume_metric(volume_metric):
-    return volume_metric if volume_metric in VOLUME_CONVERSIONS else 'mcm_d'
-
-
-def _get_detail_volume_metric_info(volume_metric):
-    return VOLUME_CONVERSIONS[_normalize_detail_volume_metric(volume_metric)]
-
-
-def _get_detail_volume_metric_factor(volume_metric, period_days=None):
-    normalized_metric = _normalize_detail_volume_metric(volume_metric)
-    if normalized_metric == 'mt':
-        days = period_days if period_days is not None else DAYS_PER_YEAR
-        return days / MCM_PER_MT
-    return VOLUME_CONVERSIONS[normalized_metric]['factor']
-
-
-def _convert_detail_volume_series(series, volume_metric, period_days=None, precision=None):
-    numeric_series = pd.to_numeric(series, errors='coerce')
-    converted_series = numeric_series * _get_detail_volume_metric_factor(
-        volume_metric,
-        period_days=period_days
-    )
-    if precision is not None:
-        converted_series = converted_series.round(precision)
-    return converted_series.where(pd.notnull(converted_series), None)
-
-
-def _convert_detail_volume_dataframe(
-    df,
-    volume_metric,
-    columns=None,
-    exclude_columns=None,
-    precision=None,
-    period_days=None,
-    period_days_by_column=None
-):
-    if df is None or df.empty:
-        return df
-
-    converted_df = df.copy()
-    exclude_columns = set(exclude_columns or [])
-    period_days_by_column = period_days_by_column or {}
-    if columns is None:
-        columns = [
-            col for col in converted_df.columns
-            if col not in exclude_columns
-        ]
-
-    for col in columns:
-        if col not in converted_df.columns or col in exclude_columns:
-            continue
-        converted_df[col] = _convert_detail_volume_series(
-            converted_df[col],
-            volume_metric,
-            period_days=period_days_by_column.get(col, period_days),
-            precision=precision
-        )
-    return converted_df
-
-
-def get_volume_metric_info(volume_metric):
-    """Return conversion metadata for a selected volume metric."""
-    return _get_detail_volume_metric_info(volume_metric)
-
-
-def convert_volume_metric_dataframe(
-    df,
-    volume_metric,
-    columns=None,
-    exclude_columns=None,
-    precision=None,
-    period_days=None,
-    period_days_by_column=None
-):
-    """Convert selected numeric dataframe columns from mcm/d to the display metric."""
-    return _convert_detail_volume_dataframe(
-        df,
-        volume_metric,
-        columns=columns,
-        exclude_columns=exclude_columns,
-        precision=precision,
-        period_days=period_days,
-        period_days_by_column=period_days_by_column
-    )
-
-
 def _is_detail_quarter_column(column_name):
     return isinstance(column_name, str) and column_name.startswith('Q') and "'" in column_name
 
@@ -635,7 +573,7 @@ def _convert_detail_period_display_df(display_df, volume_metric, rolling_window_
         volume_metric,
         columns=convert_columns,
         exclude_columns=text_columns,
-        precision=1,
+        precision=None,
         period_days_by_column=period_days_by_column
     )
 
@@ -643,10 +581,17 @@ def _convert_detail_period_display_df(display_df, volume_metric, rolling_window_
         if delta_col.startswith('Δ 7D-'):
             compare_col = delta_col.replace('Δ 7D-', '', 1)
             if {'7D', compare_col}.issubset(converted_df.columns):
-                converted_df[delta_col] = (
-                    pd.to_numeric(converted_df['7D'], errors='coerce')
-                    - pd.to_numeric(converted_df[compare_col], errors='coerce')
-                ).round(1)
+                if (
+                    _is_detail_period_volume_metric(volume_metric)
+                    and period_days_by_column.get('7D')
+                    != period_days_by_column.get(compare_col)
+                ):
+                    converted_df[delta_col] = pd.NA
+                else:
+                    converted_df[delta_col] = (
+                        pd.to_numeric(converted_df['7D'], errors='coerce')
+                        - pd.to_numeric(converted_df[compare_col], errors='coerce')
+                    )
                 continue
 
         if delta_col.startswith('Δ ') and delta_col.endswith(' Y/Y'):
@@ -656,7 +601,7 @@ def _convert_detail_period_display_df(display_df, volume_metric, rolling_window_
                 converted_df[delta_col] = (
                     pd.to_numeric(converted_df[base_col], errors='coerce')
                     - pd.to_numeric(converted_df[reference_col], errors='coerce')
-                ).round(1)
+                )
                 continue
             period_days = period_days_by_column.get(base_col)
         else:
@@ -667,7 +612,7 @@ def _convert_detail_period_display_df(display_df, volume_metric, rolling_window_
                 display_df[delta_col],
                 volume_metric,
                 period_days=period_days,
-                precision=1
+                precision=None
             )
 
     return converted_df
@@ -1213,7 +1158,12 @@ def _build_exporter_detail_period_value_styles(display_df, text_columns, total_c
     return styles
 
 
-def _build_exporter_detail_period_grid_display(display_df, columns, delta_like_cols=None):
+def _build_exporter_detail_period_grid_display(
+    display_df,
+    columns,
+    delta_like_cols=None,
+    volume_metric='mcm_d',
+):
     """Preformat period-grid numeric values so AG Grid renders like the exporter summary table."""
     grid_df = display_df.copy()
     grid_columns = [dict(column) for column in columns]
@@ -1236,12 +1186,24 @@ def _build_exporter_detail_period_grid_display(display_df, columns, delta_like_c
         if column_id not in grid_df.columns:
             continue
         raw_field = _exporter_detail_delta_raw_field(column_id)
-        grid_df[raw_field] = pd.to_numeric(grid_df[column_id], errors='coerce')
+        grid_df[raw_field] = pd.to_numeric(grid_df[column_id], errors='coerce').apply(
+            lambda value: (
+                None
+                if pd.isna(value)
+                else _round_detail_volume_metric_display_value(value, volume_metric)
+            )
+        )
 
     for column_id in numeric_ids:
         if column_id not in grid_df.columns:
             continue
-        grid_df[column_id] = grid_df[column_id].apply(_format_table_value_max_one_decimal)
+        grid_df[column_id] = grid_df[column_id].apply(
+            lambda value, is_delta=column_id in delta_ids: _format_detail_table_metric_value(
+                value,
+                volume_metric,
+                is_delta=is_delta,
+            )
+        )
 
     for column in grid_columns:
         if column.get('id') in numeric_ids:
@@ -1473,36 +1435,45 @@ def _strip_maintenance_expand_marker(value):
     return value
 
 
-def _build_maintenance_numeric_filter_js(operator, threshold_text):
+def _build_maintenance_numeric_filter_js(operator, threshold_text, raw_field=None):
+    if raw_field:
+        escaped_raw_field = str(raw_field).replace("\\", "\\\\").replace("'", "\\'")
+        return (
+            f"(params.data && Number(params.data['{escaped_raw_field}']) "
+            f"{operator} {threshold_text})"
+        )
     return (
         "(Number(String(params.value !== null && params.value !== undefined "
         f"&& params.value !== '' ? params.value : '').replace(/[^0-9.\\-]/g, '')) {operator} {threshold_text})"
     )
 
 
-def _build_maintenance_cell_class_rules():
+def _build_maintenance_cell_class_rules(raw_field=None):
     return {
         'maintenance-impact-active': {
-            'function': _build_maintenance_numeric_filter_js('>', '0')
+            'function': _build_maintenance_numeric_filter_js('>', '0', raw_field)
         },
         'maintenance-impact-watch': {
-            'function': _build_maintenance_numeric_filter_js('>=', '1')
+            'function': _build_maintenance_numeric_filter_js('>=', '1', raw_field)
         },
         'maintenance-impact-high': {
-            'function': _build_maintenance_numeric_filter_js('>=', '5')
+            'function': _build_maintenance_numeric_filter_js('>=', '5', raw_field)
         },
     }
 
 
-def _maintenance_value_js():
+def _maintenance_value_js(raw_field=None):
+    if raw_field:
+        escaped_raw_field = str(raw_field).replace("\\", "\\\\").replace("'", "\\'")
+        return f"Number(params.data && params.data['{escaped_raw_field}'])"
     return (
         "Number(String(params.value !== null && params.value !== undefined "
         "&& params.value !== '' ? params.value : '').replace(/[^0-9.\\-]/g, ''))"
     )
 
 
-def _build_maintenance_cell_style_conditions(family_class):
-    value_js = _maintenance_value_js()
+def _build_maintenance_cell_style_conditions(family_class, raw_field=None):
+    value_js = _maintenance_value_js(raw_field)
     non_total_row = "params.data && params.data.Type !== 'total'"
     active_styles = {
         'historical-quarter': {'backgroundColor': '#dce9f8', 'color': '#1e40af', 'fontWeight': '720'},
@@ -2899,9 +2870,10 @@ def _build_importer_periods_pivot(summary_scope_df, period_type, current_date=No
         )['cargo_mcm'].sum()
         grouped_df['mcm_d'] = grouped_df['cargo_mcm'] / grouped_df['days_in_period']
     else:
+        iso_calendar = historical_df['end_date'].dt.isocalendar()
         historical_df['period'] = (
-            'W' + historical_df['end_date'].dt.isocalendar().week.astype(int).astype(str) +
-            "'" + historical_df['end_date'].dt.strftime('%y')
+            'W' + iso_calendar.week.astype(int).astype(str)
+            + "'" + iso_calendar.year.astype(str).str[-2:]
         )
         grouped_df = historical_df.groupby(
             ['continent', 'country', 'period'],
@@ -2971,11 +2943,18 @@ def _build_importer_rolling_windows_pivot(summary_scope_df, rolling_window_days=
         date_window_y1_start + pd.Timedelta(days=1):date_window_y1_end
     ].mean()
 
-    rolling_series = [
-        avg_7d.rename('7D'),
-        avg_window.rename(rolling_window_label),
-        avg_window_y1.rename(f'{rolling_window_label}_Y1'),
-    ]
+    rolling_series = (
+        [
+            avg_7d.rename('7D'),
+            avg_window_y1.rename('7D_Y1'),
+        ]
+        if rolling_window_label == '7D'
+        else [
+            avg_7d.rename('7D'),
+            avg_window.rename(rolling_window_label),
+            avg_window_y1.rename(f'{rolling_window_label}_Y1'),
+        ]
+    )
     if include_comparison_reference_columns:
         avg_7d_pp = daily_pivot.loc[
             date_7d_pp_start + pd.Timedelta(days=1):date_7d_ago
@@ -2986,11 +2965,14 @@ def _build_importer_rolling_windows_pivot(summary_scope_df, rolling_window_days=
         avg_7d_y1 = daily_pivot.loc[
             date_window_y1_end - pd.Timedelta(days=6):date_window_y1_end
         ].mean()
-        rolling_series.extend([
-            avg_7d_pp.rename('7D_PP'),
-            avg_window_pp.rename(f'{rolling_window_label}_PP'),
-            avg_7d_y1.rename('7D_Y1'),
-        ])
+        if rolling_window_label == '7D':
+            rolling_series.append(avg_7d_pp.rename('7D_PP'))
+        else:
+            rolling_series.extend([
+                avg_7d_pp.rename('7D_PP'),
+                avg_window_pp.rename(f'{rolling_window_label}_PP'),
+                avg_7d_y1.rename('7D_Y1'),
+            ])
 
     rolling_df = pd.concat(rolling_series, axis=1).reset_index()
     rolling_df.columns = [
@@ -2998,7 +2980,10 @@ def _build_importer_rolling_windows_pivot(summary_scope_df, rolling_window_days=
         'country',
         *[series.name for series in rolling_series],
     ]
-    rolling_df[f'Δ 7D-{rolling_window_label}'] = rolling_df['7D'] - rolling_df[rolling_window_label]
+    if rolling_window_label != '7D':
+        rolling_df[f'Δ 7D-{rolling_window_label}'] = (
+            rolling_df['7D'] - rolling_df[rolling_window_label]
+        )
     rolling_df[f'Δ {rolling_window_label} Y/Y'] = (
         rolling_df[rolling_window_label] - rolling_df[f'{rolling_window_label}_Y1']
     )
@@ -3026,15 +3011,19 @@ def _build_importer_total_import_df(scoped_trades_df, rolling_window_days=30, cu
     if scoped_trades_df is None or scoped_trades_df.empty:
         return pd.DataFrame(columns=['date', 'year', 'day_of_year', 'month_day', 'rolling_avg', 'is_forecast'])
 
+    normalized_window_days = min(
+        normalize_rolling_window_days(rolling_window_days),
+        DETAIL_MAX_ROLLING_WINDOW_DAYS,
+    )
     date_index, reference_date = _build_importer_chart_date_index(
-        start_date=chart_start_date,
+        start_date=chart_start_date or DETAIL_CHART_QUERY_START_DATE,
         current_date=current_date
     )
     daily_series = scoped_trades_df.groupby('end_date')['cargo_mcm'].sum()
     daily_series = daily_series.reindex(date_index, fill_value=0)
     rolling_avg = daily_series.rolling(
-        window=normalize_rolling_window_days(rolling_window_days),
-        min_periods=1
+        window=normalized_window_days,
+        min_periods=normalized_window_days,
     ).mean()
 
     result_df = pd.DataFrame({
@@ -3064,8 +3053,12 @@ def _build_importer_continent_chart_df(scoped_trades_df, rolling_window_days=30,
     if not continents:
         return pd.DataFrame(columns=expected_columns)
 
+    normalized_window_days = min(
+        normalize_rolling_window_days(rolling_window_days),
+        DETAIL_MAX_ROLLING_WINDOW_DAYS,
+    )
     date_index, reference_date = _build_importer_chart_date_index(
-        start_date=chart_start_date,
+        start_date=chart_start_date or DETAIL_CHART_QUERY_START_DATE,
         current_date=current_date
     )
     daily_matrix = scoped_trades_df.groupby(
@@ -3080,8 +3073,8 @@ def _build_importer_continent_chart_df(scoped_trades_df, rolling_window_days=30,
     daily_matrix = daily_matrix.reindex(date_index, fill_value=0)
     daily_matrix = daily_matrix.reindex(columns=continents, fill_value=0).fillna(0)
     rolling_matrix = daily_matrix.rolling(
-        window=normalize_rolling_window_days(rolling_window_days),
-        min_periods=1
+        window=normalized_window_days,
+        min_periods=normalized_window_days,
     ).mean()
 
     melted_df = rolling_matrix.stack().reset_index()
@@ -3558,12 +3551,6 @@ def _filter_df_years(df, selected_years):
     return df[df['year'].astype(str).isin(selected)].copy()
 
 
-def _format_detail_metric_value(value, label):
-    if value is None or pd.isna(value):
-        return None
-    return f"{float(value):,.0f} {label}"
-
-
 def _calculate_latest_detail_metrics(df, value_col='rolling_avg', value_factor=1.0):
     if df is None or df.empty or value_col not in df.columns:
         return {}
@@ -3607,11 +3594,16 @@ def _calculate_latest_detail_metrics(df, value_col='rolling_avg', value_factor=1
     }
 
 
-def _build_detail_delta_pill(label, delta_payload, unit_label):
+def _build_detail_delta_pill(label, delta_payload, volume_metric):
+    unit_label = _get_detail_volume_metric_info(volume_metric)['label']
     if not delta_payload or delta_payload.get('delta') is None:
         return html.Span(f'{label} n/a', className='supply-rolling-delta-pill supply-rolling-delta-neutral')
 
-    delta = delta_payload.get('delta')
+    delta = _round_detail_volume_metric_display_value(
+        delta_payload.get('delta'),
+        volume_metric,
+    )
+    precision = _get_detail_volume_metric_display_precision(volume_metric)
     pct = delta_payload.get('pct')
     direction_class = (
         'supply-rolling-delta-positive'
@@ -3620,21 +3612,25 @@ def _build_detail_delta_pill(label, delta_payload, unit_label):
         if delta < 0
         else 'supply-rolling-delta-neutral'
     )
-    pct_text = f" ({pct:+.0f}%)" if pct is not None and pd.notna(pct) else ''
+    rounded_pct = round(float(pct)) if pct is not None and pd.notna(pct) else None
+    rounded_pct = 0 if rounded_pct == 0 else rounded_pct
+    pct_sign = '+' if rounded_pct is not None and rounded_pct > 0 else ''
+    pct_text = f" ({pct_sign}{rounded_pct:.0f}%)" if rounded_pct is not None else ''
+    delta_sign = '+' if delta > 0 else ''
     return html.Span(
         [
             html.Span(label, className='supply-rolling-delta-label'),
-            html.Span(f"{delta:+,.0f} {unit_label}{pct_text}"),
+            html.Span(f"{delta_sign}{delta:,.{precision}f} {unit_label}{pct_text}"),
         ],
         className=f'supply-rolling-delta-pill {direction_class}'
     )
 
 
-def _build_detail_delta_group(metrics, unit_label):
+def _build_detail_delta_group(metrics, volume_metric):
     return html.Div(
         [
-            _build_detail_delta_pill('MoM', metrics.get('mom'), unit_label),
-            _build_detail_delta_pill('YoY', metrics.get('previous_year'), unit_label),
+            _build_detail_delta_pill('MoM', metrics.get('mom'), volume_metric),
+            _build_detail_delta_pill('YoY', metrics.get('previous_year'), volume_metric),
         ],
         className='supply-rolling-delta-group'
     )
@@ -3833,26 +3829,29 @@ def _build_importer_origin_mix_table(continent_df, volume_metric='mcm_d', rollin
     def direction_class(value):
         if value is None or pd.isna(value):
             return 'continent-kpi-delta-neutral'
-        if value > 0:
+        rounded_value = _round_detail_volume_metric_display_value(value, volume_metric)
+        if rounded_value > 0:
             return 'continent-kpi-delta-positive'
-        if value < 0:
+        if rounded_value < 0:
             return 'continent-kpi-delta-negative'
         return 'continent-kpi-delta-neutral'
 
     def format_volume(value, is_delta=False):
         if value is None or pd.isna(value):
             return 'n/a'
-        rounded_value = int(round(float(value)))
+        precision = _get_detail_volume_metric_display_precision(volume_metric)
+        rounded_value = _round_detail_volume_metric_display_value(value, volume_metric)
         sign = '+' if is_delta and rounded_value > 0 else ''
-        return f'{sign}{rounded_value:,}'
+        return f'{sign}{rounded_value:,.{precision}f}'
 
     def format_share(value, is_delta=False):
         if value is None or pd.isna(value):
             return 'n/a'
-        rounded_value = int(round(float(value)))
+        rounded_value = round(float(value), 1)
+        rounded_value = 0.0 if rounded_value == 0 else rounded_value
         sign = '+' if is_delta and rounded_value > 0 else ''
         suffix = 'pp' if is_delta else '%'
-        return f'{sign}{rounded_value}{suffix}'
+        return f'{sign}{rounded_value:.1f}{suffix}'
 
     def format_delta_pct(delta_value, reference_value):
         if (
@@ -3860,7 +3859,7 @@ def _build_importer_origin_mix_table(continent_df, volume_metric='mcm_d', rollin
             or reference_value is None
             or pd.isna(delta_value)
             or pd.isna(reference_value)
-            or abs(reference_value) < 0.5
+            or abs(reference_value) < _get_detail_volume_metric_zero_tolerance(volume_metric)
         ):
             return None
         rounded_pct = int(round(float(delta_value) / abs(float(reference_value)) * 100))
@@ -4179,7 +4178,6 @@ layout = html.Div([
     dcc.Store(id='imp-origin-forecast-expanded-continents', data=[]),  # Store for WoodMac forecast table expansion
     dcc.Store(id='imp-maintenance-expanded-plants', data=[]),  # Store for expanded state of plants
     dcc.Store(id='imp-maintenance-raw-data-store', storage_type='memory'),
-    dcc.Store(id='imp-maintenance-style-refresh-store', storage_type='memory'),
     dcc.Store(id='imp-origin-forecast-source-store', storage_type='memory'),
     dcc.Store(id='imp-route-analysis-source-store', storage_type='memory'),
     dcc.Download(id='imp-download-importer-detail-supply-excel'),
@@ -4265,6 +4263,7 @@ layout = html.Div([
                             type='number',
                             value=30,
                             min=1,
+                            max=DETAIL_MAX_ROLLING_WINDOW_DAYS,
                             step=1,
                             debounce=True,
                             className='dash-input-element importer-detail-rolling-window-input'
@@ -4611,11 +4610,25 @@ layout = html.Div([
         )
     ], className='main-section-container importer-detail-section importer-detail-diversion-section'),
 
+    html.Div(
+        [
+            html.Div('Conversion Factors Used', className='exporter-detail-note-title'),
+            html.Div(
+                [
+                    html.Div(line, className='exporter-detail-note-line')
+                    for line in DETAIL_CONVERSION_NOTE_LINES
+                ],
+                className='exporter-detail-note-lines',
+            ),
+        ],
+        className='exporter-detail-conversion-note',
+    ),
+
 ], className='importer-detail-page')
 
 
 SUMMARY_LOOKBACK_START = dt.date(2023, 11, 1)
-WOODMAC_IMPORT_EXPORTS_TABLE = 'at_lng.woodmac_gas_imports_exports_monthly__mmtpa'
+WOODMAC_IMPORT_EXPORTS_TABLE = f'{DB_SCHEMA}.woodmac_gas_imports_exports_monthly__mmtpa'
 WOODMAC_LNG_CUBIC_METERS_PER_MMTPA_MONTH = 2222 * 1000 / 12
 WOODMAC_FORECAST_YEARS_AHEAD = 2
 SUPPLY_ALLOCATION_RUNS_TABLE = f'{DB_SCHEMA}.fundamentals_supply_allocation_runs'
@@ -4661,7 +4674,9 @@ def combine_origin_summary_data_hierarchical(quarters_df, months_df, weeks_df, r
         ).to_pydatetime()
         current_quarter = (current_date.month - 1) // 3 + 1
         current_year = current_date.year
-        current_week = current_date.isocalendar()[1]
+        current_iso = current_date.isocalendar()
+        current_iso_year = current_iso.year
+        current_week = current_iso.week
         month_order = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
                        'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
 
@@ -4733,9 +4748,9 @@ def combine_origin_summary_data_hierarchical(quarters_df, months_df, weeks_df, r
             completed_weeks = [
                 col for col in week_cols
                 if "W" in col and "'" in col and (
-                    int("20" + col.split("'")[1]) < current_year or
+                    int("20" + col.split("'")[1]) < current_iso_year or
                     (
-                        int("20" + col.split("'")[1]) == current_year and
+                        int("20" + col.split("'")[1]) == current_iso_year and
                         int(col.split("W")[1].split("'")[0]) < current_week
                     )
                 )
@@ -4765,6 +4780,11 @@ def combine_origin_summary_data_hierarchical(quarters_df, months_df, weeks_df, r
                     '7D_Y1',
                     f'{rolling_window_label}_Y1',
                 ])
+            rolling_cols = [
+                column_name
+                for column_name in dict.fromkeys(rolling_cols)
+                if column_name != rolling_window_label
+            ]
             for col in rolling_cols:
                 if col in rolling_df.columns:
                     result = result.merge(
@@ -4774,9 +4794,6 @@ def combine_origin_summary_data_hierarchical(quarters_df, months_df, weeks_df, r
                     )
 
         result = result.fillna(0)
-        for col in [col for col in result.columns if col not in ['continent', 'country']]:
-            result[col] = result[col].round(1)
-
         return result
     except Exception:
         return pd.DataFrame()
@@ -5158,7 +5175,7 @@ def build_origin_forecast_total_values(df, value_col, current_date=None):
     totals = {}
     for label in period_config['ordered_labels']:
         value = row.get(label)
-        totals[label] = None if pd.isna(value) else round(float(value), 1)
+        totals[label] = None if pd.isna(value) else float(value)
     return totals
 
 
@@ -5224,7 +5241,7 @@ def prepare_origin_forecast_table_for_display(df, expanded_continents=None, foot
 
     display_df = pd.concat(filtered_rows, ignore_index=True)
     for col in numeric_cols:
-        numeric_series = pd.to_numeric(display_df[col], errors='coerce').round(1)
+        numeric_series = pd.to_numeric(display_df[col], errors='coerce')
         display_df[col] = numeric_series.where(pd.notnull(numeric_series), None)
 
     return display_df
@@ -5612,8 +5629,6 @@ def _build_origin_forecast_summary_from_source(
         summary_df = summary_df.sort_values(
             ['continent', 'country']
         ).reset_index(drop=True)
-        for column in period_config['ordered_labels']:
-            summary_df[column] = summary_df[column].round(1)
 
     demand_totals_df['date'] = pd.to_datetime(
         demand_totals_df['date'],
@@ -5669,9 +5684,8 @@ def _build_origin_forecast_summary_from_source(
         if allocated_value is None and demand_value is None:
             mismatch_values[label] = None
         else:
-            mismatch_values[label] = round(
-                (allocated_value or 0) - (demand_value or 0),
-                1,
+            mismatch_values[label] = (
+                (allocated_value or 0) - (demand_value or 0)
             )
 
     footer_rows = [
@@ -5755,7 +5769,7 @@ def fetch_country_import_chart_data(destination_countries, rolling_window_days=3
         scoped_trades_df = _fetch_importer_scoped_trades(
             engine,
             normalized_destination_countries,
-            min_end_date=DETAIL_CHART_DATA_START_DATE,
+            min_end_date=DETAIL_CHART_QUERY_START_DATE,
             selected_destination_aggregation=(
                 selected_destination_aggregation
             ),
@@ -5968,7 +5982,7 @@ def fetch_continent_origin_chart_data(destination_countries, rolling_window_days
         scoped_trades_df = _fetch_importer_scoped_trades(
             engine,
             normalized_destination_countries,
-            min_end_date=DETAIL_CHART_DATA_START_DATE,
+            min_end_date=DETAIL_CHART_QUERY_START_DATE,
             selected_destination_aggregation=(
                 selected_destination_aggregation
             ),
@@ -6031,7 +6045,15 @@ def _get_detail_supply_range_years(focus_year, available_years):
     return previous_years[-SUPPLY_CHART_RANGE_LOOKBACK_YEARS:]
 
 
-def _add_detail_supply_chart_range_band(fig, df, focus_year, available_years, vol_label, value_factor=1.0):
+def _add_detail_supply_chart_range_band(
+    fig,
+    df,
+    focus_year,
+    available_years,
+    vol_label,
+    value_factor=1.0,
+    number_format=',.0f',
+):
     range_years = _get_detail_supply_range_years(focus_year, available_years)
     if not range_years or df is None or df.empty:
         return
@@ -6082,7 +6104,7 @@ def _add_detail_supply_chart_range_band(fig, df, focus_year, available_years, vo
         hovertemplate=(
             f'<b>{years_label} range</b> | '
             '%{text} | '
-            f'%{{customdata[0]:,.0f}}-%{{y:,.0f}} {vol_label}<extra></extra>'
+            f'%{{customdata[0]:{number_format}}}-%{{y:{number_format}}} {vol_label}<extra></extra>'
         ),
         showlegend=False
     ))
@@ -6097,7 +6119,7 @@ def _detail_continent_chart_line_style(year, current_year, is_forecast=False):
     }
 
 
-def _apply_time_series_chart_layout(fig, yaxis_title):
+def _apply_time_series_chart_layout(fig, yaxis_title, number_format=None):
     fig.update_layout(
         xaxis=dict(
             title=dict(text='', font=dict(size=12, color='#475569')),
@@ -6130,7 +6152,8 @@ def _apply_time_series_chart_layout(fig, yaxis_title):
             zeroline=True,
             zerolinecolor='rgba(148, 163, 184, 0.28)',
             zerolinewidth=1,
-            autorange=True
+            autorange=True,
+            **({'tickformat': number_format} if number_format else {}),
         ),
         showlegend=True,
         legend=dict(
@@ -6185,7 +6208,15 @@ def _empty_timeseries_chart(message):
     return fig
 
 
-def _create_seasonal_line_chart(df, series_col, value_col, yaxis_title, metric_label, selected_years=None):
+def _create_seasonal_line_chart(
+    df,
+    series_col,
+    value_col,
+    yaxis_title,
+    metric_label,
+    selected_years=None,
+    number_format='.1f',
+):
     df = _filter_df_years(df, selected_years)
     if df.empty:
         return _empty_timeseries_chart("No data available")
@@ -6214,7 +6245,7 @@ def _create_seasonal_line_chart(df, series_col, value_col, yaxis_title, metric_l
                     line=dict(color=base_color, width=line_style['width'], dash=line_style['dash']),
                     opacity=line_style['opacity'],
                     text=historical_data['month_day'],
-                    hovertemplate=f'<b>{year}</b> | %{{text}} | {metric_label}: %{{y:.1f}}<extra></extra>'
+                    hovertemplate=f'<b>{year}</b> | %{{text}} | {metric_label}: %{{y:{number_format}}}<extra></extra>'
                 ))
 
             if not forecast_data.empty:
@@ -6228,7 +6259,7 @@ def _create_seasonal_line_chart(df, series_col, value_col, yaxis_title, metric_l
                     line=dict(color=base_color, width=forecast_style['width'], dash=forecast_style['dash']),
                     opacity=forecast_style['opacity'],
                     text=connect_data['month_day'],
-                    hovertemplate=f'<b>{year} forecast</b> | %{{text}} | {metric_label}: %{{y:.1f}}<extra></extra>',
+                    hovertemplate=f'<b>{year} forecast</b> | %{{text}} | {metric_label}: %{{y:{number_format}}}<extra></extra>',
                     showlegend=False
                 ))
     else:
@@ -6270,7 +6301,7 @@ def _create_seasonal_line_chart(df, series_col, value_col, yaxis_title, metric_l
                         opacity=historical_style['opacity'],
                         text=historical_data['month_day'],
                         hovertemplate=(
-                            f'<b>{series_value}</b> | {year} | %{{text}} | {metric_label}: %{{y:.1f}}<extra></extra>'
+                            f'<b>{series_value}</b> | {year} | %{{text}} | {metric_label}: %{{y:{number_format}}}<extra></extra>'
                         ),
                         showlegend=show_legend
                     ))
@@ -6292,12 +6323,12 @@ def _create_seasonal_line_chart(df, series_col, value_col, yaxis_title, metric_l
                         opacity=forecast_style['opacity'],
                         text=connect_data['month_day'],
                         hovertemplate=(
-                            f'<b>{series_value}</b> | {year} forecast | %{{text}} | {metric_label}: %{{y:.1f}}<extra></extra>'
+                            f'<b>{series_value}</b> | {year} forecast | %{{text}} | {metric_label}: %{{y:{number_format}}}<extra></extra>'
                         ),
                         showlegend=False
                     ))
 
-    return _apply_time_series_chart_layout(fig, yaxis_title)
+    return _apply_time_series_chart_layout(fig, yaxis_title, number_format=number_format)
 
 
 def _create_total_import_chart_with_woodmac_forecast(
@@ -6309,6 +6340,7 @@ def _create_total_import_chart_with_woodmac_forecast(
 ):
     vol_info = get_volume_metric_info(volume_metric)
     vol_label = vol_info['label']
+    number_format = _get_detail_volume_metric_plotly_format(volume_metric)
     vol_factor = _get_detail_volume_metric_factor(
         volume_metric,
         period_days=normalize_rolling_window_days(rolling_window_days)
@@ -6351,7 +6383,8 @@ def _create_total_import_chart_with_woodmac_forecast(
             focus_year,
             all_years,
             vol_label,
-            value_factor=vol_factor
+            value_factor=vol_factor,
+            number_format=number_format,
         )
 
     for year in sorted(active_historical_df['year'].dropna().unique()):
@@ -6380,7 +6413,7 @@ def _create_total_import_chart_with_woodmac_forecast(
                 hovertemplate=(
                     f'<b>{year}</b> | '
                     '%{text} | '
-                    f'%{{y:,.0f}} {vol_label}<extra></extra>'
+                    f'%{{y:{number_format}}} {vol_label}<extra></extra>'
                 )
             ))
 
@@ -6397,7 +6430,7 @@ def _create_total_import_chart_with_woodmac_forecast(
                 hovertemplate=(
                     f'<b>{year} Kpler forecast</b> | '
                     '%{text} | '
-                    f'%{{y:,.0f}} {vol_label}<extra></extra>'
+                    f'%{{y:{number_format}}} {vol_label}<extra></extra>'
                 ),
                 showlegend=False
             ))
@@ -6446,13 +6479,13 @@ def _create_total_import_chart_with_woodmac_forecast(
             hovertemplate=(
                 f'<b>{year} WoodMac Forecast</b> | '
                 '%{text} | '
-                f'%{{y:,.0f}} {vol_label}'
+                f'%{{y:{number_format}}} {vol_label}'
                 '<br>Source: %{customdata}<extra></extra>'
             ),
             visible=True if year == default_visible_forecast_year else 'legendonly'
         ))
 
-    return _apply_time_series_chart_layout(fig, vol_label)
+    return _apply_time_series_chart_layout(fig, vol_label, number_format=number_format)
 
 
 def create_country_import_chart(destination_label, destination_countries, rolling_window_days=30,
@@ -6510,7 +6543,8 @@ def create_continent_origin_chart(destination_label, destination_countries, roll
         'rolling_avg',
         vol_label,
         f'Imports ({vol_label})',
-        selected_years=selected_years
+        selected_years=selected_years,
+        number_format=_get_detail_volume_metric_plotly_format(volume_metric),
     )
 
 
@@ -6536,16 +6570,21 @@ def create_continent_origin_percentage_chart(destination_label, destination_coun
         'percentage',
         '%',
         'Share',
-        selected_years=selected_years
+        selected_years=selected_years,
+        number_format='.1f',
     )
 
 
 @callback(
     Output('imp-supply-analysis-title', 'children'),
-    Input('imp-supply-rolling-window-input', 'value')
+    Input('imp-supply-rolling-window-input', 'value'),
+    Input('imp-volume-metric-dropdown', 'value'),
 )
-def update_supply_analysis_title(rolling_window_days):
-    return f"LNG Import Analysis - {format_rolling_window_title(rolling_window_days)} + WoodMac Forecast"
+def update_supply_analysis_title(rolling_window_days, volume_metric='mcm_d'):
+    return (
+        f"LNG Import Analysis - {_format_detail_rolling_title(rolling_window_days, volume_metric)} "
+        "+ WoodMac Forecast"
+    )
 
 
 def _build_import_analysis_base_payload(
@@ -6562,7 +6601,7 @@ def _build_import_analysis_base_payload(
             _fetch_importer_scoped_trades,
             engine,
             destination_countries,
-            DETAIL_CHART_DATA_START_DATE,
+            DETAIL_CHART_QUERY_START_DATE,
             False,
             False,
             None,
@@ -6647,7 +6686,7 @@ def refresh_import_analysis_base_data(_n_clicks, selected_destination_aggregatio
             selected_destination_aggregation,
             selected_destination,
             destination_context['destination_countries'],
-            DETAIL_CHART_DATA_START_DATE,
+            DETAIL_CHART_QUERY_START_DATE,
         )
         if source_status == 'stale':
             snapshot_result = _get_snapshot_if_available(
@@ -6817,7 +6856,7 @@ def update_import_analysis_charts(base_data, rolling_window_days, volume_metric,
             empty_fig,
             "Total Imports + WoodMac Forecast",
             None,
-            _build_detail_delta_group({}, vol_label),
+            _build_detail_delta_group({}, volume_metric),
             empty_fig,
             f"By Origin Continent ({vol_label})",
             None,
@@ -6922,8 +6961,8 @@ def update_import_analysis_charts(base_data, rolling_window_days, volume_metric,
     return (
         country_fig,
         f"{destination_label} - Total Imports",
-        _format_detail_metric_value(country_metrics.get('current_value'), vol_label),
-        _build_detail_delta_group(country_metrics, vol_label),
+        _format_detail_metric_value(country_metrics.get('current_value'), volume_metric),
+        _build_detail_delta_group(country_metrics, volume_metric),
         continent_fig,
         f"{destination_label} - Origin Volume",
         None,
@@ -7025,13 +7064,13 @@ def export_import_analysis_to_excel(n_clicks, selected_destination_aggregation, 
     vol_info = get_volume_metric_info(volume_metric)
     vol_label = vol_info['label']
     rolling_period_days = normalized_window_days
-    for frame in (supply_df, continent_df, percentage_df):
+    for frame in (supply_df, continent_df):
         if not frame.empty and 'rolling_avg' in frame.columns:
             frame['rolling_avg'] = _convert_detail_volume_series(
                 frame['rolling_avg'],
                 volume_metric,
                 period_days=rolling_period_days,
-                precision=1
+                precision=None
             )
     if not summary_df.empty:
         summary_df = _convert_detail_period_display_df(
@@ -7041,24 +7080,69 @@ def export_import_analysis_to_excel(n_clicks, selected_destination_aggregation, 
         )
 
     output = BytesIO()
+    rolling_metric_column = _get_detail_rolling_metric_export_column_name(
+        rolling_period_days,
+        volume_metric,
+    )
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         if not supply_df.empty:
             supply_export_df = supply_df.copy()
             if 'rolling_avg' in supply_export_df.columns:
-                supply_export_df = supply_export_df.rename(columns={'rolling_avg': f'rolling_avg ({vol_label})'})
+                supply_export_df = supply_export_df.rename(
+                    columns={'rolling_avg': rolling_metric_column}
+                )
             supply_export_df.to_excel(writer, sheet_name='Total Imports', index=False)
         if not continent_df.empty:
             continent_export_df = continent_df.copy()
             if 'rolling_avg' in continent_export_df.columns:
-                continent_export_df = continent_export_df.rename(columns={'rolling_avg': f'rolling_avg ({vol_label})'})
+                continent_export_df = continent_export_df.rename(
+                    columns={'rolling_avg': rolling_metric_column}
+                )
             continent_export_df.to_excel(writer, sheet_name=f"Origin Continent {vol_label.replace('/', '_')}"[:31], index=False)
         if not percentage_df.empty:
             percentage_export_df = percentage_df.copy()
             if 'rolling_avg' in percentage_export_df.columns:
-                percentage_export_df = percentage_export_df.rename(columns={'rolling_avg': f'rolling_avg ({vol_label})'})
+                percentage_export_df = percentage_export_df.rename(
+                    columns={'rolling_avg': 'rolling_avg (mcm/d)'}
+                )
             percentage_export_df.to_excel(writer, sheet_name='Origin Continent Share', index=False)
         if not summary_df.empty:
             summary_df.to_excel(writer, sheet_name='Origin Summary', index=False)
+
+        continent_sheet_name = f"Origin Continent {vol_label.replace('/', '_')}"[:31]
+        for sheet_name in ('Total Imports', continent_sheet_name if not continent_df.empty else None):
+            if sheet_name and sheet_name in writer.sheets:
+                _apply_detail_excel_metric_format(
+                    writer.sheets[sheet_name],
+                    volume_metric,
+                    metric_headers={rolling_metric_column},
+                )
+        if not summary_df.empty and 'Origin Summary' in writer.sheets:
+            summary_metric_headers = {
+                column
+                for column in summary_df.columns
+                if column not in {'continent', 'country', 'Continent', 'Country'}
+            }
+            _apply_detail_excel_metric_format(
+                writer.sheets['Origin Summary'],
+                volume_metric,
+                metric_headers=summary_metric_headers,
+            )
+        if not percentage_df.empty and 'Origin Continent Share' in writer.sheets:
+            share_sheet = writer.sheets['Origin Continent Share']
+            _apply_detail_excel_metric_format(
+                share_sheet,
+                'mcm_d',
+                metric_headers={'rolling_avg (mcm/d)'},
+            )
+            for column_cells in share_sheet.iter_cols(
+                min_row=1,
+                max_row=share_sheet.max_row,
+            ):
+                if column_cells[0].value == 'percentage':
+                    for cell in column_cells[1:]:
+                        if isinstance(cell.value, (int, float)):
+                            cell.number_format = '0.0'
 
         for worksheet in writer.sheets.values():
             for column_cells in worksheet.columns:
@@ -7579,7 +7663,7 @@ def process_maintenance_periods_hierarchical(df, expanded_plants=None):
                     if days_in_period > 0
                     else 0
                 )
-                value = round(avg_mcm_d, 1)
+                value = float(avg_mcm_d)
                 row[label] = value if value > 0 else None
                 plant_totals[plant_key]['totals'][label] += value
 
@@ -7611,7 +7695,7 @@ def process_maintenance_periods_hierarchical(df, expanded_plants=None):
                 'PlantKey': country,
             }
             for col in period_cols:
-                value = round(country_totals[country][col], 1)
+                value = float(country_totals[country][col])
                 country_row[col] = value if value > 0 else None
                 grand_total[col] += country_totals[country][col]
             final_data.append(country_row)
@@ -7629,7 +7713,7 @@ def process_maintenance_periods_hierarchical(df, expanded_plants=None):
                         'PlantKey': plant_key,
                     }
                     for col in period_cols:
-                        value = round(plant_info['totals'][col], 1)
+                        value = float(plant_info['totals'][col])
                         plant_row[col] = value if value > 0 else None
                     final_data.append(plant_row)
 
@@ -7647,7 +7731,7 @@ def process_maintenance_periods_hierarchical(df, expanded_plants=None):
             'PlantKey': 'GRAND_TOTAL',
         }
         for col in period_cols:
-            value = round(grand_total[col], 1)
+            value = float(grand_total[col])
             grand_total_row[col] = value if value > 0 else None
         final_data.append(grand_total_row)
 
@@ -7656,7 +7740,7 @@ def process_maintenance_periods_hierarchical(df, expanded_plants=None):
         return pd.DataFrame()
 
 
-def create_maintenance_summary_table(df):
+def create_maintenance_summary_table(df, volume_metric='mcm_d'):
     """Create an expandable supplier maintenance summary table using the exporter-detail grid pattern."""
     if df.empty:
         return html.Div("No maintenance data available", className="no-data-message")
@@ -7691,6 +7775,7 @@ def create_maintenance_summary_table(df):
 
         for spec in period_specs:
             family_class = _maintenance_period_family_class(spec['family'])
+            raw_field = _maintenance_raw_mcmd_field(spec['id'])
             columns.append({
                 'name': spec['label'],
                 'id': spec['id'],
@@ -7703,8 +7788,11 @@ def create_maintenance_summary_table(df):
                     'maintenance-period-header '
                     f'maintenance-period-header-{family_class}'
                 ),
-                'cellClassRules': _build_maintenance_cell_class_rules(),
-                'cellStyle': _build_maintenance_cell_style_conditions(family_class),
+                'cellClassRules': _build_maintenance_cell_class_rules(raw_field),
+                'cellStyle': _build_maintenance_cell_style_conditions(
+                    family_class,
+                    raw_field,
+                ),
             })
 
         columns.extend([
@@ -7725,7 +7813,9 @@ def create_maintenance_summary_table(df):
         display_df = df.copy()
         for col_id in period_col_ids:
             if col_id in display_df.columns:
-                display_df[col_id] = display_df[col_id].apply(_format_table_value_max_one_decimal)
+                display_df[col_id] = display_df[col_id].apply(
+                    lambda value: _format_detail_table_metric_value(value, volume_metric)
+                )
         display_df['__maintenance_row_id'] = [
             (
                 f"{index}-{row.get('Type', '')}-"
@@ -7757,7 +7847,7 @@ def create_maintenance_summary_table(df):
                 ),
                 html.Span(className='maintenance-legend-divider'),
                 html.Span(
-                    'Red = >=5 MCM/D impact',
+                    'Red = >=5 mcm/d impact',
                     className='maintenance-legend-item maintenance-legend-high-impact'
                 ),
                 html.Span('Click country or plant row to expand trains', className='maintenance-legend-note'),
@@ -7805,99 +7895,9 @@ def create_maintenance_summary_table(df):
         return html.Div(f"Error creating table: {str(e)}", className="error-message")
 
 
-clientside_callback(
-    """
-    function(children) {
-        function numericValue(text) {
-            var cleaned = String(text || '').replace(/[^0-9.\\-]/g, '');
-            if (!cleaned) {
-                return NaN;
-            }
-            return Number(cleaned);
-        }
-
-        function applyImporterMaintenanceStyles() {
-            var grid = document.querySelector('.ag-theme-alpine.mckinsey-ag-grid.importer-detail-maintenance-grid');
-            if (!grid) {
-                return 0;
-            }
-
-            var palette = {
-                high: {backgroundColor: '#f2b5bd', color: '#7f1d1d', fontWeight: '860'},
-                realized: {backgroundColor: '#dce9f8', color: '#1e40af', fontWeight: '720'},
-                current: {backgroundColor: '#cfe4ff', color: '#1d4ed8', fontWeight: '780'},
-                neartermActive: {backgroundColor: '#fff1c8', color: '#92400e', fontWeight: '720'},
-                neartermWatch: {backgroundColor: '#f7dc97', color: '#78350f', fontWeight: '800'},
-                outlookActive: {backgroundColor: '#e4eaf2', color: '#374151', fontWeight: '720'},
-                outlookWatch: {backgroundColor: '#d5dde8', color: '#1f2937', fontWeight: '780'}
-            };
-
-            var styledCount = 0;
-            grid.querySelectorAll('.maintenance-period-cell').forEach(function(cell) {
-                cell.style.backgroundColor = '';
-                cell.style.color = '';
-                cell.style.fontWeight = '';
-
-                var row = cell.closest('.ag-row');
-                if (!row || row.classList.contains('maintenance-summary-total-row')) {
-                    return;
-                }
-
-                var value = numericValue(cell.textContent);
-                if (!Number.isFinite(value) || value <= 0) {
-                    return;
-                }
-
-                var style = null;
-                if (value >= 5) {
-                    style = palette.high;
-                } else if (
-                    cell.classList.contains('maintenance-period-historical-quarter')
-                    || cell.classList.contains('maintenance-period-historical-month')
-                ) {
-                    style = palette.realized;
-                } else if (cell.classList.contains('maintenance-period-current-month')) {
-                    style = palette.current;
-                } else if (
-                    cell.classList.contains('maintenance-period-nearterm-month')
-                    || cell.classList.contains('maintenance-period-nearterm-quarter')
-                ) {
-                    style = value >= 1 ? palette.neartermWatch : palette.neartermActive;
-                } else if (cell.classList.contains('maintenance-period-outlook-quarter')) {
-                    style = value >= 1 ? palette.outlookWatch : palette.outlookActive;
-                }
-
-                if (style) {
-                    Object.assign(cell.style, style);
-                    styledCount += 1;
-                }
-            });
-
-            if (!grid.dataset.importerMaintenanceStyleBound) {
-                var schedule = function() {
-                    window.setTimeout(applyImporterMaintenanceStyles, 0);
-                    window.setTimeout(applyImporterMaintenanceStyles, 160);
-                };
-                grid.addEventListener('scroll', schedule, true);
-                grid.addEventListener('wheel', schedule, true);
-                grid.dataset.importerMaintenanceStyleBound = '1';
-            }
-            return styledCount;
-        }
-
-        window.setTimeout(applyImporterMaintenanceStyles, 0);
-        window.setTimeout(applyImporterMaintenanceStyles, 250);
-        window.setTimeout(applyImporterMaintenanceStyles, 800);
-        return Date.now();
-    }
-    """,
-    Output('imp-maintenance-style-refresh-store', 'data'),
-    Input('imp-maintenance-summary-container', 'children'),
-)
-
-
-def create_origin_forecast_summary_table(display_df):
+def create_origin_forecast_summary_table(display_df, volume_metric='mcm_d'):
     """Create the SQL-backed WoodMac origin forecast summary table."""
+    grid_df = display_df.copy()
     footer_row_labels = [
         'NET WOODMAC DEMAND TOTAL',
         'NET ALLOCATED SUPPLY TOTAL',
@@ -7909,10 +7909,15 @@ def create_origin_forecast_summary_table(display_df):
         if col in ['Continent', 'Country']:
             columns.append({'name': col_display_names.get(col, col), 'id': col, 'type': 'text'})
         else:
+            grid_df[col] = grid_df[col].map(
+                lambda value: _format_detail_table_metric_value(value, volume_metric)
+            )
             columns.append({
                 'name': col,
                 'id': col,
-                'type': 'numeric',
+                'type': 'text',
+                'sortable': False,
+                'cellClass': 'mckinsey-ag-grid-number-cell',
             })
 
     conditional_styles = [
@@ -7964,7 +7969,7 @@ def create_origin_forecast_summary_table(display_df):
 
     return create_ag_grid_from_datatable(
         id={'type': 'imp-origin-forecast-expandable-table', 'index': 'summary'},
-        data=display_df.to_dict('records'),
+        data=grid_df.to_dict('records'),
         columns=columns,
         style_data_conditional=conditional_styles,
         sort_action='native',
@@ -8178,7 +8183,11 @@ def update_origin_forecast_summary_table(selected_destination_aggregation, selec
                 )
             )
 
-        return header_text, subtitle, create_origin_forecast_summary_table(display_df)
+        return (
+            header_text,
+            subtitle,
+            create_origin_forecast_summary_table(display_df, volume_metric),
+        )
     except Exception as e:
         return (
             header_text,
@@ -8280,11 +8289,9 @@ def update_origin_summary_table(selected_destination_aggregation, selected_desti
         )
         col_display_names = {'Continent': 'Origin Level', 'Country': 'Country'}
         columns = []
-        period_numeric_format = (
-            {'specifier': ',.1f'}
-            if _normalize_detail_volume_metric(volume_metric) == 'mt'
-            else {'specifier': '.0f'}
-        )
+        period_numeric_format = {
+            'specifier': _get_detail_volume_metric_plotly_format(volume_metric)
+        }
         for col in display_df.columns:
             if col in ['Continent', 'Country']:
                 columns.append({'name': col_display_names.get(col, col), 'id': col, 'type': 'text'})
@@ -8318,7 +8325,8 @@ def update_origin_summary_table(selected_destination_aggregation, selected_desti
         grid_display_df, grid_columns = _build_exporter_detail_period_grid_display(
             display_df,
             columns,
-            delta_like_cols=comparison_delta_cols
+            delta_like_cols=comparison_delta_cols,
+            volume_metric=volume_metric,
         )
         period_numeric_columns = {column.get('id') for column in columns if column.get('type') == 'numeric'}
         width_styles = _build_importer_detail_column_width_styles(
@@ -9843,14 +9851,23 @@ def _update_maintenance_table_from_source(
             spec['id']: (spec['end'] - spec['start']).days + 1
             for spec in period_specs
         }
+        for column_name in period_days_by_column:
+            if column_name in processed_data.columns:
+                processed_data[_maintenance_raw_mcmd_field(column_name)] = (
+                    pd.to_numeric(processed_data[column_name], errors='coerce')
+                )
         processed_data = convert_volume_metric_dataframe(
             processed_data,
             volume_metric,
             columns=list(period_days_by_column.keys()),
             period_days_by_column=period_days_by_column,
-            precision=1
+            precision=None
         )
-        return create_maintenance_summary_table(processed_data), header_text, raw_data_store
+        return (
+            create_maintenance_summary_table(processed_data, volume_metric),
+            header_text,
+            raw_data_store,
+        )
     except Exception as e:
         error_store = _store_importer_maintenance_raw_data(
             destination_context['destination_countries'],
@@ -9989,14 +10006,22 @@ def toggle_maintenance_plant_expansion(active_cells, table_data_list, expanded_p
             spec['id']: (spec['end'] - spec['start']).days + 1
             for spec in period_specs
         }
+        for column_name in period_days_by_column:
+            if column_name in processed_data.columns:
+                processed_data[_maintenance_raw_mcmd_field(column_name)] = (
+                    pd.to_numeric(processed_data[column_name], errors='coerce')
+                )
         processed_data = convert_volume_metric_dataframe(
             processed_data,
             volume_metric,
             columns=list(period_days_by_column.keys()),
             period_days_by_column=period_days_by_column,
-            precision=1
+            precision=None
         )
-        return expanded_plants, create_maintenance_summary_table(processed_data)
+        return expanded_plants, create_maintenance_summary_table(
+            processed_data,
+            volume_metric,
+        )
     except PreventUpdate:
         raise
     except Exception:

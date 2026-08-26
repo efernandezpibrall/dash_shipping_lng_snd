@@ -8,8 +8,6 @@ from io import BytesIO
 import pandas as pd
 from dash import Input, Output, State, callback, dcc, html
 from dash.exceptions import PreventUpdate
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
 
 from utils.ag_grid_tables import create_ag_grid_from_datatable
 from utils.lng_phys_snapshot_data import (
@@ -243,6 +241,9 @@ def create_storage_card(record):
 
 
 def build_demand_export_bytes(row_data) -> bytes:
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
     export_frame = pd.DataFrame(row_data or [])
     if export_frame.empty:
         return b""

@@ -22,6 +22,7 @@ from utils.balance_matrix import (
 )
 from utils.balance_components import (
     build_balance_section_summary as _build_section_summary,
+    create_balance_comparison_section as _create_comparison_section,
     create_balance_empty_state as _create_empty_state,
 )
 from utils.dataframe_store import (
@@ -80,18 +81,6 @@ from utils.table_styles import (
     build_responsive_column_styles as _build_responsive_column_styles,
 )
 
-
-EXPORT_BUTTON_STYLE = {
-    "marginLeft": "20px",
-    "padding": "5px 15px",
-    "backgroundColor": "#28a745",
-    "color": "white",
-    "border": "none",
-    "borderRadius": "4px",
-    "cursor": "pointer",
-    "fontWeight": "bold",
-    "fontSize": "12px",
-}
 
 TIME_VIEW_LABELS = {
     "monthly": "Monthly",
@@ -839,186 +828,6 @@ def _build_delta_comparison_output(
     )
 
     return html.Div(), comparison_table
-
-
-def _create_comparison_section(
-    title: str,
-    export_button_id: str,
-    baseline_summary_id: str,
-    default_comparison_source: str,
-    comparison_source_dropdown_id: str,
-    comparison_st_dropdown_id: str,
-    comparison_lt_dropdown_id: str,
-    comparison_ea_upload_dropdown_id: str,
-    comparison_woodmac_controls_id: str,
-    comparison_ea_controls_id: str,
-    baseline_table_container_id: str,
-    comparison_summary_id: str,
-    comparison_table_container_id: str,
-) -> html.Div:
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H3(title, className="balance-section-title"),
-                            html.Button(
-                                "Export to Excel",
-                                id=export_button_id,
-                                n_clicks=0,
-                                style=EXPORT_BUTTON_STYLE,
-                            ),
-                        ],
-                        className="inline-section-header",
-                        style={"display": "flex", "alignItems": "center"},
-                    ),
-                ],
-                className="balance-section-header",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        "Baseline Table",
-                        className="balance-panel-title balance-panel-title-left",
-                    ),
-                    html.Div(
-                        "Delta vs Selected Snapshot",
-                        className="balance-panel-title balance-panel-title-right",
-                        title="Delta formula: left baseline table - selected snapshot",
-                        style={
-                            "textDecoration": "underline dotted",
-                            "textUnderlineOffset": "3px",
-                            "cursor": "help",
-                        },
-                    ),
-                    html.Div(
-                        [
-                            html.Div(
-                                id=baseline_summary_id,
-                                className="balance-pane-summary",
-                            )
-                        ],
-                        className="balance-pane-top-area balance-pane-top-area-left",
-                    ),
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Label(
-                                        "Source:",
-                                        htmlFor=comparison_source_dropdown_id,
-                                        className="filter-label",
-                                    ),
-                                    dcc.Dropdown(
-                                        id=comparison_source_dropdown_id,
-                                        options=[
-                                            {
-                                                "label": "WoodMac",
-                                                "value": "woodmac",
-                                            },
-                                            {
-                                                "label": "Energy Aspects",
-                                                "value": "ea",
-                                            },
-                                        ],
-                                        value=default_comparison_source,
-                                        clearable=False,
-                                        className="filter-dropdown",
-                                        style={"minWidth": "180px"},
-                                    ),
-                                ],
-                                className="filter-group",
-                            ),
-                            html.Div(
-                                [
-                                    html.Div(
-                                        [
-                                            html.Label(
-                                                "ST publication:",
-                                                htmlFor=comparison_st_dropdown_id,
-                                                className="filter-label",
-                                            ),
-                                            dcc.Dropdown(
-                                                id=comparison_st_dropdown_id,
-                                                options=[],
-                                                value=None,
-                                                clearable=False,
-                                                className="filter-dropdown",
-                                                style={"minWidth": "260px"},
-                                            ),
-                                        ],
-                                        className="filter-group",
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Label(
-                                                "LT publication:",
-                                                htmlFor=comparison_lt_dropdown_id,
-                                                className="filter-label",
-                                            ),
-                                            dcc.Dropdown(
-                                                id=comparison_lt_dropdown_id,
-                                                options=[],
-                                                value=None,
-                                                clearable=False,
-                                                className="filter-dropdown",
-                                                style={"minWidth": "260px"},
-                                            ),
-                                        ],
-                                        className="filter-group",
-                                    ),
-                                ],
-                                id=comparison_woodmac_controls_id,
-                                className="balance-comparison-control-row",
-                            ),
-                            html.Div(
-                                [
-                                    html.Div(
-                                        [
-                                            html.Label(
-                                                "upload_timestamp_utc:",
-                                                htmlFor=comparison_ea_upload_dropdown_id,
-                                                className="filter-label",
-                                            ),
-                                            dcc.Dropdown(
-                                                id=comparison_ea_upload_dropdown_id,
-                                                options=[],
-                                                value=None,
-                                                clearable=False,
-                                                className="filter-dropdown",
-                                                style={"minWidth": "280px"},
-                                            ),
-                                        ],
-                                        className="filter-group",
-                                    ),
-                                ],
-                                id=comparison_ea_controls_id,
-                                className="balance-comparison-control-row",
-                            ),
-                        ],
-                        className="balance-comparison-controls balance-pane-top-area balance-pane-top-area-right",
-                    ),
-                    html.Div(
-                        id=baseline_table_container_id,
-                        className="balance-table-container balance-table-container-left",
-                    ),
-                    html.Div(
-                        [
-                            html.Div(id=comparison_summary_id),
-                            html.Div(
-                                id=comparison_table_container_id,
-                                className="balance-table-container",
-                            ),
-                        ],
-                        className="balance-table-shell balance-table-shell-right",
-                    ),
-                ],
-                className="balance-comparison-grid",
-            ),
-        ],
-        className="balance-section-card",
-    )
 
 
 def _create_woodmac_comparison_section() -> html.Div:

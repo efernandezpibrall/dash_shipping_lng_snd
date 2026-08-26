@@ -69,8 +69,10 @@ SUPPLY_DEST_TEXT_COLUMNS = [
     'Supply Installation'
 ]
 SUPPLY_DEST_TOTAL_LABELS = ('GRAND TOTAL', 'Global')
+SUPPLY_DEST_PERCENTAGE_DISPLAY_PRECISION = 1
 SUPPLY_DEST_PBD_REFERENCE_COLUMNS = ('30D_PBD', '7D_PBD')
 SUPPLY_DEST_PBD_DELTA_COLUMNS = ('Δ 30D vs PBD', 'Δ 7D vs PBD')
+SUPPLY_DEST_PERIOD_VOLUME_UNAVAILABLE_COLUMNS = ('Δ 7D-30D',)
 SUPPLY_DEST_DELTA_RAW_FIELDS = {
     'Δ 7D-30D': '__supply_dest_delta_7d_30d_raw',
     'Δ 30D Y/Y': '__supply_dest_delta_30d_yoy_raw',
@@ -96,7 +98,7 @@ SUPPLY_DEST_DEFAULT_MONTH_COUNT = 3
 SUPPLY_DEST_DEFAULT_WEEK_COUNT = 3
 SUPPLY_DEST_DEFAULT_YEAR_COUNT = 0
 SUPPLY_DEST_MAX_QUARTER_COUNT = 8
-SUPPLY_DEST_MAX_MONTH_COUNT = 12
+SUPPLY_DEST_MAX_MONTH_COUNT = 48
 SUPPLY_DEST_MAX_WEEK_COUNT = 12
 SUPPLY_DEST_MAX_YEAR_COUNT = 5
 SUPPLY_DEST_PRELOAD_YEAR_COUNT = SUPPLY_DEST_MAX_YEAR_COUNT + 1
@@ -111,13 +113,35 @@ MCM_PER_MT = BCM_PER_MMTPA * MCM_PER_BCM
 MMTPA_PER_MCM_D = DAYS_PER_YEAR / MCM_PER_MT
 
 VOLUME_CONVERSIONS = {
-    'mcm_d': {'factor': 1.0, 'label': 'mcm/d'},
-    'mt': {'factor': None, 'label': 'MT'},
-    'mtpa': {'factor': MMTPA_PER_MCM_D, 'label': 'MMTPA'},
+    'mcm_d': {
+        'factor': 1.0,
+        'label': 'mcm/d',
+        'quantity_kind': 'rate',
+        'display_precision': 0,
+    },
+    'bcm': {
+        'factor': None,
+        'label': 'bcm',
+        'quantity_kind': 'period_volume',
+        'display_precision': 1,
+    },
+    'mt': {
+        'factor': None,
+        'label': 'MT',
+        'quantity_kind': 'period_volume',
+        'display_precision': 1,
+    },
+    'mtpa': {
+        'factor': MMTPA_PER_MCM_D,
+        'label': 'MMTPA',
+        'quantity_kind': 'rate',
+        'display_precision': 1,
+    },
 }
 
 VOLUME_METRIC_OPTIONS = [
     {'label': 'mcm/d', 'value': 'mcm_d'},
+    {'label': 'bcm', 'value': 'bcm'},
     {'label': 'MT', 'value': 'mt'},
     {'label': 'MMTPA', 'value': 'mtpa'},
 ]
@@ -134,7 +158,6 @@ SUPPLY_CHART_COLOR_SEQUENCE = [
 ]
 SUPPLY_CHART_FORECAST_DASH = 'dot'
 SUPPLY_CHART_ANCHOR_YEAR = 2024
-SUPPLY_CHART_QUERY_START_DATE = '2020-11-01'
 SUPPLY_CHART_DISPLAY_START_DATE = '2021-01-01'
 SUPPLY_CHART_DEFAULT_SELECTED_YEAR_COUNT = 2
 SUPPLY_CHART_DEFAULT_DESELECTED_YEARS = {'2024'}
@@ -161,7 +184,6 @@ CONTINENT_CHART_PREVIOUS_YEAR_WIDTH = 1.15
 CONTINENT_CHART_CURRENT_YEAR_WIDTH = 2.8
 CONTINENT_CHART_FORECAST_DASH = 'dot'
 CONTINENT_CHART_ANCHOR_YEAR = 2024
-CONTINENT_CHART_QUERY_START_DATE = '2020-11-01'
 CONTINENT_CHART_DISPLAY_START_DATE = '2021-01-01'
 CONTINENT_CHART_DEFAULT_SELECTED_YEAR_COUNT = 2
 DEFAULT_SUPPLY_ROLLING_AVG_DAYS = 30
@@ -174,9 +196,52 @@ def _get_volume_metric_info(volume_metric):
     return VOLUME_CONVERSIONS.get(volume_metric or 'mcm_d', VOLUME_CONVERSIONS['mcm_d'])
 
 
+def _get_volume_metric_display_precision(volume_metric):
+    """Return the page-wide decimal precision for a selected volume metric."""
+    return int(_get_volume_metric_info(volume_metric).get('display_precision', 0))
+
+
+def _get_volume_metric_chart_precision(volume_metric):
+    """Return the chart/KPI decimal precision for a selected volume metric."""
+    return _get_volume_metric_display_precision(volume_metric)
+
+
+def _get_volume_metric_plotly_number_format(volume_metric):
+    """Return a Plotly number-format fragment without the surrounding placeholder."""
+    precision = _get_volume_metric_chart_precision(volume_metric)
+    return f',.{precision}f'
+
+
+def _get_volume_metric_zero_tolerance(volume_metric):
+    """Return the threshold below which a value renders as zero at display precision."""
+    return 0.5 * (10 ** -_get_volume_metric_display_precision(volume_metric))
+
+
+def _round_volume_metric_display_value(value, volume_metric):
+    """Round a volume value once and normalize signed zero for page display."""
+    precision = _get_volume_metric_display_precision(volume_metric)
+    rounded_value = round(float(value), precision)
+    return 0.0 if rounded_value == 0 else rounded_value
+
+
+def _is_period_volume_metric(volume_metric):
+    """Return whether the metric represents volume accumulated over a time window."""
+    return _get_volume_metric_info(volume_metric).get('quantity_kind') == 'period_volume'
+
+
+def _get_supply_dest_display_precision(view_type, volume_metric):
+    """Return destination-grid precision without coupling percentages to volume units."""
+    if view_type == 'percentage':
+        return SUPPLY_DEST_PERCENTAGE_DISPLAY_PRECISION
+    return _get_volume_metric_display_precision(volume_metric)
+
+
 def _get_volume_metric_factor(volume_metric, period_days=None):
     """Return the mcm/d conversion factor for the selected display metric."""
     normalized_metric = volume_metric if volume_metric in VOLUME_CONVERSIONS else 'mcm_d'
+    if normalized_metric == 'bcm':
+        days = period_days if period_days is not None else DAYS_PER_YEAR
+        return float(days) / MCM_PER_BCM
     if normalized_metric == 'mt':
         days = period_days if period_days is not None else DAYS_PER_YEAR
         return float(days) / MCM_PER_MT
@@ -233,9 +298,31 @@ def _supply_rolling_window_preceding_days(value):
     return normalize_supply_rolling_avg_days(value) - 1
 
 
-def _format_rolling_average_section_title(title_prefix, rolling_avg_days):
+def _get_rolling_query_start_date(display_start_date, rolling_avg_days):
+    """Return the earliest date needed for a complete first visible rolling window."""
+    display_start = pd.Timestamp(display_start_date).normalize()
+    return (
+        display_start
+        - pd.Timedelta(days=_supply_rolling_window_preceding_days(rolling_avg_days))
+    ).strftime('%Y-%m-%d')
+
+
+def _format_rolling_average_section_title(
+    title_prefix,
+    rolling_avg_days,
+    volume_metric='mcm_d',
+):
     days = normalize_supply_rolling_avg_days(rolling_avg_days)
-    return f'{title_prefix} - {days}-Day Rolling Average'
+    measure = 'Rolling Volume' if _is_period_volume_metric(volume_metric) else 'Rolling Average'
+    return f'{title_prefix} - {days}-Day {measure}'
+
+
+def _get_rolling_metric_export_column_name(rolling_avg_days, volume_metric):
+    """Return a unit-bearing export header that matches the selected metric semantics."""
+    days = normalize_supply_rolling_avg_days(rolling_avg_days)
+    measure = 'rolling_volume' if _is_period_volume_metric(volume_metric) else 'rolling_avg'
+    vol_label = _get_volume_metric_info(volume_metric)['label']
+    return f'{measure}_{days}d ({vol_label})'
 
 
 def _empty_supply_dest_summary_store_payload():
@@ -356,7 +443,7 @@ def _get_supply_dest_summary_week_days(column_name):
 
 
 def _get_supply_dest_summary_column_period_days(column_name):
-    """Return the represented period length for mcm/d-to-MT conversion."""
+    """Return the represented period length for mcm/d-to-period-volume conversion."""
     column_name = str(column_name)
     if column_name in {'30D', '30D_PP', '30D_Y1', '30D_PBD'}:
         return 30
@@ -401,14 +488,19 @@ def _build_supply_dest_summary_period_days_map(columns):
     return period_days_by_column
 
 
-def _recalculate_supply_dest_absolute_delta_columns(display_df):
+def _recalculate_supply_dest_absolute_delta_columns(display_df, volume_metric='mcm_d'):
     """Refresh absolute delta columns after period-aware unit conversion."""
     recalculated_df = display_df.copy()
     if {'Δ 7D-30D', '7D', '30D'}.issubset(recalculated_df.columns):
-        recalculated_df['Δ 7D-30D'] = (
-            pd.to_numeric(recalculated_df['7D'], errors='coerce')
-            - pd.to_numeric(recalculated_df['30D'], errors='coerce')
-        ).round(1)
+        if _is_period_volume_metric(volume_metric):
+            # Seven- and thirty-day totals cover unequal horizons, so their
+            # difference is not a meaningful period-volume comparison.
+            recalculated_df['Δ 7D-30D'] = pd.NA
+        else:
+            recalculated_df['Δ 7D-30D'] = (
+                pd.to_numeric(recalculated_df['7D'], errors='coerce')
+                - pd.to_numeric(recalculated_df['30D'], errors='coerce')
+            ).round(1)
     if {'Δ 30D Y/Y', '30D', '30D_Y1'}.issubset(recalculated_df.columns):
         recalculated_df['Δ 30D Y/Y'] = (
             pd.to_numeric(recalculated_df['30D'], errors='coerce')
@@ -470,7 +562,10 @@ def _convert_supply_dest_absolute_volume_metric(display_df, volume_metric):
         precision=1,
         period_days_by_column=period_days_by_column
     )
-    return _recalculate_supply_dest_absolute_delta_columns(converted_df)
+    return _recalculate_supply_dest_absolute_delta_columns(
+        converted_df,
+        volume_metric,
+    )
 
 
 def _get_supply_dest_summary_previous_week_label(column_name, week_cols):
@@ -840,9 +935,9 @@ EXPORTERS_OVERVIEW_NAMESPACE = 'exporters-overview-v1'
 EXPORTERS_DESTINATION_BASE_NAMESPACE = 'exporters-destination-base-v2'
 EXPORTERS_DESTINATION_PBD_BASE_NAMESPACE = 'exporters-destination-pbd-base-v1'
 EXPORTERS_DESTINATION_SUMMARY_NAMESPACE = 'exporters-destination-summary-v2'
-EXPORTERS_SUPPLY_CHARTS_NAMESPACE = 'exporters-supply-charts-v1'
-EXPORTERS_CONTINENT_DATA_NAMESPACE = 'exporters-continent-data-v1'
-EXPORTERS_CONTINENT_EXPORT_NAMESPACE = 'exporters-continent-export-v1'
+EXPORTERS_SUPPLY_CHARTS_NAMESPACE = 'exporters-supply-charts-v2'
+EXPORTERS_CONTINENT_DATA_NAMESPACE = 'exporters-continent-data-v2'
+EXPORTERS_CONTINENT_EXPORT_NAMESPACE = 'exporters-continent-export-v2'
 EXPORTERS_REFERENCE_NAMESPACES = frozenset({
     EXPORTERS_OVERVIEW_NAMESPACE,
     EXPORTERS_DESTINATION_BASE_NAMESPACE,
@@ -1919,7 +2014,12 @@ def fetch_global_supply_data(engine, schema, classification_mode='Country', roll
         classification_mode: 'Country' or 'Classification Level 1'
         rolling_avg_days: Number of days to use for the rolling average
     """
+    rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
     rolling_window_preceding_days = _supply_rolling_window_preceding_days(rolling_avg_days)
+    query_start_date = _get_rolling_query_start_date(
+        SUPPLY_CHART_DISPLAY_START_DATE,
+        rolling_avg_days,
+    )
 
     try:
         with engine.connect() as conn:
@@ -1955,13 +2055,13 @@ def fetch_global_supply_data(engine, schema, classification_mode='Country', roll
                 {classification_join_clause}
                 , latest_data ld
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                    AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                    AND kt.start >= '{query_start_date}'
                     {internal_flow_filter}
             ),
             -- Get all dates in our range
             all_dates AS (
                 SELECT generate_series(
-                    '{SUPPLY_CHART_QUERY_START_DATE}'::date,
+                    '{query_start_date}'::date,
                     (CURRENT_DATE + INTERVAL '14 days')::date,
                     '1 day'::interval
                 )::date as date
@@ -1984,7 +2084,7 @@ def fetch_global_supply_data(engine, schema, classification_mode='Country', roll
                 {classification_join_clause}
                 , latest_data ld
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                    AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                    AND kt.start >= '{query_start_date}'
                     AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
                     {internal_flow_filter}
                 GROUP BY kt.start::date, COALESCE(NULLIF(kt.continent_destination_name, ''), 'Unknown')
@@ -2012,15 +2112,17 @@ def fetch_global_supply_data(engine, schema, classification_mode='Country', roll
                 SELECT
                     date,
                     mcmd,
-                    AVG(mcmd) OVER (
-                        ORDER BY date
-                        ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
-                    ) as rolling_avg,
+                    AVG(mcmd) OVER rolling_window as rolling_avg,
+                    COUNT(*) OVER rolling_window as rolling_window_day_count,
                     CASE
                         WHEN date > CURRENT_DATE THEN true
                         ELSE false
                     END as is_forecast
                 FROM daily_supply
+                WINDOW rolling_window AS (
+                        ORDER BY date
+                        ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
+                )
             )
             SELECT
                 date,
@@ -2031,6 +2133,7 @@ def fetch_global_supply_data(engine, schema, classification_mode='Country', roll
                 is_forecast
             FROM rolling_supply
             WHERE date >= '{SUPPLY_CHART_DISPLAY_START_DATE}'
+                AND rolling_window_day_count = {rolling_avg_days}
             ORDER BY date
             """)
 
@@ -2064,7 +2167,12 @@ def fetch_country_supply_data(
         classification_mode: 'Country' or 'Classification Level 1'
         rolling_avg_days: Number of days to use for the rolling average
     """
+    rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
     rolling_window_preceding_days = _supply_rolling_window_preceding_days(rolling_avg_days)
+    query_start_date = _get_rolling_query_start_date(
+        SUPPLY_CHART_DISPLAY_START_DATE,
+        rolling_avg_days,
+    )
 
     try:
         with engine.connect() as conn:
@@ -2089,14 +2197,14 @@ def fetch_country_supply_data(
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
                     AND mc.country_classification_level1 = :country
                     AND mc.country_classification_level1 IS NOT NULL
-                    AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                    AND kt.start >= '{query_start_date}'
                     AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
                         IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
                 ),
                 -- Get all dates in our range
                 all_dates AS (
                     SELECT generate_series(
-                        '{SUPPLY_CHART_QUERY_START_DATE}'::date,
+                        '{query_start_date}'::date,
                         (CURRENT_DATE + INTERVAL '14 days')::date,
                         '1 day'::interval
                     )::date as date
@@ -2122,7 +2230,7 @@ def fetch_country_supply_data(
                 WHERE kt.upload_timestamp_utc = ld.max_timestamp
                     AND mc.country_classification_level1 = :country
                     AND mc.country_classification_level1 IS NOT NULL
-                    AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                    AND kt.start >= '{query_start_date}'
                     AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
                     AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
                         IS DISTINCT FROM COALESCE(mc.country_classification_level1, 'Unknown')
@@ -2151,15 +2259,17 @@ def fetch_country_supply_data(
                     SELECT
                         date,
                         mcmd,
-                        AVG(mcmd) OVER (
-                            ORDER BY date
-                            ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
-                        ) as rolling_avg,
+                        AVG(mcmd) OVER rolling_window as rolling_avg,
+                        COUNT(*) OVER rolling_window as rolling_window_day_count,
                         CASE
                             WHEN date > CURRENT_DATE THEN true
                             ELSE false
                         END as is_forecast
                     FROM daily_supply
+                    WINDOW rolling_window AS (
+                            ORDER BY date
+                            ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
+                    )
                 )
                 SELECT
                     date,
@@ -2170,6 +2280,7 @@ def fetch_country_supply_data(
                     is_forecast
                 FROM rolling_supply
                 WHERE date >= '{SUPPLY_CHART_DISPLAY_START_DATE}'
+                    AND rolling_window_day_count = {rolling_avg_days}
                 ORDER BY date
                 """)
             else:
@@ -2189,14 +2300,14 @@ def fetch_country_supply_data(
                     , latest_data ld
                     WHERE kt.upload_timestamp_utc = ld.max_timestamp
                         AND kt.origin_country_name = :country
-                        AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                        AND kt.start >= '{query_start_date}'
                         AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
                             IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
                 ),
                 -- Get all dates in our range
                 all_dates AS (
                     SELECT generate_series(
-                        '{SUPPLY_CHART_QUERY_START_DATE}'::date,
+                        '{query_start_date}'::date,
                         (CURRENT_DATE + INTERVAL '14 days')::date,
                         '1 day'::interval
                     )::date as date
@@ -2219,7 +2330,7 @@ def fetch_country_supply_data(
                     , latest_data ld
                     WHERE kt.upload_timestamp_utc = ld.max_timestamp
                         AND kt.origin_country_name = :country
-                        AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                        AND kt.start >= '{query_start_date}'
                         AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
                         AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
                             IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
@@ -2248,15 +2359,17 @@ def fetch_country_supply_data(
                     SELECT
                         date,
                         mcmd,
-                        AVG(mcmd) OVER (
-                            ORDER BY date
-                            ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
-                        ) as rolling_avg,
+                        AVG(mcmd) OVER rolling_window as rolling_avg,
+                        COUNT(*) OVER rolling_window as rolling_window_day_count,
                         CASE
                             WHEN date > CURRENT_DATE THEN true
                             ELSE false
                         END as is_forecast
                     FROM daily_supply
+                    WINDOW rolling_window AS (
+                            ORDER BY date
+                            ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
+                    )
                 )
                 SELECT
                     date,
@@ -2267,6 +2380,7 @@ def fetch_country_supply_data(
                     is_forecast
                 FROM rolling_supply
                 WHERE date >= '{SUPPLY_CHART_DISPLAY_START_DATE}'
+                    AND rolling_window_day_count = {rolling_avg_days}
                 ORDER BY date
                 """)
 
@@ -2349,7 +2463,12 @@ def _split_supply_chart_batch_df(batch_df, entity_names):
 
 def _fetch_country_supply_chart_batch(engine, schema, rolling_avg_days=DEFAULT_SUPPLY_ROLLING_AVG_DAYS):
     """Fetch Global and configured country supply chart data in one SQL round trip."""
+    rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
     rolling_window_preceding_days = _supply_rolling_window_preceding_days(rolling_avg_days)
+    query_start_date = _get_rolling_query_start_date(
+        SUPPLY_CHART_DISPLAY_START_DATE,
+        rolling_avg_days,
+    )
     entity_names = ['Global'] + SUPPLY_CHART_VISIBLE_COUNTRIES
 
     query = text(f"""
@@ -2365,7 +2484,7 @@ def _fetch_country_supply_chart_batch(engine, schema, rolling_avg_days=DEFAULT_S
                 'Global'::text as entity_name
             FROM {schema}.kpler_trades kt, latest_data ld
             WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                AND kt.start >= '{query_start_date}'
                 AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
                     IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
 
@@ -2376,13 +2495,13 @@ def _fetch_country_supply_chart_batch(engine, schema, rolling_avg_days=DEFAULT_S
             FROM {schema}.kpler_trades kt, latest_data ld
             WHERE kt.upload_timestamp_utc = ld.max_timestamp
                 AND kt.origin_country_name IN :entity_names
-                AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                AND kt.start >= '{query_start_date}'
                 AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
                     IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
         ),
         all_dates AS (
             SELECT generate_series(
-                '{SUPPLY_CHART_QUERY_START_DATE}'::date,
+                '{query_start_date}'::date,
                 (CURRENT_DATE + INTERVAL '14 days')::date,
                 '1 day'::interval
             )::date as date
@@ -2401,7 +2520,7 @@ def _fetch_country_supply_chart_batch(engine, schema, rolling_avg_days=DEFAULT_S
                 SUM(kt.cargo_origin_cubic_meters * 0.6 / 1000) as daily_export_mcmd
             FROM {schema}.kpler_trades kt, latest_data ld
             WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                AND kt.start >= '{query_start_date}'
                 AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
                 AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
                     IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
@@ -2416,7 +2535,7 @@ def _fetch_country_supply_chart_batch(engine, schema, rolling_avg_days=DEFAULT_S
             FROM {schema}.kpler_trades kt, latest_data ld
             WHERE kt.upload_timestamp_utc = ld.max_timestamp
                 AND kt.origin_country_name IN :entity_names
-                AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                AND kt.start >= '{query_start_date}'
                 AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
                 AND COALESCE(NULLIF(BTRIM(kt.destination_country_name), ''), 'Unknown')
                     IS DISTINCT FROM COALESCE(NULLIF(BTRIM(kt.origin_country_name), ''), 'Unknown')
@@ -2439,16 +2558,18 @@ def _fetch_country_supply_chart_batch(engine, schema, rolling_avg_days=DEFAULT_S
                 entity_name,
                 date,
                 mcmd,
-                AVG(mcmd) OVER (
-                    PARTITION BY entity_name
-                    ORDER BY date
-                    ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
-                ) as rolling_avg,
+                AVG(mcmd) OVER rolling_window as rolling_avg,
+                COUNT(*) OVER rolling_window as rolling_window_day_count,
                 CASE
                     WHEN date > CURRENT_DATE THEN true
                     ELSE false
                 END as is_forecast
             FROM daily_supply
+            WINDOW rolling_window AS (
+                    PARTITION BY entity_name
+                    ORDER BY date
+                    ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
+            )
         )
         SELECT
             entity_name,
@@ -2460,6 +2581,7 @@ def _fetch_country_supply_chart_batch(engine, schema, rolling_avg_days=DEFAULT_S
             is_forecast
         FROM rolling_supply
         WHERE date >= '{SUPPLY_CHART_DISPLAY_START_DATE}'
+            AND rolling_window_day_count = {rolling_avg_days}
         ORDER BY entity_name, date
     """).bindparams(bindparam('entity_names', expanding=True))
 
@@ -2484,7 +2606,12 @@ def _fetch_classification_supply_chart_batch(
     if not classification_groups:
         return {'Global': fetch_global_supply_data(engine, schema, 'Classification Level 1', rolling_avg_days)}
 
+    rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
     rolling_window_preceding_days = _supply_rolling_window_preceding_days(rolling_avg_days)
+    query_start_date = _get_rolling_query_start_date(
+        SUPPLY_CHART_DISPLAY_START_DATE,
+        rolling_avg_days,
+    )
 
     query = text(f"""
         WITH latest_data AS (
@@ -2502,7 +2629,7 @@ def _fetch_classification_supply_chart_batch(
             LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
             , latest_data ld
             WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                AND kt.start >= '{query_start_date}'
                 AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
                     IS DISTINCT FROM COALESCE(mc_origin.country_classification_level1, 'Unknown')
 
@@ -2517,13 +2644,13 @@ def _fetch_classification_supply_chart_batch(
             WHERE kt.upload_timestamp_utc = ld.max_timestamp
                 AND mc_origin.country_classification_level1 IN :entity_names
                 AND mc_origin.country_classification_level1 IS NOT NULL
-                AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                AND kt.start >= '{query_start_date}'
                 AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
                     IS DISTINCT FROM COALESCE(mc_origin.country_classification_level1, 'Unknown')
         ),
         all_dates AS (
             SELECT generate_series(
-                '{SUPPLY_CHART_QUERY_START_DATE}'::date,
+                '{query_start_date}'::date,
                 (CURRENT_DATE + INTERVAL '14 days')::date,
                 '1 day'::interval
             )::date as date
@@ -2545,7 +2672,7 @@ def _fetch_classification_supply_chart_batch(
             LEFT JOIN {schema}.mappings_country mc_dest ON kt.destination_country_name = mc_dest.country
             , latest_data ld
             WHERE kt.upload_timestamp_utc = ld.max_timestamp
-                AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                AND kt.start >= '{query_start_date}'
                 AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
                 AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
                     IS DISTINCT FROM COALESCE(mc_origin.country_classification_level1, 'Unknown')
@@ -2564,7 +2691,7 @@ def _fetch_classification_supply_chart_batch(
             WHERE kt.upload_timestamp_utc = ld.max_timestamp
                 AND mc_origin.country_classification_level1 IN :entity_names
                 AND mc_origin.country_classification_level1 IS NOT NULL
-                AND kt.start >= '{SUPPLY_CHART_QUERY_START_DATE}'
+                AND kt.start >= '{query_start_date}'
                 AND kt.start::date <= CURRENT_DATE + INTERVAL '14 days'
                 AND COALESCE(mc_dest.country_classification_level1, 'Unknown')
                     IS DISTINCT FROM COALESCE(mc_origin.country_classification_level1, 'Unknown')
@@ -2587,16 +2714,18 @@ def _fetch_classification_supply_chart_batch(
                 entity_name,
                 date,
                 mcmd,
-                AVG(mcmd) OVER (
-                    PARTITION BY entity_name
-                    ORDER BY date
-                    ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
-                ) as rolling_avg,
+                AVG(mcmd) OVER rolling_window as rolling_avg,
+                COUNT(*) OVER rolling_window as rolling_window_day_count,
                 CASE
                     WHEN date > CURRENT_DATE THEN true
                     ELSE false
                 END as is_forecast
             FROM daily_supply
+            WINDOW rolling_window AS (
+                    PARTITION BY entity_name
+                    ORDER BY date
+                    ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
+            )
         )
         SELECT
             entity_name,
@@ -2608,6 +2737,7 @@ def _fetch_classification_supply_chart_batch(
             is_forecast
         FROM rolling_supply
         WHERE date >= '{SUPPLY_CHART_DISPLAY_START_DATE}'
+            AND rolling_window_day_count = {rolling_avg_days}
         ORDER BY entity_name, date
     """).bindparams(bindparam('entity_names', expanding=True))
 
@@ -3368,7 +3498,12 @@ def _empty_continent_chart_figure(message, height=328):
     return fig
 
 
-def _apply_continent_chart_layout(fig, y_title, yaxis_range=None):
+def _apply_continent_chart_layout(
+    fig,
+    y_title,
+    yaxis_range=None,
+    yaxis_tickformat=None,
+):
     yaxis_config = dict(
         title=dict(text=y_title, font=dict(size=11, color='#475569')),
         showgrid=True,
@@ -3385,6 +3520,8 @@ def _apply_continent_chart_layout(fig, y_title, yaxis_range=None):
         yaxis_config['range'] = yaxis_range
     else:
         yaxis_config['autorange'] = True
+    if yaxis_tickformat is not None:
+        yaxis_config['tickformat'] = yaxis_tickformat
 
     fig.update_layout(
         xaxis=dict(
@@ -3496,7 +3633,10 @@ def _normalize_continent_chart_selected_years(selected_years, available_years, u
     return _default_continent_chart_selected_years(available_years)
 
 
-def _get_continent_chart_selected_window(selected_years):
+def _get_continent_chart_selected_window(
+    selected_years,
+    rolling_avg_days=DEFAULT_SUPPLY_ROLLING_AVG_DAYS,
+):
     available_years = _get_continent_chart_available_years()
     active_years = _normalize_continent_chart_selected_years(
         selected_years,
@@ -3504,16 +3644,24 @@ def _get_continent_chart_selected_window(selected_years):
         use_default=selected_years is None
     )
     if not active_years:
-        return active_years, CONTINENT_CHART_QUERY_START_DATE, CONTINENT_CHART_DISPLAY_START_DATE
+        return (
+            active_years,
+            _get_rolling_query_start_date(
+                CONTINENT_CHART_DISPLAY_START_DATE,
+                rolling_avg_days,
+            ),
+            CONTINENT_CHART_DISPLAY_START_DATE,
+        )
 
     first_selected_year = int(active_years[0])
     focus_year = int(active_years[-1])
     earliest_available_year = pd.Timestamp(CONTINENT_CHART_DISPLAY_START_DATE).year
     first_required_year = max(min(first_selected_year, focus_year - 1), earliest_available_year)
     display_start_date = f'{first_required_year}-01-01'
-    query_start_date = (
-        pd.Timestamp(year=first_required_year, month=1, day=1) - pd.DateOffset(months=2)
-    ).strftime('%Y-%m-%d')
+    query_start_date = _get_rolling_query_start_date(
+        display_start_date,
+        rolling_avg_days,
+    )
     return active_years, query_start_date, display_start_date
 
 
@@ -3530,7 +3678,11 @@ def fetch_continent_chart_data_batch(
     if not entity_names:
         return pd.DataFrame()
 
-    requested_years, query_start_date, display_start_date = _get_continent_chart_selected_window(selected_years)
+    rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
+    requested_years, query_start_date, display_start_date = _get_continent_chart_selected_window(
+        selected_years,
+        rolling_avg_days,
+    )
     if not requested_years:
         return pd.DataFrame()
 
@@ -3765,16 +3917,18 @@ def fetch_continent_chart_data_batch(
                 entity_name,
                 continent_destination,
                 daily_export_mcmd,
-                AVG(daily_export_mcmd) OVER (
-                    PARTITION BY entity_name, continent_destination
-                    ORDER BY date
-                    ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
-                ) as rolling_avg_30d,
+                AVG(daily_export_mcmd) OVER rolling_window as rolling_avg_30d,
+                COUNT(*) OVER rolling_window as rolling_window_day_count,
                 CASE
                     WHEN date > CURRENT_DATE THEN true
                     ELSE false
                 END as is_forecast
             FROM daily_exports_complete
+            WINDOW rolling_window AS (
+                    PARTITION BY entity_name, continent_destination
+                    ORDER BY date
+                    ROWS BETWEEN {rolling_window_preceding_days} PRECEDING AND CURRENT ROW
+            )
         ),
         rolling_with_totals AS (
             SELECT
@@ -3798,6 +3952,7 @@ def fetch_continent_chart_data_batch(
             is_forecast
         FROM rolling_with_totals
         WHERE date >= '{display_start_date}'
+            AND rolling_window_day_count = {rolling_avg_days}
         ORDER BY entity_name, continent_destination, date
     """)
     if bind_params:
@@ -3821,24 +3976,40 @@ def _get_continent_year_selector_options():
     ]
 
 
-def _format_continent_kpi_value(value, chart_type, vol_label, is_delta=False, include_unit=True):
+def _format_continent_kpi_value(
+    value,
+    chart_type,
+    vol_label,
+    volume_metric='mcm_d',
+    is_delta=False,
+    include_unit=True,
+):
     if value is None or pd.isna(value):
         return 'n/a'
 
-    rounded_value = int(round(float(value)))
+    precision = (
+        0
+        if chart_type == 'percentage'
+        else _get_volume_metric_chart_precision(volume_metric)
+    )
+    rounded_value = round(float(value), precision)
+    if rounded_value == 0:
+        rounded_value = 0.0
     sign = '+' if is_delta and rounded_value > 0 else ''
     if chart_type == 'percentage':
-        return f'{sign}{rounded_value}pp' if is_delta else f'{rounded_value}%'
+        integer_value = int(rounded_value)
+        return f'{sign}{integer_value}pp' if is_delta else f'{integer_value}%'
 
     suffix = '' if is_delta or not include_unit else f' {vol_label}'
-    return f'{sign}{rounded_value:,}{suffix}'
+    return f'{sign}{rounded_value:,.{precision}f}{suffix}'
 
 
 def _format_continent_kpi_pct(delta_pct):
     if delta_pct is None or pd.isna(delta_pct):
         return ''
-    sign = '+' if delta_pct > 0 else ''
-    return f' ({sign}{delta_pct:.0f}%)'
+    rounded_pct = int(round(float(delta_pct)))
+    sign = '+' if rounded_pct > 0 else ''
+    return f' ({sign}{rounded_pct}%)'
 
 
 def _format_continent_kpi_pct_compact(delta_pct):
@@ -3849,26 +4020,46 @@ def _format_continent_kpi_pct_compact(delta_pct):
     return f'({sign}{rounded_pct}%)'
 
 
-def _continent_kpi_direction_class(value):
+def _continent_kpi_direction_class(value, chart_type='absolute', volume_metric='mcm_d'):
     if value is None or pd.isna(value):
         return 'continent-kpi-delta-neutral'
-    if value > 0:
+    direction_value = float(value)
+    if chart_type != 'percentage':
+        direction_value = _round_volume_metric_display_value(
+            value,
+            volume_metric,
+        )
+    if direction_value > 0:
         return 'continent-kpi-delta-positive'
-    if value < 0:
+    if direction_value < 0:
         return 'continent-kpi-delta-negative'
     return 'continent-kpi-delta-neutral'
 
 
-def _continent_kpi_value_displays_zero(value, chart_type, is_delta_pct=False):
+def _continent_kpi_value_displays_zero(
+    value,
+    chart_type,
+    volume_metric='mcm_d',
+    is_delta_pct=False,
+):
     if value is None or pd.isna(value):
         return True
 
-    display_tolerance = 0.05 if chart_type == 'percentage' and not is_delta_pct else 0.5
+    if chart_type == 'percentage' and not is_delta_pct:
+        display_tolerance = 0.05
+    elif is_delta_pct:
+        display_tolerance = 0.5
+    else:
+        return _round_volume_metric_display_value(
+            value,
+            volume_metric,
+        ) == 0
     return abs(float(value)) < display_tolerance
 
 
 def _continent_kpi_all_displayed_values_zero(
     chart_type,
+    volume_metric,
     show_deltas,
     latest_value,
     mom_delta_value,
@@ -3892,12 +4083,24 @@ def _continent_kpi_all_displayed_values_zero(
             ])
 
     return all(
-        _continent_kpi_value_displays_zero(value, chart_type, is_delta_pct)
+        _continent_kpi_value_displays_zero(
+            value,
+            chart_type,
+            volume_metric,
+            is_delta_pct,
+        )
         for value, is_delta_pct in values_to_check
     )
 
 
-def _calculate_continent_kpis(df, active_years, metric_column, chart_type, vol_label):
+def _calculate_continent_kpis(
+    df,
+    active_years,
+    metric_column,
+    chart_type,
+    vol_label,
+    volume_metric='mcm_d',
+):
     if df.empty or not active_years:
         return []
 
@@ -3975,6 +4178,7 @@ def _calculate_continent_kpis(df, active_years, metric_column, chart_type, vol_l
 
         if _continent_kpi_all_displayed_values_zero(
             chart_type,
+            volume_metric,
             show_deltas,
             latest_numeric,
             mom_delta_numeric,
@@ -3991,30 +4195,68 @@ def _calculate_continent_kpis(df, active_years, metric_column, chart_type, vol_l
             'chart_type': chart_type,
             'unit_label': vol_label,
             'latest_value': latest_numeric,
-            'latest_text': _format_continent_kpi_value(latest_value, chart_type, vol_label, include_unit=False),
+            'latest_text': _format_continent_kpi_value(
+                latest_value,
+                chart_type,
+                vol_label,
+                volume_metric,
+                include_unit=False,
+            ),
             'latest_label': latest_point.get('month_day', ''),
             'mom_delta_value': mom_delta_numeric,
             'mom_value_text': (
-                _format_continent_kpi_value(mom_delta_value, chart_type, vol_label, is_delta=True)
+                _format_continent_kpi_value(
+                    mom_delta_value,
+                    chart_type,
+                    vol_label,
+                    volume_metric,
+                    is_delta=True,
+                )
             ) if mom_delta_value is not None and pd.notna(mom_delta_value) else 'n/a',
             'mom_pct_text': _format_continent_kpi_pct_compact(mom_delta_pct),
             'mom_text': (
-                _format_continent_kpi_value(mom_delta_value, chart_type, vol_label, is_delta=True)
+                _format_continent_kpi_value(
+                    mom_delta_value,
+                    chart_type,
+                    vol_label,
+                    volume_metric,
+                    is_delta=True,
+                )
                 + _format_continent_kpi_pct(mom_delta_pct)
             ) if mom_delta_value is not None and pd.notna(mom_delta_value) else 'n/a',
-            'mom_class': _continent_kpi_direction_class(mom_delta_value),
+            'mom_class': _continent_kpi_direction_class(
+                mom_delta_value,
+                chart_type,
+                volume_metric,
+            ),
             'mom_delta_pct': mom_pct_numeric,
             'yoy_delta_value': yoy_delta_numeric,
             'yoy_value_text': (
-                _format_continent_kpi_value(yoy_delta_value, chart_type, vol_label, is_delta=True)
+                _format_continent_kpi_value(
+                    yoy_delta_value,
+                    chart_type,
+                    vol_label,
+                    volume_metric,
+                    is_delta=True,
+                )
             ) if yoy_delta_value is not None and pd.notna(yoy_delta_value) else 'n/a',
             'yoy_pct_text': _format_continent_kpi_pct_compact(yoy_delta_pct),
             'yoy_text': (
-                _format_continent_kpi_value(yoy_delta_value, chart_type, vol_label, is_delta=True)
+                _format_continent_kpi_value(
+                    yoy_delta_value,
+                    chart_type,
+                    vol_label,
+                    volume_metric,
+                    is_delta=True,
+                )
                 + _format_continent_kpi_pct(yoy_delta_pct)
             ) if yoy_delta_value is not None and pd.notna(yoy_delta_value) else 'n/a',
             'yoy_delta_pct': yoy_pct_numeric,
-            'yoy_class': _continent_kpi_direction_class(yoy_delta_value)
+            'yoy_class': _continent_kpi_direction_class(
+                yoy_delta_value,
+                chart_type,
+                volume_metric,
+            )
         })
 
     return sorted(metrics, key=lambda item: item['latest_value'], reverse=True)
@@ -4249,9 +4491,13 @@ def _create_continent_destination_chart_from_df(
     """Create the absolute continent chart from a preloaded dataframe."""
     vol_info = _get_volume_metric_info(volume_metric)
     vol_label = vol_info['label']
+    plotly_number_format = _get_volume_metric_plotly_number_format(volume_metric)
 
     try:
-        requested_years, _, _ = _get_continent_chart_selected_window(selected_years)
+        requested_years, _, _ = _get_continent_chart_selected_window(
+            selected_years,
+            rolling_avg_days,
+        )
         if not requested_years:
             return _empty_continent_chart_figure("Select a year above.")
 
@@ -4274,7 +4520,14 @@ def _create_continent_destination_chart_from_df(
         if not active_years:
             return _empty_continent_chart_figure("No data for the selected years.")
 
-        kpi_metrics = _calculate_continent_kpis(df, active_years, 'rolling_avg', 'absolute', vol_label)
+        kpi_metrics = _calculate_continent_kpis(
+            df,
+            active_years,
+            'rolling_avg',
+            'absolute',
+            vol_label,
+            volume_metric,
+        )
 
         df = df[df['_year_token'].isin(active_years)].copy()
         if df.empty:
@@ -4315,7 +4568,7 @@ def _create_continent_destination_chart_from_df(
                         hovertemplate=(
                             f'<b>{continent}</b> | {year} | '
                             '%{text} | '
-                            f'%{{y:,.0f}} {vol_label}<extra></extra>'
+                            f'%{{y:{plotly_number_format}}} {vol_label}<extra></extra>'
                         ),
                         text=historical_data['month_day'],
                         showlegend=show_legend
@@ -4339,13 +4592,17 @@ def _create_continent_destination_chart_from_df(
                         hovertemplate=(
                             f'<b>{continent}</b> | {year} forecast | '
                             '%{text} | '
-                            f'%{{y:,.0f}} {vol_label}<extra></extra>'
+                            f'%{{y:{plotly_number_format}}} {vol_label}<extra></extra>'
                         ),
                         text=connect_data['month_day'],
                         showlegend=False
                     ))
 
-        _apply_continent_chart_layout(fig, vol_label)
+        _apply_continent_chart_layout(
+            fig,
+            vol_label,
+            yaxis_tickformat=plotly_number_format,
+        )
         fig.update_layout(meta={'continent_kpis': kpi_metrics})
         return fig
 
@@ -4453,12 +4710,22 @@ def _create_continent_percentage_chart_from_df(df, selected_years=None):
         return _empty_continent_chart_figure("Error loading data")
 
 
-def _build_supply_dest_columns(display_df, view_type='absolute', hidden_cols=None, delta_like_cols=None):
+def _build_supply_dest_columns(
+    display_df,
+    view_type='absolute',
+    hidden_cols=None,
+    delta_like_cols=None,
+    volume_metric='mcm_d',
+):
     """Build DataTable column definitions for supply-destination tables."""
     hidden_cols = set(hidden_cols or ['30D_Y1'])
     hidden_cols.update(SUPPLY_DEST_ROLLING_REFERENCE_COLUMNS)
     delta_cols = set(col for col in display_df.columns if str(col).startswith('Δ '))
     delta_cols.update(delta_like_cols or [])
+    display_precision = _get_supply_dest_display_precision(
+        view_type,
+        volume_metric,
+    )
 
     columns = []
     for col in display_df.columns:
@@ -4471,29 +4738,44 @@ def _build_supply_dest_columns(display_df, view_type='absolute', hidden_cols=Non
                 'name': col,
                 'id': col,
                 'type': 'numeric',
-                'format': Format(precision=0, scheme=Scheme.fixed)
+                'format': Format(
+                    precision=display_precision,
+                    scheme=Scheme.fixed
+                )
             })
         elif view_type == 'percentage':
             columns.append({
                 'name': col,
                 'id': col,
                 'type': 'numeric',
-                'format': Format(precision=0, scheme=Scheme.percentage)
+                'format': Format(
+                    precision=display_precision,
+                    scheme=Scheme.percentage
+                )
             })
         else:
             columns.append({
                 'name': col,
                 'id': col,
                 'type': 'numeric',
-                'format': Format(precision=0, scheme=Scheme.fixed)
+                'format': Format(
+                    precision=display_precision,
+                    scheme=Scheme.fixed
+                )
             })
     return columns
 
 
-def _format_supply_dest_width_sample(value, view_type='absolute', is_numeric=False,
-                                     is_delta=False, is_preformatted_pp=False):
+def _format_supply_dest_width_sample(
+    value,
+    view_type='absolute',
+    is_numeric=False,
+    is_delta=False,
+    is_preformatted_pp=False,
+    precision=SUPPLY_DEST_PERCENTAGE_DISPLAY_PRECISION,
+):
     """Return a compact display-like string used only for AG Grid width estimation."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    if value is None or pd.isna(value):
         return ''
 
     if not is_numeric:
@@ -4507,14 +4789,19 @@ def _format_supply_dest_width_sample(value, view_type='absolute', is_numeric=Fal
     if view_type == 'percentage' and is_delta:
         pp_value = numeric_value if is_preformatted_pp else numeric_value * 100
         sign = '+' if pp_value > 0 else ''
-        return f"{sign}{pp_value:,.0f} pp"
+        return f"{sign}{pp_value:,.{precision}f} pp"
     if view_type == 'percentage':
-        return f"{numeric_value:.0%}"
-    return f"{numeric_value:,.0f}"
+        return f"{numeric_value:.{precision}%}"
+    return f"{numeric_value:,.{precision}f}"
 
 
-def _build_supply_dest_summary_column_width_styles(display_df, columns, view_type='absolute',
-                                                   delta_like_cols=None):
+def _build_supply_dest_summary_column_width_styles(
+    display_df,
+    columns,
+    view_type='absolute',
+    delta_like_cols=None,
+    volume_metric='mcm_d',
+):
     """Size LNG Supply by Destination columns from their headers and visible values."""
     if display_df.empty:
         return []
@@ -4523,6 +4810,10 @@ def _build_supply_dest_summary_column_width_styles(display_df, columns, view_typ
     delta_like_cols = set(delta_like_cols or [])
     real_delta_ids = {col for col in display_df.columns if str(col).startswith('Δ ')}
     all_delta_ids = real_delta_ids | delta_like_cols
+    display_precision = _get_supply_dest_display_precision(
+        view_type,
+        volume_metric,
+    )
     text_width_limits = {
         'Aggregation Supply': (130, 190),
         'Aggregation Demand': (130, 190),
@@ -4551,7 +4842,8 @@ def _build_supply_dest_summary_column_width_styles(display_df, columns, view_typ
                 view_type,
                 not is_text,
                 is_delta=is_delta,
-                is_preformatted_pp=is_preformatted_pp
+                is_preformatted_pp=is_preformatted_pp,
+                precision=display_precision,
             )
             for value in display_df[column_id].tolist()
         )
@@ -4576,8 +4868,13 @@ def _build_supply_dest_summary_column_width_styles(display_df, columns, view_typ
     return width_styles
 
 
-def _build_supply_dest_summary_grid_display(display_df, columns, view_type='absolute',
-                                            delta_like_cols=None):
+def _build_supply_dest_summary_grid_display(
+    display_df,
+    columns,
+    view_type='absolute',
+    delta_like_cols=None,
+    volume_metric='mcm_d',
+):
     """Return display-only records/columns for the executive summary AG Grid."""
     grid_df = display_df.copy()
     grid_columns = [dict(column) for column in columns]
@@ -4590,6 +4887,10 @@ def _build_supply_dest_summary_grid_display(display_df, columns, view_type='abso
     real_delta_ids = {column_id for column_id in numeric_ids if str(column_id).startswith('Δ ')}
     delta_ids = real_delta_ids | delta_like_cols
     preformatted_pp_ids = delta_like_cols - real_delta_ids
+    display_precision = _get_supply_dest_display_precision(
+        view_type,
+        volume_metric,
+    )
 
     for column_id in delta_ids:
         if column_id not in grid_df.columns:
@@ -4600,7 +4901,8 @@ def _build_supply_dest_summary_grid_display(display_df, columns, view_type='abso
         raw_values = pd.to_numeric(grid_df[column_id], errors='coerce')
         if view_type == 'percentage':
             raw_values = raw_values * 100
-        raw_values = raw_values.mask(raw_values.abs() < 0.5, 0)
+        raw_values = raw_values.round(display_precision)
+        raw_values = raw_values.mask(raw_values == 0, 0)
         grid_df[raw_field] = raw_values
 
     for column_id in numeric_ids:
@@ -4608,10 +4910,13 @@ def _build_supply_dest_summary_grid_display(display_df, columns, view_type='abso
             continue
 
         def format_value(value):
-            if value is None or (isinstance(value, float) and pd.isna(value)):
+            if value is None or pd.isna(value):
                 return (
                     '—'
-                    if column_id in SUPPLY_DEST_PBD_DELTA_COLUMNS
+                    if column_id in {
+                        *SUPPLY_DEST_PBD_DELTA_COLUMNS,
+                        *SUPPLY_DEST_PERIOD_VOLUME_UNAVAILABLE_COLUMNS,
+                    }
                     else ''
                 )
             try:
@@ -4620,20 +4925,28 @@ def _build_supply_dest_summary_grid_display(display_df, columns, view_type='abso
                 return str(value)
             if view_type == 'percentage' and column_id in delta_ids:
                 pp_value = numeric_value if column_id in preformatted_pp_ids else numeric_value * 100
-                if abs(pp_value) < 0.5:
-                    pp_value = 0
+                pp_value = round(pp_value, display_precision)
+                if pp_value == 0:
+                    pp_value = 0.0
                 sign = '+' if pp_value > 0 else ''
-                return f'{sign}{pp_value:,.0f} pp'
+                return f'{sign}{pp_value:,.{display_precision}f} pp'
             if view_type == 'percentage' and column_id not in delta_ids:
-                return f'{numeric_value:.0%}'
-            if column_id in delta_ids and abs(numeric_value) < 0.5:
-                numeric_value = 0
+                percentage_value = round(
+                    numeric_value * 100,
+                    display_precision,
+                )
+                if percentage_value == 0:
+                    percentage_value = 0.0
+                return f'{percentage_value:.{display_precision}f}%'
+            numeric_value = round(numeric_value, display_precision)
+            if numeric_value == 0:
+                numeric_value = 0.0
             if (
                 column_id in SUPPLY_DEST_PBD_DELTA_COLUMNS
                 and numeric_value > 0
             ):
-                return f'+{numeric_value:,.0f}'
-            return f'{numeric_value:,.0f}'
+                return f'+{numeric_value:,.{display_precision}f}'
+            return f'{numeric_value:,.{display_precision}f}'
 
         grid_df[column_id] = grid_df[column_id].apply(format_value)
 
@@ -6102,14 +6415,23 @@ layout = html.Div([
 @callback(
     [Output('supply-rolling-section-title', 'children'),
      Output('continent-rolling-section-title', 'children')],
-    Input('supply-rolling-window-days-input', 'value'),
+    [Input('supply-rolling-window-days-input', 'value'),
+     Input('exporters-volume-metric-dropdown', 'value')],
     prevent_initial_call=False
 )
-def update_rolling_average_section_titles(rolling_avg_days):
-    """Keep rolling-average section titles synchronized with the sticky selector."""
+def update_rolling_average_section_titles(rolling_avg_days, volume_metric):
+    """Keep rolling section titles synchronized with the window and metric selectors."""
     return (
-        _format_rolling_average_section_title('LNG Supply', rolling_avg_days),
-        _format_rolling_average_section_title('LNG Supply by Destination Continent', rolling_avg_days)
+        _format_rolling_average_section_title(
+            'LNG Supply',
+            rolling_avg_days,
+            volume_metric,
+        ),
+        _format_rolling_average_section_title(
+            'LNG Supply by Destination Continent',
+            rolling_avg_days,
+            volume_metric,
+        ),
     )
 
 
@@ -6361,7 +6683,7 @@ def _exporters_continent_data_source_key(
     selected_years,
 ):
     selected_years, _query_start_date, _display_start_date = (
-        _get_continent_chart_selected_window(selected_years)
+        _get_continent_chart_selected_window(selected_years, rolling_avg_days)
     )
     return _build_source_key(
         EXPORTERS_CONTINENT_DATA_NAMESPACE,
@@ -6379,14 +6701,20 @@ def _exporters_continent_export_source_key(
     rolling_avg_days,
     entity_names,
 ):
+    _selected_years, query_start_date, display_start_date = (
+        _get_continent_chart_selected_window(
+            _get_continent_chart_available_years(),
+            rolling_avg_days,
+        )
+    )
     return _build_source_key(
         EXPORTERS_CONTINENT_EXPORT_NAMESPACE,
         _exporters_semantic_source_state(source_state),
         classification_mode,
         rolling_avg_days,
         list(entity_names),
-        CONTINENT_CHART_QUERY_START_DATE,
-        CONTINENT_CHART_DISPLAY_START_DATE,
+        query_start_date,
+        display_start_date,
     )
 
 
@@ -6466,14 +6794,14 @@ def _build_exporters_continent_snapshot_payload(
     entity_names,
     selected_years,
 ):
-    selected_years, _query_start_date, _display_start_date = (
-        _get_continent_chart_selected_window(selected_years)
-    )
-    source_state = _validate_exporters_source_state(source_state)
-    classification_mode = classification_mode or 'Country'
     rolling_avg_days = normalize_supply_rolling_avg_days(
         rolling_avg_days
     )
+    selected_years, _query_start_date, _display_start_date = (
+        _get_continent_chart_selected_window(selected_years, rolling_avg_days)
+    )
+    source_state = _validate_exporters_source_state(source_state)
+    classification_mode = classification_mode or 'Country'
     continent_df = fetch_continent_chart_data_batch(
         engine_inst,
         schema,
@@ -6590,7 +6918,7 @@ def _load_exporters_continent_snapshot(
     selected_years,
 ):
     selected_years, _query_start_date, _display_start_date = (
-        _get_continent_chart_selected_window(selected_years)
+        _get_continent_chart_selected_window(selected_years, rolling_avg_days)
     )
     return _get_or_build_snapshot(
         engine_inst,
@@ -6630,6 +6958,9 @@ def _load_exporters_continent_export_snapshot(
     entity_names,
 ):
     selected_years = _get_continent_chart_available_years()
+    _selected_years, query_start_date, display_start_date = (
+        _get_continent_chart_selected_window(selected_years, rolling_avg_days)
+    )
     return _get_or_build_snapshot(
         engine_inst,
         namespace=EXPORTERS_CONTINENT_EXPORT_NAMESPACE,
@@ -6653,8 +6984,8 @@ def _load_exporters_continent_export_snapshot(
             'classification_mode': classification_mode,
             'rolling_avg_days': rolling_avg_days,
             'entity_names': list(entity_names),
-            'query_start_date': CONTINENT_CHART_QUERY_START_DATE,
-            'display_start_date': CONTINENT_CHART_DISPLAY_START_DATE,
+            'query_start_date': query_start_date,
+            'display_start_date': display_start_date,
         },
     )
 
@@ -6672,11 +7003,12 @@ def _resolve_or_load_exporters_continent_payload(
         rolling_avg_days
     )
     selected_years, _query_start_date, _display_start_date = (
-        _get_continent_chart_selected_window(selected_years)
+        _get_continent_chart_selected_window(selected_years, rolling_avg_days)
     )
     payload_selected_years, _payload_query_start, _payload_display_start = (
         _get_continent_chart_selected_window(
-            payload['selected_years']
+            payload['selected_years'],
+            rolling_avg_days,
         )
     )
 
@@ -7168,7 +7500,14 @@ def _get_supply_chart_range_years(focus_year, available_years):
     return previous_years[-SUPPLY_CHART_RANGE_LOOKBACK_YEARS:]
 
 
-def _add_supply_chart_range_band(fig, df, focus_year, available_years, vol_label):
+def _add_supply_chart_range_band(
+    fig,
+    df,
+    focus_year,
+    available_years,
+    vol_label,
+    volume_metric='mcm_d',
+):
     range_years = _get_supply_chart_range_years(focus_year, available_years)
     if not range_years:
         return
@@ -7200,6 +7539,7 @@ def _add_supply_chart_range_band(fig, df, focus_year, available_years, vol_label
         return
 
     years_label = f"{range_years[0]}-{range_years[-1]}" if len(range_years) > 1 else range_years[0]
+    plotly_number_format = _get_volume_metric_plotly_number_format(volume_metric)
     fig.add_trace(go.Scatter(
         x=range_df['plot_date'],
         y=range_df['range_min'],
@@ -7221,7 +7561,8 @@ def _add_supply_chart_range_band(fig, df, focus_year, available_years, vol_label
         hovertemplate=(
             f'<b>{years_label} range</b> | '
             '%{text} | '
-            f'%{{customdata[0]:,.0f}}-%{{y:,.0f}} {vol_label}<extra></extra>'
+            f'%{{customdata[0]:{plotly_number_format}}}-'
+            f'%{{y:{plotly_number_format}}} {vol_label}<extra></extra>'
         ),
         showlegend=False
     ))
@@ -7440,6 +7781,7 @@ def create_supply_chart(
     """Create seasonal comparison chart for LNG supply with professional styling."""
     vol_info = _get_volume_metric_info(volume_metric)
     vol_label = vol_info['label']
+    plotly_number_format = _get_volume_metric_plotly_number_format(volume_metric)
 
     df = _prepare_supply_chart_dataframe(data, volume_metric, rolling_avg_days)
     if df.empty:
@@ -7466,7 +7808,14 @@ def create_supply_chart(
     years = sorted(active_years, key=_supply_chart_year_sort_key)
     focus_year = years[-1]
     color_by_year = _get_supply_chart_color_map(available_years)
-    _add_supply_chart_range_band(fig, df, focus_year, available_years, vol_label)
+    _add_supply_chart_range_band(
+        fig,
+        df,
+        focus_year,
+        available_years,
+        vol_label,
+        volume_metric,
+    )
 
     for year in years:
         year_data = active_df[active_df['_year_token'] == year].copy()
@@ -7499,7 +7848,7 @@ def create_supply_chart(
                     hovertemplate=(
                         f'<b>{year_label}</b> | '
                         '%{text} | '
-                        f'%{{y:,.0f}} {vol_label}<extra></extra>'
+                        f'%{{y:{plotly_number_format}}} {vol_label}<extra></extra>'
                     ),
                     text=historical_data['month_day'],
                     showlegend=show_legend
@@ -7525,7 +7874,7 @@ def create_supply_chart(
                     hovertemplate=(
                         f'<b>{year_label} forecast</b> | '
                         '%{text} | '
-                        f'%{{y:,.0f}} {vol_label}<extra></extra>'
+                        f'%{{y:{plotly_number_format}}} {vol_label}<extra></extra>'
                     ),
                     text=connect_data['month_day'],
                     showlegend=False
@@ -7545,7 +7894,7 @@ def create_supply_chart(
                 hovertemplate=(
                     f'<b>{year_label}</b> | '
                     '%{text} | '
-                    f'%{{y:,.0f}} {vol_label}<extra></extra>'
+                    f'%{{y:{plotly_number_format}}} {vol_label}<extra></extra>'
                 ),
                 text=year_data['month_day'],
                 showlegend=show_legend
@@ -7597,6 +7946,7 @@ def create_supply_chart(
         ),
         yaxis=dict(
             title=dict(text=vol_label, font=dict(size=11, color='#475569')),
+            tickformat=plotly_number_format,
             showgrid=True,
             gridcolor='rgba(148, 163, 184, 0.22)',
             gridwidth=0.5,
@@ -8135,7 +8485,8 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
             display_df,
             view_type,
             hidden_cols=['30D_Y1'],
-            delta_like_cols=summary_comparison_delta_cols
+            delta_like_cols=summary_comparison_delta_cols,
+            volume_metric=volume_metric,
         )
 
         # Get conditional styles (includes alternating rows, country totals, grand total)
@@ -8311,7 +8662,8 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
                 display_df,
                 columns,
                 view_type,
-                delta_like_cols=summary_comparison_delta_cols
+                delta_like_cols=summary_comparison_delta_cols,
+                volume_metric=volume_metric,
             )
         )
 
@@ -8319,7 +8671,8 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
             display_df,
             columns,
             view_type,
-            delta_like_cols=summary_comparison_delta_cols
+            delta_like_cols=summary_comparison_delta_cols,
+            volume_metric=volume_metric,
         )
         grid_columns = _apply_supply_dest_summary_column_classes(grid_columns)
         grid_columns = _apply_supply_dest_delta_heatmap_class_rules(
@@ -8400,15 +8753,19 @@ def update_supply_dest_table(supply_dest_data, expanded_classifications, expande
             comparison_note = '; level columns shown vs previous period'
         elif summary_comparison_basis == 'same_period_last_year':
             comparison_note = '; level columns shown vs previous year'
-        value_note_text = (
-            (
+        if view_type == 'percentage':
+            value_note_text = (
                 'Market share levels shown as %; comparison and delta columns shown in percentage points (pp)'
                 if comparison_note
                 else 'Market share levels shown as %; delta columns shown in percentage points (pp)'
             )
-            if view_type == 'percentage'
-            else f'Values shown are bilateral trade flows in {vol_label}{comparison_note}'
-        )
+        else:
+            value_note_text = f'Values shown are bilateral trade flows in {vol_label}{comparison_note}'
+            if _is_period_volume_metric(volume_metric):
+                value_note_text += (
+                    '; Δ 7D-30D unavailable because the period totals cover '
+                    'different horizons'
+                )
 
         def _format_snapshot_lineage(snapshot):
             if not isinstance(snapshot, dict):
@@ -8841,50 +9198,69 @@ def update_continent_charts(
     )
 
 
-def _format_supply_chart_current_value(metrics, vol_label):
+def _format_supply_chart_current_value(metrics, volume_metric='mcm_d'):
     if not metrics or metrics.get('latest_value') is None:
         return None
 
     latest_label = metrics.get('latest_label') or metrics.get('focus_year') or ''
-    return f"{latest_label}: {metrics['latest_value']:,.0f} {vol_label}"
+    vol_label = _get_volume_metric_info(volume_metric)['label']
+    precision = _get_volume_metric_chart_precision(volume_metric)
+    latest_value = round(float(metrics['latest_value']), precision)
+    if latest_value == 0:
+        latest_value = 0.0
+    return f"{latest_label}: {latest_value:,.{precision}f} {vol_label}"
 
 
-def _build_supply_chart_delta_pill(label, delta_value, delta_pct):
+def _build_supply_chart_delta_pill(
+    label,
+    delta_value,
+    delta_pct,
+    volume_metric='mcm_d',
+):
     if delta_value is None or pd.isna(delta_value):
         return html.Span(f'{label} n/a', className='supply-rolling-delta-pill supply-rolling-delta-neutral')
 
+    precision = _get_volume_metric_chart_precision(volume_metric)
+    rounded_delta = round(float(delta_value), precision)
+    if rounded_delta == 0:
+        rounded_delta = 0.0
+
     direction_class = 'supply-rolling-delta-neutral'
-    if delta_value > 0:
+    if rounded_delta > 0:
         direction_class = 'supply-rolling-delta-positive'
-    elif delta_value < 0:
+    elif rounded_delta < 0:
         direction_class = 'supply-rolling-delta-negative'
 
-    sign = '+' if delta_value > 0 else ''
+    sign = '+' if rounded_delta > 0 else ''
     pct_text = ''
     if delta_pct is not None and pd.notna(delta_pct):
-        pct_text = f" ({sign}{delta_pct:.0f}%)"
+        rounded_pct = int(round(float(delta_pct)))
+        pct_sign = '+' if rounded_pct > 0 else ''
+        pct_text = f" ({pct_sign}{rounded_pct}%)"
 
     return html.Span(
         [
             html.Span(label, className='supply-rolling-delta-label'),
-            html.Span(f"{sign}{delta_value:,.0f}{pct_text}")
+            html.Span(f"{sign}{rounded_delta:,.{precision}f}{pct_text}")
         ],
         className=f'supply-rolling-delta-pill {direction_class}'
     )
 
 
-def _build_supply_chart_delta_indicators(metrics):
+def _build_supply_chart_delta_indicators(metrics, volume_metric='mcm_d'):
     return html.Div(
         [
             _build_supply_chart_delta_pill(
                 'MoM',
                 metrics.get('mom_delta_value') if metrics else None,
-                metrics.get('mom_delta_pct') if metrics else None
+                metrics.get('mom_delta_pct') if metrics else None,
+                volume_metric,
             ),
             _build_supply_chart_delta_pill(
                 'YoY',
                 metrics.get('delta_value') if metrics else None,
-                metrics.get('delta_pct') if metrics else None
+                metrics.get('delta_pct') if metrics else None,
+                volume_metric,
             )
         ],
         className='supply-rolling-delta-group'
@@ -8916,7 +9292,7 @@ def update_supply_charts(
         return html.Div("No data available", className='supply-rolling-empty-state')
 
     charts = []
-    vol_label = _get_volume_metric_info(volume_metric or 'mcm_d')['label']
+    volume_metric = volume_metric or 'mcm_d'
     rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
 
     # Create chart for each entity (country or classification group)
@@ -8924,17 +9300,17 @@ def update_supply_charts(
         fig = create_supply_chart(
             entity_data,
             show_legend=False,
-            volume_metric=volume_metric or 'mcm_d',
+            volume_metric=volume_metric,
             selected_years=selected_years,
             rolling_avg_days=rolling_avg_days
         )
         metrics = get_supply_chart_header_metrics(
             entity_data,
-            volume_metric=volume_metric or 'mcm_d',
+            volume_metric=volume_metric,
             selected_years=selected_years,
             rolling_avg_days=rolling_avg_days
         )
-        current_value = _format_supply_chart_current_value(metrics, vol_label)
+        current_value = _format_supply_chart_current_value(metrics, volume_metric)
         card_class_name = (
             'supply-rolling-card supply-rolling-card-primary'
             if entity_name == 'Global'
@@ -8951,7 +9327,7 @@ def update_supply_charts(
                         ],
                         className='supply-rolling-card-title-group'
                     ),
-                    _build_supply_chart_delta_indicators(metrics)
+                    _build_supply_chart_delta_indicators(metrics, volume_metric)
                 ],
                 className='supply-rolling-card-header'
             ),
@@ -9022,8 +9398,15 @@ def _resolve_table_export_df(derived_virtual_data_list, data_list, columns_list)
     return export_df
 
 
-def _send_export_dataframe(export_df, filename_prefix, sheet_name):
+def _send_export_dataframe(
+    export_df,
+    filename_prefix,
+    sheet_name,
+    header_comments=None,
+):
     """Create a single-sheet Excel download from a dataframe."""
+    from openpyxl.comments import Comment
+
     if export_df is None or export_df.empty:
         return None
 
@@ -9032,6 +9415,10 @@ def _send_export_dataframe(export_df, filename_prefix, sheet_name):
         export_df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
 
         worksheet = writer.sheets[sheet_name[:31]]
+        for cell in worksheet[1]:
+            comment_text = (header_comments or {}).get(str(cell.value))
+            if comment_text:
+                cell.comment = Comment(comment_text, 'LNG dashboard')
         for column in worksheet.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -9053,18 +9440,33 @@ def _send_export_dataframe(export_df, filename_prefix, sheet_name):
     State({'type': 'supply-dest-expandable-table', 'index': ALL}, 'virtualRowData'),
     State({'type': 'supply-dest-expandable-table', 'index': ALL}, 'rowData'),
     State({'type': 'supply-dest-expandable-table', 'index': ALL}, 'columnDefs'),
+    State('exporters-volume-metric-dropdown', 'value'),
+    State('supply-dest-view-type', 'value'),
     prevent_initial_call=True
 )
-def export_supply_dest_table_to_excel(n_clicks, derived_virtual_data_list, data_list, columns_list):
+def export_supply_dest_table_to_excel(
+    n_clicks,
+    derived_virtual_data_list,
+    data_list,
+    columns_list,
+    volume_metric='mcm_d',
+    view_type='absolute',
+):
     """Export the currently rendered LNG Supply by Destination table to Excel."""
     if not n_clicks:
         return None
 
     export_df = _resolve_table_export_df(derived_virtual_data_list, data_list, columns_list)
+    header_comments = {}
+    if view_type != 'percentage' and _is_period_volume_metric(volume_metric):
+        header_comments['Δ 7D-30D'] = (
+            'Unavailable because the 7D and 30D period totals cover different horizons.'
+        )
     return _send_export_dataframe(
         export_df,
         'LNG_Supply_by_Destination',
-        'Supply by Destination'
+        'Supply by Destination',
+        header_comments=header_comments,
     )
 
 
@@ -9083,8 +9485,10 @@ def export_supply_charts_to_excel(n_clicks, charts_data, volume_metric, rolling_
     if n_clicks == 0 or not charts_data:
         return None
     rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
-    vol_label = _get_volume_metric_info(volume_metric)['label']
-    rolling_col = f'rolling_avg_{rolling_avg_days}d ({vol_label})'
+    rolling_col = _get_rolling_metric_export_column_name(
+        rolling_avg_days,
+        volume_metric,
+    )
 
     # Convert all entities' data to DataFrames
     all_data = []
@@ -9201,8 +9605,6 @@ def export_continent_charts_to_excel(
         return None
 
     rolling_avg_days = normalize_supply_rolling_avg_days(rolling_avg_days)
-    vol_label = _get_volume_metric_info(volume_metric)['label']
-
     all_data = []
     for entity_name in entities_list:
         try:
@@ -9276,7 +9678,10 @@ def export_continent_charts_to_excel(
         if chart_type == 'percentage':
             cols = ['entity', 'date', 'continent_destination', 'year', 'month_day', 'percentage', 'is_forecast']
         else:
-            rolling_col = f'rolling_avg_{rolling_avg_days}d ({vol_label})'
+            rolling_col = _get_rolling_metric_export_column_name(
+                rolling_avg_days,
+                volume_metric,
+            )
             if 'rolling_avg' in combined_df.columns:
                 combined_df = combined_df.rename(columns={'rolling_avg': rolling_col})
             cols = ['entity', 'date', 'continent_destination', 'year', 'month_day', rolling_col, 'is_forecast']
@@ -9291,7 +9696,10 @@ def export_continent_charts_to_excel(
             if chart_type == 'percentage':
                 sheet_cols = ['date', 'continent_destination', 'year', 'month_day', 'percentage', 'is_forecast']
             else:
-                rolling_col = f'rolling_avg_{rolling_avg_days}d ({vol_label})'
+                rolling_col = _get_rolling_metric_export_column_name(
+                    rolling_avg_days,
+                    volume_metric,
+                )
                 entity_df = entity_df.rename(columns={'rolling_avg': rolling_col})
                 sheet_cols = ['date', 'continent_destination', 'year', 'month_day', rolling_col, 'is_forecast']
             sheet_cols = [c for c in sheet_cols if c in entity_df.columns]

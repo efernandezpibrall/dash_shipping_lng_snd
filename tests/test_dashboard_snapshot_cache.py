@@ -45,6 +45,188 @@ def _cross_process_snapshot_worker(
         snapshots.close_persistent_snapshot_cache()
 
 
+def _abba_source_token(_namespace, source_key):
+    stripe = 0 if str(source_key).endswith("a") else 1
+    return f"{stripe:016x}" + "0" * 48
+
+
+def _thread_compound_abba_worker(cache_directory, result_queue):
+    os.environ[snapshots.LOCAL_PERSISTENCE_ENV] = "1"
+    os.environ[snapshots.LOCAL_CACHE_DIR_ENV] = cache_directory
+    snapshots.close_persistent_snapshot_cache()
+    snapshots._disk_source_token = _abba_source_token
+    stores = snapshots._get_persistent_stores()
+    overlap_count = 0
+    overlap_lock = threading.Lock()
+    overlap = threading.Event()
+    errors = []
+
+    def run(bundle_source, artifact_source):
+        nonlocal overlap_count
+        try:
+            with snapshots.snapshot_build_lock("bundle", bundle_source):
+                with overlap_lock:
+                    overlap_count += 1
+                    if overlap_count == 2:
+                        overlap.set()
+                overlap.wait(timeout=0.2)
+                with snapshots._disk_source_lock(
+                    stores,
+                    "artifact",
+                    artifact_source,
+                ):
+                    pass
+                with overlap_lock:
+                    overlap_count -= 1
+        except BaseException as exc:
+            errors.append((type(exc).__name__, str(exc)))
+
+    threads = [
+        threading.Thread(target=run, args=("bundle-a", "artifact-b"), daemon=True),
+        threading.Thread(target=run, args=("bundle-b", "artifact-a"), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+    result_queue.put(
+        ("ok", not any(thread.is_alive() for thread in threads), errors)
+    )
+
+
+def _cross_generation_abba_worker(cache_directory, result_queue):
+    os.environ[snapshots.LOCAL_PERSISTENCE_ENV] = "1"
+    os.environ[snapshots.LOCAL_CACHE_DIR_ENV] = cache_directory
+    snapshots.close_persistent_snapshot_cache()
+    snapshots._disk_source_token = _abba_source_token
+    retired_stores = snapshots._get_persistent_stores()
+    stripe_entered = threading.Event()
+    compound_entered = threading.Event()
+    errors = []
+
+    def hold_retired_stripe():
+        try:
+            with snapshots._disk_source_lock(
+                retired_stores,
+                "source",
+                "artifact-a",
+            ):
+                stripe_entered.set()
+                assert compound_entered.wait(timeout=2)
+                with pytest.raises(
+                    snapshots._PersistentStorageError,
+                    match="must be acquired before",
+                ):
+                    with snapshots.snapshot_build_lock(
+                        "bundle",
+                        "bundle-b",
+                    ):
+                        pass
+        except BaseException as exc:
+            errors.append((type(exc).__name__, str(exc)))
+
+    def replace_store_and_build():
+        try:
+            assert stripe_entered.wait(timeout=2)
+            snapshots.close_persistent_snapshot_cache()
+            current_stores = snapshots._get_persistent_stores()
+            assert current_stores is not retired_stores
+            assert current_stores.lock_depths is retired_stores.lock_depths
+            with snapshots.snapshot_build_lock("bundle", "bundle-b"):
+                compound_entered.set()
+                with snapshots._disk_source_lock(
+                    current_stores,
+                    "source",
+                    "artifact-a",
+                ):
+                    pass
+        except BaseException as exc:
+            errors.append((type(exc).__name__, str(exc)))
+
+    threads = [
+        threading.Thread(target=hold_retired_stripe, daemon=True),
+        threading.Thread(target=replace_store_and_build, daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=4)
+    result_queue.put(
+        ("ok", not any(thread.is_alive() for thread in threads), errors)
+    )
+
+
+def _process_compound_abba_worker(
+    cache_directory,
+    bundle_source,
+    artifact_source,
+    overlap_count,
+    overlap,
+    result_queue,
+):
+    os.environ[snapshots.LOCAL_PERSISTENCE_ENV] = "1"
+    os.environ[snapshots.LOCAL_CACHE_DIR_ENV] = cache_directory
+    snapshots.close_persistent_snapshot_cache()
+    snapshots._disk_source_token = _abba_source_token
+    stores = snapshots._get_persistent_stores()
+    try:
+        with snapshots.snapshot_build_lock("bundle", bundle_source):
+            with overlap_count.get_lock():
+                overlap_count.value += 1
+                if overlap_count.value == 2:
+                    overlap.set()
+            overlap.wait(timeout=0.2)
+            with snapshots._disk_source_lock(
+                stores,
+                "artifact",
+                artifact_source,
+            ):
+                pass
+        result_queue.put(("ok", os.getpid()))
+    except BaseException as exc:
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+    finally:
+        snapshots.close_persistent_snapshot_cache()
+
+
+def _post_fork_lock_worker(result_queue):
+    try:
+        stores = snapshots._get_persistent_stores()
+        with snapshots._disk_source_lock(stores, "fork", "same-source"):
+            pass
+        result_queue.put(("ok", stores.process_id, os.getpid()))
+    except BaseException as exc:
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+
+
+def _retired_store_post_fork_worker(
+    inherited_file_descriptor,
+    inherited_lock_identity,
+    result_queue,
+):
+    try:
+        descriptor_stat = os.fstat(inherited_file_descriptor)
+    except OSError:
+        inherited_descriptor_open = False
+    else:
+        inherited_descriptor_open = (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        ) == tuple(inherited_lock_identity)
+    try:
+        stores = snapshots._get_persistent_stores()
+        result_queue.put(
+            (
+                "ok",
+                inherited_descriptor_open,
+                stores.process_id,
+                os.getpid(),
+            )
+        )
+    except BaseException as exc:
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+
+
 @pytest.fixture(autouse=True)
 def _isolate_snapshot_backend(monkeypatch):
     monkeypatch.setenv(snapshots.LOCAL_PERSISTENCE_ENV, "0")
@@ -1225,6 +1407,253 @@ def test_cross_process_lock_files_use_fixed_bounded_stripes(
     }
     assert 1 <= len(lock_names) <= snapshots._LOCK_STRIPE_COUNT
     assert lock_names <= allowed_names
+
+
+def test_disk_source_lock_reuses_same_stripe_within_thread(
+    monkeypatch,
+    tmp_path,
+):
+    _enable_persistence(monkeypatch, tmp_path)
+    stores = snapshots._get_persistent_stores()
+    flock_calls = []
+    monkeypatch.setattr(
+        snapshots,
+        "_disk_source_token",
+        lambda *_args: "0" * 64,
+    )
+    monkeypatch.setattr(
+        snapshots.fcntl,
+        "flock",
+        lambda file_descriptor, operation: flock_calls.append(
+            (file_descriptor, operation)
+        ),
+    )
+
+    with snapshots._disk_source_lock(stores, "bundle", "outer"):
+        with snapshots._disk_source_lock(stores, "artifact", "inner"):
+            assert stores.lock_depths.values == {0: 2}
+
+    assert [operation for _, operation in flock_calls] == [
+        snapshots.fcntl.LOCK_EX,
+        snapshots.fcntl.LOCK_UN,
+    ]
+    assert stores.lock_depths.values == {}
+
+
+def test_compound_lock_prevents_thread_cross_stripe_abba(
+    monkeypatch,
+    tmp_path,
+):
+    cache_directory = _enable_persistence(monkeypatch, tmp_path)
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_thread_compound_abba_worker,
+        args=(str(cache_directory), result_queue),
+    )
+
+    process.start()
+    process.join(timeout=8)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+
+    assert process.exitcode == 0
+    assert result_queue.get(timeout=2) == ("ok", True, [])
+    result_queue.close()
+    result_queue.join_thread()
+
+
+def test_same_root_store_generations_share_lock_hierarchy(
+    monkeypatch,
+    tmp_path,
+):
+    cache_directory = _enable_persistence(monkeypatch, tmp_path)
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_cross_generation_abba_worker,
+        args=(str(cache_directory), result_queue),
+    )
+
+    process.start()
+    process.join(timeout=10)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+
+    assert process.exitcode == 0
+    assert result_queue.get(timeout=2) == ("ok", True, [])
+    result_queue.close()
+    result_queue.join_thread()
+
+
+def test_compound_lock_prevents_process_cross_stripe_abba(
+    monkeypatch,
+    tmp_path,
+):
+    cache_directory = _enable_persistence(monkeypatch, tmp_path)
+    context = multiprocessing.get_context("spawn")
+    overlap_count = context.Value("i", 0)
+    overlap = context.Event()
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_process_compound_abba_worker,
+            args=(
+                str(cache_directory),
+                bundle_source,
+                artifact_source,
+                overlap_count,
+                overlap,
+                result_queue,
+            ),
+        )
+        for bundle_source, artifact_source in (
+            ("bundle-a", "artifact-b"),
+            ("bundle-b", "artifact-a"),
+        )
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=8)
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+
+    assert [process.exitcode for process in processes] == [0, 0]
+    results = [result_queue.get(timeout=2) for _ in processes]
+    assert [result[0] for result in results] == ["ok", "ok"]
+    assert len({result[1] for result in results}) == 2
+    result_queue.close()
+    result_queue.join_thread()
+
+
+def test_lock_hierarchy_rejects_stripe_inversions(monkeypatch, tmp_path):
+    _enable_persistence(monkeypatch, tmp_path)
+    stores = snapshots._get_persistent_stores()
+    monkeypatch.setattr(snapshots, "_disk_source_token", _abba_source_token)
+
+    with snapshots._disk_source_lock(stores, "source", "artifact-a"):
+        with pytest.raises(
+            snapshots._PersistentStorageError,
+            match="stripes require snapshot_build_lock",
+        ):
+            with snapshots._disk_source_lock(
+                stores,
+                "source",
+                "artifact-b",
+            ):
+                pass
+        with pytest.raises(
+            snapshots._PersistentStorageError,
+            match="must be acquired before",
+        ):
+            with snapshots.snapshot_build_lock("bundle", "bundle-b"):
+                pass
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="requires POSIX fork semantics",
+)
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded.*:DeprecationWarning"
+)
+def test_post_fork_child_reinitializes_inherited_lock_state(
+    monkeypatch,
+    tmp_path,
+):
+    _enable_persistence(monkeypatch, tmp_path)
+    stores = snapshots._get_persistent_stores()
+    context = multiprocessing.get_context("fork")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_post_fork_lock_worker,
+        args=(result_queue,),
+    )
+
+    with snapshots._disk_source_lock(stores, "fork", "same-source"):
+        process.start()
+        time.sleep(0.1)
+        assert process.is_alive()
+
+    process.join(timeout=8)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+
+    assert process.exitcode == 0
+    status, store_process_id, worker_process_id = result_queue.get(timeout=2)
+    assert status == "ok"
+    assert store_process_id == worker_process_id
+    assert worker_process_id != os.getpid()
+    result_queue.close()
+    result_queue.join_thread()
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="requires POSIX fork semantics",
+)
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded.*:DeprecationWarning"
+)
+def test_post_fork_child_closes_retired_store_lock_descriptors(
+    monkeypatch,
+    tmp_path,
+):
+    _enable_persistence(monkeypatch, tmp_path)
+    retired_stores = snapshots._get_persistent_stores()
+    context = multiprocessing.get_context("fork")
+    result_queue = context.Queue()
+
+    with snapshots._disk_source_lock(
+        retired_stores,
+        "retired",
+        "same-source",
+    ):
+        inherited_file_descriptor = next(
+            iter(retired_stores.active_lock_fds)
+        )
+        descriptor_stat = os.fstat(inherited_file_descriptor)
+        inherited_lock_identity = (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        )
+        snapshots.close_persistent_snapshot_cache()
+        monkeypatch.setenv(
+            snapshots.LOCAL_CACHE_DIR_ENV,
+            str(tmp_path / "replacement-cache"),
+        )
+        replacement_stores = snapshots._get_persistent_stores()
+        assert replacement_stores is not retired_stores
+        process = context.Process(
+            target=_retired_store_post_fork_worker,
+            args=(
+                inherited_file_descriptor,
+                inherited_lock_identity,
+                result_queue,
+            ),
+        )
+        process.start()
+
+    process.join(timeout=8)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+
+    assert process.exitcode == 0
+    result = result_queue.get(timeout=2)
+    assert result[0] == "ok"
+    assert result[1] is False
+    assert result[2] == result[3]
+    assert result[3] != os.getpid()
+    result_queue.close()
+    result_queue.join_thread()
 
 
 def test_clear_defaults_to_memory_only_and_explicit_persistent_clear_deletes(

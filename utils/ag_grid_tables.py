@@ -329,7 +329,7 @@ def _build_column_defs(
         column_def: dict[str, Any] = {
             "headerName": header_name,
             "field": field,
-            "sortable": sort_action != "none",
+            "sortable": bool(column.get("sortable", sort_action != "none")),
             "filter": (
                 "agNumberColumnFilter"
                 if filter_action == "native" and is_numeric

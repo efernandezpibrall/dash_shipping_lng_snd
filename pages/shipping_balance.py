@@ -19,7 +19,7 @@ from utils.dashboard_snapshot_cache import (
     was_global_refresh_triggered as _was_global_refresh_triggered,
     with_snapshot_slot as _with_snapshot_slot,
 )
-from utils.database import engine
+from utils.database import DB_SCHEMA, engine
 
 from fundamentals.lng.shipping.shipping_balance_calculator import global_shipping_balance as calc_global_shipping_balance, kpler_analysis
 
@@ -27,27 +27,27 @@ logger = logging.getLogger(__name__)
 
 SHIPPING_BALANCE_NAMESPACE = "shipping-balance-v1"
 
-SHIPPING_BALANCE_SOURCE_STATE_QUERY = '''
+SHIPPING_BALANCE_SOURCE_STATE_QUERY = f'''
 SELECT
     (SELECT snapshot_timestamp_utc
-     FROM at_lng.kpler_trade_snapshots
+     FROM {DB_SCHEMA}.kpler_trade_snapshots
      WHERE run_kind = 'canonical' AND status = 'published'
      ORDER BY snapshot_date_utc DESC
      LIMIT 1) AS kpler_upload,
     (SELECT MAX(publication_date::timestamp)
-     FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa) AS woodmac_publication,
-    (SELECT MAX(upload_timestamp_utc) FROM at_lng.syy_newbuilds) AS syy_upload,
-    (SELECT MAX(upload_timestamp_utc) FROM at_lng.kpler_vessels_info) AS vessel_upload,
+     FROM {DB_SCHEMA}.woodmac_gas_imports_exports_monthly__mmtpa) AS woodmac_publication,
+    (SELECT MAX(upload_timestamp_utc) FROM {DB_SCHEMA}.syy_newbuilds) AS syy_upload,
+    (SELECT MAX(upload_timestamp_utc) FROM {DB_SCHEMA}.kpler_vessels_info) AS vessel_upload,
     (SELECT md5(COALESCE(string_agg(
         concat_ws('|', COALESCE(country, ''), COALESCE(shipping_region, '')),
         '||' ORDER BY COALESCE(country, '')
-    ), '')) FROM at_lng.mappings_country) AS mapping_hash
+    ), '')) FROM {DB_SCHEMA}.mappings_country) AS mapping_hash
 '''
 
-SHIPPING_BALANCE_DATE_STATE_QUERY = '''
+SHIPPING_BALANCE_DATE_STATE_QUERY = f'''
 WITH latest_kpler AS (
     SELECT snapshot_timestamp_utc
-    FROM at_lng.kpler_trade_snapshots
+    FROM {DB_SCHEMA}.kpler_trade_snapshots
     WHERE run_kind = 'canonical' AND status = 'published'
     ORDER BY snapshot_date_utc DESC
     LIMIT 1
@@ -58,7 +58,7 @@ SELECT
     MAX(s.max_delivered_end) FILTER (
         WHERE s.snapshot_timestamp_utc = latest_kpler.snapshot_timestamp_utc
     ) AS hist_date_max
-FROM at_lng.kpler_trade_snapshots s
+FROM {DB_SCHEMA}.kpler_trade_snapshots s
 CROSS JOIN latest_kpler
 '''
 
@@ -155,10 +155,10 @@ def _fetch_woodmac_flow_validation_total(direction, measured_at, aggregation_lev
             SUM(metric_value) / 12 * 2222*1000 AS value,
             publication_date,
             'Short Term' as source
-        FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+        FROM {DB_SCHEMA}.woodmac_gas_imports_exports_monthly__mmtpa
         WHERE market_outlook = (
             SELECT market_outlook
-            FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+            FROM {DB_SCHEMA}.woodmac_gas_imports_exports_monthly__mmtpa
             WHERE release_type = 'Short Term Outlook'
             GROUP BY market_outlook
             ORDER BY TO_DATE(
@@ -188,10 +188,10 @@ def _fetch_woodmac_flow_validation_total(direction, measured_at, aggregation_lev
             SUM(metric_value) / 12 * 2222*1000 AS value,
             publication_date,
             'Long Term' as source
-        FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+        FROM {DB_SCHEMA}.woodmac_gas_imports_exports_monthly__mmtpa
         WHERE market_outlook = (
             SELECT market_outlook
-            FROM at_lng.woodmac_gas_imports_exports_monthly__mmtpa
+            FROM {DB_SCHEMA}.woodmac_gas_imports_exports_monthly__mmtpa
             WHERE release_type = 'Long Term Outlook'
             GROUP BY market_outlook
             ORDER BY TO_DATE(
