@@ -16,7 +16,7 @@ from utils.ea_run_interface import (
     ea_values_at_run_source_sql,
     fetch_current_ea_run,
 )
-from utils.import_flow_data import DB_SCHEMA, engine
+from utils.database import DB_SCHEMA, engine
 
 
 LOGGER = logging.getLogger(__name__)

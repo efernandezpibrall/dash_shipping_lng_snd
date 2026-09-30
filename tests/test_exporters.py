@@ -2017,13 +2017,6 @@ def test_exporter_persistent_sources_track_mapping_and_refresh_generations(
 
 # Consolidated from test_exporters_pbd_changes.py.
 
-import base64
-from io import BytesIO
-
-from openpyxl import load_workbook
-import numpy as np
-import pandas as pd
-import pytest
 
 from pages import exporters
 
@@ -3282,24 +3275,10 @@ def test_snapshot_cache_keys_are_versioned_and_include_exact_pair():
 
 # Consolidated from test_exporters_snapshot_refs.py.
 
-import base64
-import copy
-from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
 import statistics
-import threading
-import time
 
 from dash import html, no_update
-from dash._utils import to_json
 from flask import Flask, Response
-import numpy as np
-from openpyxl import load_workbook
-import pandas as pd
-import pytest
-
-from pages import exporters
-from utils import dashboard_snapshot_cache as snapshots
 
 
 def _make_exporters_payload(

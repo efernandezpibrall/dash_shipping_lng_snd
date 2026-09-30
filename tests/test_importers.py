@@ -2475,13 +2475,8 @@ def test_importer_persistent_sources_track_mapping_and_refresh_generations(
 
 # Consolidated from test_importers_pbd_changes.py.
 
-import base64
 from datetime import date
-from io import BytesIO
 
-from openpyxl import load_workbook
-import pandas as pd
-import pytest
 from dash import html
 
 from pages import importer_detail, importers
@@ -3570,26 +3565,14 @@ def test_period_excel_sheet_reconciles_rendered_pbd_values():
 
 # Consolidated from test_importers_snapshot_refs.py.
 
-import base64
-import copy
-from concurrent.futures import ThreadPoolExecutor
 import inspect
-from io import BytesIO
 import statistics
-import threading
-import time
 
 from dash import html, no_update
 from dash._callback import GLOBAL_CALLBACK_MAP
-from dash._utils import to_json
 from flask import Flask, Response
-import numpy as np
-from openpyxl import load_workbook
-import pandas as pd
-import pytest
 
 from pages import importers
-from utils import dashboard_snapshot_cache as snapshots
 
 
 def _make_overview_payload(

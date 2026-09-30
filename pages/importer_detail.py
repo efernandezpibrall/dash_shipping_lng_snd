@@ -43,8 +43,12 @@ from utils.detail_volume_metrics import (
     round_volume_metric_display_value as _round_detail_volume_metric_display_value,
 )
 from utils.detail_table_formatting import (
+    column_header_text as _column_header_text,
+    column_id as _column_id,
+    compact_column_width as _compact_column_width,
     format_table_value_max_one_decimal as _format_table_value_max_one_decimal,
     round_table_value_max_one_decimal as _round_table_value_max_one_decimal,
+    width_sample_text as _width_sample_text,
 )
 from utils.dataframe_store import (
     load_dataframe_from_payload as _load_store_dataframe,
@@ -1211,44 +1215,6 @@ def _build_exporter_detail_period_grid_display(
             column.pop('format', None)
 
     return grid_df, grid_columns
-
-
-def _column_header_text(column):
-    name = column.get('name') or column.get('headerName') or column.get('id') or column.get('field') or ''
-    if isinstance(name, (list, tuple)):
-        return ' '.join(str(part) for part in name)
-    return str(name)
-
-
-def _column_id(column):
-    value = column.get('id', column.get('field', column.get('name', '')))
-    return str(value)
-
-
-def _width_sample_text(value):
-    if value is None:
-        return ''
-    try:
-        if pd.isna(value):
-            return ''
-    except (TypeError, ValueError):
-        pass
-    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
-        return _format_table_value_max_one_decimal(value)
-    return str(value)
-
-
-def _compact_column_width(header_text, value_samples, min_width, max_width, is_numeric=False):
-    samples = [str(header_text), *[str(sample) for sample in value_samples if str(sample)]]
-    max_header_chars = len(str(header_text))
-    max_value_chars = max((len(sample) for sample in samples[1:]), default=0)
-    effective_header_chars = max_header_chars
-    if not is_numeric and max_header_chars > 16:
-        effective_header_chars = int(np.ceil(max_header_chars / 2)) + 2
-    header_px = effective_header_chars * 6.4 + (26 if is_numeric else 28)
-    value_px = max_value_chars * (6.1 if is_numeric else 6.0) + (22 if is_numeric else 24)
-    width = int(round(max(header_px, value_px, min_width)))
-    return int(min(max(width, min_width), max_width))
 
 
 def _build_importer_detail_column_width_styles(

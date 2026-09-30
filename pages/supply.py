@@ -6,7 +6,6 @@ import dash_ag_grid as dag
 from dash.dash_table.Format import Format, Scheme
 from utils.ag_grid_tables import create_ag_grid_from_datatable
 from dash.exceptions import PreventUpdate
-from sqlalchemy import text
 
 from utils.balance_time import (
     build_lng_season_periods as _build_lng_season_periods,
@@ -56,7 +55,6 @@ from utils.snapshot_controls import (
     woodmac_metadata_from_publication_options as _woodmac_metadata_from_publication_options,
 )
 from utils.export_flow_data import (
-    DB_SCHEMA,
     build_export_flow_matrix,
     default_selected_countries,
     engine,
@@ -291,27 +289,6 @@ def _build_destination_aggregation_lookup_records(mapping_df: pd.DataFrame) -> l
         deduped_df[column_name] = deduped_df[column_name].fillna(UNKNOWN_DESTINATION_GROUP)
 
     return deduped_df[DESTINATION_AGGREGATION_LOOKUP_COLUMNS].to_dict("records")
-
-
-def _fetch_destination_aggregation_lookup_records() -> list[dict]:
-    query = text(
-        f"""
-        SELECT
-            country,
-            country_name,
-            continent,
-            subcontinent,
-            basin,
-            country_classification_level1,
-            country_classification,
-            shipping_region
-        FROM {DB_SCHEMA}.mappings_country
-        """
-    )
-
-    with engine.connect() as connection:
-        mapping_df = pd.read_sql_query(query, connection)
-    return _build_destination_aggregation_lookup_records(mapping_df)
 
 
 def _sort_destination_group_values(values) -> list[str]:

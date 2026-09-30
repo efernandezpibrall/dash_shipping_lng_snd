@@ -5456,15 +5456,6 @@ def _build_importers_overview_payload_from_source(
     }
 
 
-def _build_importers_overview_payload(classification_mode, rolling_avg_days):
-    """Build a standalone overview payload through the optimized source path."""
-    return _build_importers_overview_payload_from_source(
-        _build_importers_source_payload(),
-        classification_mode,
-        rolling_avg_days,
-    )
-
-
 def _normalize_importers_source_state(source_state):
     source_state = (
         dict(source_state)

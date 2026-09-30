@@ -1,6 +1,13 @@
 # Scenario Models: Capacity vs Production
 
-This note summarizes how scenarios work today in:
+> Current behavior (2026-09-07): Production selects a Capacity scenario's
+> `display_run_id` and reads its ramp production output. See
+> `pages/production.py:select_capacity_ramp_display_run`. The comparison below
+> documents the earlier Production implementation and the legacy terminal
+> adjustment workflow; it is historical context, not the current Production
+> data contract.
+
+This historical note summarizes the scenario models in:
 
 - the `Capacity` page
 - the `Production` page / legacy `Terminals`-adjustment flow

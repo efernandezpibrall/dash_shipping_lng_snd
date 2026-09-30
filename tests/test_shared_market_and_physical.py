@@ -104,11 +104,8 @@ def test_corrupt_arrow_payload_fails_closed():
 
 # Consolidated from test_dashboard_page_snapshot_fallbacks.py.
 
-import pandas as pd
-import pytest
 
 from pages import supply
-from utils import dashboard_snapshot_cache as snapshots
 from utils import market_balance_data
 
 
@@ -168,8 +165,6 @@ def test_market_provider_failure_uses_original_source_functions(monkeypatch):
 
 import json
 
-import pandas as pd
-import pytest
 from openpyxl import Workbook
 
 from pages import exporter_detail, importer_detail
@@ -689,18 +684,13 @@ def test_importer_forecast_mismatch_is_calculated_before_bcm_display_rounding():
 
 # Consolidated from test_detail_snapshot_precompute.py.
 
-import copy
 import os
 from pathlib import Path
 import subprocess
 import sys
 
-import pandas as pd
-import pytest
 from sqlalchemy import create_engine, text
 
-from pages import exporter_detail, importer_detail
-from utils import dashboard_snapshot_cache as snapshots
 from utils import detail_snapshot_precompute as precompute
 
 
@@ -1109,12 +1099,10 @@ def test_cli_help_does_not_import_dashboard_pages():
 
 # Consolidated from test_ea_run_interface.py.
 
-import pytest
 
 from utils import ea_run_interface
 from utils import export_flow_data
 from utils import import_flow_data
-from utils import market_balance_data
 from utils import provider_flow_snapshot
 from utils import snapshot_controls
 
@@ -1382,7 +1370,6 @@ def test_pinned_market_payload_does_not_fallback_to_moving_latest(monkeypatch):
 
 # Consolidated from test_global_supply_comparison.py.
 
-import pandas as pd
 
 from utils import global_supply_comparison as comparison
 
@@ -1528,10 +1515,7 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 
-import pandas as pd
-import pytest
 
-from utils import dashboard_snapshot_cache as snapshots
 from utils import historical_comparison_snapshot as comparisons
 
 
@@ -1787,10 +1771,8 @@ def test_changed_mapping_during_build_refuses_publication(
 # Consolidated from test_lng_phys_snapshot.py.
 
 from io import BytesIO
-from pathlib import Path
 from threading import Barrier
 
-import pandas as pd
 from openpyxl import load_workbook
 
 from pages import lng_phys_snapshot as page
@@ -2290,11 +2272,6 @@ def test_storage_failure_does_not_affect_demand_callback(monkeypatch):
 
 from threading import Barrier, Event, Lock, enumerate as enumerate_threads
 
-import pandas as pd
-import pytest
-
-from utils import market_balance_data
-
 
 def _comparison_mapping_frame():
     return pd.DataFrame(
@@ -2468,20 +2445,11 @@ def test_comparison_preserves_deterministic_failure_order(monkeypatch):
 # Consolidated from test_market_balance_snapshot_refs.py.
 
 import base64
-import copy
-from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
-import threading
-import time
 
 from dash import html
 from dash._utils import to_json
-from openpyxl import load_workbook
-import pandas as pd
-import pytest
 
 from pages import market_balance
-from utils import dashboard_snapshot_cache as snapshots
 
 
 OVERVIEW_NAMESPACE = "market-balance-overview-v2"
@@ -3375,8 +3343,6 @@ def test_importers_period_selector_supports_up_to_48_months():
 
 # Consolidated from test_production.py.
 
-import pandas as pd
-import pytest
 
 from pages import production
 
@@ -3621,10 +3587,6 @@ def test_global_supply_quarter_table_and_chart_use_same_period_totals():
 
 # Consolidated from test_snapshot_manifest_resolution.py.
 
-import pytest
-
-from utils import dashboard_snapshot_cache as snapshots
-
 
 def test_exact_manifest_survives_restart_and_newer_revision(
     monkeypatch,
@@ -3712,23 +3674,10 @@ def test_exact_manifest_survives_restart_and_newer_revision(
 
 # Consolidated from test_supply_demand_snapshot_refs.py.
 
-import base64
-import copy
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
-from io import BytesIO
-import threading
-import time
 
-from dash import html
-from dash._utils import to_json
-from openpyxl import load_workbook
-import pandas as pd
-import pytest
 
 from pages import demand, supply
-from utils import dashboard_snapshot_cache as snapshots
-from utils import provider_flow_snapshot
 
 
 PAGES = (

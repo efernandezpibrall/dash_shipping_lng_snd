@@ -12,7 +12,7 @@ from utils.dashboard_snapshot_cache import (
     is_snapshot_reference,
     resolve_snapshot_manifest,
 )
-from utils.export_flow_data import engine
+from utils.database import engine
 from utils.provider_flow_snapshot import (
     NAMESPACE as PROVIDER_FLOW_NAMESPACE,
     fetch_provider_flow_mapping_state,

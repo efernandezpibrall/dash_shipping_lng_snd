@@ -8,8 +8,6 @@ import json
 import math
 import re
 from threading import RLock
-import uuid
-
 import pandas as pd
 import plotly.graph_objects as go
 import dash_ag_grid as dag
@@ -1364,105 +1362,6 @@ def _standardize_country_names(
     return standardized_df
 
 
-def _apply_train_mapping(
-    raw_df: pd.DataFrame,
-    train_mapping_df: pd.DataFrame | None,
-    provider: str,
-    parent_source_field: str,
-    parent_source_column: str,
-    source_field: str,
-    source_column: str,
-    capacity_column: str = "capacity_mtpa",
-    output_column: str = "train",
-    mapping_applied_column: str | None = None,
-) -> pd.DataFrame:
-    if raw_df.empty or source_column not in raw_df.columns or parent_source_column not in raw_df.columns:
-        return raw_df
-
-    standardized_df = raw_df.copy()
-    standardized_df[parent_source_column] = (
-        standardized_df[parent_source_column]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
-    standardized_df[source_column] = (
-        standardized_df[source_column]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
-
-    relevant_mapping_df = pd.DataFrame()
-    if train_mapping_df is not None and not train_mapping_df.empty:
-        relevant_mapping_df = train_mapping_df[
-            (train_mapping_df["provider"] == provider)
-            & (train_mapping_df["parent_source_field"] == parent_source_field)
-            & (train_mapping_df["source_field"] == source_field)
-        ][
-            [
-                "country_name",
-                "plant_name",
-                "__parent_source_name_key",
-                "__source_name_key",
-                "train",
-                "allocation_share",
-            ]
-        ].rename(
-            columns={
-                "train": "__mapped_train",
-                "allocation_share": "__mapped_allocation_share",
-            }
-        )
-
-    standardized_df["__parent_source_name_key"] = standardized_df[parent_source_column].str.upper()
-    standardized_df["__source_name_key"] = standardized_df[source_column].str.upper()
-    if not relevant_mapping_df.empty:
-        standardized_df = standardized_df.merge(
-            relevant_mapping_df,
-            how="left",
-            on=["country_name", "plant_name", "__parent_source_name_key", "__source_name_key"],
-        )
-    else:
-        standardized_df["__mapped_train"] = pd.NA
-        standardized_df["__mapped_allocation_share"] = pd.NA
-
-    mapped_train_series = pd.to_numeric(
-        standardized_df["__mapped_train"],
-        errors="coerce",
-    ).astype("Int64")
-    inferred_train_series = _infer_direct_train_series(
-        standardized_df,
-        parent_source_column=parent_source_column,
-        source_column=source_column,
-        mapped_train_series=mapped_train_series,
-    )
-    mapped_mask = mapped_train_series.notna()
-    standardized_df[output_column] = mapped_train_series.where(mapped_mask, inferred_train_series)
-    standardized_df["allocation_share"] = pd.to_numeric(
-        standardized_df["__mapped_allocation_share"],
-        errors="coerce",
-    ).fillna(1.0)
-    if capacity_column in standardized_df.columns:
-        standardized_df[capacity_column] = (
-            pd.to_numeric(standardized_df[capacity_column], errors="coerce").fillna(0.0)
-            * standardized_df["allocation_share"]
-        )
-    if mapping_applied_column:
-        standardized_df[mapping_applied_column] = mapped_mask.astype(bool)
-    standardized_df = standardized_df.drop(
-        columns=[
-            "__parent_source_name_key",
-            "__source_name_key",
-            "__mapped_train",
-            "__mapped_allocation_share",
-        ],
-        errors="ignore",
-    )
-
-    return standardized_df
-
-
 def _canonical_train_number(value: object) -> int | None:
     if value is None or isinstance(value, bool):
         return None
@@ -2152,33 +2051,6 @@ def _build_capacity_source_snapshot_key(
         separators=(",", ":"),
     )
     return hashlib.sha256(serialized_watermarks.encode("utf-8")).hexdigest()
-
-
-def _build_woodmac_capacity_from_train_data(
-    train_capacity_df: pd.DataFrame,
-) -> pd.DataFrame:
-    columns = ["month", "country_name", "total_mmtpa"]
-    if train_capacity_df.empty:
-        return pd.DataFrame(columns=columns)
-
-    required_columns = {"month", "country_name", "capacity_mtpa"}
-    if not required_columns.issubset(train_capacity_df.columns):
-        return pd.DataFrame(columns=columns)
-
-    capacity_df = train_capacity_df.copy()
-    capacity_df["month"] = pd.to_datetime(capacity_df["month"], errors="coerce")
-    capacity_df["capacity_mtpa"] = pd.to_numeric(
-        capacity_df["capacity_mtpa"],
-        errors="coerce",
-    ).fillna(0.0)
-    capacity_df = (
-        capacity_df.dropna(subset=["month"])
-        .groupby(["month", "country_name"], as_index=False)["capacity_mtpa"]
-        .sum()
-        .rename(columns={"capacity_mtpa": "total_mmtpa"})
-    )
-    capacity_df = capacity_df[capacity_df["total_mmtpa"].ne(0)].copy()
-    return capacity_df.sort_values(["month", "country_name"]).reset_index(drop=True)[columns]
 
 
 def _deserialize_woodmac_capacity_store(
@@ -5776,24 +5648,6 @@ def _build_capacity_scenario_message(
     )
 
 
-def _run_capacity_ramp_forecast(scenario_id: int | None) -> dict:
-    if scenario_id is None:
-        return {
-            "outcome": "failed",
-            "run_status": None,
-            "message": "No internal scenario selected for ramp generation.",
-        }
-    try:
-        return generate_ramp_forecast_for_capacity_scenario(int(scenario_id), engine)
-    except Exception as exc:
-        return {
-            "outcome": "failed",
-            "run_status": None,
-            "message": str(exc),
-            "selector_token": f"capacity_ramp_{int(scenario_id)}",
-        }
-
-
 def _format_capacity_ramp_result_message(result: dict | None) -> tuple[str, str]:
     result = result or {}
     selector_token = result.get("selector_token") or "capacity_ramp_<scenario_id>"
@@ -5846,16 +5700,6 @@ def _format_capacity_ramp_result_message(result: dict | None) -> tuple[str, str]
         f"Ramp forecast failed: {message}",
         "warning",
     )
-
-
-def _append_capacity_ramp_result_message(
-    prefix: str,
-    result: dict | None,
-    default_tone: str = "success",
-) -> html.Div:
-    ramp_text, ramp_tone = _format_capacity_ramp_result_message(result)
-    tone = ramp_tone if ramp_tone != "success" else default_tone
-    return _build_capacity_scenario_message(f"{prefix} {ramp_text}", tone)
 
 
 def _render_capacity_ramp_status_card(status: dict | None) -> html.Div:
@@ -16455,21 +16299,6 @@ def _clean_mapping_text_value(value: object) -> str | None:
         return None
 
     return " ".join(text_value.split())
-
-
-def _clean_positive_train_value(value: object) -> int | None:
-    if pd.isna(value) or str(value).strip() == "":
-        return None
-
-    numeric_value = pd.to_numeric([value], errors="coerce")[0]
-    if pd.isna(numeric_value):
-        return None
-
-    numeric_value = float(numeric_value)
-    if numeric_value <= 0 or not numeric_value.is_integer():
-        return None
-
-    return int(numeric_value)
 
 
 def _clean_allocation_share_value(value: object, default: float = 1.0) -> float | None:

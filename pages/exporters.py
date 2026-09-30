@@ -3573,22 +3573,6 @@ def _apply_continent_chart_layout(
     )
 
 
-def _get_continent_entity_filter(entity_name, classification_mode):
-    if entity_name == "Global":
-        return "", {}
-
-    if classification_mode == 'Classification Level 1':
-        return "AND mc.country_classification_level1 = %(entity_name)s", {'entity_name': entity_name}
-
-    if entity_name == SUPPLY_CHART_REST_OF_COUNTRIES_LABEL:
-        return (
-            "AND COALESCE(kt.origin_country_name, '') != ALL(%(excluded_origin_countries)s)",
-            {'excluded_origin_countries': SUPPLY_CHART_VISIBLE_COUNTRIES}
-        )
-
-    return "AND kt.origin_country_name = %(entity_name)s", {'entity_name': entity_name}
-
-
 def _continent_chart_year_token(year):
     try:
         if pd.isna(year):
@@ -6433,38 +6417,6 @@ def update_rolling_average_section_titles(rolling_avg_days, volume_metric):
             volume_metric,
         ),
     )
-
-
-def _build_exporters_overview_payload(
-    engine_inst,
-    schema,
-    classification_mode,
-    demand_aggregation_mode,
-    rolling_avg_days,
-):
-    chart_dfs = fetch_supply_chart_data(
-        engine_inst,
-        schema,
-        classification_mode,
-        rolling_avg_days,
-    )
-    charts_data = {
-        entity_name: entity_df.to_dict('records') if entity_df is not None and not entity_df.empty else []
-        for entity_name, entity_df in chart_dfs.items()
-    }
-    supply_dest_base_df = fetch_supply_destination_base_data(engine_inst, schema)
-    supply_dest_summary_payload = build_supply_dest_summary_store_payload(
-        engine_inst,
-        schema,
-        supply_dest_base_df,
-        classification_mode,
-        demand_aggregation_mode,
-    )
-    return {
-        'charts_cube': _pack_record_mapping(charts_data),
-        'continent_entities': list(charts_data.keys()),
-        'supply_dest': supply_dest_summary_payload,
-    }
 
 
 def _normalize_exporters_source_watermark(value):

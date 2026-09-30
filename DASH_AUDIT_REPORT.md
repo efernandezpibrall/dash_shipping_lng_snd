@@ -3,6 +3,8 @@
 Audit dates: 2026-08-19 to 2026-08-20
 Scope: application-owned Dash, Python, SQL, delivery, cache, and test code in this repository. Imported write/data helpers in the private sibling `fundamentals` package were treated as an explicit audit boundary.
 
+Current configuration note (2026-09-07): the worker-pool recommendation below is historical. `utils/database.py` and `config/production-4-workers.env.example` now specify a pool size of 2 with zero overflow, allowing eight connections across four workers for this engine unless environment overrides are applied. Historical measurements and test results below have not been rerun as part of this documentation correction.
+
 ## Executive result
 
 The application keeps the same valid-input business outputs and visible page behavior, while closing correctness, security, multi-worker, delivery, and maintainability gaps.

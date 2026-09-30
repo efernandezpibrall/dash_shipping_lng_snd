@@ -244,8 +244,6 @@ def test_http_compression_flag_preserves_bytes_and_clears_ten_percent():
 
 # Consolidated from test_capacity_performance.py.
 
-import json
-from pathlib import Path
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -2382,13 +2380,9 @@ def test_train_timeline_rejects_duplicate_grid_row_ids():
 
 # Consolidated from test_capacity_render_revisions.py.
 
-import pandas as pd
-import pytest
 from dash._callback import GLOBAL_CALLBACK_MAP
-from dash.exceptions import PreventUpdate
 
 import index_shipping_snd
-from pages import capacity
 
 
 SOURCE_KEY = "capacity-source-2026-07-26"
@@ -2694,10 +2688,6 @@ def test_relational_capacity_metadata_carries_source_identity(monkeypatch):
 
 from io import BytesIO
 
-import pandas as pd
-
-from pages import capacity
-
 
 def _scenario_rows() -> pd.DataFrame:
     return pd.DataFrame(
@@ -2804,16 +2794,8 @@ def test_timeline_upload_restores_deleted_saved_row_with_canonical_identity():
 
 # Consolidated from test_contracts_concurrent_loading.py.
 
-from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Lock
-import json
-import os
-import subprocess
-import sys
-import time
 
-import pandas as pd
-import pytest
 
 from pages import contracts
 from utils import dashboard_snapshot_cache as snapshots
@@ -3453,11 +3435,6 @@ def test_contract_source_drift_is_not_published(
 
 # Consolidated from test_database_singleton.py.
 
-from concurrent.futures import ThreadPoolExecutor
-import json
-import os
-import subprocess
-import sys
 from threading import Event
 
 from pages import (
@@ -3732,12 +3709,6 @@ def test_registry_has_exact_navigation_order_and_ids():
 
 # Consolidated from test_shipping_balance_deactivation.py.
 
-import json
-from pathlib import Path
-import subprocess
-import sys
-import textwrap
-
 
 _SHIPPING_REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -3880,8 +3851,6 @@ def test_clientside_title_and_active_navigation_use_exporters_for_root():
 
 from threading import Barrier
 
-import pandas as pd
-import pytest
 
 from pages import terminal_adjustments
 

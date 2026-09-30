@@ -10,6 +10,7 @@ config.ini
 # Editors
 .vscode/
 .spyproject/
+.DS_Store
 
 # Data files
 *.xlsx

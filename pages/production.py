@@ -9,6 +9,7 @@ import os
 import sys
 from dash.dash_table.Format import Format, Scheme
 from utils.ag_grid_tables import create_ag_grid_from_datatable
+from utils.database import engine
 from dash.exceptions import PreventUpdate
 
 # Add project root to path for imports
@@ -40,7 +41,6 @@ from utils.table_styles import (
 from pages.terminals import (
     PRIMARY_COLORS,
     convert_to_mcmd,
-    engine,
     hex_to_rgb,
 )
 
